@@ -9,7 +9,7 @@ desc: |
   适不适合提问。正在睡着时几乎不会开口，而不是“概率打折后照发”。
   反过来，它会把“刚替她主动说过一句”与“被连着冷落几次”写回一个独立的信号文件，
   影响她的心境与想说的心思。两边各写各的文件，不会互相抢写。
-version: "1.7.6"
+version: "1.7.7"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.0.0"
