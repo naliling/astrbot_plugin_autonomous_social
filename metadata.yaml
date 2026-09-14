@@ -1,0 +1,27 @@
+name: astrbot_plugin_autonomous_social
+display_name: 自主拟人社交
+short_desc: 想说是攒出来的，话没说完会追回来，事没结果会追问。
+desc: |
+  主动发消息不难，难的是主动得有道理。
+
+  越在意的人攒得越快，对方不玩手机的时段攒不动；攒满了还要过一句「现在说这个合适吗」，很多时候
+  答案是想过，不说了。话没说完会追问那件事，事没结果会记着问后来，你一直不回她也不追。
+
+  只在开口前调一次模型，零额外依赖。
+version: "1.8.0"
+author: 娜莉灵
+repo: https://github.com/naliling/astrbot_plugin_autonomous_social
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - wechat
+tags:
+  - 拟真
+  - 自主社交
+  - 拟人
+  - 主动消息
+  - 未完话题
+  - 追问
+  - 时段感知
+  - 具身
