@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.8.1 — 修一个把插件堵死的括号
+
+v1.8.0 的出站记账钩子写成了 `@after_message_sent`（无括号）。AstrBot 的
+`register_after_message_sent(**kwargs)` 只收关键字参数，裸用等于把函数当位置参数递进去，
+**插件模块在 import 阶段就抛 `TypeError: register_after_message_sent() takes 0 positional
+arguments but 1 was given`**。管理面板上看到的就是「安装失败 / 更新失败」，而插件目录已经
+落地了，之后再传 zip 会一直撞「目录已存在」——不卸干净就再也装不回去。
+
+1.8.1 只改 `main.py:175` 这一行（补上括号，AstrBot 自带插件 `builtin_stars/astrbot/main.py:338`
+就是这个写法），其余代码与 1.8.0 逐字相同。
+
+漏检原因：入口冒烟测试里的 astrbot 桩用了一个「带括号不带括号都吃」的宽松装饰器，把真机上
+必然发生的 TypeError 吐掉了。已把桩里 12 个注册装饰器全部换成从 AstrBot 源码抄来的真实签名，
+现在这一处会直接测红。
+
 ## v1.8.0 — 未完话题：让她接得上自己的话
 
 上一版把「断话跟进」做出来了，但用下来发现两件事：它不够拟人，而且它那条主路径**在实际

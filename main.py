@@ -172,7 +172,7 @@ class AutonomousSocial(Star):
         except Exception as exc:
             logger.warning(f"[autonomous_social] 观察消息失败: {exc}")
 
-    @after_message_sent
+    @after_message_sent()
     async def observe_outgoing(self, event: AstrMessageEvent):
         """记下 bot 自己说出去的话。
 

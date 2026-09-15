@@ -1,6 +1,6 @@
 name: astrbot_plugin_autonomous_social
 display_name: 自主拟人社交
-short_desc: 想说是攒出来的，话没说完会追回来，事没结果会追问。
+short_desc: 想说是攒出来的，话没说完会追回来，事没结果会记着问。
 desc: |
   主动发消息不难，难的是主动得有道理。
 
@@ -8,7 +8,7 @@ desc: |
   答案是想过，不说了。话没说完会追问那件事，事没结果会记着问后来，你一直不回她也不追。
 
   只在开口前调一次模型，零额外依赖。
-version: "1.8.0"
+version: "1.8.1"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.0.0"

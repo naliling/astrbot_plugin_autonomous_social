@@ -16,6 +16,17 @@
 | **回访没结果的事** | 几小时到一夜：你提过一句没说后来 | `loop_min_hours` / `loop_max_hours` |
 | **给悬着的话收场** | 几小时到几天：她主动发的没人接 | `closer_after_hours`（最多收三次） |
 
+## v1.8.1：修一个把插件堵死的括号
+
+v1.8.0 发出去的包在 AstrBot 4.28 上 import 就炸：`@after_message_sent` 少了一对括号，而框架
+那个注册函数只收关键字参数，于是所有人安装/更新都失败，报的是
+`TypeError: register_after_message_sent() takes 0 positional arguments but 1 was given`。
+1.8.1 就是把它补上，功能与 1.8.0 逐字相同。
+
+已经被 1.8.0 堵住的：那个坏版本已经插件市场发出去了，所以光点「更新」不够——先确认
+`data/plugins/astrbot_plugin_autonomous_social` 里已是 1.8.1 的代码（或先把它删干净再装），
+她的配置与状态在 `data/config/` 和 `data/plugin_data/` 下，不会掉。
+
 ## v1.8.0：未完话题 + 让她看得见自己说的话
 
 用户反馈很直接：「聊完之后我随便发几句，她不会回来追问」。查下来不是参数调得不对，是缺了
@@ -214,6 +225,21 @@ Humanoid Core v2.14 开始把身体导出成一份带版本号的契约快照（
 - 主动消息依赖 `context.send_message`。qq_official 这类不支持主动发送的平台会返回 `False`，此时按发送失败处理，不会误记冷却与统计。
 - 社交状态按 bot 独立保存；状态文件自动补齐新字段（旧版 v1 结构会先迁移到 v2）。
 - 兼容 AstrBot v4 新旧两套 API；引擎与状态层共用同一个可注入时间源。
+
+## 升级（覆盖安装）
+AstrBot 的「本地安装 zip」不会覆盖同名目录：装过旧版时直接上传会报
+`安装失败：目录 astrbot_plugin_autonomous_social 已存在。`，插件列表里的「更新」也只会报
+`该插件不是通过插件市场安装，无法检测或执行更新。`（上传安装的插件没有市场来源）。
+所以升级二选一，两种都不丢状态与配置：
+
+1. 面板：插件 → 本插件 → 卸载（**不要勾**「删除配置」「删除数据」）→ 立即上传新 zip。
+   配置在 `data/config/<目录名>_config.json`、状态在 `data/plugin_data/<目录名>/`，
+   卸载只删 `data/plugins/<目录名>` 这一个目录，两个都不动。
+2. 终端原地替换：先把新 zip 用「本地安装」上传一次（会失败，但包已落到
+   `data/temp/plugin_upload_<原文件名>`），再解压覆盖 `data/plugins/<目录名>`，最后在面板点「重载」。
+
+上传失败后如果 `data/plugins/` 里留下 `plugin_upload_*` 之类的残留目录，或插件出现在
+「加载失败的插件」列表里，要先把它删掉/卸载，否则下次上传仍会撞「目录已存在」。
 
 ## 文件
 ```
