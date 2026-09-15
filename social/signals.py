@@ -70,6 +70,14 @@ class SignalsWriter:
         self._dirty = True
         self.flush()
 
+    def beat(self) -> bool:
+        """每个周期刷一次：内容没变时只按心跳刷新 mtime，文件不存在就立刻建出来。
+
+        没有这一手的话，两个插件看起来「没对接」：三个 setter 都在「值没变」时直接 return，
+        而冷落计数为 0、desire 拿不到时永远算「没变」——社交层跑得好好的，那个文件却永远不会
+        被创建；就算创建过一次，Core 那边按 mtime 判过期（15 分钟），一过就再也不采信。"""
+        return self.flush()
+
     def flush(self, force: bool = False) -> bool:
         """内容真变了就立刻写；没变时只按心跳刷新 mtime。
 

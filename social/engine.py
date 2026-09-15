@@ -130,6 +130,12 @@ class SocialEngine:
     def start(self) -> None:
         """启动引擎。"""
         self.running = True
+        # 先把信号文件放下去：Core 那边靠它判断「社交层活着」，不能等到第一次真的发消息才写。
+        if self.cfg.mode != "standalone":
+            try:
+                self.signals.beat()
+            except Exception as exc:  # 写不进去不影响启动
+                logger.warning(f"[autonomous_social] 信号文件初始化失败: {exc}")
         logger.info(f"[autonomous_social] 引擎启动，模式: {self.cfg.mode}")
 
     def stop(self) -> None:
@@ -865,6 +871,9 @@ class SocialEngine:
         try:
             self.signals.set_ignored_streak(max_streak)
             self.signals.set_desire(top_desire)
+            # 两个 setter 都可能因为「值没变」而提前 return，那样文件永远不会被创建、
+            # mtime 也不会新鲜，Core 会一直报「读不到信号」。每周期再刷一次心跳。
+            self.signals.beat()
         except Exception as e:
             self.log(f"写回社交信号失败: {e}")
 

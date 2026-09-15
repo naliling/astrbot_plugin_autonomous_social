@@ -265,7 +265,10 @@ social/
 ## 数据
 - `data/plugin_data/astrbot_plugin_autonomous_social/state.json`：本插件自己的状态。
 - `data/plugin_data/astrbot_plugin_autonomous_social/humanoid_signals.json`：写回给
-  Humanoid Core 的信号（Core 只读，超过 15 分钟不采信）。
+  Humanoid Core 的信号（Core 只读，超过 15 分钟不采信）。**v1.8.2 起引擎启动时就写第一份，
+  之后每轮刷一次心跳**——以前三个 setter 都在「值没变」时提前 return，冷落计数为 0、
+  欲望拿不到时这个文件永远不会出现，Core 那边就显示「读不到信号」，跟真没装一样。
+  装完两边都重启一次，Core 的 `/拟人诊断` 会显示「社交层信号：读到并在用」。
 
 ## 指令
 - `/自主社交状态`：念头面板（谁攒到多少、多久没说话、上次是被接住还是没接）、当前节奏参数、Core 与人格联动、权限判定依据。仅主人/白名单。
