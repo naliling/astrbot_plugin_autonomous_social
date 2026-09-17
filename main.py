@@ -52,6 +52,39 @@ if after_message_sent is None:
 else:
     HOOK_AFTER_SENT = True
 
+# on_llm_request 钩子：把主动消息补回 LLM 上下文。
+# 主动消息走 context.send_message 发出，不经过 respond 阶段，不会自动进会话历史，
+# 用户回复时 AI 看不到自己刚说了什么。老版本没有这个钩子时跳过——功能照常运行，
+# 只是回复主动消息时 AI 不知道自己上条说了啥。
+on_llm_request = None
+try:
+    from astrbot.api.event.filter import on_llm_request  # type: ignore[assignment]
+except Exception:
+    try:
+        on_llm_request = filter.on_llm_request  # type: ignore[name-defined]
+    except Exception:
+        on_llm_request = None
+
+if on_llm_request is None:
+    def on_llm_request(_func=None, **_kwargs):
+        if _func is not None:
+            return _func
+
+        def _decorator(func):
+            return func
+
+        return _decorator
+
+    HOOK_LLM_REQUEST = False
+else:
+    HOOK_LLM_REQUEST = True
+
+# ProviderRequest：用于类型提示，拿不到就用 Any
+try:
+    from astrbot.api.provider import ProviderRequest  # type: ignore[assignment]
+except Exception:
+    from typing import Any as ProviderRequest  # type: ignore[misc, assignment]
+
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except ImportError:
@@ -156,6 +189,12 @@ class AutonomousSocial(Star):
                     "插件看不到 bot 自己说过的话：追问会退化成只按对方最后那句判断。"
                     "升级 AstrBot 到 4.x 后重开插件即可。"
                 )
+            if not HOOK_LLM_REQUEST:
+                logger.warning(
+                    "[autonomous_social] 这个 AstrBot 版本没有 on_llm_request 钩子，"
+                    "主动消息发出去后用户回复时，AI 看不到自己刚才说了什么。"
+                    "升级 AstrBot 到支持该钩子的版本即可修复。"
+                )
         except Exception as e:
             logger.error(f"[autonomous_social] 启动失败: {e}")
             raise
@@ -186,6 +225,53 @@ class AutonomousSocial(Star):
             await self._engine.note_spoken(event)
         except Exception as exc:
             logger.warning(f"[autonomous_social] 记录已发送消息失败: {exc}")
+
+    @on_llm_request()
+    async def inject_proactive_context(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """把主动消息补回 LLM 上下文。
+
+        主动消息走 context.send_message 发出，不经过 AstrBot 的 respond 阶段，
+        因此不会自动进入会话历史。用户回复时 AI 看不到自己刚说了什么，
+        在这里把那条主动消息作为 assistant 消息插回上下文。
+
+        只在私聊中生效：群聊场景更复杂，主动消息通常是对所有人说的，
+        简单插回上下文可能不对。
+        """
+        if self._engine is None:
+            return
+        try:
+            if not self._engine.cfg.enabled:
+                return
+            if self._engine.cfg.private_only and self._is_group(event):
+                return
+            bid = self._engine._get_bot_id(event)
+            uid = self._engine._get_sender_id(event)
+            if not bid or not uid or uid == bid:
+                return
+            text = self._engine.consume_pending_proactive_context(bid, uid)
+            if not text:
+                return
+            # 把主动消息作为 assistant 消息插到最后一条 user 消息前面
+            contexts = getattr(req, "contexts", None)
+            if not isinstance(contexts, list):
+                return
+            # 从后往前找最后一条 user 消息
+            insert_idx = -1
+            for i in range(len(contexts) - 1, -1, -1):
+                item = contexts[i]
+                if isinstance(item, dict) and str(item.get("role", "")) == "user":
+                    insert_idx = i
+                    break
+            if insert_idx < 0:
+                return
+            contexts.insert(insert_idx, {"role": "assistant", "content": text})
+            logger.debug(
+                f"[autonomous_social] 主动消息已补入上下文（{len(text)} 字）: {text[:40]}…"
+            )
+        except Exception as exc:
+            logger.warning(f"[autonomous_social] 主动消息补入上下文失败: {exc}")
 
     @command("自主社交状态")
     async def social_status(self, event: AstrMessageEvent):

@@ -1,6 +1,6 @@
 # 自主拟人社交
 
-标准 AstrBot 插件结构，版本 1.8.0。
+标准 AstrBot 插件结构，版本 1.9.0。
 
 ## 它解决什么问题
 
@@ -15,6 +15,25 @@
 | **问一句在不在** | 十几分钟：话说到一半人没了 | `followup_after_minutes`（不看 urge） |
 | **回访没结果的事** | 几小时到一夜：你提过一句没说后来 | `loop_min_hours` / `loop_max_hours` |
 | **给悬着的话收场** | 几小时到几天：她主动发的没人接 | `closer_after_hours`（最多收三次） |
+
+## v1.9.0：更频繁的默认节奏；刚装就能认识人
+
+两件事。
+
+**节奏整体往前顶**：`activity_level` 55→65、`urge_refill_hours` 3→2、`user_cooldown` 90→45、
+`global_cooldown` 20→10、`skip_cooldown` 25→15。装过 1.8.x 的会在升级后首启时被自动
+提升到新节奏（只提升没改过的默认值，自己改过的不动）。面板里每个选项的描述也重写了一遍。
+
+**播种：不靠「先聊过」也认识人**。之前插件的用户池只有一条入口——谁私聊过 bot 谁才进
+state.json，刚装好的插件眼里一个人都没有。现在补两条入口，都不依赖装好后再聊一句：
+
+- **历史导入**（`history_ingest`，默认开）：启动与每半小时只读一次 AstrBot 会话库
+  （`data/data_v4.db` 的 conversations 表），把装插件之前就聊过的人导进来：umo、
+  聊过多少条、最后活跃时间。导入的人从「最后聊天的时刻」开始攒念头——三天前聊过的人，
+  攒不满三个小时就能被主动找上。
+- **播种名单**（`seed_users` + `seed_platform`，默认空）：连历史都没有的人也能写进名单，
+  她攒够念头会主动找上门。名单里的人攒念头速度自动打五折（素未谋面，开口本来就比熟人慢），
+  被冷落够多次后天花板机制自然把她压下去。
 
 ## v1.8.1：修一个把插件堵死的括号
 
@@ -178,6 +197,8 @@ Humanoid Core v2.14 开始把身体导出成一份带版本号的契约快照（
 - 全局冷却与用户冷却降级为**护栏**（防刷屏），不再是节奏的来源。
 - 安静时段与对方作息是硬闸：那个点就是不发，念头留着等合适的时候。
 - LLM 同时负责「要不要说」和「说什么」；调度、积累、结算全在插件里。
+- 播种：历史导入（读回装插件前就聊过的人）与播种名单（没聊过的人也能被主动找上），
+  刚装好的插件不必等先聊一句才开始认识人。
 
 ### 拟人化特性
 
@@ -256,6 +277,7 @@ social/
   core_bridge.py   # Humanoid Core 只读桥接（优先读 contract 快照）
   signals.py       # 写回 humanoid_signals.json 给 Core
   desire.py        # 念头模型：urge 积分、在意度、作息、冷落、身体轴
+  history_ingest.py# 播种：读 AstrBot 会话库导入历史私聊对象 + 应用播种名单
   reasoning.py     # 由头提取、时段、关系档位、消息类型、问句/敷衍判定
   threads.py       # 未完话题：追问、回访挂事、收场
   generator.py     # 「该不该说」判断 + 写话 + 输出清洗
@@ -280,8 +302,8 @@ social/
 |---|---|---|
 | `enabled` | `true` | 是否启用自主社交 |
 | `mode` | `auto` | `auto`／`humanoid`／`standalone` |
-| `activity_level` | `55` | 整体想说说话的程度，缩放念头积累速度（不是「每隔几分钟发一条」）；不影响未完话题那几条 |
-| `urge_refill_hours` | `3` | 【节奏】最在意的人攒满一次念头大约要多少小时；一般熟的人按比例自动更慢。只管另起话题 |
+| `activity_level` | `65` | 整体想说说话的程度，缩放念头积累速度（不是「每隔几分钟发一条」）；不影响未完话题那几条 |
+| `urge_refill_hours` | `2` | 【节奏】最在意的人攒满一次念头大约要多少小时；一般熟的人按比例自动更慢。只管另起话题 |
 | `recent_talk_minutes` | `25` | 【节奏】刚聊完多久之内绝不另起话题（不影响未完话题那几条） |
 | `followup_enabled` | `true` | 【未完话题】这场话断了就接一句（自动分「追问那件事」与「问在不在」两种） |
 | `probe_after_minutes` | `3` | 【未完话题】对方回得敷衍时，隔多久追问那件事 |
@@ -295,11 +317,11 @@ social/
 | `track_own_replies` | `true` | 【拟人地基】把 bot 自己说过的话也记进对话账本，追问才接得上话头 |
 | `use_core_clock` | `true` | 【时区】安静时段与作息画像按她所在城市的小时算（需 Core v2.14.2+） |
 | `llm_gate` | `true` | 发送前让模型判断该不该说，它可以说 NO |
-| `skip_cooldown_minutes` | `40` | 模型否决后，多久之内不再就同一个人重新纠结 |
+| `skip_cooldown_minutes` | `15` | 模型否决后，多久之内不再就同一个人重新纠结 |
 | `respect_user_rhythm` | `true` | 按对方平时的活跃时段挑时机 |
 | `cue_followup` | `true` | 记住对方说的时间锚点，到点当成开口的由头 |
-| `global_cooldown_minutes` | `30` | 【护栏】两次主动消息的最短间隔 |
-| `user_cooldown_minutes` | `120` | 【护栏】同一个人两次被主动联系的最短间隔 |
+| `global_cooldown_minutes` | `10` | 【护栏】两次主动消息的最短间隔 |
+| `user_cooldown_minutes` | `45` | 【护栏】同一个人两次被主动联系的最短间隔 |
 | `quiet_start` / `quiet_end` | `23` / `7` | 安静时段：这段时间念头几乎不增长，且到点也不发（开了 `use_core_clock` 就按她那里的小时） |
 | `private_only` | `true` | 仅私聊 |
 | `debug` | `false` | 决策日志（谁攒满了念头、为什么没说） |
@@ -317,3 +339,6 @@ social/
 | `allowed_trigger_uids` | `[]` | 额外白名单，仅在 `owner_only_commands` 关闭时生效 |
 | `store_message_text` | `true` | 是否把私聊正文存入 state.json |
 | `user_retention_days` | `30` | 长期不活跃用户的历史正文清理天数，0 = 永不清理 |
+| `history_ingest` | `true` | 【播种】启动与每半小时读 AstrBot 会话库，把装插件前就聊过的人导进来 |
+| `seed_users` | `[]` | 【播种】没聊过的人也能写进来，她攒够念头会主动找上门（user_id 或 platform:user_id） |
+| `seed_platform` | `aiocqhttp` | 【播种】seed_users 只填 user_id 时拼私聊目标用的平台标识 |

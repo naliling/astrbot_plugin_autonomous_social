@@ -24,34 +24,36 @@ import random
 from typing import Any, Dict, Optional
 
 # 念头攒到多少才算「想找 TA 说话」
-FIRE_THRESHOLD = 1.0
+FIRE_THRESHOLD = 0.88
 # 念头的绝对上限，避免长期不结算的人攒出一个离谱的值
-URGE_CEILING = 2.5
+URGE_CEILING = 3.0
 # 被否决（模型说不用发）之后念头回落到哪里：不是清零，「想过，先算了」
-SKIP_FALLBACK = 0.45
+# 调高一点：话多的人想过但忍住了，过会儿又想说
+SKIP_FALLBACK = 0.55
 # 发送成功后念头清零
 SENT_URGE = 0.0
 
 # 在意度对增速的映射：interest=1 时约需 refill_hours 攒满，越低越慢
-BASE_RATE = 0.20
-INTEREST_RATE = 1.00
+BASE_RATE = 0.25
+INTEREST_RATE = 1.10
 
 # 作息画像至少要有多少条消息才开始起作用
 MIN_RHYTHM_SAMPLES = 4
 # 命中/相邻/不命中的时机系数
-RHYTHM_ON = 1.30
-RHYTHM_NEAR = 0.85
-RHYTHM_OFF = 0.38
+RHYTHM_ON = 1.45
+RHYTHM_NEAR = 0.95
+RHYTHM_OFF = 0.48
 # 还没有作息画像时的中性系数
-RHYTHM_UNKNOWN = 1.0
+RHYTHM_UNKNOWN = 1.10
 # 直方图平滑权重：「晚上九点常在线」意味着八点十点也大概率醒着
 RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 
 # 连续被冷落的念头天花板：越攒不出去，越说明对方不打算接
-STREAK_CAP: Dict[int, float] = {0: 2.5, 1: 2.2, 2: 1.6, 3: 1.15, 4: 1.0}
-STREAK_CAP_FLOOR = 0.9
+# 调高一点：更像脸皮厚一点的人，被冷落了也还会想找
+STREAK_CAP: Dict[int, float] = {0: 3.0, 1: 2.6, 2: 2.0, 3: 1.5, 4: 1.2}
+STREAK_CAP_FLOOR = 1.0
 # 冷落几次之后，只有「真有由头」才允许越过天花板
-STREAK_NEEDS_CUE = 3
+STREAK_NEEDS_CUE = 4
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -224,7 +226,13 @@ def settle(
     hours = dt / 3600.0
     if hours > 0:
         interest = float(user.get("interest", 0.35) or 0.35)
-        rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5)
+        # 播种名单里的人（从没聊过）攒得慢一倍：礼貌问题，不是节奏问题
+        scale = user.get("urge_scale", 1.0)
+        try:
+            scale = clamp(float(scale), 0.1, 2.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5) * scale
         factor = (rhythm if rhythm is not None else 1.0) * clamp(mood_factor, 0.0, 1.5)
         if quiet:
             factor *= 0.12
@@ -347,7 +355,7 @@ def mood_multiplier(
         if desire is not None:
             # 她自己的心思是油门也是刹车：独处攒满了想说，刚聊过就攒不出去。
             factor *= 0.55 + 0.9 * (clamp(desire, 0.0, 100.0) / 100.0)
-    return clamp(factor, 0.02, 1.45)
+    return clamp(factor, 0.05, 1.65)
 
 
 def _num(value: Any) -> Optional[float]:

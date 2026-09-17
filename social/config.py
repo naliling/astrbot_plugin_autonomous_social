@@ -19,44 +19,49 @@ VALID_MODES = {"auto", "humanoid", "standalone"}
 # 配置范围常量
 ACTIVITY_MIN = 10
 ACTIVITY_MAX = 90
-ACTIVITY_DEFAULT = 55
+# 65：接近一个「闲下来就想找人说话」的人。v1.8.x 的 55 被反馈为「主动消息不够频繁」，
+# 整体节奏再往上顶一格（念头攒得快 × 冷却放得低，两边一起动才有感觉）
+# v1.9.x 拉到 75：更像一个平时就话比较多、闲不住想找人聊两句的人
+ACTIVITY_DEFAULT = 75
 
 # 冷却项现在只是护栏（防刷屏），真正的节奏由 urge 决定，所以默认值可以放得很低
 GLOBAL_COOLDOWN_MIN = 5
 GLOBAL_COOLDOWN_MAX = 1440
-GLOBAL_COOLDOWN_DEFAULT = 20
+GLOBAL_COOLDOWN_DEFAULT = 7
 
 USER_COOLDOWN_MIN = 10
 USER_COOLDOWN_MAX = 2880
-USER_COOLDOWN_DEFAULT = 90
+USER_COOLDOWN_DEFAULT = 30
 
 # 一个最在意的人多久能攒满一次「想说两句」的念头
-URGE_REFILL_MIN = 2
+URGE_REFILL_MIN = 1
 URGE_REFILL_MAX = 96
 # 8 小时是对 interest=1（最在意的人）而言的，普通人按比例更慢，实际要攒十几个小时
-# 才发得出一条——那与「插件在跑但永远没动静」基本同义。降到 4。
-URGE_REFILL_DEFAULT = 3
+# 才发得出一条——那与「插件在跑但永远没动静」基本同义。降到 4；
+# v1.9.0 直接降到下限 2：再配合更低的冷却，主动消息才算真的「频繁」
+# v1.9.x 再降到 1.5：更像话多的人，心里一有事就想找人说
+URGE_REFILL_DEFAULT = 2
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
 RECENT_TALK_MIN = 5
 RECENT_TALK_MAX = 720
-RECENT_TALK_DEFAULT = 25
+RECENT_TALK_DEFAULT = 18
 
 # 这一场话断了：多久之后接一句。追问那件事（有由头）比光问「在吗」可以更早。
 FOLLOWUP_AFTER_MIN = 2
 FOLLOWUP_AFTER_MAX = 240
-FOLLOWUP_AFTER_DEFAULT = 6
+FOLLOWUP_AFTER_DEFAULT = 4
 PROBE_AFTER_MIN = 1
 PROBE_AFTER_MAX = 120
-PROBE_AFTER_DEFAULT = 3
+PROBE_AFTER_DEFAULT = 2
 # 超过这么久再问就不像接话了，像隔了半天重新打招呼
 FOLLOWUP_MAX_MIN = 15
 FOLLOWUP_MAX_MAX = 720
-FOLLOWUP_MAX_DEFAULT = 90
+FOLLOWUP_MAX_DEFAULT = 70
 # 同一段沉默只接一次；两次跟进之间的最短间隔
 FOLLOWUP_COOLDOWN_MIN = 5
 FOLLOWUP_COOLDOWN_MAX = 720
-FOLLOWUP_COOLDOWN_DEFAULT = 45
+FOLLOWUP_COOLDOWN_DEFAULT = 30
 
 # 隔一阵回访那件事：对方提了个没说完结果的事，过几小时问「后来呢」
 LOOP_MIN_HOURS_FLOOR = 1.0
@@ -71,7 +76,7 @@ CLOSER_AFTER_DEFAULT = 8
 # 模型否决（想过但决定不说）之后，多久之内不再就同一个人重新纠结
 SKIP_COOLDOWN_MIN = 5
 SKIP_COOLDOWN_MAX = 480
-SKIP_COOLDOWN_DEFAULT = 25
+SKIP_COOLDOWN_DEFAULT = 10
 
 HOUR_MIN = 0
 HOUR_MAX = 23
@@ -95,6 +100,10 @@ SOCIAL_ENERGY_THRESHOLD_MIN = 0
 SOCIAL_ENERGY_THRESHOLD_MAX = 100
 SOCIAL_ENERGY_THRESHOLD_DEFAULT = 20
 
+# 播种：没聊过的人（seed_users 名单）攒念头的速度倍率。这是「礼貌倍率」不是频率旋钮：
+# 跟一个素未谋面的人开口，间隔本来就比熟人长，不能拿熟人节奏硬套
+SEED_URGE_SCALE = 0.5
+
 REPLY_WINDOW_MIN = 1
 REPLY_WINDOW_MAX = 48
 # 把 6 小时后的回复也算作「回了我的主动消息」会高估回复率，进而错估关系熟细度；
@@ -113,16 +122,18 @@ USER_RETENTION_DEFAULT = 30
 # 所以调默认值对老用户完全无效 —— 他们永远停在装插件那一版的行为上。
 # 首次以本版本运行时，如果某项仍然等于某个旧默认值（用户没自己改过），就提升到现在的新默认。
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
-    "global_cooldown_minutes": {45, 90, 30},
-    "user_cooldown_minutes": {180, 720, 120},
+    "global_cooldown_minutes": {45, 90, 30, 20, 10},
+    "user_cooldown_minutes": {180, 720, 120, 90, 45},
     "max_message_length": {200},
     "reply_window_hours": {6},
-    "urge_refill_hours": {8, 4},
-    "recent_talk_minutes": {45, 30},
-    "skip_cooldown_minutes": {40},
-    "activity_level": {45},
-    "followup_after_minutes": {12},
-    "followup_cooldown_minutes": {60},
+    "urge_refill_hours": {8, 4, 3, 2},
+    "recent_talk_minutes": {45, 30, 25},
+    "skip_cooldown_minutes": {40, 25, 15},
+    "activity_level": {45, 55, 65},
+    "followup_after_minutes": {12, 6},
+    "followup_cooldown_minutes": {60, 45},
+    "probe_after_minutes": {3},
+    "followup_max_minutes": {90},
 }
 
 # 迁移标记文件：只跑一次，用户之后主动改回旧值不会被反复覆盖
@@ -199,6 +210,15 @@ class SocialConfig:
 
     # 手动触发白名单：管理面板里逐条添加的列表；留空则回退到 AstrBot 管理员（全局配置 admins_id）
     allowed_trigger_uids: Any = None
+
+    # 播种：启动时从 AstrBot 会话库（data/data_v4.db 的 conversations 表）读回装插件
+    # 之前就聊过的人，不用等插件装好后先聊一句才认识
+    history_ingest: bool = True
+    # 播种名单：没聊过、也读不到历史的人也能写进来，她攒够念头会主动找上门
+    # （逐条 user_id，或 platform:user_id）；攒念头的速度按 SEED_URGE_SCALE 打折
+    seed_users: Any = None
+    # seed_users 只填 user_id 时，用来拼私聊目标的平台标识（与管理面板的平台名一致）
+    seed_platform: str = "aiocqhttp"
 
     # 是否持久化私聊消息文本（关闭后仅统计、不落盘正文）
     store_message_text: bool = DEFAULT_STORE_MESSAGE_TEXT
@@ -341,6 +361,9 @@ class SocialConfig:
                 min(REPLY_WINDOW_MAX, int(g("reply_window_hours", REPLY_WINDOW_DEFAULT))),
             ),
             allowed_trigger_uids=g("allowed_trigger_uids", None),
+            history_ingest=bool(g("history_ingest", True)),
+            seed_users=g("seed_users", None),
+            seed_platform=str(g("seed_platform", "aiocqhttp") or "aiocqhttp").strip() or "aiocqhttp",
             store_message_text=bool(g("store_message_text", DEFAULT_STORE_MESSAGE_TEXT)),
             user_retention_days=max(
                 USER_RETENTION_MIN,

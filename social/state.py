@@ -126,6 +126,8 @@ class SocialState:
             "fire_gate": 1.0,
             "interest": None,
             "interest_at": 0.0,
+            # 攒念头的速度倍率：播种名单（从没聊过的人）为 0.5，正常用户 1.0
+            "urge_scale": 1.0,
             # v1.7.4 作息画像：对方在 0-23 点各自的活跃计数
             "active_hours": [0.0] * RETENTION_RHYTHM_HOURS,
             "rhythm_samples": 0,
@@ -662,6 +664,15 @@ class SocialState:
         u["last_spoken"] = ts
         u["last_spoken_text"] = str(text or "")[:120]
         u["last_spoken_question"] = is_question(str(text or ""))
+        # 保存完整文本，等用户回复时补进 LLM 上下文（主动消息走 context.send_message，
+        # 不经过 respond 阶段，不会自动进会话历史，用户回复时 AI 看不到自己刚说了什么）。
+        # on_llm_request 里消费掉这个字段后清空，避免每条消息都重复注入。
+        # 连发（burst）时追加而不是覆盖：两条都得让 AI 看得见。
+        existing = str(u.get("pending_proactive_context", "") or "")
+        if existing and len(existing) < 500:
+            u["pending_proactive_context"] = existing + "\n" + str(text or "")[:300]
+        else:
+            u["pending_proactive_context"] = str(text or "")[:500]
 
         self.mark_dirty()
         return u

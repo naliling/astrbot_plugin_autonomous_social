@@ -25,6 +25,7 @@ except ImportError:
     MessageChain = None
 
 from . import __version__, desire
+from . import history_ingest
 from .config import SocialConfig
 from .core_bridge import CoreBridge
 from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
@@ -85,6 +86,10 @@ BURST_DELAY_MAX = 180
 PRUNE_INTERVAL_SECONDS = 3600
 
 
+# 播种（读 AstrBot 会话库 + 应用名单）的扫描间隔（秒）
+SEED_INTERVAL_SECONDS = 1800
+
+
 class SocialEngine:
     """自主社交引擎。"""
 
@@ -114,9 +119,11 @@ class SocialEngine:
             os.path.join(os.path.dirname(state_path), SIGNALS_FILE_NAME), time_source=self._time
         )
         self.generator = MessageGenerator(context, self.cfg)
+        self._data_dir = data_dir
         self.running = False
         self._last_flush = 0.0
         self._last_prune = 0.0
+        self._last_seed = 0.0
         self._last_llm_error = ""
         # bid -> 本周期实际用到的人格名（仅用于状态展示，不落盘）
         self._last_persona: Dict[str, str] = {}
@@ -136,6 +143,9 @@ class SocialEngine:
                 self.signals.beat()
             except Exception as exc:  # 写不进去不影响启动
                 logger.warning(f"[autonomous_social] 信号文件初始化失败: {exc}")
+        # 启动即播种：读回 AstrBot 会话库里的历史私聊对象 + 应用播种名单，
+        # 不用等装好后再聊一句才开始认识人
+        self._seed_tick(force=True)
         logger.info(f"[autonomous_social] 引擎启动，模式: {self.cfg.mode}")
 
     def stop(self) -> None:
@@ -285,6 +295,25 @@ class SocialEngine:
         self.state.record_spoken(
             bid, uid, text, store_text=self.cfg.store_message_text
         )
+
+    def consume_pending_proactive_context(self, bid: str, uid: str) -> str:
+        """取出并清除待补入 LLM 上下文的主动消息文本。
+
+        主动消息走 context.send_message 发出，不经过 AstrBot 的 respond 阶段，
+        因此不会自动进入会话历史。用户回复时 AI 看不到自己刚说了什么，
+        需要在 on_llm_request 钩子里把这条消息作为 assistant 插回上下文。
+
+        消费后立即清空，避免后续每条消息都重复注入。
+        """
+        if not bid or not uid:
+            return ""
+        u = self.state.user(bid, uid)
+        text = str(u.get("pending_proactive_context", "") or "")
+        if not text:
+            return ""
+        u["pending_proactive_context"] = ""
+        self.state.mark_dirty()
+        return text
 
     @staticmethod
     def _spoken_text(event: Any) -> str:
@@ -1116,7 +1145,10 @@ class SocialEngine:
 
         users = self.state.bot(bid).get("users", {})
         if not users:
-            return "还没有任何用户记录（没有人私聊过 bot），无法触发。可先和 bot 说句话再来试。"
+            return (
+                "还没有可联系的用户（都没人私聊过 bot，且历史导入与播种名单都是空的）。"
+                "可先和 bot 说句话，或在配置里打开 history_ingest / 填 seed_users。"
+            )
 
         core_root = None
         bot_state = None
@@ -1246,6 +1278,49 @@ class SocialEngine:
 
     # ─── 后台循环 ───────────────────────────────────────
 
+    def _seed_tick(self, force: bool = False) -> None:
+        """播种用户：把还没进插件状态的人补进来（历史导入 + 播种名单）。
+
+        历史导入是启动一次 + 每半小时一次：数据库在长，插件状态里的「认识的人」
+        要跟上。已经在 state.json 里的用户一律不动，实时数据永远比旧快照新。
+        """
+        if not (force or self._time() - self._last_seed >= SEED_INTERVAL_SECONDS):
+            return
+        self._last_seed = self._time()
+        if not self.cfg.history_ingest and not self.cfg.seed_users:
+            return
+        added = 0
+        try:
+            if self.cfg.history_ingest:
+                added += history_ingest.seed_from_history(
+                    self.state,
+                    self._data_dir,
+                    private_only=self.cfg.private_only,
+                    store_text=self.cfg.store_message_text,
+                    now=self._time(),
+                )
+            if self.cfg.seed_users:
+                added += history_ingest.apply_seed_list(
+                    self.state,
+                    self.cfg.seed_users,
+                    self.cfg.seed_platform,
+                    now=self._time(),
+                )
+            if added:
+                self.state.save()
+                n_list = len(
+                    history_ingest.normalize_seed_entries(
+                        self.cfg.seed_users, self.cfg.seed_platform
+                    )
+                )
+                logger.info(
+                    f"[autonomous_social] 播种用户：新导入/新增 {added} 人"
+                    f"（历史导入{'开' if self.cfg.history_ingest else '关'}，"
+                    f"名单 {n_list} 人）"
+                )
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 播种用户失败: {e}")
+
     def _prune_expired(self) -> None:
         """每小时最多扫一次，把长期不活跃用户的历史正文从状态文件里清掉。
 
@@ -1276,6 +1351,7 @@ class SocialEngine:
                 if not self.running:
                     break
                 self._prune_expired()
+                self._seed_tick()
                 await self.try_once()
             except asyncio.CancelledError:
                 logger.info("[autonomous_social] 后台循环被取消")
@@ -1371,7 +1447,7 @@ class SocialEngine:
                     float(u.get("last_seen", 0) or 0),
                 ))
         if not rows:
-            return "  还没有用户记录（没人私聊过 bot）"
+            return "  还没有用户记录（没人说过话，也没播种进来任何人）"
         rows.sort(key=lambda x: -x[2])
         lines: List[str] = []
         for bid, uid, urge, interest, pend, seen in rows[:limit]:
@@ -1531,6 +1607,8 @@ class SocialEngine:
             + "\n"
             f"护栏冷却：全局 {self.cfg.global_cooldown_minutes} 分钟 / 同一人 "
             f"{self.cfg.user_cooldown_minutes} 分钟\n"
+            f"播种：历史导入{'开' if self.cfg.history_ingest else '关'}　"
+            f"名单 {len(history_ingest.normalize_seed_entries(self.cfg.seed_users, self.cfg.seed_platform))} 人（没聊过也能找）\n"
             f"记录 bot：{len(bots)}（{bot_list}）\n"
             f"候选用户：{users}\n"
             f"主动消息发送/回复：{reply_rate}\n"

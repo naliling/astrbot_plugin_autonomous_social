@@ -15,6 +15,11 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
 # ─── 时段定义 ───────────────────────────────────────
 
 _TIME_SLOTS: List[Tuple[int, int, str]] = [
@@ -47,6 +52,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "早上头一件事就是刷眼手机。",
         "醒了就睡不着了，躺着发了会儿呆。",
         "今天居然没赖床，有点不习惯。",
+        "楼下卖早餐的香味飘上来了，有点饿。",
+        "做了个奇怪的梦，醒过来还记着一点。",
     ],
     "morning": [
         "上午有点走神，手头的事提不起劲。",
@@ -55,6 +62,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "开了个没什么用的会，出来透透气。",
         "咖啡喝到第二杯了，还是有点困。",
         "今天状态还行，就是闲不住想唠两句。",
+        "刚才摸鱼刷到个好玩的东西。",
+        "工位旁边的同事今天话特别多，有点烦。",
     ],
     "lunch": [
         "中午吃完没什么精神，犯困。",
@@ -63,6 +72,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "困得不行，但又不想睡，随便打几个字。",
         "中午难得闲下来，脑子开始乱飘。",
         "吃完饭散了会儿步，回来有点想说话。",
+        "今天的外卖送了快一小时才到。",
+        "食堂今天居然有我爱吃的菜。",
     ],
     "afternoon": [
         "事情做到一半卡住了，摸会儿鱼缓缓。",
@@ -71,6 +82,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "刚被一堆事轰炸完，终于安静了。",
         "坐着坐着突然有点无聊。",
         "今天过得意外的快。",
+        "三点多了，有点想吃下午茶。",
+        "刚才跟人吵架了，心情有点不爽。",
     ],
     "evening": [
         "忙完一天窝着，心里挺松的。",
@@ -79,6 +92,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "晚风很舒服，在楼下晃了一圈回来。",
         "心情说不上好也说不上坏，就想说说话。",
         "剧看到一半，突然想换个脑子。",
+        "今天居然准点下班了，有点不习惯。",
+        "洗了个澡出来，整个人都松了。",
     ],
     "late_night": [
         "还没睡，安静的时候脑子最活跃。",
@@ -87,6 +102,8 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "夜宵刚吃完，有点罪恶感。",
         "戴着耳机随机播放，听到一首老歌。",
         "明明困了但就是不想先睡。",
+        "窗外还挺亮的，不像深夜。",
+        "有点饿，但又不想起来弄吃的。",
     ],
     "deep_night": [
         "凌晨了，迷迷糊糊还没睡。",
@@ -94,6 +111,9 @@ _TIME_REASONS: Dict[str, List[str]] = {
         "这个点醒着的人不多，有种奇怪的安全感。",
         "半夜饿了，翻完冰箱坐在这发呆。",
         "睡不着，索性不睡了。",
+        "做了个噩梦，醒过来有点懵。",
+        "外面居然还有人在走路。",
+        "手机刷到没电了，还是不想睡。",
     ],
 }
 
@@ -108,7 +128,7 @@ _TIME_REASONS: Dict[str, List[str]] = {
 
 MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
     "share_thought": {
-        "weight": 30,
+        "weight": 22,
         "desc": "分享一个突然冒出来的想法或感受",
         "examples": [
             ("刚才看到一个东西挺有意思", 0),
@@ -119,7 +139,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "express_feeling": {
-        "weight": 20,
+        "weight": 18,
         "desc": "自然地表达一点情绪或感受",
         "examples": [
             ("今天好累啊", 0),
@@ -129,8 +149,19 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("突然有点想你了", 3),
         ],
     },
+    "share_daily": {
+        "weight": 16,
+        "desc": "分享一件日常小事，像随手拍给对方看的感觉",
+        "examples": [
+            ("楼下的猫又在晒太阳", 0),
+            ("今天的咖啡特别苦", 0),
+            ("刚路过一家店闻着好香", 0),
+            ("外面下雨了 你那边下了吗", 0),
+            ("今天路上看到一只超可爱的狗", 1),
+        ],
+    },
     "continue_topic": {
-        "weight": 20,
+        "weight": 14,
         "desc": "自然地延续之前聊过的话题",
         "examples": [
             ("对了之前那个后来怎么样了", 0),
@@ -139,7 +170,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "casual_hello": {
-        "weight": 15,
+        "weight": 10,
         "desc": "不打招呼的招呼，像随口说的一句",
         "examples": [
             ("嘿", 0),
@@ -148,8 +179,18 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("突然想跟你说句话", 1),
         ],
     },
+    "complain": {
+        "weight": 8,
+        "desc": "吐槽一件小事，不是抱怨大道理，就是随口嘟囔",
+        "examples": [
+            ("今天地铁人也太多了", 0),
+            ("公司的午饭越来越难吃", 0),
+            ("刚才被领导叫住说了半天 头都大了", 1),
+            ("今天诸事不顺 喝口水都塞牙", 2),
+        ],
+    },
     "check_in": {
-        "weight": 10,
+        "weight": 6,
         "desc": "自然的关心，但不要太像问候语",
         "examples": [
             ("最近降温了 你那边冷不冷", 0),
@@ -157,8 +198,17 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("你上次说的那个事 后来顺不顺利", 2),
         ],
     },
+    "ask_advice": {
+        "weight": 4,
+        "desc": "问个小建议或对方的看法，不是真的需要答案，就是想聊",
+        "examples": [
+            ("你一般失眠的时候都干嘛", 0),
+            ("有没有什么摸鱼的好办法", 0),
+            ("你觉得我要不要染头发", 2),
+        ],
+    },
     "react_time": {
-        "weight": 5,
+        "weight": 2,
         "desc": "基于当前时间或状态的反应",
         "examples": [
             ("这个点了还没睡", 0),
@@ -421,12 +471,19 @@ _LONG_ABSENCE_REASONS: List[str] = [
     "隔了好几天没聊，刚才提到一半的事突然又想起来了。",
     "这几天都没动静，不知道对方在忙什么。",
     "翻手机看到跟TA的聊天记录停在几天前。",
+    "突然想起这个人了，好久没聊了。",
+    "这几天总觉得少了点什么，原来是没跟TA说话。",
+    "刷手机的时候突然想到TA，就想发一句。",
+    "好几天没见人了，有点好奇TA在干嘛。",
 ]
 
 _ABSENCE_REASONS: List[str] = [
     "有一天多没联系了。",
     "昨天聊到一半就去睡了，今天还没说上话。",
     "隔了一天，有点想接上前天的话。",
+    "快一天没说话了，有点想找TA说一句。",
+    "昨天聊完之后就没下文了，今天想接着聊聊。",
+    "一整天没见人了，不知道TA今天过得咋样。",
 ]
 
 
@@ -593,6 +650,12 @@ def select_message_type(
 ) -> Tuple[str, Dict[str, Any]]:
     """选择消息类型，避免重复。
 
+    权重受多种拟人化因素影响：
+    - 关系远近：越亲近越敢表达感受和吐槽，不熟的人以分享日常和想法为主
+    - 久未联系：越久没聊越容易说「想你」，久到一定程度又会变得客气
+    - 精力状态：累的时候抱怨多、分享少；精力好的时候日常分享多
+    - 社交能量：高的时候更主动搭话，低的时候更倾向于「随口说一句」
+
     Args:
         user_data: 用户状态 dict
         now: 当前时间戳
@@ -604,12 +667,78 @@ def select_message_type(
     recent_types = recent_types or []
     age = now - float(user_data.get("last_seen", now))
     msg_count = int(user_data.get("message_count", 0))
+    affection = user_data.get("_affection")  # 0-100，可能为 None
+    body = user_data.get("_body")  # Core 契约里的身体状态，可能为 None
 
     # 复制基础权重
     weights: Dict[str, float] = {
         key: float(info["weight"])
         for key, info in MESSAGE_TYPES.items()
     }
+
+    # ─── 关系远近影响类型分布 ──────────────────────────
+    # 越亲近，表达感受和吐槽的比例越高；不熟的人以分享日常和想法为主
+    if affection is not None:
+        aff = clamp(float(affection) / 100.0, 0.0, 1.0)
+        # express_feeling：亲近的人表达感受更多（2.2x），不熟的人少一点（0.7x）
+        weights["express_feeling"] *= 0.7 + 1.5 * aff
+        # complain：越亲近越敢吐槽（越熟越不掩饰）
+        weights["complain"] *= 0.5 + 1.8 * aff
+        # ask_advice：关系好才会问个人建议
+        weights["ask_advice"] *= 0.6 + 1.2 * aff
+        # casual_hello：越不熟越用招呼开场
+        weights["casual_hello"] *= 1.4 - 0.7 * aff
+        # share_daily：日常分享是中性的，跟关系远近关系不大，微调
+        weights["share_daily"] *= 0.9 + 0.3 * aff
+
+    # ─── 久未联系：越久越容易说想你，但太久了又会变客气 ───
+    days_absent = age / 86400.0
+    if days_absent > 0.5:  # 半天以上没聊
+        # 「想你」的峰值在 1-3 天左右，之后慢慢回落（太久了说想你有点突兀）
+        missing_peak = min(days_absent / 1.5, 1.0) if days_absent < 3 else max(0.3, 1.0 - (days_absent - 3) / 10)
+        if affection is not None and float(affection) >= 60:
+            # 只有关系够近才会说想你
+            weights["express_feeling"] *= 1.0 + missing_peak * 1.5
+        # 久未联系时 check_in 也会增加
+        weights["check_in"] *= 1.0 + min(days_absent / 2.0, 1.5)
+        # 太久没聊了，casual_hello 反而更自然
+        if days_absent > 5:
+            weights["casual_hello"] *= 1.3
+
+    # ─── 身体状态影响类型 ──────────────────────────
+    if body and isinstance(body, dict):
+        energy = body.get("energy")
+        social_desire = body.get("social_desire")
+        sleep_pressure = body.get("sleep_pressure")
+        hunger = body.get("hunger")
+        discomfort = body.get("discomfort")
+
+        # 累/困的时候：抱怨多、分享想法少、更多表达感受
+        if energy is not None and float(energy) < 35:
+            weights["complain"] *= 1.4
+            weights["share_thought"] *= 0.7
+            weights["express_feeling"] *= 1.2
+            weights["share_daily"] *= 0.8
+
+        # 不舒服的时候：更想找人说话（表达感受 + 吐槽）
+        if discomfort is not None and float(discomfort) >= 50:
+            weights["express_feeling"] *= 1.3
+            weights["complain"] *= 1.2
+
+        # 饿的时候：吐槽食物相关，分享日常（吃的）更多
+        if hunger is not None and float(hunger) >= 70:
+            weights["share_daily"] *= 1.2
+            weights["complain"] *= 1.1
+
+        # 社交欲望高的时候：更想搭话，招呼类更多
+        if social_desire is not None and float(social_desire) >= 70:
+            weights["casual_hello"] *= 1.3
+            weights["express_feeling"] *= 1.1
+
+        # 社交欲望低的时候：更少主动搭话，更多分享（就是随手发一句）
+        if social_desire is not None and float(social_desire) < 30:
+            weights["casual_hello"] *= 0.7
+            weights["share_daily"] *= 1.2
 
     # 有到点的由头：这次就是去问那件事的，其他类型都往后排
     if live_cue(user_data, now):
@@ -625,6 +754,7 @@ def select_message_type(
         weights["express_feeling"] = NEW_USER_EXPRESS_WEIGHT
         weights["check_in"] = NEW_USER_CHECKIN_WEIGHT
         weights["casual_hello"] = NEW_USER_HELLO_WEIGHT
+        weights["complain"] = max(MIN_WEIGHT, weights.get("complain", 8) * 0.5)
 
     # 长时间未联系：提升关心类权重
     if age > LONG_ABSENCE_THRESHOLD:
