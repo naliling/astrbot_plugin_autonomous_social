@@ -17,12 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-try:
-    from astrbot.api import logger
-except Exception:  # 非 AstrBot 环境兜底
-    import logging
-
-    logger = logging.getLogger("autonomous_social")
+from astrbot.api import logger
 
 # 人设原文注入上限：人设可能写得很长，主动消息只需要它的语气与身份，
 # 全文塞进去会淹没「发一句很短的话」这个任务本身。

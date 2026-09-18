@@ -2,6 +2,12 @@
 
 只记当前版本。更早的改动看 git 历史或 Release 页。
 
+## v1.9.1 — 日志规范修复
+
+- `social/generator.py`、`social/persona.py`：删掉非 AstrBot 环境下的 `logging.getLogger`
+  兜底分支，logger 改为直接 `from astrbot.api import logger`，与插件其余文件保持一致。
+  插件本就只在 AstrBot 内运行，该兜底分支永远不会被走到，行为无任何变化。
+
 ## v1.9.0 — 更频繁的默认节奏；刚装就能认识人（历史导入 + 播种名单）
 
 两条主线，都是针对「装完就默默没人、想找人得先跟她说句话才认识她」的反馈。

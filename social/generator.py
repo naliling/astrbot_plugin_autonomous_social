@@ -27,12 +27,7 @@ from .reasoning import (
     time_slot,
 )
 
-try:
-    from astrbot.api import logger
-except Exception:  # 非 AstrBot 环境兜底
-    import logging
-
-    logger = logging.getLogger("autonomous_social")
+from astrbot.api import logger
 
 # ─── 常量定义 ───────────────────────────────────────
 
