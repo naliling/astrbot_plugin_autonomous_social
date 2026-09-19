@@ -11,6 +11,7 @@ v1.7.4：从定时器改成念头驱动
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import time
@@ -23,6 +24,15 @@ try:
     from astrbot.api.event import MessageChain
 except ImportError:
     MessageChain = None
+
+# pipeline 处理 LLM 请求时持有的就是这把按会话区分的锁；写会话历史时拿同一把，
+# 避免和主链路「读历史→跑模型→写回」撞车把对方刚聊完的回合覆盖掉。老版本没有就裸写。
+try:
+    from astrbot.core.utils.session_lock import (
+        session_lock_manager as _session_lock_manager,
+    )
+except Exception:
+    _session_lock_manager = None
 
 from . import __version__, desire
 from . import history_ingest
@@ -314,6 +324,67 @@ class SocialEngine:
         u["pending_proactive_context"] = ""
         self.state.mark_dirty()
         return text
+
+    def _consume_pending_line(self, bid: str, uid: str, text: str) -> None:
+        """从待注入文本里划掉已经写进会话历史的那一句。
+
+        连发时 pending 里会累积两句；第一句写库成功、第二句失败的话，只能划掉
+        第一句，剩下那句还得留给 on_llm_request 兑底。
+        """
+        u = self.state.user(bid, uid)
+        pending = str(u.get("pending_proactive_context", "") or "")
+        if not pending:
+            return
+        target = str(text or "").strip()
+        lines = [l for l in pending.split("\n") if l.strip() and l.strip() != target]
+        u["pending_proactive_context"] = "\n".join(lines)
+        self.state.mark_dirty()
+
+    async def _persist_proactive_message(self, umo: str, text: str) -> bool:
+        """把主动发出的那句写进 AstrBot 的会话历史。
+
+        主动消息走 context.send_message，不经过 respond 阶段，AstrBot 不会把它存进
+        会话库——用户回复时模型看不到她自己刚说了什么，靠 on_llm_request 注入只能
+        救当轮，下一轮又失忆。这里用官方 conversation_manager 把它作为 assistant
+        消息追加到该会话当前历史的末尾，之后每一轮请求都自然看得见。
+
+        对方从没跟 bot 走过 LLM（还没有会话）或写入失败时返回 False，调用方保留
+        pending 字段走注入兑底。
+        """
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None:
+            return False
+        text = str(text or "").strip()
+        if not umo or not text:
+            return False
+
+        async def _write() -> bool:
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return False
+            conv = await cm.get_conversation(umo, cid)
+            if conv is None:
+                return False
+            try:
+                history = json.loads(conv.history) if conv.history else []
+            except Exception:
+                history = []
+            if not isinstance(history, list):
+                history = []
+            history.append({"role": "assistant", "content": text})
+            await cm.update_conversation(umo, cid, history=history)
+            return True
+
+        try:
+            if _session_lock_manager is not None:
+                async with _session_lock_manager.acquire_lock(umo):
+                    return await _write()
+            return await _write()
+        except Exception as e:
+            logger.warning(
+                f"[autonomous_social] 主动消息写入会话历史失败（转用上下文注入兑底）: {e}"
+            )
+            return False
 
     @staticmethod
     def _spoken_text(event: Any) -> str:
@@ -1099,6 +1170,8 @@ class SocialEngine:
         sent_ts = self._time()
         msg_type = reason_meta.get("msg_type") if reason_meta else None
         self.state.record_outgoing(bid, uid, parts[0], msg_type)
+        if await self._persist_proactive_message(umo, parts[0]):
+            self._consume_pending_line(bid, uid, parts[0])
         category = str((reason_meta or {}).get("category") or "")
         if category in ("probe", "presence"):
             # 这段沉默已经接过一回了：对方再不回，也不能追第二遍
@@ -1269,6 +1342,8 @@ class SocialEngine:
             ok, _ = await self._send_with_retry(umo, text)
             if ok:
                 self.state.record_outgoing(bid, uid, text, count_proactive=False)
+                if await self._persist_proactive_message(umo, text):
+                    self._consume_pending_line(bid, uid, text)
                 self.state.save()
                 self.log(f"已连发补充给 {uid}")
         except asyncio.CancelledError:

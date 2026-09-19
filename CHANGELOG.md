@@ -2,6 +2,38 @@
 
 只记当前版本。更早的改动看 git 历史或 Release 页。
 
+## v1.9.2 — 修「回复主动消息时 AI 失忆」：主动消息写进会话历史
+
+现象：她主动发了一句（比如追问一句「到底喜不喜欢」），用户认真回了，模型的回复却
+像从没发过那句一样——不知道自己问过什么，甚至把已经回答过的问题再问一遍。
+
+根因（对照 AstrBot 4.28.1 源码核实）：主动消息走 `context.send_message`，不经过
+respond 阶段，**永远不会进会话库**。v1.9.1 加的 `on_llm_request` 注入本来是补这个的，
+但有两处实打实的 bug：
+
+1. **插错位置**：钩子触发时 `req.contexts` 里只有已落库的历史，当前这条 user 消息
+   在 `req.prompt` 里、还没进 contexts；旧代码却「插到最后一条 user 消息之前」，
+   等于把那句主动消息塞进了上一轮对话的中间，模型看到的时间线是乱的。
+2. **文本丢失**：pending 文本在注入前就被消费清空，contexts 为空（对方还没跟 bot
+   走过 LLM、会话刚建）时直接 return——那句主动消息从此谁也看不到了。
+
+而且就算注入成功也只救当轮：AstrBot 只把 [user, assistant] 成对存库，注入进去的
+那句下一轮就没了。
+
+**本版改法：正路写库，注入降级为兑底**
+
+- **发送成功后，用官方 `conversation_manager` API 把主动消息作为 assistant 消息
+  追加到该会话当前历史的末尾**（`engine._persist_proactive_message`）。之后每一轮
+  LLM 请求都自然看得见这句，不只是用户回复的第一轮。连发的第二条同样写。
+- 读写历史拿的是 pipeline 同一把会话锁（`astrbot.core.utils.session_lock`），
+  避免和主链路「读历史→跑模型→写回」撞车把对方刚聊完的回合覆盖掉；老版本
+  AstrBot 没有这个模块时裸写。
+- 写库成功后从 pending 里划掉那一句（`_consume_pending_line`，按句划不按整字段清，
+  连发两句一句成功一句失败时不丢）；写不进去（没有会话、API 异常）时保留 pending，
+  走 `on_llm_request` 注入兑底。
+- 兑底注入本身修掉上面两个 bug：**补到 contexts 末尾**（时序正确），连发几句各补
+  成一条 assistant 消息；contexts 校验提前到消费之前，不再弄丢文本。
+
 ## v1.9.1 — 日志规范修复
 
 - `social/generator.py`、`social/persona.py`：删掉非 AstrBot 环境下的 `logging.getLogger`

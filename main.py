@@ -52,10 +52,11 @@ if after_message_sent is None:
 else:
     HOOK_AFTER_SENT = True
 
-# on_llm_request 钩子：把主动消息补回 LLM 上下文。
-# 主动消息走 context.send_message 发出，不经过 respond 阶段，不会自动进会话历史，
-# 用户回复时 AI 看不到自己刚说了什么。老版本没有这个钩子时跳过——功能照常运行，
-# 只是回复主动消息时 AI 不知道自己上条说了啥。
+# on_llm_request 钩子：把主动消息补回 LLM 上下文（兑底路）。
+# 正路是发送后用 conversation_manager 把那句写进会话历史（见 engine._persist_proactive_message）；
+# 写不进去时才由这里补。主动消息走 context.send_message 发出，不经过 respond 阶段，
+# 不会自动进会话历史，用户回复时 AI 看不到自己刚说了什么。老版本没有这个钩子时
+# 跳过——功能照常运行，只是回复主动消息时 AI 不知道自己上条说了啥。
 on_llm_request = None
 try:
     from astrbot.api.event.filter import on_llm_request  # type: ignore[assignment]
@@ -230,11 +231,15 @@ class AutonomousSocial(Star):
     async def inject_proactive_context(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """把主动消息补回 LLM 上下文。
+        """把主动消息补回 LLM 上下文（兑底路）。
 
-        主动消息走 context.send_message 发出，不经过 AstrBot 的 respond 阶段，
-        因此不会自动进入会话历史。用户回复时 AI 看不到自己刚说了什么，
-        在这里把那条主动消息作为 assistant 消息插回上下文。
+        主动消息发送后，引擎会先用 conversation_manager 把它写进会话历史（正路）；
+        写不进去（对方从没跟 bot 走过 LLM、还没有会话）时才轮到这里：把那句
+        pending 的话作为 assistant 消息补进本次请求的上下文。
+
+        注意钩子触发时 req.contexts 里只有已落库的历史，当前这条 user 消息在
+        req.prompt 里、还没进 contexts——所以补的位置是 contexts 末尾，
+        不是「最后一条 user 消息之前」。
 
         只在私聊中生效：群聊场景更复杂，主动消息通常是对所有人说的，
         简单插回上下文可能不对。
@@ -246,6 +251,9 @@ class AutonomousSocial(Star):
                 return
             if self._engine.cfg.private_only and self._is_group(event):
                 return
+            contexts = getattr(req, "contexts", None)
+            if not isinstance(contexts, list):
+                return
             bid = self._engine._get_bot_id(event)
             uid = self._engine._get_sender_id(event)
             if not bid or not uid or uid == bid:
@@ -253,20 +261,11 @@ class AutonomousSocial(Star):
             text = self._engine.consume_pending_proactive_context(bid, uid)
             if not text:
                 return
-            # 把主动消息作为 assistant 消息插到最后一条 user 消息前面
-            contexts = getattr(req, "contexts", None)
-            if not isinstance(contexts, list):
-                return
-            # 从后往前找最后一条 user 消息
-            insert_idx = -1
-            for i in range(len(contexts) - 1, -1, -1):
-                item = contexts[i]
-                if isinstance(item, dict) and str(item.get("role", "")) == "user":
-                    insert_idx = i
-                    break
-            if insert_idx < 0:
-                return
-            contexts.insert(insert_idx, {"role": "assistant", "content": text})
+            # 连发的几句各补成一条 assistant 消息，和聊天里实际看到的样子一致
+            for line in text.split("\n"):
+                line = line.strip()
+                if line:
+                    contexts.append({"role": "assistant", "content": line})
             logger.debug(
                 f"[autonomous_social] 主动消息已补入上下文（{len(text)} 字）: {text[:40]}…"
             )
