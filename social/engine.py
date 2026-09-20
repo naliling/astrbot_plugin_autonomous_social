@@ -353,6 +353,7 @@ class SocialEngine:
         """
         cm = getattr(self.context, "conversation_manager", None)
         if cm is None:
+            logger.info("[autonomous_social] 这个 AstrBot 版本没有 conversation_manager，主动消息写不进会话历史，只能靠注入兑底")
             return False
         text = str(text or "").strip()
         if not umo or not text:
@@ -361,6 +362,7 @@ class SocialEngine:
         async def _write() -> bool:
             cid = await cm.get_curr_conversation_id(umo)
             if not cid:
+                logger.info(f"[autonomous_social] {umo} 还没有当前会话，主动消息写不进历史（转注入兑底）")
                 return False
             conv = await cm.get_conversation(umo, cid)
             if conv is None:
@@ -373,6 +375,7 @@ class SocialEngine:
                 history = []
             history.append({"role": "assistant", "content": text})
             await cm.update_conversation(umo, cid, history=history)
+            logger.info(f"[autonomous_social] 主动消息已写入会话历史（{len(text)} 字）: {text[:30]}…")
             return True
 
         try:
@@ -385,6 +388,48 @@ class SocialEngine:
                 f"[autonomous_social] 主动消息写入会话历史失败（转用上下文注入兑底）: {e}"
             )
             return False
+
+    async def _load_session_history(self, umo: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """从 AstrBot 会话库读最近几轮真实聊天。
+
+        插件自己的账本靠 observe/after_message_sent 记，流式回复有已知缺口，
+        主动消息以前也进不来——生成侧只看账本就会「不知道聊过天」，主动消息
+        像凭空触发的任务。会话库是模型真正读的那份历史（含刚写进去的主动消息），
+        有就用它当「最近的对话」。
+        """
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None or not umo:
+            return []
+        try:
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return []
+            conv = await cm.get_conversation(umo, cid)
+            if conv is None or not conv.history:
+                return []
+            history = json.loads(conv.history)
+            if not isinstance(history, list):
+                return []
+            out: List[Dict[str, Any]] = []
+            for m in history[-limit:]:
+                if not isinstance(m, dict):
+                    continue
+                role = str(m.get("role") or "")
+                content = m.get("content")
+                if isinstance(content, list):
+                    # 分段消息（如 qq_official 的多段 content）拼成一段纯文本
+                    content = "".join(
+                        str(seg.get("text", "") or "") if isinstance(seg, dict) else str(seg)
+                        for seg in content
+                    )
+                text = str(content or "").strip()
+                if not text or text.startswith("/"):
+                    continue
+                out.append({"dir": "out" if role == "assistant" else "in", "text": text[:300]})
+            return out
+        except Exception as e:
+            logger.debug(f"[autonomous_social] 读取会话历史失败: {e}")
+            return []
 
     @staticmethod
     def _spoken_text(event: Any) -> str:
@@ -1095,6 +1140,12 @@ class SocialEngine:
         # 接了 Core v2.14 的契约时这里有完整的身体：困不困、饿不饿、想说话的程度，
         # 以及她此刻正手上的事。拿不到契约时为空，生成器会退回旧的两个标量。
         u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
+
+        # 「最近的对话」优先用会话库里的真实聊天；账本只在拿不到时兜底。
+        # 会话库为空说明这个会话还没聊过，账本里的观察记录仍有参考价值。
+        session_history = await self._load_session_history(umo)
+        if session_history:
+            u_copy["conversation"] = session_history
 
         if preset is not None:
             reason, reason_meta = preset
