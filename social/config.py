@@ -39,7 +39,7 @@ URGE_REFILL_MAX = 96
 # 8 小时是对 interest=1（最在意的人）而言的，普通人按比例更慢，实际要攒十几个小时
 # 才发得出一条——那与「插件在跑但永远没动静」基本同义。降到 4；
 # v1.9.0 直接降到下限 2：再配合更低的冷却，主动消息才算真的「频繁」
-# v1.9.x 再降到 1.5：更像话多的人，心里一有事就想找人说
+# v1.9.x 降到下限 2：更像话多的人，心里一有事就想找人说（URGE_REFILL_DEFAULT 实际为 2）
 URGE_REFILL_DEFAULT = 2
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
@@ -437,6 +437,9 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     "activity_level": ACTIVITY_DEFAULT,
     "followup_after_minutes": FOLLOWUP_AFTER_DEFAULT,
     "followup_cooldown_minutes": FOLLOWUP_COOLDOWN_DEFAULT,
+    # LEGACY_DEFAULTS 里有这两个键，_NEW_DEFAULTS 必须同样有，否则迁移循环取 new_value 时 KeyError
+    "probe_after_minutes": PROBE_AFTER_DEFAULT,
+    "followup_max_minutes": FOLLOWUP_MAX_DEFAULT,
 }
 
 

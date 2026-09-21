@@ -85,6 +85,15 @@ CUE_RETRY_DELAY_SECONDS = 6 * 3600
 SEND_RETRY_COUNT = 2
 SEND_RETRY_DELAY = 1.0
 
+# 发送持续失败（非好友 / 平台不支持主动消息 / 会话失效）后，隔离这个人多久不再试
+SEND_BLOCK_HOURS = 24
+# 发送失败文案里命中这些关键词，就当作“对这个人发不了”而非一次性抵达，隔离他
+_UNREACHABLE_ERROR_MARKERS = (
+    "请添加对方为好友", "添加对方为好友", "不是好友", "非好友", "not friend",
+    "add friend", "friend", "未找到匹配会话平台", "不支持主动", "qq_official",
+    "对方不在你的好友列表", "deleted", "blocked", "黑名单",
+)
+
 # 回访那件事之前，这场话至少凉下来多久：还在你来我往时问「后来呢」太急
 LOOP_QUIET_GAP_SECONDS = 1800.0
 
@@ -277,6 +286,11 @@ class SocialEngine:
         u = self.state.user(bid, uid)
         if umo and u.get("umo") != umo:
             u["umo"] = umo
+            self.state.mark_dirty()
+        # 对方又发消息了：说明这个会话现在能通，清掉之前的发送隔离
+        if float(u.get("send_blocked_until", 0) or 0) > 0:
+            u["send_blocked_until"] = 0.0
+            u["send_blocked_reason"] = ""
             self.state.mark_dirty()
         # 注意：这里不调用 save()，靠周期性 flush 落盘
 
@@ -635,9 +649,15 @@ class SocialEngine:
         for uid, u in users.items():
             if not u.get("umo"):
                 continue
+            if self.state.is_send_blocked(bid, uid, now):
+                # 发送隔离期内（非好友/不支持主动消息等）：不攒念头、不选中，避免反复撞失败
+                continue
 
             # 上次主动联系有没有被接住（对方再也没回的情况在这里结算）
             self.state.settle_pending(bid, uid, now, reply_window)
+            # 被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」，
+            # 而不是从此对这个人永久静默
+            desire.decay_streak(u, now)
 
             affection = None
             if core_root is not None:
@@ -678,6 +698,7 @@ class SocialEngine:
                 # 被冷落够了，没正事就攒不过这道坎
                 u["urge"] = round(cap, 4)
                 urge = cap
+                self.state.mark_dirty()  # cap 改了内存 urge 就落盘，否则这轮无人 ready 时不写盘
             # 到点的由头本身就是一次念头落地：「想起一件具体的事」不需要再等时候攒满
             if cue:
                 urge = max(urge, desire.FIRE_THRESHOLD)
@@ -701,6 +722,12 @@ class SocialEngine:
     def _pending_window(self) -> float:
         """多久没回算「没接话」：在回复统计窗口基础上至少给半天。"""
         return max(self.cfg.reply_window_hours, PENDING_IGNORE_MIN_HOURS) * 3600
+
+    @staticmethod
+    def _is_unreachable_error(err: str) -> bool:
+        """发送失败是不是“对这个人根本发不了”（非好友 / 不支持主动 / 会话失效）。"""
+        low = str(err or "").lower()
+        return any(m.lower() in low for m in _UNREACHABLE_ERROR_MARKERS)
 
     def gate_reason(
         self,
@@ -798,6 +825,8 @@ class SocialEngine:
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo"):
                 continue
+            if self.state.is_send_blocked(bid, uid, now):
+                continue
             kind, reason = thread_reason(
                 u,
                 now,
@@ -849,6 +878,8 @@ class SocialEngine:
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo"):
                 continue
+            if self.state.is_send_blocked(bid, uid, now):
+                continue
             about = live_loop(u, now)
             if not about:
                 continue
@@ -895,6 +926,8 @@ class SocialEngine:
         best: Optional[Tuple[float, str, Dict[str, Any], str]] = None
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo"):
+                continue
+            if self.state.is_send_blocked(bid, uid, now):
                 continue
             reason = closer_reason(u, now, after_seconds=after)
             if not reason:
@@ -1147,6 +1180,15 @@ class SocialEngine:
         if session_history:
             u_copy["conversation"] = session_history
 
+        # 7 天主动消息日志（按 bid,uid 隔离）喂给生成侧防重复：比从会话史里扫 out 更准，
+        # 不会把对方的话或别人的话混进来
+        recent_pro = self.state.recent_proactive(bid, uid, now)
+        u_copy["_recent_proactive"] = [
+            str(e.get("text", "") or "").strip()
+            for e in recent_pro
+            if str(e.get("text", "") or "").strip()
+        ]
+
         if preset is not None:
             reason, reason_meta = preset
         else:
@@ -1216,6 +1258,16 @@ class SocialEngine:
         sent_ok, err = await self._send_with_retry(umo, parts[0])
         if not sent_ok:
             defer_cue()
+            # 非好友 / 平台不支持主动消息 / 会话失效：不是“这一次没发成”而是“对这个人发不了”，
+            # 把他隔离一段时间，别每个心跳都去撞同一堆“请添加对方为好友”、白燒冷却
+            if self._is_unreachable_error(err):
+                self.state.block_send(
+                    bid, uid, self._time() + SEND_BLOCK_HOURS * 3600.0, err
+                )
+                logger.warning(
+                    f"[autonomous_social] {uid}（bid={bid}, umo={umo}）发送持续失败，"
+                    f"隔离 {SEND_BLOCK_HOURS}h：{err}"
+                )
             return False, f"消息写好了但发送失败：{err}"
 
         sent_ts = self._time()
@@ -1656,6 +1708,44 @@ class SocialEngine:
                 f"  上次想过没说：{skip[1]}（{int((now - skip[0]) / 60)} 分钟前）{skip[2]}"
             )
         return "\n".join(lines) if lines else "  还没有主动联系过任何人"
+
+    def proactive_log_text(self, uid_filter: str = "", limit_users: int = 6, limit_each: int = 15) -> str:
+        """按用户列出最近 7 天发过的主动消息（按 bid,uid 隔离不串台），供主人审计。
+
+        uid_filter 非空时只看那个用户；为空时列最近发过主动消息的几个人。
+        """
+        now = self._time()
+        want = str(uid_filter or "").strip()
+        rows: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
+        for bid, bot in self.state.data.get("bots", {}).items():
+            for uid, u in (bot.get("users") or {}).items():
+                if want and str(uid) != want:
+                    continue
+                log = self.state.recent_proactive(bid, uid, now)
+                if not log:
+                    continue
+                last_ts = max((float(e.get("ts", 0) or 0) for e in log), default=0.0)
+                rows.append((last_ts, bid, uid, log))
+        if not rows:
+            if want:
+                return f"  {want}：最近 7 天没给 TA 发过主动消息"
+            return "  最近 7 天还没给任何人发过主动消息"
+        rows.sort(key=lambda x: -x[0])
+        lines: List[str] = []
+        for _last, bid, uid, log in rows[:limit_users]:
+            name = str(self.state.user(bid, uid).get("name", "") or uid)
+            lines.append(f"◆ {name}（{uid} @ {bid}）最近 7 天发过 {len(log)} 条：")
+            for e in log[-limit_each:]:
+                try:
+                    ts = float(e.get("ts", 0) or 0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "??"
+                text = str(e.get("text", "") or "").strip()
+                lines.append(f"    {when}  {text}")
+        if len(rows) > limit_users:
+            lines.append(f"  …另有 {len(rows) - limit_users} 人未列出（用「主动消息记录 <用户ID>」看单个人）")
+        return "\n".join(lines)
 
     async def status_text(self) -> str:
         """获取插件状态文本。"""

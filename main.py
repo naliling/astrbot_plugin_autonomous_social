@@ -33,8 +33,11 @@ try:
     from astrbot.api.event.filter import after_message_sent  # type: ignore[assignment]
 except Exception:
     try:
-        after_message_sent = filter.after_message_sent  # type: ignore[name-defined]
-    except Exception:
+        # 不依赖顶部只在旧路径才绑定的 filter，直接重新导入 filter 模块，避免 NameError 被吞
+        from astrbot.api.event import filter as _filter_mod  # type: ignore[assignment]
+        after_message_sent = getattr(_filter_mod, "after_message_sent", None)
+    except Exception as _e:
+        logger.info(f"[autonomous_social] 未找到 after_message_sent 钩子（{_e}），追问会变弱")
         after_message_sent = None
 
 if after_message_sent is None:
@@ -62,8 +65,10 @@ try:
     from astrbot.api.event.filter import on_llm_request  # type: ignore[assignment]
 except Exception:
     try:
-        on_llm_request = filter.on_llm_request  # type: ignore[name-defined]
-    except Exception:
+        from astrbot.api.event import filter as _filter_mod2  # type: ignore[assignment]
+        on_llm_request = getattr(_filter_mod2, "on_llm_request", None)
+    except Exception as _e:
+        logger.info(f"[autonomous_social] 未找到 on_llm_request 钩子（{_e}），回复主动消息时可能失忆")
         on_llm_request = None
 
 if on_llm_request is None:
@@ -148,10 +153,15 @@ class AutonomousSocial(Star):
             if hasattr(self.context, "get_plugin_data_dir"):
                 path = self.context.get_plugin_data_dir()
                 if path:
-                    # get_plugin_data_dir 返回的是插件专属目录，需要回退两级到 data/
-                    parent = os.path.dirname(os.path.dirname(path))
-                    if os.path.basename(parent) == "plugin_data":
-                        return os.path.dirname(parent)
+                    # get_plugin_data_dir 返回插件专属目录 .../data/plugin_data/<插件名>，
+                    # 目标是 .../data。先看直接父级是不是 plugin_data，是则回退两级拿 data。
+                    # （旧写法先 dirname 两次拿到 data 再比 basename=="plugin_data"，永远为假，
+                    # 于是总掉到方式3 拿进程 cwd 下的 data，部署目录不对时 state 会写错地方。）
+                    plugin_parent = os.path.dirname(path)
+                    if os.path.basename(plugin_parent) == "plugin_data":
+                        return os.path.dirname(plugin_parent)
+                    # 不是预期的 plugin_data 布局时，退一级也好过直接用 cwd
+                    return plugin_parent
         except Exception:
             pass
 
@@ -322,6 +332,39 @@ class AutonomousSocial(Star):
             yield event.plain_result(f"触发失败: {e}")
             return
         yield event.plain_result(result)
+
+    @command("主动消息记录")
+    async def proactive_log(self, event: AstrMessageEvent):
+        """查看最近 7 天发过的主动消息（按用户隔离不串台）。仅机器人主人可用。
+
+        可选带一个用户 ID：「主动消息记录 12345」只看那个人；不带则列最近发过的几个人。
+        """
+        if self._engine is None:
+            yield event.plain_result("自主社交插件未正常初始化。")
+            return
+        allowed, why = self._check_owner(event)
+        if not allowed:
+            if self._is_group(event):
+                logger.info(f"[autonomous_social] 忽略群内查看主动消息记录：{why}")
+                return
+            yield event.plain_result("这个指令只有机器人的主人能用。")
+            return
+        uid_filter = ""
+        try:
+            raw = str(getattr(event, "message_str", "") or "").strip()
+            # 去掉指令本身，剩下的当用户 ID
+            parts = raw.split(None, 1)
+            if len(parts) > 1:
+                uid_filter = parts[1].strip()
+        except Exception:
+            uid_filter = ""
+        try:
+            text = self._engine.proactive_log_text(uid_filter)
+        except Exception as e:
+            logger.error(f"[autonomous_social] 获取主动消息记录失败: {e}")
+            yield event.plain_result(f"获取失败: {e}")
+            return
+        yield event.plain_result("最近 7 天主动消息记录（按用户隔离）：\n" + text)
 
     @staticmethod
     def _norm_id(x: object) -> str:

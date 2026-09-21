@@ -1,6 +1,6 @@
 # 自主拟人社交
 
-标准 AstrBot 插件结构，版本 1.9.3。
+标准 AstrBot 插件结构，版本 1.10.1。
 
 ## 它解决什么问题
 
@@ -23,6 +23,10 @@
 **节奏整体往前顶**：`activity_level` 55→65、`urge_refill_hours` 3→2、`user_cooldown` 90→45、
 `global_cooldown` 20→10、`skip_cooldown` 25→15。装过 1.8.x 的会在升级后首启时被自动
 提升到新节奏（只提升没改过的默认值，自己改过的不动）。面板里每个选项的描述也重写了一遍。
+
+> 注：v1.10 又把这几个默认往上顶了一格（当前值见下方配置表：`activity_level` 75、`user_cooldown` 30、
+> `global_cooldown` 7、`recent_talk` 18、`skip_cooldown` 10、`followup_after` 4、`probe_after` 2、
+> `followup_max` 70、`followup_cooldown` 30）。schema 默认与代码 dataclass 默认已对齐，老用户仍走一次性迁移。
 
 **播种：不靠「先聊过」也认识人**。之前插件的用户池只有一条入口——谁私聊过 bot 谁才进
 state.json，刚装好的插件眼里一个人都没有。现在补两条入口，都不依赖装好后再聊一句：

@@ -400,14 +400,20 @@ SLEEP_SUPPRESS_SECONDS = 8 * 3600
 
 
 def sleep_signal(user: Dict[str, Any], now: float) -> bool:
-    """对方最近说过要睡了：这时候再去发消息（尤其别再说「该睡了」）很不对。"""
+    """对方最近说过要睡了：这时候再去发消息（尤其别再说「该睡了」）很不对。
+
+    只看**对方**（dir=='in'）说的话：她自己道的晚安不算对方要睡。
+    旧实现用 `text in _SLEEP_WORDS` 先 continue，把正好等于一个睡意词的消息（如「晚安」）
+    跳掉了，导致对方明明道了晚安却判不出来；也没按 dir 过滤，bot 自己的「晚安」也会被扫到。
+    """
     conv = user.get("conversation") or []
     try:
         recent = [m for m in conv if str(m.get("text", ""))][-4:]
     except TypeError:
         return False
     for m in reversed(recent):
-        if str(m.get("text", "")) in _SLEEP_WORDS:
+        # 只看对方说的；她自己说的（dir=='out'）跳过
+        if str(m.get("dir", "")) == "out":
             continue
         if now - float(m.get("ts", 0) or 0) > SLEEP_SUPPRESS_SECONDS:
             return False

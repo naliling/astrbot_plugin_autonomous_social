@@ -32,13 +32,18 @@ MESSAGE_TRUNCATE_LENGTH = 500
 CONVERSATION_TRUNCATE_LENGTH = 200
 # 最近消息类型追踪数量
 RECENT_MSG_TYPES_COUNT = 6
+# 每用户主动消息日志保留天数：只记自己主动发出的那几条，按（bid,uid）天然隔离不串台，
+# 既用于生成时防重复，也供主人指令审计。超过保留期的条目写入时自动清。
+PROACTIVE_LOG_DAYS = 7
+# 主动消息日志最多留多少条（防止单个用户日志无限涨）
+PROACTIVE_LOG_MAX = 60
 # 话题提取允许的最大单段长度（超过此长度不提取）
 TOPIC_MAX_CHARS = 6
 
 # 长期不活跃用户会被重置的历史字段：这些是状态文件里真正占体积的部分。
 # 保留 name/umo/message_count/last_seen 与各回复统计：umo 是主动发送的唯一目标地址，
 # 回复统计驱动自适应权重，丢了会直接影响选择谁、多久发一次。
-RETENTION_HEAVY_LIST_FIELDS = ("conversation", "topics", "recent_msg_types")
+RETENTION_HEAVY_LIST_FIELDS = ("conversation", "topics", "recent_msg_types", "proactive_log")
 RETENTION_HEAVY_TEXT_FIELDS = ("last_message", "cue", "loop", "last_spoken_text")
 # 作息画像也是逐条攒出来的正文派生物，人长期不说话了它就没意义了
 RETENTION_RHYTHM_HOURS = 24
@@ -171,6 +176,12 @@ class SocialState:
             "topics": [],
             # v2: 最近消息类型（反重复）
             "recent_msg_types": [],
+            # 主动消息 7 天日志：只记自己主动发出的那几条（{ts, text, cat}），
+            # 按（bid,uid）隔离不串台，写入时自动修剪过期条目
+            "proactive_log": [],
+            # 发送失败（非好友/不支持主动消息等）隔离：隔离到什么时候、为什么
+            "send_blocked_until": 0.0,
+            "send_blocked_reason": "",
         }
 
     # ─── 加载与迁移 ─────────────────────────────────────
@@ -246,6 +257,18 @@ class SocialState:
             return  # 还是 default，没法迁
         if self.data.get("_default_migrated"):
             return  # 已经迁移过了
+
+        # 多 bot 串台保护：default 里可能混了多个角色的播种/历史用户（_seed_target_bid 在
+        # 2+ 个真实 bot 时统一归 default）。若除了 real_bid 还存在其它真实 bot，把 default
+        # 整批搬给 real_bid 会把 B 的人误搬到 A 名下——发送时走 A 的适配器，而 A 不是这个人的
+        # 好友，就报“请添加对方为好友”。这种时候宁可不搬：留在 default 照样结算，
+        # 人格按 umo 解析仍正确，发送按 umo 平台路由，不主动把别人的人污染过去。
+        other_real_bots = [
+            b for b in bots
+            if b not in (DEFAULT_BOT_KEY, real_bid) and (bots.get(b) or {}).get("users")
+        ]
+        if other_real_bots:
+            return
 
         default_bot = bots[DEFAULT_BOT_KEY]
         if real_bid not in bots or not bots[real_bid].get("users"):
@@ -640,6 +663,14 @@ class SocialState:
         conv.append({"text": text[:CONVERSATION_TRUNCATE_LENGTH], "ts": ts, "dir": "out"})
         del conv[:-MAX_CONVERSATION_HISTORY]
 
+        # 主动消息 7 天日志：只记自己主动发的（含连发的后续条），按（bid,uid）隔离。
+        # 写入时修剪掉超过 7 天的旧条目与超额条数。
+        log = u.setdefault("proactive_log", [])
+        log.append({"ts": ts, "text": str(text or "")[:CONVERSATION_TRUNCATE_LENGTH], "cat": str(msg_type or "")})
+        cutoff = ts - PROACTIVE_LOG_DAYS * 86400.0
+        pruned = [e for e in log if isinstance(e, dict) and float(e.get("ts", 0) or 0) >= cutoff]
+        u["proactive_log"] = pruned[-PROACTIVE_LOG_MAX:]
+
         # 主动消息统计（仅首条计入冷却与回复率）
         if count_proactive:
             u["proactive_sent"] = int(u.get("proactive_sent", 0)) + 1
@@ -676,6 +707,46 @@ class SocialState:
 
         self.mark_dirty()
         return u
+
+    def recent_proactive(
+        self, bid: str, uid: str, now: Optional[float] = None, days: float = PROACTIVE_LOG_DAYS
+    ) -> List[Dict[str, Any]]:
+        """返回某用户最近 days 天内发过的主动消息日志（按时间升序）。
+
+        按（bid,uid）取，天然不串台。用于生成时防重复与主人指令审计。
+        """
+        now = self._now() if now is None else float(now)
+        cutoff = now - float(days) * 86400.0
+        u = self.user(bid, uid)
+        out: List[Dict[str, Any]] = []
+        for e in u.get("proactive_log", []) or []:
+            if not isinstance(e, dict):
+                continue
+            try:
+                ts = float(e.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts >= cutoff:
+                out.append(e)
+        return out
+
+    def block_send(self, bid: str, uid: str, until: float, reason: str) -> None:
+        """把一个发送持续失败（非好友 / 平台不支持主动消息）的用户隔离到 until。
+
+        隔离期内不再选中他，避免每个心跳都去撞同一堆“请添加对方为好友”。
+        """
+        u = self.user(bid, uid)
+        u["send_blocked_until"] = float(until)
+        u["send_blocked_reason"] = str(reason or "")[:120]
+        self.mark_dirty()
+
+    def is_send_blocked(self, bid: str, uid: str, now: float) -> bool:
+        """该用户是否仍在发送隔离期内。"""
+        u = self.user(bid, uid)
+        try:
+            return float(u.get("send_blocked_until", 0) or 0) > now
+        except (TypeError, ValueError):
+            return False
 
     # ─── 话题提取 ───────────────────────────────────────
 

@@ -51,9 +51,15 @@ RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 # 连续被冷落的念头天花板：越攒不出去，越说明对方不打算接
 # 调高一点：更像脸皮厚一点的人，被冷落了也还会想找
 STREAK_CAP: Dict[int, float] = {0: 3.0, 1: 2.6, 2: 2.0, 3: 1.5, 4: 1.2}
-STREAK_CAP_FLOOR = 1.0
-# 冷落几次之后，只有「真有由头」才允许越过天花板
+# 天花板地板必须高于发出门槛：被冷落再多次，念头也得留一条能攒过 FIRE_THRESHOLD 的
+# 缝隙，只是慢。压到门槛以下等于对这个人永久静默——那不是「脸皮厚」，是彻底不再找了，
+# 也正是「几百小时不再发一次」的成因。
+STREAK_CAP_FLOOR = FIRE_THRESHOLD + 0.12
+# 冷落几次之后，没有「真有由头」时天花板收紧，但仍留在门槛之上（不再压到门槛以下）
 STREAK_NEEDS_CUE = 4
+# 被冷落封顶后，隔多久没有任何来往就把冷落计数往回退一格：真人晾了很久也会
+# 「算了再找一次看看」，而不是从此当这个人不存在。默认 3 天退一次。
+STREAK_DECAY_DAYS = 3.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -161,13 +167,46 @@ def rhythm_factor(user: Dict[str, Any], hour: int) -> float:
 
 
 def urge_cap(user: Dict[str, Any], has_live_cue: bool) -> float:
-    """念头能攒到多高。被冷落得越多，天花板越低。"""
+    """念头能攒到多高。被冷落得越多，天花板越低——但永远不低于发出门槛。
+
+    过去的实现会在 streak≥STREAK_NEEDS_CUE 且没由头时把天花板压到门槛以下（×0.98），
+    于是这个人除非主动发消息（after_reply 把 streak 归零），否则永远攒不到门槛、
+    永远不会再被主动找——那就是“几百小时不发”。现在天花板下限卡在
+    STREAK_CAP_FLOOR（高于门槛），被冷落只会拖慢节奏，不会彻底封死。
+    """
     streak = int(user.get("no_reply_streak", 0) or 0)
     cap = STREAK_CAP.get(streak, STREAK_CAP_FLOOR)
     if streak >= STREAK_NEEDS_CUE and not has_live_cue:
-        # 没话找话的份上不去；有具体由头（对方说过「明天面试」）才允许再试一次
-        cap = min(cap, FIRE_THRESHOLD * 0.98)
-    return cap
+        # 没话找话时收紧到下限，但不再压到门槛以下：就算没具体由头，晾久了也还能慢慢攒一次
+        cap = min(cap, STREAK_CAP_FLOOR)
+    return max(cap, STREAK_CAP_FLOOR)
+
+
+def decay_streak(user: Dict[str, Any], now: float) -> None:
+    """被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」。
+
+    以「最后一次主动发 / 最后一次对方说话」中较近的那个为起点：只要这段时间内
+    真的没任何来往，每过 STREAK_DECAY_DAYS 就把 streak 降一格，直到 0。
+    对方一旦重新说话，after_reply 会直接归零，这里只管“一直没人理”的情况。
+    """
+    streak = int(user.get("no_reply_streak", 0) or 0)
+    if streak <= 0:
+        return
+    anchor = max(
+        float(user.get("last_sent", 0) or 0),
+        float(user.get("last_seen", 0) or 0),
+    )
+    if anchor <= 0:
+        return
+    window = STREAK_DECAY_DAYS * 86400.0
+    if window <= 0:
+        return
+    steps = int((now - anchor) // window)
+    if steps <= 0:
+        return
+    new_streak = max(0, streak - steps)
+    if new_streak != streak:
+        user["no_reply_streak"] = new_streak
 
 
 def settle(
@@ -287,8 +326,11 @@ def after_ignored(user: Dict[str, Any], now: float) -> None:
     user["urge_at"] = now
     user["pending_since"] = 0.0
     user["pending_result"] = "ignored"
+    # 轻微掋一下就好：后续的 interest_level/smooth_interest 会根据回复率与 streak 自行
+    # 把基线拉回来，这里再重手只会把一个只是最近很忙的人越掋越边缘。地板拉高一点，
+    # 避免 interest 被掋到 0.05 后念头慢到几乎不涨。
     interest = float(user.get("interest", 0.35) or 0.35)
-    user["interest"] = round(clamp(interest - 0.05, 0.05, 1.0), 4)
+    user["interest"] = round(clamp(interest - 0.03, 0.12, 1.0), 4)
 
 
 def after_skip(user: Dict[str, Any], now: float) -> None:
@@ -306,7 +348,7 @@ def mood_multiplier(
     social_threshold: float = 20.0,
     body: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """我自己此刻有多想说句话（0.15-1.45）。
+    """我自己此刻有多想说句话（clamp 到 0.05-1.65）。
 
     累和不想说话的时候，人不会到处找人聊天 —— 这比「概率打折」更贴近实际：
     它让念头攒得慢，而不是攒满了再被随机数否掉。

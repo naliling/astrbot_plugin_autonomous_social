@@ -110,6 +110,9 @@ async def resolve_persona(context: Any, umo: str) -> Tuple[str, str]:
     """
     persona_mgr = getattr(context, "persona_manager", None)
     if persona_mgr is None:
+        # 这个 AstrBot 版本没有 persona_manager：主动消息会退回插件默认口吻，可能破坏角色风格。
+        # 记一条方便真机定位“没读到人设”到底是哪一步断的。
+        logger.info("[autonomous_social] context 上没有 persona_manager，主动消息取不到人设，退回默认口吻")
         return "", ""
 
     try:
@@ -119,6 +122,9 @@ async def resolve_persona(context: Any, umo: str) -> Tuple[str, str]:
         return "", ""
 
     if not persona:
+        # 解析链走完什么都没拿到（会话未绑人格且无全局默认，或显式标了不用人格）：
+        # 同样记一条，否则主人只看到“没取到人设”却不知道是没绑还是没配。
+        logger.info(f"[autonomous_social] 会话 {umo} 没解析到生效人格（未绑人格/无默认/显式不用），主动消息退回默认口吻")
         return "", ""
     # 人设存在但没名字时给中性占位；NO_PERSONA_MARKER 的含义是「不用人格」，不能拿来当名字显示
     return _persona_name(persona) or "（未命名人设）", _persona_prompt(persona)

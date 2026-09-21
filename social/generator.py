@@ -115,28 +115,13 @@ _GOOD_PATTERNS_GENERAL: List[str] = [
     "今天也不知道怎么了",
 ]
 
-# 连发（burst）：按概率允许模型把消息拆成两条短句
+# 连发（burst）：按概率允许模型把消息自然拆成两段
 BURST_PROBABILITY = 0.42
 MAX_BURST_PARTS = 2
 
-# 目标长度分布：真人主动发的消息绝大多数是一两句短句，很少写满。
-# 不给长度目标时模型会顶到 max_len，每条都变成小作文。元组为（字数下限，上限，权重）。
-_LENGTH_TARGETS: List[tuple] = [
-    (1, 5, 22),       # 「草」「嗯？」「哦」这种——真人有近一半消息就这么短
-    (4, 10, 32),
-    (8, 16, 24),
-    (14, 24, 14),
-    (22, 36, 6),
-    (30, 50, 2),
-]
-
-# 未完话题那几条各自的字数。追问与回访就是要问一句，收场那句不该再向对方要回复。
-_MODE_LENGTHS = {
-    "probe": (2, 12),
-    "presence": (2, 10),
-    "loop": (6, 18),
-    "closer": (5, 16),
-}
+# 长度不再由插件攒权重指定：该多长由人设与触发这条消息的具体情境决定，
+# prompt 里不再出现「字数目标」与「少量短句/宁可短」这类把模型往短里抽的提示。
+# max_message_length（默认 60）只作为唯一的硬上限，超了才按句子边界截断。
 
 # 输出清洗：模型偶尔会交回 markdown、标题前缀或多行段落，直接发出去就不是聊天
 _MD_BOLD = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)", re.S)
@@ -163,6 +148,12 @@ _EMOJI = re.compile(
     "\uFE0F\u200D\u20E3"
     "]+"
 )
+
+# 带推理的模型（R1/QwQ 类）会先吐一大段思考链再给结果，包在 <think></think> 里，
+# 或干脆裸写。不清掉的话会连同思考链一起被当成正文发出去——那就是“乱码/无关文字”。
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.S | re.I)
+_THINK_OPEN = re.compile(r"<think>.*$", re.S | re.I)
+_THINK_STRAY = re.compile(r"</?think>", re.I)
 
 # 模型把否决理由写在同一行：「NO，刚聊过」
 _NO_LEADING = re.compile(r"^\s*(?:NO|SKIP)\b|^\s*(?:不发|算了|不要发|不该发)", re.I)
@@ -348,6 +339,24 @@ def _relationship_line(target: Dict[str, Any]) -> str:
     return "你对TA现在的感觉（这会改变你说什么和说多长，但别在消息里明说）：" + "；".join(bits) + "。"
 
 
+# 亲密/贴面语境的轻量级识别词：命中时不把最近的露骨聊天逐字塞进生成 prompt——
+# 那会触发模型自己的安全训练、发出拒绝/乱码。改用一句中性的氛围提示，
+# 让她顺着当下亲密的氛围说下去，而不是把露骨正文抹进来。
+_INTIMATE_MARKERS: tuple = (
+    "做爱", "高潮", "射了", "射出", "插进", "伸进", "抽插", "呻吟", "口交", "深喉",
+    "乳头", "乳房", "下面湿", "好湿", "私处", "敏感", "体内", "裸", "脱光", "脱掉",
+    "腿张开", "腿分开", "内裤", "发情", "情欲", "顶到", "舔",
+)
+
+
+def _looks_intimate(*texts: str) -> bool:
+    """最近的聊天是不是处在亲密/露骨氛围里。只做粗粒度判断，宁漏不误伤。"""
+    blob = " ".join(str(t or "") for t in texts)
+    if not blob:
+        return False
+    return any(m and m in blob for m in _INTIMATE_MARKERS)
+
+
 def _body_line(body: Dict[str, Any]) -> str:
     """把 Core 契约里的身体写成一句第一人称近况。
 
@@ -526,12 +535,30 @@ class MessageGenerator:
         # 对话历史
         conv_text = self._format_conversation(target.get("conversation", []))
 
-        # 文风级反重复：列出最近发给对方的几条，要求换句式
-        recent_out = [
-            str(m.get("text", "") or "").strip()
-            for m in target.get("conversation", [])
-            if m.get("dir") == "out" and str(m.get("text", "") or "").strip()
-        ][-RECENT_OUT_COUNT:]
+        # 最近聊天是不是处在亲密/露骨氛围：是的话不把露骨正文抹进 prompt（避免触发
+        # 模型安全拒绝/乱码），而是用一句中性氛围提示，让她顺着当下的亲密感说下去。
+        intimate = _looks_intimate(
+            str(target.get("last_message") or ""),
+            str(target.get("last_spoken_text") or ""),
+            conv_text,
+        )
+        if intimate:
+            conv_text = ""
+
+        # 文风级反重复：列出最近主动发给对方的几条，要求换句式。
+        # 优先用引擎传进来的 7 天主动消息日志（按 bid,uid 隔离，只含自己主动发的），
+        # 拿不到时才退回从会话账本里扫 out。
+        recent_pro = [
+            str(t or "").strip() for t in (target.get("_recent_proactive") or []) if str(t or "").strip()
+        ]
+        if recent_pro:
+            recent_out = recent_pro[-RECENT_OUT_COUNT:]
+        else:
+            recent_out = [
+                str(m.get("text", "") or "").strip()
+                for m in target.get("conversation", [])
+                if m.get("dir") == "out" and str(m.get("text", "") or "").strip()
+            ][-RECENT_OUT_COUNT:]
         out_block = ""
         if recent_out:
             out_block = (
@@ -576,15 +603,7 @@ class MessageGenerator:
             f"{now.strftime('%m月%d日')} 星期{weekday_cn} "
             f"{now.strftime('%H:%M')}，{slot_name_cn(slot)}"
         )
-        # 本条的目标字数：没有目标时模型会顶到 max_len，每条都写成小作文
-        if is_followup or is_closer:
-            lo, hi = _MODE_LENGTHS.get(mode, (4, 14))
-        else:
-            lo, hi, _w = random.choices(
-                _LENGTH_TARGETS, weights=[item[2] for item in _LENGTH_TARGETS], k=1
-            )[0]
-        hi = max(8, min(hi, max_len))
-        lo = min(lo, hi)
+        # 长度不再由插件指定：交给人设与情境，max_len（默认 60）只在清洗时做硬上限。
 
         # 收集「对方相关」背景（用户可控内容，按惰性资料处理以抗提示词注入）
         # 具体拼装在下面的 assemble 里做，因为超预算时这几行会被整块丢掉。
@@ -597,13 +616,17 @@ class MessageGenerator:
         # 连发：按概率允许拆成两条短句
         allow_burst = bool(getattr(self.cfg, "allow_burst", True)) if self.cfg else True
         want_split = allow_burst and random.random() < BURST_PROBABILITY
+        # 是否剥掉括号动作/旁白：关掉（strip_roleplay_actions=false）时尊重人设本身的说话
+        # 风格（语C 人设靠括号动作表达），不再强制她把动作神态删干净把角色风格抄平。
+        strip_rp = (
+            bool(getattr(self.cfg, "strip_roleplay_actions", True)) if self.cfg else True
+        )
         burst_lines: List[str] = []
         if want_split:
             burst_lines = [
-                "真人聊天经常不是一大段，而是想到哪说到哪、连着发两三条短句。",
-                "要是这条你自然想拆着发，就写成两段，中间单独一行只写 ---。",
-                "两条都得是能单独看懂的完整话，不要把一句话从中间劈断；",
-                "第二条不要以「而且」「还有」「然后」「就是」这类连接词开头，另起一个念头更像真的。",
+                "要是你自然想把这条拆成两段发，就写成两段，中间单独一行只写 ---。",
+                "两段都得是能单独看懂的完整话，不要把一句话从中间劈断；",
+                "第二段不要以「而且」「还有」「然后」「就是」这类连接词开头，另起一个念头更像真的。",
                 "",
             ]
 
@@ -611,18 +634,22 @@ class MessageGenerator:
         # 而不是把整段 prompt 从中间硬截断（截断会呬掉输出格式要求）。
         def assemble(dropped: frozenset) -> str:
             ref_lines: List[str] = []
-            last_msg = str(target.get("last_message") or "").strip()
-            if last_msg:
-                ref_lines.append(f"对方最近说过的：{last_msg[:120]}")
-            spoken = str(target.get("last_spoken_text") or "").strip()
-            if spoken and "out_block" not in dropped:
-                # 不记这一笔，她下一句接不上自己刚才说的话，看起来就像换了个人
-                ref_lines.append(f"你自己上一句对TA说的是：{spoken[:120]}")
-            if topics_text and "topics" not in dropped:
-                ref_lines.append(f"之前聊到的话题：{topics_text}")
-            if conv_text and "history" not in dropped:
-                ref_lines.append("最近的对话：")
-                ref_lines.append(conv_text)
+            if intimate:
+                # 亲密氛围：不抹露骨正文，只给一句氛围提示，让她顺着当下的亲昵感接下去
+                ref_lines.append("你们刚才聊得很亲密黏糊，氛围还暖着，顺着这个感觉自然说一句就好。")
+            else:
+                last_msg = str(target.get("last_message") or "").strip()
+                if last_msg:
+                    ref_lines.append(f"对方最近说过的：{last_msg[:120]}")
+                spoken = str(target.get("last_spoken_text") or "").strip()
+                if spoken and "out_block" not in dropped:
+                    # 不记这一笔，她下一句接不上自己刚才说的话，看起来就像换了个人
+                    ref_lines.append(f"你自己上一句对TA说的是：{spoken[:120]}")
+                if topics_text and "topics" not in dropped:
+                    ref_lines.append(f"之前聊到的话题：{topics_text}")
+                if conv_text and "history" not in dropped:
+                    ref_lines.append("最近的对话：")
+                    ref_lines.append(conv_text)
             block = ""
             if ref_lines:
                 block = (
@@ -637,11 +664,18 @@ class MessageGenerator:
                 idx = cut.rfind("\n")
                 persona_text = (cut[:idx] if idx >= PERSONA_SHED_CHARS // 2 else cut) + "…"
             if persona_text:
+                parts.append(persona_text)
+                parts.append("")
+                if strip_rp:
+                    parts.extend([
+                        "上面是你在 AstrBot 里的人格设定，用这个身份和说话方式来，不要把设定内容本身复述出来。",
+                        "设定里如果有动作描写、神态、旁白那一套，只用来理解性格，发消息时不写那些。",
+                    ])
+                else:
+                    parts.append(
+                        "上面是你在 AstrBot 里的人格设定，就用这个身份和它本来的说话风格来（包括它惯用的语气、动作描写），不要把设定内容本身复述出来。"
+                    )
                 parts.extend([
-                    persona_text,
-                    "",
-                    "上面是你在 AstrBot 里的人格设定，用这个身份和说话方式来，不要把设定内容本身复述出来。",
-                    "设定里如果有动作描写、神态、旁白那一套，只用来理解性格，发消息时不写那些。",
                     "",
                     f"你除了聊天还有自己的日常生活。现在是{when}。",
                 ])
@@ -716,26 +750,19 @@ class MessageGenerator:
             if "burst" not in dropped:
                 parts.extend(burst_lines)
 
+            parts.append("几件事：")
+            if strip_rp:
+                parts.append("- 你在用手机打字，只打话本身，不写括号里的动作神态、不用星号旁白。")
+            else:
+                parts.append("- 你在用手机打字，按你人设平时的说话方式来就行。")
+            if is_followup:
+                parts.append("- 就那件事接一句，别重新起头。")
+            elif is_closer:
+                parts.append("- 这句不要向TA要回复、不要问句，说完就完。")
             parts.extend([
-                "关键要求：",
-                "- 你在用手机打字聊天。只打文字本身：不写括号里的动作和神态，不用星号，不描述表情，不分行分段。",
-                (
-                    "- 这次就是一句短问话，别超过十个字，别加铺垫。"
-                    if is_followup
-                    else (
-                        "- 这句不要向TA要回复，不要问句，说完就完。"
-                        if is_closer
-                        else "- 大多数时候你说的是陈述句，不是问句。你只是想说句话，不是在等对方回答。"
-                    )
-                ),
-                "- 像微信里跟朋友发消息一样，不用标点收尾也行，口语化，不用书面语。",
-                f"- 这条说 {lo}~{hi} 个字左右就够了，宁可短，别写成一段话。",
+                "- 像平时聊天那样口语化，不用书面语，不用刻意用标点收尾。",
                 "- 不要解释你为什么发消息，不要说\"突然来找你\"这种话。",
-                "- 不要每句都叫「亲爱的/宝/乖/小笨蛋」这类爱称，一条里最多出现一次，不出现更好。",
-                "- 不要催对方睡觉、不要道晚安，除非TA刚刚说要睡。",
-                "- 可以顺着上面「对方相关」里聊过的话题自然接一句，但别刻意。",
-                "- 不要假装发生了什么事，说你自己真实可能有的感受就好。",
-                "- 不要出现「作为AI」「我是机器人」之类的话，也不要解释你的设定。",
+                "- 不要出现「作为AI」「我是机器人」之类的话，也不要把人设设定本身复述出来。",
                 "",
             ])
 
@@ -823,13 +850,35 @@ class MessageGenerator:
 
     @classmethod
     def _parse_decision(cls, text: str, max_len: int, cfg: Any = None) -> Optional[Decision]:
-        """解析 SEND / NO 输出。没给标记但写了正文，按要发处理。"""
+        """解析 SEND / NO 输出。没给标记但写了正文，按要发处理。
+
+        先剥掉 <think></think> 思考链：推理模型会把思考写在 SEND/NO 之前，不先删的话
+        首行是 <think> 而不是协议词，fallback 会把整段含思考链的 raw 当正文发出去。
+        """
         raw = str(text or "").strip()
+        if not raw:
+            return None
+        raw = _THINK_BLOCK.sub("", raw)
+        raw = _THINK_OPEN.sub("", raw)
+        raw = _THINK_STRAY.sub("", raw).strip()
         if not raw:
             return None
         head, _, rest = raw.partition("\n")
         head = head.strip().strip("[]【】:： ").upper()
         body = rest if rest.strip() else ""
+
+        # 嗦嗦型模型会在 SEND/NO 之前写一段铺垫（“好的，我想想…”），首行不是协议词，
+        # 不处理的话铺垫会连同正文一起发出去。首行不是标记时，扫描后续行找一个单独成行
+        # 的 SEND/NO，以它为界重新划分头/体，把前面的铺垫丢掉。
+        if head not in _DECISION_NO_ALIASES and head != _DECISION_SEND and not _NO_LEADING.match(raw):
+            lines = raw.split("\n")
+            for i, ln in enumerate(lines):
+                token = ln.strip().strip("[]【】:： ").upper()
+                if token == _DECISION_SEND or token in _DECISION_NO_ALIASES:
+                    head = token
+                    body = "\n".join(lines[i + 1:]) if i + 1 < len(lines) else ""
+                    rest = body
+                    break
 
         no_marked = head in _DECISION_NO_ALIASES
         if not no_marked and _NO_LEADING.match(raw):
@@ -1065,7 +1114,12 @@ class MessageGenerator:
         if not isinstance(text, str):
             return None
 
-        t = MessageGenerator._strip_markdown(text).strip()
+        # 先剥掉推理模型的思考链：完整的 <think>…</think> 整块删，只有开标签没闭合时
+        # 把它到行尾都当思考丢掉，残留的裸标签也清。不清就会把思考链当正文发出去。
+        t = _THINK_BLOCK.sub("", text)
+        t = _THINK_OPEN.sub("", t)
+        t = _THINK_STRAY.sub("", t)
+        t = MessageGenerator._strip_markdown(t).strip()
         if not t:
             return None
 
