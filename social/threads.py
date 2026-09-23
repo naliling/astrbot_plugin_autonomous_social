@@ -139,14 +139,16 @@ def thread_meta(kind: str, about: str = "", asked: str = "") -> Dict[str, Any]:
             "intent": "followup",
             "mode": "probe",
             "msg_type": "continue_topic",
-            "msg_type_desc": "就着刚才那件事再问一句，问具体的那件，不是问TA在不在",
-            "msg_examples": [
-                ("所以到底咋回事", 0),
-                ("后来呢", 0),
-                ("那你现在打算怎么办", 1),
-                ("真的假的", 0),
-                ("严重吗", 1),
-            ],
+        "msg_type_desc": "就着刚才那件事再问一句，问具体的那件，不是问TA在不在",
+        # 纯文本列表：生成器直接拼进 prompt。这里曾经是 (文本, 档位) 元组，
+        # 元组被原样印进提示词（「('后来呢', 0)」），既污染 prompt 又让示例失效。
+        "msg_examples": [
+            "所以到底咋回事",
+            "后来呢",
+            "那你现在打算怎么办",
+            "真的假的",
+            "严重吗",
+        ],
             "about": about,
             "asked": asked,
         }
@@ -157,11 +159,11 @@ def thread_meta(kind: str, about: str = "", asked: str = "") -> Dict[str, Any]:
         "msg_type": "check_in",
         "msg_type_desc": "把说到一半断掉的话接上，问一句还在不在、是不是被什么事打断了",
         "msg_examples": [
-            ("刚才是不是卡了", 0),
-            ("人呢", 0),
-            ("被啥事叫走了？", 0),
-            ("你先忙，忙完说一声", 1),
-            ("话没说完就没了？", 1),
+            "刚才是不是卡了",
+            "人呢",
+            "被啥事叫走了？",
+            "你先忙，忙完说一声",
+            "话没说完就没了？",
         ],
         "about": about,
         "asked": asked,
@@ -275,10 +277,10 @@ def loop_meta(text: str) -> Dict[str, Any]:
         "msg_type": "check_in",
         "msg_type_desc": "问一句TA之前提的那件事后来怎么样了",
         "msg_examples": [
-            ("对了你那天那个事后来咋样", 0),
-            ("那个有结果了吗", 0),
-            ("后来怎么样了", 0),
-            ("那个还顺利吗", 1),
+            "对了你那天那个事后来咋样",
+            "那个有结果了吗",
+            "后来怎么样了",
+            "那个还顺利吗",
         ],
         "about": text,
     }
@@ -342,10 +344,10 @@ def closer_meta(about: str = "") -> Dict[str, Any]:
         "msg_type": "share_thought",
         "msg_type_desc": "给自己上次那句没人接的话收个尾，说完整、不要求对方回",
         "msg_examples": [
-            ("没事 我就是随口一说", 0),
-            ("刚想到个好玩的 不用回", 1),
-            ("你忙你的", 1),
-            ("也不是啥大事", 0),
+            "没事 我就是随口一说",
+            "刚想到个好玩的 不用回",
+            "你忙你的",
+            "也不是啥大事",
         ],
         "about": about,
     }

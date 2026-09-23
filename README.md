@@ -1,6 +1,6 @@
 # 自主拟人社交
 
-标准 AstrBot 插件结构，版本 1.10.1。
+标准 AstrBot 插件结构，版本 1.12.0。
 
 ## 它解决什么问题
 
@@ -10,11 +10,35 @@
 
 | | 什么时候开口 | 靠什么 |
 |---|---|---|
+| **早晚问候** | 到点就说：早安/晚安窗口 | `greeting_*`（不看 urge，每人每天每窗口一次） |
 | **另起一个新话题** | 慢慢来：得真的想说（urge 攒满） | `urge_refill_hours`、`activity_level`、作息画像 |
 | **追问那件事** | 几分钟：对方回得越来越敷衍 | `probe_after_minutes`（不看 urge） |
 | **问一句在不在** | 十几分钟：话说到一半人没了 | `followup_after_minutes`（不看 urge） |
 | **回访没结果的事** | 几小时到一夜：你提过一句没说后来 | `loop_min_hours` / `loop_max_hours` |
 | **给悬着的话收场** | 几小时到几天：她主动发的没人接 | `closer_after_hours`（最多收三次） |
+
+> v1.10.2 起**每个用户独立计算**：A 被找过不会让 B 多等（旧版所有人排一条队，
+> 全局冷却把 B 扣到 A 的冷却结束才轮得上）。每人自己的念头与 `user_cooldown_minutes`
+> 才是节奏来源；`max_sends_per_round`（默认 3）只是别在一轮心跳里把话一口气全倒出去的护栏。
+
+## 群聊心流（v1.11.0）
+
+上面那些都是**私聊**主动。v1.11.0 把主动消息铺到**群里**，默认在 bot 所在的所有群生效
+（与私聊侧 `private_only` 互不影响）：
+
+| | 什么时候 | 靠什么 |
+|---|---|---|
+| **心流接话** | bot 在群里说过话后的关注窗口内，群里继续聊 | `group_flow_enabled`、`flow_window_minutes`（无@，模型可拒答） |
+| **冷场破冰** | 群安静超过几小时 | `group_icebreak_enabled`、`group_idle_hours` |
+| **发言参考库** | 生成时注入“这个群怎么说话” | `group_ref_lib_enabled`、`group_ref_prompt_count` |
+
+> **保守档**：心流只在 bot 自己刚发过言后的窗口内才可能无@接话，不主动盯整个群。
+> **不刷屏**：两次插话最短间隔、每窗口上限、每群每小时总上限、连着没人接就安静，四道闸叠着拦。
+> **被踢就不再管**：心流只由实时群消息驱动（收不到消息自然停）；群发送失败隔离 24h；
+> 超 `group_stale_days` 天没见消息的群连样本一起清。用「群社交状态」指令（仅主人）看在管的群。
+>
+> ⚠ 默认在**所有群**启用，意味着心流接话是**公开可见**的；误判会当众发出。上面的频率总闸与
+> 保守触发是为了把打扰压到最低；不想要就把 `group_flow_enabled` / `group_icebreak_enabled` 关掉。
 
 ## v1.9.0：更频繁的默认节奏；刚装就能认识人
 
@@ -25,8 +49,9 @@
 提升到新节奏（只提升没改过的默认值，自己改过的不动）。面板里每个选项的描述也重写了一遍。
 
 > 注：v1.10 又把这几个默认往上顶了一格（当前值见下方配置表：`activity_level` 75、`user_cooldown` 30、
-> `global_cooldown` 7、`recent_talk` 18、`skip_cooldown` 10、`followup_after` 4、`probe_after` 2、
+> `recent_talk` 18、`skip_cooldown` 10、`followup_after` 4、`probe_after` 2、
 > `followup_max` 70、`followup_cooldown` 30）。schema 默认与代码 dataclass 默认已对齐，老用户仍走一次性迁移。
+> v1.10.2 起 `global_cooldown_minutes` 已废弃移除（每用户独立调度后不再需要跨用户排队）。
 
 **播种：不靠「先聊过」也认识人**。之前插件的用户池只有一条入口——谁私聊过 bot 谁才进
 state.json，刚装好的插件眼里一个人都没有。现在补两条入口，都不依赖装好后再聊一句：
@@ -226,7 +251,7 @@ Humanoid Core v2.14 开始把身体导出成一份带版本号的契约快照（
 
 **语气仲裁**：时段、精力、社交能量冲突时融合成自洽描述，不会出现「凌晨困倦」撞「精神不错」的矛盾指令。
 
-**连发模式**：约 42% 的主动消息拆成两条短句，隔 1-3 分钟补发第二条；期间对方回话则取消，补发条不计入回复率与冷却。
+**连发模式**：过半（约 62%）的主动消息拆成 2-3 条短句，隔 1-3 分钟逐条补发；期间对方回话即停，补发条不计入回复率与冷却。上限由 `max_burst_parts` 控制（1-3，默认 3）。
 
 **用人格设定说话（按角色隔离，插件里没有人格配置项）**：主动消息直接取 AstrBot 内置人设，按目标会话的 `unified_msg_origin` 解析。解析链与正常聊天一致：会话级指定 → 对话上的人设 → 该会话配置画像的默认人设 → 全局默认，所以**多角色天然各用各的**。插件里故意不放人格开关 —— 一个全局值会把所有角色压成同一个人格。读不到人设时回退默认口吻，不阻塞发送。
 
@@ -299,6 +324,8 @@ social/
 ## 指令
 - `/自主社交状态`：念头面板（谁攒到多少、多久没说话、上次是被接住还是没接）、当前节奏参数、Core 与人格联动、权限判定依据。仅主人/白名单。
 - `/触发社交`：立刻挑念头最重的人说一句，绕过念头门槛与冷却，也不经过模型否决（主人要看效果就别替他否决），但仍不插话进热聊。仅主人/白名单。
+- `/主动消息记录 [用户ID]`：看最近 7 天发过的主动消息（按用户隔离不串台）。仅主人。
+- `/群社交状态`：群聊心流在管的群列表——最近活跃、心流窗口是否开着、是否被隔离（被踢/会话失效）。仅主人。
 
 ## 配置项
 
@@ -324,8 +351,11 @@ social/
 | `skip_cooldown_minutes` | `15` | 模型否决后，多久之内不再就同一个人重新纠结 |
 | `respect_user_rhythm` | `true` | 按对方平时的活跃时段挑时机 |
 | `cue_followup` | `true` | 记住对方说的时间锚点，到点当成开口的由头 |
-| `global_cooldown_minutes` | `10` | 【护栏】两次主动消息的最短间隔 |
-| `user_cooldown_minutes` | `45` | 【护栏】同一个人两次被主动联系的最短间隔 |
+| `user_cooldown_minutes` | `30` | 【护栏】同一个人两次被主动联系的最短间隔（每人独立，互不排队） |
+| `max_sends_per_round` | `3` | 【护栏】一轮心跳里一个角色最多主动联系几个不同的人（防刷屏总闸） |
+| `greeting_enabled` | `true` | 【早晚问候】到窗口、今天还没问候过就说一句（不看 urge；只问候最近 4 天有来往的人） |
+| `greeting_morning_start` / `greeting_morning_end` | `7` / `11` | 【早晚问候】早安窗口（小时，按她所在城市的钟） |
+| `greeting_night_start` / `greeting_night_end` | `21` / `24` | 【早晚问候】晚安窗口（24 视作午夜 0；支持跨午夜写法） |
 | `quiet_start` / `quiet_end` | `23` / `7` | 安静时段：这段时间念头几乎不增长，且到点也不发（开了 `use_core_clock` 就按她那里的小时） |
 | `private_only` | `true` | 仅私聊 |
 | `debug` | `false` | 决策日志（谁攒满了念头、为什么没说） |
@@ -333,6 +363,7 @@ social/
 | `strip_roleplay_actions` | `true` | 去掉括号动作与旁白 |
 | `allow_emoji` | `false` | 是否保留 emoji |
 | `allow_burst` | `true` | 连发模式 |
+| `max_burst_parts` | `3` | 一次主动开口最多拆成几条（1-3） |
 | `topic_memory_count` | `5` | 话题记忆数量 |
 | `weekend_boost` | `true` | 周末念头涨得快些 |
 | `energy_threshold` | `15` | 精力低于此值念头几乎涨不动 |
@@ -346,3 +377,17 @@ social/
 | `history_ingest` | `true` | 【播种】启动与每半小时读 AstrBot 会话库，把装插件前就聊过的人导进来 |
 | `seed_users` | `[]` | 【播种】没聊过的人也能写进来，她攒够念头会主动找上门（user_id 或 platform:user_id） |
 | `seed_platform` | `aiocqhttp` | 【播种】seed_users 只填 user_id 时拼私聊目标用的平台标识 |
+| `group_flow_enabled` | `true` | 【群聊心流】bot 在群里说过话后的关注窗口内，无@主动接话（模型可拒答） |
+| `group_icebreak_enabled` | `true` | 【群聊心流】群冷场时主动抛个轻话题 |
+| `group_ref_lib_enabled` | `true` | 【群聊心流】采集群友发言风格并注入生成 |
+| `group_store_message_text` | `true` | 【群聊心流】是否落盘群友发言正文作为参考库（关掉则参考库为空） |
+| `flow_window_minutes` | `8` | 【群聊心流】bot 说过话后关注窗口持续多少分钟 |
+| `flow_min_gap_seconds` | `45` | 【群聊心流】两次插话最短间隔（秒） |
+| `flow_max_replies_per_window` | `3` | 【群聊心流】一个窗口内最多接几条 |
+| `flow_hourly_cap` | `6` | 【群聊心流】每群每小时插话总上限（防刷屏总闸） |
+| `flow_ignored_exit` | `2` | 【群聊心流】连着插几条都没人接就退出心流安静下来 |
+| `group_idle_hours` | `6.0` | 【群聊心流】群安静超过多少小时才考虑破冰 |
+| `icebreak_daily_cap` | `2` | 【群聊心流】每群每天最多破冰几次 |
+| `group_stale_days` | `3` | 【群聊心流】超过多少天没见消息就当已不在这个群（不再破冰并清样本） |
+| `group_ref_sample_size` | `30` | 【群聊心流】参考库每群保留多少条样本 |
+| `group_ref_prompt_count` | `8` | 【群聊心流】生成时抽多少条当风格参考（设 0 不注入） |

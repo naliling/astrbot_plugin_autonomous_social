@@ -102,6 +102,7 @@ _BAD_PATTERNS: List[str] = [
 ]
 
 # 正面模式：参考的说话感觉（避免与 _BAD_PATTERNS 撞车；不含「突然想到你了」这类高频模板句）
+# 带几条问句示例：主动开口本来就该有「想接着聊」的样子，全是陈述句会把模型带成报天气。
 _GOOD_PATTERNS_GENERAL: List[str] = [
     "刚想到一个事",
     "突然想起来个东西",
@@ -113,11 +114,15 @@ _GOOD_PATTERNS_GENERAL: List[str] = [
     "有点无聊",
     "刚碰到个好笑的",
     "今天也不知道怎么了",
+    "你上次说的那个游戏好玩吗",
+    "周末有啥安排没",
+    "那个事后来弄完了没",
 ]
 
-# 连发（burst）：按概率允许模型把消息自然拆成两段
-BURST_PROBABILITY = 0.42
-MAX_BURST_PARTS = 2
+# 连发（burst）：允许模型把消息自然拆成几段。v1.10.2 起上限 3 条、概率提高——
+# 真人想说一件稍长的事经常连着发两三条，永远只发孤零零一句反而是机器人味。
+BURST_PROBABILITY = 0.62
+MAX_BURST_PARTS = 3
 
 # 长度不再由插件攒权重指定：该多长由人设与触发这条消息的具体情境决定，
 # prompt 里不再出现「字数目标」与「少量短句/宁可短」这类把模型往短里抽的提示。
@@ -261,6 +266,18 @@ _MODE_NOTES = {
         "- 不许提「你怎么没回」「在吗」，那会变成催；\n"
         "- 也别道歉、别解释你上次为什么发那句。"
     ),
+    "greet_morning": (
+        "现在是早上，你想跟TA道个早安。\n"
+        "- 别只发「早安」两个字，后面自然带一句你刚醒的状态、或者今天的头一件小事；\n"
+        "- 可以顺势问一句TA今天有什么安排，一个就够，别问一串；\n"
+        "- 想拆成两条发也行（先一句早安，再补一句今天的状态）。"
+    ),
+    "greet_night": (
+        "现在是夜里，你准备睡了，想跟TA道一句晚安。\n"
+        "- 别只发「晚安」两个字，可以带一句今天收尾的感觉；\n"
+        "- 不要问句，别让TA觉得必须回你才能睡；\n"
+        "- 短一点，晚安本身就是收尾。"
+    ),
 }
 
 _MODE_ASK = {
@@ -295,6 +312,14 @@ _DECIDE_NOTES = {
     "loop": (
         "但这一次不是没话找话：TA 之前提过一件事没说结果，你到今天才想起来问。"
         "隔了半天再问一句后来怎么样，比当时追着问更像人。"
+    ),
+    "greet_morning": (
+        "但这一次不是没话找话：现在是早上，跟TA说句早安是正常人每天都可能做的事，"
+        "一天就这一句，别觉得多余。"
+    ),
+    "greet_night": (
+        "但这一次不是没话找话：现在是夜里，你准备睡了，睡前道一句晚安是很自然的事，"
+        "一天就这一句。"
     ),
 }
 
@@ -470,6 +495,115 @@ class MessageGenerator:
             return None
         return self._parse_decision(result_text, max_len, self.cfg)
 
+    async def group_message(
+        self,
+        umo: str,
+        mode: str,
+        group_ctx: Dict[str, Any],
+        persona_prompt: str = "",
+        at: Optional[float] = None,
+        clock_offset: Optional[int] = None,
+    ) -> Optional[List[str]]:
+        """群聊心流/破冰的生成。mode="flow"（接话，可拒答）/ "icebreak"（破冰）。
+
+        与 1:1 主动消息不同：这里没有单一「对方」，是对着一群人说话，参考库告诉模型
+        “这个群平时怎么说话”。flow 用 SEND/NO 协议——接不上就让它答 NO，不硬接。
+
+        Returns:
+            消息段落列表；flow 选择不接、或 LLM 不可用/解析失败时返回 None。
+        """
+        provider = await self._get_provider(umo)
+        if provider is None:
+            logger.warning("[autonomous_social] 群聊心流：取不到 LLM provider，本轮不发")
+            return None
+        max_len = int(getattr(self.cfg, "max_message_length", DEFAULT_MAX_LENGTH) or DEFAULT_MAX_LENGTH) if self.cfg else DEFAULT_MAX_LENGTH
+        prompt = self._compose_group(mode, group_ctx, persona_prompt, max_len)
+        try:
+            result_text = await self._call_llm(provider, prompt)
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 群聊心流生成异常: {e}")
+            return None
+        if not result_text:
+            return None
+        if mode == "flow":
+            decision = self._parse_decision(result_text, max_len, self.cfg)
+            if decision is None or not decision.send:
+                return None
+            return decision.parts
+        # icebreak：直接当正文（也容错模型多写了 SEND 前缀，_split_parts 里的清洗会处理）
+        return self._split_parts(result_text, max_len, self.cfg)
+
+    def _compose_group(
+        self,
+        mode: str,
+        group_ctx: Dict[str, Any],
+        persona_prompt: str,
+        max_len: int,
+    ) -> str:
+        """拼群聊心流/破冰的 prompt。"""
+        allow_emoji = bool(getattr(self.cfg, "allow_emoji", False)) if self.cfg else False
+        strip_rp = bool(getattr(self.cfg, "strip_roleplay_actions", True)) if self.cfg else True
+        blocks: List[str] = []
+        if persona_prompt:
+            blocks.append("【你是谁】\n" + persona_prompt.strip())
+        style_ref = str(group_ctx.get("style_ref", "") or "").strip()
+        if style_ref:
+            blocks.append(style_ref)
+        recent = group_ctx.get("recent") or []
+        conv_lines: List[str] = []
+        for m in recent:
+            name = str(m.get("name", "") or "群友").strip() or "群友"
+            txt = str(m.get("text", "") or "").strip()
+            who = "你" if m.get("self") else name
+            if txt:
+                conv_lines.append(f"  {who}：{txt}")
+        last_flow = str(group_ctx.get("last_flow_text", "") or "").strip()
+
+        shape: List[str] = []
+        if not allow_emoji:
+            shape.append("不要用 emoji。")
+        if strip_rp:
+            shape.append("不要写括号里的动作神态旁白（像（笑）、*摸头*那种），群里没人这么打字。")
+
+        if mode == "icebreak":
+            reason = str(group_ctx.get("reason", "") or "").strip()
+            head = "你在一个群聊里，群已经安静了一阵。"
+            if reason:
+                head += reason
+            body = [
+                head,
+                "你想在群里抛一个轻松的话头，让大家搭句话。",
+                "要求：",
+                "- 像群里正常一员那样起个话头，短、口语，不需要谁必须回；",
+                "- 别像客服/播报，别用「有人在吗」这种查岗式开头；",
+                "- 一句就够，可以带一个轻松的小问题。",
+            ]
+            if shape:
+                body.append("- " + " ".join(shape))
+            body.append(f"长度不超过 {max_len} 字。直接写你要发到群里的那句话，不要写别的。")
+            blocks.append("\n".join(body))
+            return "\n\n".join(b for b in blocks if b)
+
+        # mode == flow
+        if conv_lines:
+            blocks.append("群里最近在聊（你=你自己）：\n" + "\n".join(conv_lines))
+        if last_flow:
+            blocks.append(f"你刚才在这个群里插过一句：「{last_flow}」。别重复这个意思。")
+        instr = [
+            "你刚才在这个群里说过话，现在群里有人继续在聊。你可以像群里熟人一样自然接一句，也可以不接。",
+            "判断：这话你接得上、接了不尴、能让聊天更热闹就接；接不上、没意思、或会打断别人就别接。",
+            "要求：",
+            "- 像群里正常一员那样说话，短、口语，可以自然地玩梗/接梗，但别硬玩、别复读别人的话；",
+            "- 一句就够，不要长篇；不要 @ 任何人，除非特别自然；",
+            "- 不要每条都接，宁可不接也别尬聊。",
+        ]
+        if shape:
+            instr.append("- " + " ".join(shape))
+        instr.append(f"长度不超过 {max_len} 字。")
+        instr.append("输出格式：想接就第一行写 SEND，第二行开始写你要发的话；不想接就只写一行 NO。")
+        blocks.append("\n".join(instr))
+        return "\n\n".join(b for b in blocks if b)
+
     async def _compose(
         self,
         umo: str,
@@ -581,12 +715,20 @@ class MessageGenerator:
         # 性格不再由插件自己填：直接用 AstrBot 当前生效的人格设定
         personality = str(persona_prompt or "").strip()
 
-        # 消息类型信息
+        # 消息类型信息（示例兼容 (文本, 档位) 元组与纯文本两种形态，防御旧调用方）
         msg_type_desc = ""
         msg_examples: List[str] = []
         if reason_meta:
-            msg_type_desc = reason_meta.get("msg_type_desc", "")
-            msg_examples = reason_meta.get("msg_examples", [])
+            msg_type_desc = str(reason_meta.get("msg_type_desc", "") or "")
+            raw_examples = reason_meta.get("msg_examples", []) or []
+            for e in raw_examples:
+                if isinstance(e, tuple):
+                    msg_examples.append(str(e[0]) if e else "")
+                elif isinstance(e, list):
+                    msg_examples.append(str(e[0]) if e else "")
+                else:
+                    msg_examples.append(str(e))
+            msg_examples = [x for x in msg_examples if x]
 
         # ─── 构建 prompt ───
 
@@ -623,12 +765,20 @@ class MessageGenerator:
         )
         burst_lines: List[str] = []
         if want_split:
-            burst_lines = [
-                "要是你自然想把这条拆成两段发，就写成两段，中间单独一行只写 ---。",
-                "两段都得是能单独看懂的完整话，不要把一句话从中间劈断；",
-                "第二段不要以「而且」「还有」「然后」「就是」这类连接词开头，另起一个念头更像真的。",
-                "",
-            ]
+            n = (
+                int(getattr(self.cfg, "max_burst_parts", MAX_BURST_PARTS) or MAX_BURST_PARTS)
+                if self.cfg
+                else MAX_BURST_PARTS
+            )
+            n = max(1, min(MAX_BURST_PARTS, n))
+            if n >= 2:
+                burst_lines = [
+                    f"要是你自然想把这条拆开发，就写成最多 {n} 段，中间单独一行只写 ---。",
+                    "每段都得是能单独看懂的完整话，不要把一句话从中间劈断；",
+                    "就像真人连着发几条那样，一段一个念头；",
+                    "后面几段不要以「而且」「还有」「然后」「就是」这类连接词开头，另起一个念头更像真的。",
+                    "",
+                ]
 
         # 构建 prompt。抽成一个函数是为了能在超预算时丢掉装饰性内容重拼一次，
         # 而不是把整段 prompt 从中间硬截断（截断会呬掉输出格式要求）。
@@ -759,6 +909,12 @@ class MessageGenerator:
                 parts.append("- 就那件事接一句，别重新起头。")
             elif is_closer:
                 parts.append("- 这句不要向TA要回复、不要问句，说完就完。")
+            elif mode == "greet_night":
+                parts.append("- 晚安不要带问句，说完就睡，别让TA觉得必须回。")
+            elif mode == "greet_morning":
+                parts.append("- 早安可以带一句问TA今天安排的话，一个就够。")
+            else:
+                parts.append("- 想接着聊下去的话，自然带一个问句也行，别每次都只是陈述句。")
             parts.extend([
                 "- 像平时聊天那样口语化，不用书面语，不用刻意用标点收尾。",
                 "- 不要解释你为什么发消息，不要说\"突然来找你\"这种话。",
@@ -905,13 +1061,19 @@ class MessageGenerator:
 
     @staticmethod
     def _split_parts(text: str, max_len: int, cfg: Any = None) -> Optional[List[str]]:
-        """按 --- 分隔行拆成连发段落，最多 MAX_BURST_PARTS 段。"""
+        """按 --- 分隔行拆成连发段落（上限取配置 max_burst_parts，至多 3 段）。"""
         if not str(text or "").strip():
             return None
         allow_emoji = bool(getattr(cfg, "allow_emoji", False)) if cfg is not None else False
         strip_rp = (
             bool(getattr(cfg, "strip_roleplay_actions", True)) if cfg is not None else True
         )
+        limit = (
+            int(getattr(cfg, "max_burst_parts", MAX_BURST_PARTS) or MAX_BURST_PARTS)
+            if cfg is not None
+            else MAX_BURST_PARTS
+        )
+        limit = max(1, min(MAX_BURST_PARTS, limit))
         segments = re.split(r"\n\s*-{3,}\s*\n?", text)
         parts = [
             p
@@ -923,7 +1085,7 @@ class MessageGenerator:
             )
             if p
         ]
-        return parts[:MAX_BURST_PARTS] if parts else None
+        return parts[:limit] if parts else None
 
     async def _get_provider(self, umo: str) -> Optional[Any]:
         """获取 LLM provider，兼容多种 API。

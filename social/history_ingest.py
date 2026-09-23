@@ -35,6 +35,21 @@ _MAX_CONVERSATIONS = 300
 _PRIVATE_TYPES = {"private", "p2p", "c2c", "friend", "single", "1:1"}
 _GROUP_TYPES = {"group", "g"}
 
+def _like_pattern(msg_type: str) -> str:
+    """转义 LIKE 里的通配符（下划线/百分号），再包上 umo 的 %:msg_type: 结构。
+    配合 _private_only_clause 的 ESCAPE '\\' 用。"""
+    s = msg_type.replace("%", "\\%").replace("_", "\\_")
+    return f"%:{s}:%"
+
+
+def _private_only_clause() -> str:
+    """在 SQL 里直接过滤私聊会话（带 ESCAPE 子句，下划线/百分号不会当通配符用）：
+    否则 ORDER BY updated_at + LIMIT 会被群会话占满名额（群消息不断刷新 updated_at），
+    私聊会话全部被挤出扫描窗口，装完插件一个「聊过的人」都导不进来。"""
+    return " OR ".join(
+        "user_id LIKE '%s' ESCAPE '\\'" % _like_pattern(t) for t in sorted(_PRIVATE_TYPES)
+    )
+
 
 def find_astrbot_db(data_dir: Optional[str]) -> Optional[str]:
     """找 AstrBot 会话数据库文件，找不到返回 None。"""
@@ -146,17 +161,19 @@ def _connect_ro(db_path: str) -> sqlite3.Connection:
 
 
 def iter_conversations(
-    db_path: str, limit: int = _MAX_CONVERSATIONS
+    db_path: str, limit: int = _MAX_CONVERSATIONS, private_only: bool = False
 ) -> Iterator[Dict[str, Any]]:
     """按更新时间倒序逐个会话读出 user_id(umo)、updated_at、content。
 
-    表不存在 / 库打不开时静默结束（调用方记一次日志），不抛异常。
+    private_only=True 时在 SQL 里就只扫私聊会话（群会话会刷新 updated_at 把私聊挤出
+    LIMIT 窗口）；表不存在 / 库打不开时静默结束（调用方记一次日志），不抛异常。
     """
+    where = f" WHERE {_private_only_clause()}" if private_only else ""
     try:
         conn = _connect_ro(db_path)
         try:
             cursor = conn.execute(
-                "SELECT user_id, updated_at, content FROM conversations "
+                f"SELECT user_id, updated_at, content FROM conversations{where} "
                 "ORDER BY updated_at DESC LIMIT ?",
                 (limit,),
             )
@@ -217,7 +234,7 @@ def seed_from_history(
     existing = _existing_uids(state)
     bid = _seed_target_bid(state)
     added = 0
-    for conv in iter_conversations(db_path):
+    for conv in iter_conversations(db_path, private_only=private_only):
         umo = conv["umo"]
         kind = umo_kind(umo)
         if private_only and kind == "group":
@@ -244,6 +261,37 @@ def seed_from_history(
     if added:
         state.mark_dirty()
     return added
+
+
+def seed_diag_snapshot(
+    state: SocialState,
+    data_dir: Optional[str],
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """读一次会话库现状，给状态面板展示「识别」到底跑没跑、认出了谁。
+
+    不写任何东西：已导入的数 state.json 里自己查，这里只报 db 路径、私聊会话数、
+    还能再导几个（未进 state 的）。
+    """
+    out: Dict[str, Any] = {
+        "db_path": None,
+        "private_conversations": 0,
+        "importable": 0,
+        "reason": "",
+    }
+    out["db_path"] = find_astrbot_db(data_dir)
+    if not out["db_path"]:
+        out["reason"] = "会话库未找到（data 目录解析不对或还没聊过天）"
+        return out
+    existing = _existing_uids(state)
+    convs = list(iter_conversations(out["db_path"], private_only=True))
+    out["private_conversations"] = len(convs)
+    out["importable"] = sum(
+        1 for c in convs
+        if _uid_of(c["umo"]) and _uid_of(c["umo"]) not in existing
+    )
+    return out
 
 
 def normalize_seed_entries(raw: Any, default_platform: str) -> List[Tuple[str, str, str]]:

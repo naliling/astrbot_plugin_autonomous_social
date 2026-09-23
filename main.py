@@ -366,6 +366,27 @@ class AutonomousSocial(Star):
             return
         yield event.plain_result("最近 7 天主动消息记录（按用户隔离）：\n" + text)
 
+    @command("群社交状态")
+    async def group_social_status(self, event: AstrMessageEvent):
+        """查看群聊心流在管的群：最近活跃、心流窗口、是否被隔离（被踢/会话失效）。仅机器人主人可用。"""
+        if self._engine is None:
+            yield event.plain_result("自主社交插件未正常初始化。")
+            return
+        allowed, why = self._check_owner(event)
+        if not allowed:
+            if self._is_group(event):
+                logger.info(f"[autonomous_social] 忽略群内查看群社交状态：{why}")
+                return
+            yield event.plain_result("这个指令只有机器人的主人能用。")
+            return
+        try:
+            text = self._engine.group_status_text()
+        except Exception as e:
+            logger.error(f"[autonomous_social] 获取群社交状态失败: {e}")
+            yield event.plain_result(f"获取失败: {e}")
+            return
+        yield event.plain_result(text)
+
     @staticmethod
     def _norm_id(x: object) -> str:
         """归一化 ID：去空白、去前缀、大小写不敏感，避免面板里多个空格就匹配不上。"""

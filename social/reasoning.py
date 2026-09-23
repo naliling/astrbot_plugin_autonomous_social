@@ -136,6 +136,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("今天也不知道怎么的，心情还行", 0),
             ("脑子里突然冒出个念头", 0),
             ("想起之前聊的那个，其实我后来又想了一下", 1),
+            ("你说人是不是都这样", 2),
         ],
     },
     "express_feeling": {
@@ -158,6 +159,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("刚路过一家店闻着好香", 0),
             ("外面下雨了 你那边下了吗", 0),
             ("今天路上看到一只超可爱的狗", 1),
+            ("刚看到个事 你觉得靠谱吗", 1),
         ],
     },
     "continue_topic": {
@@ -167,6 +169,8 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("对了之前那个后来怎么样了", 0),
             ("那个东西我后来查了一下", 0),
             ("你上次提的那个事我去看了下", 1),
+            ("那个咋样了", 0),
+            ("你后来去了吗", 1),
         ],
     },
     "casual_hello": {
@@ -177,6 +181,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("冒个泡", 0),
             ("也没什么事 就是想说句话", 0),
             ("突然想跟你说句话", 1),
+            ("吃饭了没", 1),
         ],
     },
     "complain": {
@@ -187,6 +192,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("公司的午饭越来越难吃", 0),
             ("刚才被领导叫住说了半天 头都大了", 1),
             ("今天诸事不顺 喝口水都塞牙", 2),
+            ("你说气不气", 1),
         ],
     },
     "check_in": {
@@ -196,6 +202,8 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("最近降温了 你那边冷不冷", 0),
             ("忙完这阵了没", 1),
             ("你上次说的那个事 后来顺不顺利", 2),
+            ("这周忙不忙", 1),
+            ("最近睡得好吗", 2),
         ],
     },
     "ask_advice": {
@@ -205,6 +213,7 @@ MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
             ("你一般失眠的时候都干嘛", 0),
             ("有没有什么摸鱼的好办法", 0),
             ("你觉得我要不要染头发", 2),
+            ("你说我该不该去", 1),
         ],
     },
     "react_time": {
@@ -532,6 +541,94 @@ def is_thin(text: str) -> bool:
         if any(word in cleaned for word in _THIN_WORDS):
             return True
     return len(cleaned) <= 2
+
+
+# ─── 早晚问候（时间性触发） ─────────────────────────
+
+# 问候不靠念头攒：它是「一天两次的固定由头」，到了窗口就该说，跟想不想聊无关。
+# 默认窗口（小时，按她所在城市的钟走）：早安 7-11，晚安 21-24。
+GREETING_MORNING_WINDOW = (7, 11)
+GREETING_NIGHT_WINDOW = (21, 24)
+
+_GREET_REASON_MORNING: List[str] = [
+    "早上刚醒，脑子还糊着，顺手跟TA说句早安。",
+    "洗漱完摸到手机，想跟TA道个早安。",
+    "醒了一会儿了，今天也想跟TA说句早安。",
+    "外面天刚亮，起来第一件事想跟TA道声早。",
+    "闹钟响过了还没完全醒，想跟TA说个早安。",
+]
+
+_GREET_REASON_NIGHT: List[str] = [
+    "今天到最后了，想跟TA道一句晚安。",
+    "准备睡了，睡前想跟TA说声晚安。",
+    "今天聊得挺舒服，睡前道个晚安。",
+    "夜深了，躺下了想跟TA说句晚安再睡。",
+    "眼睛已经睁不开了，想先跟TA道个晚安。",
+]
+
+
+def greeting_window_kind(
+    hour: int,
+    morning: Tuple[int, int] = GREETING_MORNING_WINDOW,
+    night: Tuple[int, int] = GREETING_NIGHT_WINDOW,
+) -> Optional[str]:
+    """她那里的这个钟点落在哪个问候窗口里。返回 'morning' / 'night' / None。"""
+    for start, end in (morning, night):
+        if start <= end:
+            if start <= hour < end:
+                return "morning" if (start, end) == morning else "night"
+        else:  # 跨午夜的窗口（如 22 → 2）
+            if hour >= start or hour < end:
+                return "morning" if (start, end) == morning else "night"
+    return None
+
+
+def greeting_due(user: Dict[str, Any], day: str, kind: str) -> bool:
+    """这个人今天（按她所在城市算的 day）还有没有这个窗口的问候可发。"""
+    return not (
+        str(user.get("greet_day", "") or "") == day
+        and str(user.get("greet_kind", "") or "") == kind
+    )
+
+
+def greet_reason(kind: str) -> str:
+    """问候的动机（从池子里随机挑一句，喂给生成侧）。"""
+    return random.choice(
+        _GREET_REASON_NIGHT if kind == "night" else _GREET_REASON_MORNING
+    )
+
+
+def greet_meta(kind: str) -> Dict[str, Any]:
+    """问候的 preset 元数据：跟未完话题同一条路走，交给生成器写台词。"""
+    if kind == "night":
+        return {
+            "category": "greet",
+            "intent": "greet",
+            "mode": "greet_night",
+            "kind": "night",
+            "msg_type": "greeting",
+            "msg_type_desc": "睡前跟TA道一句晚安，可以带一句今天收尾的感觉，不要问句",
+            "msg_examples": [
+                "晚安 今天聊得挺开心的",
+                "先睡了 明天再聊",
+                "困了 晚安好梦",
+                "今天就这样啦 晚安",
+            ],
+        }
+    return {
+        "category": "greet",
+        "intent": "greet",
+        "mode": "greet_morning",
+        "kind": "morning",
+        "msg_type": "greeting",
+        "msg_type_desc": "早上跟TA道个早安，带一句刚醒的状态或今天的头一件小事，可以顺势问一句TA今天的安排",
+        "msg_examples": [
+            "早 刚醒还迷糊着",
+            "早安 今天天不错",
+            "醒了 你吃早饭没",
+            "早啊 今天有啥安排",
+        ],
+    }
 
 
 # ─── 工具函数 ───────────────────────────────────────

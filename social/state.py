@@ -162,6 +162,11 @@ class SocialState:
             # 对方没回也不空着：closer_for 记下「为哪一次没人回收过场」
             "closer_for": 0.0,
             "closer_at": 0.0,
+            # v1.10.2 早晚问候：greet_day 记「哪天问候过」（按她所在城市的日期），
+            # greet_kind 记那次是早安还是晚安——每个用户每天每窗口各一次，互不共用
+            "greet_day": "",
+            "greet_kind": "",
+            "greet_at": 0.0,
             # v2: 对话历史
             "conversation": [],
             # v2: 主动消息回复追踪
@@ -184,7 +189,163 @@ class SocialState:
             "send_blocked_reason": "",
         }
 
-    # ─── 加载与迁移 ─────────────────────────────────────
+    # ─── 群会话（v1.11.0 群聊心流） ─────────────────────
+
+    def groups(self, bid: str) -> Dict[str, Any]:
+        """这个角色名下的群会话表（gid -> 群状态）。与 users 平行，按 bid 隔离不串群。"""
+        return self.bot(bid).setdefault("groups", {})
+
+    def group(self, bid: str, gid: str) -> Dict[str, Any]:
+        """获取或创建群状态。"""
+        g = self.groups(bid).setdefault(gid, self._default_group())
+        # 老记录补齐新键
+        for k, v in self._default_group().items():
+            g.setdefault(k, v)
+        return g
+
+    @staticmethod
+    def _default_group() -> Dict[str, Any]:
+        """群会话默认结构。umo 原样存 event.unified_msg_origin，用于精准发送。"""
+        return {
+            "umo": "",
+            "group_id": "",
+            "name": "",
+            "last_seen": 0.0,        # 最近一条群消息（任何人）
+            "msg_count": 0,
+            "last_bot_spoke": 0.0,   # bot 最近在这个群说话（主链路回复/破冰/心流）
+            "flow_open_until": 0.0,  # 心流关注窗口到期
+            "flow_replies": 0,       # 当前窗口已主动接几条
+            "flow_last_reply_at": 0.0,
+            "flow_ignored": 0,       # 连续插话没人接的计数
+            "flow_hour_bucket": 0,   # 小时级插话计数的时间桶（epoch 小时）
+            "flow_hour_count": 0,
+            "last_flow_reply_text": "",  # bot 上一句心流接的话，给生成侧防重复
+            "icebreak_day": "",      # 最近破冰的日期（按角色时钟）
+            "icebreak_count_day": 0,
+            "icebreak_at": 0.0,
+            "samples": [],           # 参考库：近期群友发言 [{ts, name, text}]（去重、限长）
+            "blocked_until": 0.0,    # 发送失败（被踢/会话失效）隔离
+            "blocked_reason": "",
+        }
+
+    def record_group_message(
+        self,
+        bid: str,
+        gid: str,
+        umo: str,
+        name: str,
+        sender_name: str,
+        text: str,
+        is_bot: bool,
+        now: float,
+        store_text: bool = True,
+        sample_cap: int = 30,
+    ) -> Dict[str, Any]:
+        """记下一条群消息：刷新 last_seen/umo，并（需要时）把群友发言存进参考库。
+
+        is_bot=True 时不进参考库（不学自己），但会刷 last_seen。参考库只存真人发言。
+        """
+        g = self.group(bid, gid)
+        if umo and g.get("umo") != umo:
+            g["umo"] = umo
+        if not g.get("group_id"):
+            g["group_id"] = str(gid)
+        if name:
+            g["name"] = str(name)[:60]
+        g["last_seen"] = now
+        g["msg_count"] = int(g.get("msg_count", 0) or 0) + 1
+        # 收到群消息说明这个群现在能通：清掉之前的发送隔离
+        if float(g.get("blocked_until", 0) or 0) > 0:
+            g["blocked_until"] = 0.0
+            g["blocked_reason"] = ""
+        if not is_bot and store_text:
+            body = str(text or "").strip()
+            if body and not body.startswith("/"):
+                samples = g.setdefault("samples", [])
+                body = body[:CONVERSATION_TRUNCATE_LENGTH]
+                # 跟上一条一模一样就不重复存（复读/刷屏预防）
+                if not samples or str(samples[-1].get("text", "")) != body:
+                    samples.append({"ts": now, "name": str(sender_name or "")[:24], "text": body})
+                    if len(samples) > sample_cap:
+                        del samples[: len(samples) - sample_cap]
+        self.mark_dirty()
+        return g
+
+    def open_flow(self, bid: str, gid: str, now: float, window_seconds: float) -> None:
+        """bot 在这个群说了话（走主链路回复/破冰）：开/续关注窗口。
+
+        bot 亲口说过一句算一次“真正参与”（多半是被 @ 后回的），所以把“连着插话没人
+        理”的计数 flow_ignored 归零；本窗接话计数只在新开窗时归零。心流插话本身不延长
+        窗口（走 note_flow_reply），避免自己把窗口无限推下去。
+        """
+        g = self.group(bid, gid)
+        was_open = float(g.get("flow_open_until", 0) or 0) > now
+        g["last_bot_spoke"] = now
+        g["flow_open_until"] = now + max(0.0, window_seconds)
+        g["flow_ignored"] = 0
+        if not was_open:
+            g["flow_replies"] = 0
+        self.mark_dirty()
+
+    def note_flow_reply(self, bid: str, gid: str, now: float, text: str) -> None:
+        """记一次心流接话：窗口计数 +1、“连续自说自话”计数 +1、刷小时桶、记下接的话防重复。
+
+        flow_ignored 在这里递增：统计“自上次真正被搞话（被@回）以来连着插了几句”。
+        插够 flow_ignored_exit 次都没人正式搞你，就安静下来，别自说自话。不延长关注窗口。
+        """
+        g = self.group(bid, gid)
+        g["flow_replies"] = int(g.get("flow_replies", 0) or 0) + 1
+        g["flow_ignored"] = int(g.get("flow_ignored", 0) or 0) + 1
+        g["flow_last_reply_at"] = now
+        g["last_bot_spoke"] = now
+        g["last_flow_reply_text"] = str(text or "")[:120]
+        bucket = int(now // 3600)
+        if int(g.get("flow_hour_bucket", 0) or 0) == bucket:
+            g["flow_hour_count"] = int(g.get("flow_hour_count", 0) or 0) + 1
+        else:
+            g["flow_hour_bucket"] = bucket
+            g["flow_hour_count"] = 1
+        self.mark_dirty()
+
+    def flow_hour_count(self, g: Dict[str, Any], now: float) -> int:
+        """当前自然小时里已经心流插了几次（跨桶自动归零）。"""
+        if int(g.get("flow_hour_bucket", 0) or 0) != int(now // 3600):
+            return 0
+        return int(g.get("flow_hour_count", 0) or 0)
+
+    def note_icebreak(self, bid: str, gid: str, now: float, day: str) -> None:
+        """记一次破冰：同一天计数 +1，跨天归零。"""
+        g = self.group(bid, gid)
+        if str(g.get("icebreak_day", "") or "") == day:
+            g["icebreak_count_day"] = int(g.get("icebreak_count_day", 0) or 0) + 1
+        else:
+            g["icebreak_day"] = day
+            g["icebreak_count_day"] = 1
+        g["icebreak_at"] = now
+        self.mark_dirty()
+
+    def is_group_blocked(self, bid: str, gid: str, now: float) -> bool:
+        return float(self.group(bid, gid).get("blocked_until", 0) or 0) > now
+
+    def block_group(self, bid: str, gid: str, until: float, reason: str) -> None:
+        g = self.group(bid, gid)
+        g["blocked_until"] = until
+        g["blocked_reason"] = str(reason or "")[:120]
+        self.mark_dirty()
+
+    def group_samples(self, bid: str, gid: str, count: int) -> List[str]:
+        """抽最近 count 条群友发言正文（去 @/命令），供风格参考。"""
+        if count <= 0:
+            return []
+        samples = self.group(bid, gid).get("samples", []) or []
+        out: List[str] = []
+        for s in samples[-count:]:
+            t = str(s.get("text", "") or "").strip()
+            if t:
+                out.append(t)
+        return out
+
+    # ─── 加载与迁移 ──────────────────────────────────────────────
 
     def load(self) -> None:
         """从磁盘加载状态。"""
@@ -241,6 +402,29 @@ class SocialState:
                         if k in u:
                             u.pop(k, None)
                             self._dirty = True
+                # v1.11.0 群会话：补齐新键（加法式，不动已有 users）
+                groups = bot.get("groups")
+                if isinstance(groups, dict):
+                    for g in groups.values():
+                        if not isinstance(g, dict):
+                            continue
+                        for k, v in self._default_group().items():
+                            g.setdefault(k, v)
+                # v1.12.0：清掉旧版历史导入误进 users 的群会话幽灵。旧版按 updated_at
+                # 取前 300 个会话再滤群，`GroupMessage` 类型不在识别表里被判 unknown
+                # 放行，群会话被当「人」导入、拿群 umo 去发主动消息。群消息在观察链路
+                # 里从不建 per-user 记录，所以 users 里 umo 是群会话的一定是幽灵。
+                users = bot.get("users")
+                if isinstance(users, dict):
+                    for uid, u in list(users.items()):
+                        if not isinstance(u, dict):
+                            continue
+                        segs = str(u.get("umo", "") or "").lower().split(":")
+                        mtype = segs[1] if len(segs) >= 3 else ""
+                        if mtype in ("group", "g", "groupmessage", "guild"):
+                            users.pop(uid)
+                            self._dirty = True
+            self.data["_ghosts_cleaned"] = True
         except Exception:
             pass
 
@@ -380,6 +564,44 @@ class SocialState:
         return pruned
 
     # ─── 持久化 ─────────────────────────────────────────
+
+    def prune_stale_groups(self, stale_days: int, now: Optional[float] = None) -> int:
+        """丢掉超过 stale_days 天没见过任何消息的群（被踢/退群/解散），返回被清群数。
+
+        心流只由实时群消息驱动，被踢自然收不到消息、不再触发；这里把长期不活跃
+        的群连样本一起删，既防状态文件膨胀，也确保不再对它破冰。从未记过 last_seen
+        （为 0）的群跳过。stale_days <= 0 表示不清理。
+        """
+        try:
+            stale_days = int(stale_days)
+        except (TypeError, ValueError):
+            return 0
+        if stale_days <= 0:
+            return 0
+        now = self._now() if now is None else float(now)
+        cutoff = now - stale_days * 86400.0
+        removed = 0
+        for bot in self.data.get("bots", {}).values():
+            if not isinstance(bot, dict):
+                continue
+            groups = bot.get("groups")
+            if not isinstance(groups, dict):
+                continue
+            for gid in list(groups.keys()):
+                g = groups.get(gid)
+                if not isinstance(g, dict):
+                    continue
+                try:
+                    seen = float(g.get("last_seen", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if seen <= 0 or seen > cutoff:
+                    continue
+                del groups[gid]
+                removed += 1
+        if removed:
+            self.mark_dirty()
+        return removed
 
     def mark_dirty(self) -> None:
         """标记状态已变更但暂不写入磁盘。"""

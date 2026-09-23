@@ -104,6 +104,80 @@ SOCIAL_ENERGY_THRESHOLD_DEFAULT = 20
 # 跟一个素未谋面的人开口，间隔本来就比熟人长，不能拿熟人节奏硬套
 SEED_URGE_SCALE = 0.5
 
+# 早晚问候（时间性触发）：早安/晚安窗口（小时，按她所在城市的钟走）
+GREETING_ENABLED_DEFAULT = True
+GREETING_MORNING_START_DEFAULT = 7
+GREETING_MORNING_END_DEFAULT = 11
+GREETING_NIGHT_START_DEFAULT = 21
+GREETING_NIGHT_END_DEFAULT = 24   # 24 视作 0（午夜）
+
+# 每轮心跳里一个角色最多主动发几条（对不同用户）：防刷屏上限。
+# v1.10.2 之前所有人排成一条队（每轮只发一个人 + 全局冷却跨用户互卡），
+# 表现出来就是「跟A聊完要过好久才轮到B」。现在每个用户独立算，
+# 这条只是别在一轮里全发出去的护栏。
+MAX_SENDS_PER_ROUND_MIN = 1
+MAX_SENDS_PER_ROUND_MAX = 10
+MAX_SENDS_PER_ROUND_DEFAULT = 3
+
+# 连发：一次主动开口最多拆成几条消息（1-3）
+MAX_BURST_PARTS_MIN = 1
+MAX_BURST_PARTS_MAX = 3
+MAX_BURST_PARTS_DEFAULT = 3
+
+# ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
+# 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
+# 下面这些管群聊侧。默认在 bot 所在的所有群生效（不需要白名单）。
+
+# 心流：bot 在群里说过话后，开一个「关注窗口」，窗口内群消息若值得接就无需被@接一句。
+# 保守档——只有 bot 自己刚发过言才会开窗，不主动盯着整个群。
+FLOW_WINDOW_MIN = 1
+FLOW_WINDOW_MAX = 60
+FLOW_WINDOW_DEFAULT = 8            # 分钟
+
+# 两次心流插话之间的最短间隔（秒）：别人一句我一句地刷屏不像人
+FLOW_MIN_GAP_MIN = 10
+FLOW_MIN_GAP_MAX = 600
+FLOW_MIN_GAP_DEFAULT = 45
+
+# 一个关注窗口内最多主动接几条
+FLOW_MAX_REPLIES_MIN = 1
+FLOW_MAX_REPLIES_MAX = 10
+FLOW_MAX_REPLIES_DEFAULT = 3
+
+# 每群每小时心流插话总上限（防刷屏总闸）
+FLOW_HOURLY_CAP_MIN = 1
+FLOW_HOURLY_CAP_MAX = 60
+FLOW_HOURLY_CAP_DEFAULT = 6
+
+# 连续插话这么多条都没人接，就退出心流安静下来（别尬聊）
+FLOW_IGNORED_EXIT_MIN = 1
+FLOW_IGNORED_EXIT_MAX = 10
+FLOW_IGNORED_EXIT_DEFAULT = 2
+
+# 冷场破冰：群安静超过这么久（小时）才考虑主动抛个轻话题
+GROUP_IDLE_HOURS_MIN = 1.0
+GROUP_IDLE_HOURS_MAX = 240.0
+GROUP_IDLE_HOURS_DEFAULT = 6.0
+
+# 每群每天最多破冰几次
+ICEBREAK_DAILY_CAP_MIN = 1
+ICEBREAK_DAILY_CAP_MAX = 10
+ICEBREAK_DAILY_CAP_DEFAULT = 2
+
+# 超过这么多天没在某个群见到任何消息，就当已经不在这个群了（被踢/退群/群解散）：
+# 不再对它破冰，并在清理时丢掉它的样本。心流本身只由实时群消息驱动，被踢自然就停。
+GROUP_STALE_DAYS_MIN = 1
+GROUP_STALE_DAYS_MAX = 90
+GROUP_STALE_DAYS_DEFAULT = 3
+
+# 发言参考库：每群保留多少条近期群友发言样本，注入生成时抽几条当风格参考
+GROUP_REF_SAMPLE_MIN = 5
+GROUP_REF_SAMPLE_MAX = 200
+GROUP_REF_SAMPLE_DEFAULT = 30
+GROUP_REF_PROMPT_MIN = 0
+GROUP_REF_PROMPT_MAX = 30
+GROUP_REF_PROMPT_DEFAULT = 8
+
 REPLY_WINDOW_MIN = 1
 REPLY_WINDOW_MAX = 48
 # 把 6 小时后的回复也算作「回了我的主动消息」会高估回复率，进而错估关系熟细度；
@@ -121,8 +195,8 @@ USER_RETENTION_DEFAULT = 30
 # 历史上各版本的默认值。AstrBot 更新 schema 只会补缺失项，从不覆盖已有值，
 # 所以调默认值对老用户完全无效 —— 他们永远停在装插件那一版的行为上。
 # 首次以本版本运行时，如果某项仍然等于某个旧默认值（用户没自己改过），就提升到现在的新默认。
+# v1.10.2：global_cooldown_minutes 已废弃（每用户独立调度），不再迁移它。
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
-    "global_cooldown_minutes": {45, 90, 30, 20, 10},
     "user_cooldown_minutes": {180, 720, 120, 90, 45},
     "max_message_length": {200},
     "reply_window_hours": {6},
@@ -150,7 +224,10 @@ class SocialConfig:
 
     # 活跃度与护栏冷却（冷却只是防刷屏的下限，真正的节奏由念头攒得多快决定）
     activity_level: int = ACTIVITY_DEFAULT
+    # v1.10.2 起废弃：全局冷却会把所有用户排成一条队（「跟 A 说完要等好久才轮到
+    # B」），已从调度里移除；保留字段仅为兼容旧配置读取，schema 中亦不再出现
     global_cooldown_minutes: int = GLOBAL_COOLDOWN_DEFAULT
+    # 每个人自己的冷却才是节奏的来源：不同用户互不影响
     user_cooldown_minutes: int = USER_COOLDOWN_DEFAULT
 
     # 念头模型
@@ -226,8 +303,37 @@ class SocialConfig:
     # 连续这么多天没再说过话的用户，丢掉历史对话正文/话题，只留统计与发送目标（0 = 永不清理）
     user_retention_days: int = USER_RETENTION_DEFAULT
 
-    # 连发模式：约 30% 的主动消息可拆成两条短句，间隔 1-3 分钟补发第二条
+    # 连发模式：主动消息可自然拆成多条短句逐条补发（间隔 1-3 分钟）
     allow_burst: bool = True
+    # 连发最多拆几条（1-3）
+    max_burst_parts: int = MAX_BURST_PARTS_DEFAULT
+
+    # 每轮心跳每个角色最多主动发几条（对不同用户；同一用户仍走自己的冷却）
+    max_sends_per_round: int = MAX_SENDS_PER_ROUND_DEFAULT
+
+    # 早晚问候（时间性触发）：不靠念头攒，窗口到了、今天还没问候过就说一句
+    greeting_enabled: bool = GREETING_ENABLED_DEFAULT
+    greeting_morning_start: int = GREETING_MORNING_START_DEFAULT
+    greeting_morning_end: int = GREETING_MORNING_END_DEFAULT
+    greeting_night_start: int = GREETING_NIGHT_START_DEFAULT
+    greeting_night_end: int = GREETING_NIGHT_END_DEFAULT
+
+    # 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰，各自独立开关
+    group_flow_enabled: bool = True
+    group_icebreak_enabled: bool = True
+    group_ref_lib_enabled: bool = True
+    # 参考库是否落盘群友发言正文（关掉则只统计、不存正文，参考库会空）
+    group_store_message_text: bool = True
+    flow_window_minutes: int = FLOW_WINDOW_DEFAULT
+    flow_min_gap_seconds: int = FLOW_MIN_GAP_DEFAULT
+    flow_max_replies_per_window: int = FLOW_MAX_REPLIES_DEFAULT
+    flow_hourly_cap: int = FLOW_HOURLY_CAP_DEFAULT
+    flow_ignored_exit: int = FLOW_IGNORED_EXIT_DEFAULT
+    group_idle_hours: float = GROUP_IDLE_HOURS_DEFAULT
+    icebreak_daily_cap: int = ICEBREAK_DAILY_CAP_DEFAULT
+    group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
+    group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
+    group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
 
     # 输出形状：是否保留 emoji、是否去掉括号动作/旁白
     allow_emoji: bool = False
@@ -240,6 +346,12 @@ class SocialConfig:
     def mood_scale(self) -> float:
         """整体想说活的程度：活跃度 45 为 1.0，90 约 1.6，10 约 0.4。"""
         return max(0.35, min(1.7, 0.55 + (self.activity_level / 100.0) * 1.25))
+
+    def greeting_windows(self) -> tuple:
+        """问候窗口（含跨午夜归一化）：(早安窗口, 晚安窗口)。"""
+        morning = (self.greeting_morning_start % 24, self.greeting_morning_end % 24)
+        night = (self.greeting_night_start % 24, self.greeting_night_end % 24)
+        return morning, night
 
     def allowed_trigger_uid_set(self) -> set:
         """解析 allowed_trigger_uids 为去重后的集合。
@@ -370,6 +482,66 @@ class SocialConfig:
                 min(USER_RETENTION_MAX, int(g("user_retention_days", USER_RETENTION_DEFAULT))),
             ),
             allow_burst=bool(g("allow_burst", True)),
+            max_burst_parts=max(
+                MAX_BURST_PARTS_MIN,
+                min(MAX_BURST_PARTS_MAX, int(g("max_burst_parts", MAX_BURST_PARTS_DEFAULT))),
+            ),
+            max_sends_per_round=max(
+                MAX_SENDS_PER_ROUND_MIN,
+                min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", MAX_SENDS_PER_ROUND_DEFAULT))),
+            ),
+            greeting_enabled=bool(g("greeting_enabled", GREETING_ENABLED_DEFAULT)),
+            greeting_morning_start=max(
+                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_morning_start", GREETING_MORNING_START_DEFAULT)))
+            ),
+            greeting_morning_end=max(
+                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_morning_end", GREETING_MORNING_END_DEFAULT)))
+            ),
+            greeting_night_start=max(
+                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_night_start", GREETING_NIGHT_START_DEFAULT)))
+            ),
+            greeting_night_end=max(
+                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_night_end", GREETING_NIGHT_END_DEFAULT)))
+            ),
+            group_flow_enabled=bool(g("group_flow_enabled", True)),
+            group_icebreak_enabled=bool(g("group_icebreak_enabled", True)),
+            group_ref_lib_enabled=bool(g("group_ref_lib_enabled", True)),
+            group_store_message_text=bool(g("group_store_message_text", True)),
+            flow_window_minutes=max(
+                FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, int(g("flow_window_minutes", FLOW_WINDOW_DEFAULT)))
+            ),
+            flow_min_gap_seconds=max(
+                FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, int(g("flow_min_gap_seconds", FLOW_MIN_GAP_DEFAULT)))
+            ),
+            flow_max_replies_per_window=max(
+                FLOW_MAX_REPLIES_MIN,
+                min(FLOW_MAX_REPLIES_MAX, int(g("flow_max_replies_per_window", FLOW_MAX_REPLIES_DEFAULT))),
+            ),
+            flow_hourly_cap=max(
+                FLOW_HOURLY_CAP_MIN, min(FLOW_HOURLY_CAP_MAX, int(g("flow_hourly_cap", FLOW_HOURLY_CAP_DEFAULT)))
+            ),
+            flow_ignored_exit=max(
+                FLOW_IGNORED_EXIT_MIN,
+                min(FLOW_IGNORED_EXIT_MAX, int(g("flow_ignored_exit", FLOW_IGNORED_EXIT_DEFAULT))),
+            ),
+            group_idle_hours=max(
+                GROUP_IDLE_HOURS_MIN, min(GROUP_IDLE_HOURS_MAX, float(g("group_idle_hours", GROUP_IDLE_HOURS_DEFAULT)))
+            ),
+            icebreak_daily_cap=max(
+                ICEBREAK_DAILY_CAP_MIN,
+                min(ICEBREAK_DAILY_CAP_MAX, int(g("icebreak_daily_cap", ICEBREAK_DAILY_CAP_DEFAULT))),
+            ),
+            group_stale_days=max(
+                GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", GROUP_STALE_DAYS_DEFAULT)))
+            ),
+            group_ref_sample_size=max(
+                GROUP_REF_SAMPLE_MIN,
+                min(GROUP_REF_SAMPLE_MAX, int(g("group_ref_sample_size", GROUP_REF_SAMPLE_DEFAULT))),
+            ),
+            group_ref_prompt_count=max(
+                GROUP_REF_PROMPT_MIN,
+                min(GROUP_REF_PROMPT_MAX, int(g("group_ref_prompt_count", GROUP_REF_PROMPT_DEFAULT))),
+            ),
             urge_refill_hours=max(
                 URGE_REFILL_MIN,
                 min(URGE_REFILL_MAX, int(g("urge_refill_hours", URGE_REFILL_DEFAULT))),
@@ -427,7 +599,6 @@ class SocialConfig:
 
 # 旧默认值对应的新默认
 _NEW_DEFAULTS: Dict[str, Any] = {
-    "global_cooldown_minutes": GLOBAL_COOLDOWN_DEFAULT,
     "user_cooldown_minutes": USER_COOLDOWN_DEFAULT,
     "max_message_length": MAX_MSG_LEN_DEFAULT,
     "reply_window_hours": REPLY_WINDOW_DEFAULT,

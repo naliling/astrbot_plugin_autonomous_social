@@ -135,19 +135,20 @@
     "hint": "状态面板会标注当前用的是「她所在城市」还是「本机时钟」。",
     "default": true
   },
-  "global_cooldown_minutes": {
-    "type": "int",
-    "description": "【护栏】两次主动消息之间的最短间隔（分钟），所有角色共享。节奏主要由念头决定，这里只防极端情况下的刷屏（比如两个人同时攒满、同轮里一条接一条）。v1.9.0 起默认 10。它同时是「同一轮里不能既追问又另起话题」的闸门。",
-    "default": 7,
-    "min": 5,
-    "max": 1440
-  },
   "user_cooldown_minutes": {
     "type": "int",
-    "description": "【护栏】同一个人两次被主动联系的最短间隔（分钟）。上次主动找 TA 之后，哪怕念头已经重新攒满、模型也说该发，冷却没过就再等等。v1.9.0 起默认 45。",
+    "description": "【护栏】同一个人两次被主动联系的最短间隔（分钟）。v1.10.2 起每个人的节奏只由 TA 自己的念头与这条冷却决定，跟「她刚找过谁」无关——A 被找过不会让 B 多等。上次主动找 TA 之后，哪怕念头已经重新攒满、模型也说该发，冷却没过就再等等。",
+    "hint": "旧版全局冷却（global_cooldown_minutes）已移除：它把所有人排成一条队，「跟 A 说完要等好久才轮到 B」正是它造成的。",
     "default": 30,
     "min": 10,
     "max": 2880
+  },
+  "max_sends_per_round": {
+    "type": "int",
+    "description": "【护栏】一轮心跳（约 3-8 分钟一次）里，一个角色最多主动联系几个不同的人。这是唯一防刷屏的总闸：不同的人互不排队，B 不必等 A 的冷却。攒满念头的人多时，超出配额的下一个心跳自然轮到。设 1 即回到「一轮只找一个」的克制模式。",
+    "default": 3,
+    "min": 1,
+    "max": 10
   },
   "quiet_start": {
     "type": "int",
@@ -192,8 +193,139 @@
   },
   "allow_burst": {
     "type": "bool",
-    "description": "连发模式：约 30% 的主动消息会自然拆成两条短句，间隔 1-3 分钟补发第二条（对方期间回话则取消第二条）。真人聊天经常不是「一条完整的」而是「想到哪说到哪」，这条让节奏更松。关闭后每次只发一条。",
+    "description": "连发模式：过半主动消息会自然拆成 2-3 条短句，间隔 1-3 分钟逐条补发（对方期间回话则停）。真人聊天经常不是「一条完整的」而是「想到哪说到哪」——永远只发孤零零一句反而是机器人味。关闭后每次只发一条。拆几条由下方 max_burst_parts 控制。",
     "default": true
+  },
+  "max_burst_parts": {
+    "type": "int",
+    "description": "一次主动开口最多拆成几条消息（1-3）。默认 3：稍长一点的事拆成两三条说，比一大段更像真人打字。设 1 则永不连发。",
+    "default": 3,
+    "min": 1,
+    "max": 3
+  },
+  "greeting_enabled": {
+    "type": "bool",
+    "description": "【早晚问候】时间性触发：到了早安/晚安窗口、这个人今天还没被问候过，就说一句——不看念头攒没攒满。问候有自己的闸门：不查「刚聊过」（早上的第一句往往就在昨晚那句之后）、不查「上一条没人回」（晚安没被理，早上照样道早安）。每个用户每天每个窗口各一次；只问候最近 4 天有来往的人，对早就不聊的人每天道早安像定时群发。问候优先级排在所有念头之前（窗口过了就没了）。",
+    "hint": "窗口按她所在城市的钟走（联动 Core 时），默认早安 7-11 点、晚安 21-24 点。",
+    "default": true
+  },
+  "greeting_morning_start": {
+    "type": "int",
+    "description": "【早晚问候】早安窗口开始小时（0-23）。她所在城市的钟点。24 视作 0（午夜）。",
+    "default": 7,
+    "min": 0,
+    "max": 23
+  },
+  "greeting_morning_end": {
+    "type": "int",
+    "description": "【早晚问候】早安窗口结束小时。窗口支持跨午夜写法（如 22 → 2）。",
+    "default": 11,
+    "min": 1,
+    "max": 24
+  },
+  "greeting_night_start": {
+    "type": "int",
+    "description": "【早晚问候】晚安窗口开始小时（0-23）。夜里她真去睡了（Core 报 asleep）时不会硬发。",
+    "default": 21,
+    "min": 0,
+    "max": 23
+  },
+  "greeting_night_end": {
+    "type": "int",
+    "description": "【早晚问候】晚安窗口结束小时，24 视作 0（午夜）。跨午夜写法如 22 → 2 也支持。",
+    "default": 24,
+    "min": 1,
+    "max": 24
+  },
+  "group_flow_enabled": {
+    "type": "bool",
+    "description": "【群聊心流】主动回复：bot 在群里说过话后会进入一个“关注窗口”，窗口内群消息若值得参与，无需被 @ 也会主动接一句（保守档：只有自己刚发过言才开窗，不盯整个群）。在 bot 所在的所有群生效；被踢出群后自然停。与私聊主动（private_only）互不影响。",
+    "default": true
+  },
+  "group_icebreak_enabled": {
+    "type": "bool",
+    "description": "【群聊心流】冷场破冰：群安静超过 group_idle_hours 后，bot 主动抛个轻话题（不靠别人先开口）。只在活跃时段、非安静时段发，每群每天有上限。",
+    "default": true
+  },
+  "group_ref_lib_enabled": {
+    "type": "bool",
+    "description": "【群聊心流】发言参考库：按群采集群友真实发言样本，生成时抽几条当“这个群平时怎么说话”的风格参考，让接话更自然、不端着。关掉则不采集也不注入风格。",
+    "default": true
+  },
+  "group_store_message_text": {
+    "type": "bool",
+    "description": "【群聊心流】是否落盘群友发言正文作为参考库（隐私向：关掉后仅统计、不存正文，此时参考库为空）。样本按群隔离、去重限长，过期不活跃的群会被清理。",
+    "default": true
+  },
+  "flow_window_minutes": {
+    "type": "int",
+    "description": "【群聊心流】bot 在群里说过话后，关注窗口持续多少分钟。窗口内才会考虑无 @ 接话，过了就安静。",
+    "default": 8,
+    "min": 1,
+    "max": 60
+  },
+  "flow_min_gap_seconds": {
+    "type": "int",
+    "description": "【群聊心流】两次主动插话之间的最短间隔（秒）。别人一句我一句地跟不像人。",
+    "default": 45,
+    "min": 10,
+    "max": 600
+  },
+  "flow_max_replies_per_window": {
+    "type": "int",
+    "description": "【群聊心流】一个关注窗口内最多主动接几条。",
+    "default": 3,
+    "min": 1,
+    "max": 10
+  },
+  "flow_hourly_cap": {
+    "type": "int",
+    "description": "【群聊心流】每群每小时心流插话总上限（防刷屏总闸，跨窗口也算）。",
+    "default": 6,
+    "min": 1,
+    "max": 60
+  },
+  "flow_ignored_exit": {
+    "type": "int",
+    "description": "【群聊心流】连续插话这么多条都没人接，就退出心流安静下来，别尬聊。",
+    "default": 2,
+    "min": 1,
+    "max": 10
+  },
+  "group_idle_hours": {
+    "type": "float",
+    "description": "【群聊心流】冷场破冰：群安静超过这么多小时才考虑主动抛话题。",
+    "default": 6.0,
+    "min": 1.0,
+    "max": 240.0
+  },
+  "icebreak_daily_cap": {
+    "type": "int",
+    "description": "【群聊心流】每群每天最多破冰几次。",
+    "default": 2,
+    "min": 1,
+    "max": 10
+  },
+  "group_stale_days": {
+    "type": "int",
+    "description": "【群聊心流】超过这么多天没在某个群见到任何消息，就当已经不在这个群了（被踢/退群/解散）：不再破冰，并在清理时丢掉它的样本。",
+    "default": 3,
+    "min": 1,
+    "max": 90
+  },
+  "group_ref_sample_size": {
+    "type": "int",
+    "description": "【群聊心流】发言参考库每群保留多少条近期群友发言样本。",
+    "default": 30,
+    "min": 5,
+    "max": 200
+  },
+  "group_ref_prompt_count": {
+    "type": "int",
+    "description": "【群聊心流】生成时从参考库抽多少条当风格参考。设 0 则不注入风格样本。",
+    "default": 8,
+    "min": 0,
+    "max": 30
   },
   "topic_memory_count": {
     "type": "int",
