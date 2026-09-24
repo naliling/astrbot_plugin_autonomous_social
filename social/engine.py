@@ -36,6 +36,7 @@ except Exception:
 
 from . import __version__, desire
 from . import history_ingest
+from .clock import city_now
 from .config import SocialConfig
 from .core_bridge import CoreBridge
 from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
@@ -114,6 +115,9 @@ GREET_FRESH_SECONDS = 4 * 86400.0
 # 连发：后续每条的补发间隔（秒）
 BURST_DELAY_MIN = 60
 BURST_DELAY_MAX = 180
+# 群聊心流连发：同一个念头拆成几句快速补发（秒）——群里节奏快，不像私聊隔几分钟
+GROUP_BURST_DELAY_MIN = 3
+GROUP_BURST_DELAY_MAX = 9
 
 # 过期用户数据清理的扫描间隔（秒）
 PRUNE_INTERVAL_SECONDS = 3600
@@ -274,7 +278,7 @@ class SocialEngine:
         if self.cfg.cue_followup and self.cfg.store_message_text:
             try:
                 cue_text, cue_due = extract_cue(
-                    msg, self._time(), self._clock_offset_for(bid) or 0
+                    msg, self._time(), self._clock_offset_for(bid)
                 )
             except Exception as e:
                 self.log(f"提取时间锚点失败: {e}")
@@ -287,7 +291,7 @@ class SocialEngine:
                 loop_text, loop_due = extract_open_loop(
                     msg,
                     self._time(),
-                    self._clock_offset_for(bid) or 0,
+                    self._clock_offset_for(bid),
                     min_hours=self.cfg.loop_min_hours,
                     max_hours=self.cfg.loop_max_hours,
                 )
@@ -447,14 +451,18 @@ class SocialEngine:
             )
             return False
 
-    async def _load_session_history(self, umo: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """从 AstrBot 会话库读最近几轮真实聊天。
+    async def _load_session_history(self, umo: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """从 AstrBot 会话库读最近几轮真实聊天（含 bot 自己发的）。
 
         插件自己的账本靠 observe/after_message_sent 记，流式回复有已知缺口，
         主动消息以前也进不来——生成侧只看账本就会「不知道聊过天」，主动消息
         像凭空触发的任务。会话库是模型真正读的那份历史（含刚写进去的主动消息），
-        有就用它当「最近的对话」。
+        有就用它当「最近的对话」。条数由 context_inject_count 控制（limit=None 时）。
         """
+        if limit is None:
+            limit = int(getattr(self.cfg, "context_inject_count", 10) or 0)
+        if limit <= 0:
+            return []
         cm = getattr(self.context, "conversation_manager", None)
         if cm is None or not umo:
             return []
@@ -587,26 +595,56 @@ class SocialEngine:
 
     @staticmethod
     def _detect_is_group(event: Any) -> bool:
-        """判定是否群消息。
+        """判定是否群消息。多路取证，任一权威信号说是群就按群处理。
 
-        优先事件自带的 is_group 布尔属性；否则回退到 message_obj.group_id：
-        群消息 group_id 非空且非 0，私聊为 0/空/None。无法判定时按私聊处理。
+        误判成私聊代价最大：会把一条群消息记成 per-user 记录、拿群 umo 当私聊
+        目标，主动开口时把「我好想你」发进群里。所以宁可多查几处，也别漏判。
         """
+        # 1. 最权威：AstrBot 的 MessageType 枚举（FriendMessage / GroupMessage）
         try:
-            ig = getattr(event, "is_group", None)
-            if isinstance(ig, bool):
-                return ig
+            mt = event.get_message_type()
+            token = str(
+                getattr(mt, "name", "") or getattr(mt, "value", "") or mt
+            ).upper()
+            if "GROUP" in token or "GUILD" in token:
+                return True
+            if any(k in token for k in ("FRIEND", "PRIVATE", "DIRECT", "C2C")):
+                return False
         except Exception:
             pass
+        # 2. message_obj.group_id：群消息非空、私聊为空（官方文档明确）
         try:
             mo = getattr(event, "message_obj", None)
             if mo is not None:
                 gid = getattr(mo, "group_id", None)
                 if gid is None:
                     gid = getattr(mo, "group", None)
-                if gid in (None, "", 0):
-                    return False
+                if gid not in (None, "", 0):
+                    return True
+        except Exception:
+            pass
+        # 3. is_private_chat()：私聊 True
+        try:
+            ipc = event.is_private_chat()
+            if isinstance(ipc, bool):
+                return not ipc
+        except Exception:
+            pass
+        # 4. is_group 布尔属性
+        try:
+            ig = getattr(event, "is_group", None)
+            if isinstance(ig, bool):
+                return ig
+        except Exception:
+            pass
+        # 5. 最后看 unified_msg_origin 的 message_type 段
+        try:
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            kind = history_ingest.umo_kind(umo)
+            if kind == "group":
                 return True
+            if kind == "private":
+                return False
         except Exception:
             pass
         return False
@@ -630,6 +668,25 @@ class SocialEngine:
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _mentions_bot(event: Any, bid: str) -> bool:
+        """这条群消息是不是 @ 了 bot。用作心流「有人接我插的话」的硬信号。
+
+        扫消息链里的 At 段（qq/target/user_id 字段 ≡ bot 自己的 id）。
+        """
+        if not bid:
+            return False
+        try:
+            chain = getattr(getattr(event, "message_obj", None), "message", None) or []
+            for comp in chain:
+                for attr in ("qq", "target", "user_id"):
+                    val = getattr(comp, attr, None)
+                    if val is not None and str(val) == str(bid):
+                        return True
+        except Exception:
+            pass
+        return False
 
     # ─── 群聊心流（v1.11.0） ───────────────────
 
@@ -669,6 +726,14 @@ class SocialEngine:
             bid, gid, umo, group_name, sender_name, msg, is_bot, now,
             store_text=store_text, sample_cap=self.cfg.group_ref_sample_size,
         )
+        # 有人 @ 了 bot 且心流窗口开着：算「接住了我刚插的话」，把连着插没人理的计数清零，
+        # 允许继续接。不是 @ 的普通群聊不算接话（避免一有人说话就当受欢迎继续无脑插）。
+        if (
+            not is_bot
+            and self._mentions_bot(event, bid)
+            and float(g.get("flow_open_until", 0) or 0) > now
+        ):
+            self.state.note_flow_pickup(bid, gid)
         # 心流：窗口开着、不是 bot 自己发的、预筛过了，才去试着接一句
         if not self.cfg.group_flow_enabled or is_bot:
             return
@@ -752,16 +817,25 @@ class SocialEngine:
             else:
                 self.log(f"群 {gid} 心流发送失败：{err}")
             return
-        self.state.note_flow_reply(bid, gid, self._time(), text)
+        sent_ts = self._time()
+        self.state.note_flow_reply(bid, gid, sent_ts, text)
         self.state.save()
         self.log(f"群 {gid} 心流接话→ {text}")
+        # 同一句拆成了多段：剩下的快速补发。算同一次插话（不再各自计额/过闸）。
+        if len(parts) > 1:
+            self._schedule_group_burst(bid, gid, umo, parts[1:], sent_ts)
 
     def _build_group_ctx(self, bid: str, gid: str, g: Dict[str, Any]) -> Dict[str, Any]:
         """给生成侧凑群上下文：风格参考 + 最近几条群友发言 + 上一句心流接的话。"""
         samples = g.get("samples", []) or []
+        n = max(1, int(getattr(self.cfg, "context_inject_count", 10) or 10))
         recent = [
-            {"name": str(s.get("name", "") or ""), "text": str(s.get("text", "") or "")}
-            for s in samples[-8:]
+            {
+                "name": str(s.get("name", "") or ""),
+                "text": str(s.get("text", "") or ""),
+                "self": bool(s.get("self")),
+            }
+            for s in samples[-n:]
             if str(s.get("text", "") or "").strip()
         ]
         style_ref = ""
@@ -864,11 +938,12 @@ class SocialEngine:
             self._city_offset[bid] = value
 
     def _moment_of(self, bid: str, now: float) -> datetime:
-        """她那里现在是几点。没接到 Core 时退回本机时间。"""
+        """她那里现在是几点。接了 Core 就按她所在城市的 UTC 偏移算（不受容器时区影响），
+        没接到时退回本机/内置时间。注意 offset 可能为 0（如伦敦/UTC+0 城市），
+        不能拿 0 当「没 Core」——只有 None 才退本机。
+        """
         offset = self._city_offset.get(bid) if self.cfg.use_core_clock else None
-        if not offset:
-            return datetime.fromtimestamp(now)
-        return datetime.fromtimestamp(now + offset * 60.0)
+        return city_now(now, offset)
 
     def _clock_offset_for(self, bid: str) -> Optional[int]:
         """本角色用的时区偏移（分钟）；None 表示没有契约可参考，用本机时间。"""
@@ -1519,7 +1594,14 @@ class SocialEngine:
         if not umo:
             return False, "没有可用的会话来源（umo），发不出去"
 
-        # 用户级 Core 快照（复用调用方读到的 root 之外再读一次代价很小）
+        # 私聊主动内容（可能很亲密，如「我好想你」）绝不能发进群：群会话只走群聊心
+        # 流，那边用群感知的口吻生成。一个群 umo 出现在 1:1 用户池里必是幽灵（观察
+        # 链路从不给群建 per-user 记录，只有旧版导入/群判定失误才会混进来），顺手清
+        # 掉，别每个心跳都撞。
+        if history_ingest.umo_kind(umo) == "group":
+            self.state.bot(bid).get("users", {}).pop(uid, None)
+            self.state.mark_dirty()
+            return False, f"目标 {umo} 是群会话，不在这里发 1:1 主动消息（已清掉这条群幽灵）"
         user_core = None
         core_context = "没有可用的 Humanoid Core 状态。"
         try:
@@ -1841,6 +1923,47 @@ class SocialEngine:
         except Exception as e:
             logger.warning(f"[autonomous_social] 连发补充失败: {e}")
 
+    def _schedule_group_burst(
+        self, bid: str, gid: str, umo: str, rest: List[str], sent_ts: float
+    ) -> None:
+        """把群聊心流连发的后续几句挂成后台任务，不阻塞观察链路。"""
+        task = asyncio.create_task(
+            self._send_group_burst_followup(bid, gid, umo, rest, sent_ts)
+        )
+        self._burst_tasks.add(task)
+        task.add_done_callback(self._burst_tasks.discard)
+
+    async def _send_group_burst_followup(
+        self, bid: str, gid: str, umo: str, rest: List[str], sent_ts: float
+    ) -> None:
+        """隔几秒逐条补发心流连发的剩余句子（同一个念头拆成的）。
+
+        这几句不再各自过心流闸/计额（算同一次插话），只写进自己的近期发言供下一句参考。
+        插件停了、群被隔离就不再补。
+        """
+        try:
+            for text in rest:
+                await asyncio.sleep(
+                    random.randint(GROUP_BURST_DELAY_MIN, GROUP_BURST_DELAY_MAX)
+                )
+                if not self.running or not self.cfg.enabled:
+                    return
+                now = self._time()
+                if self.state.is_group_blocked(bid, gid, now):
+                    return
+                ok, _ = await self._send_with_retry(umo, text)
+                if not ok:
+                    return
+                self.state.record_group_self_text(
+                    bid, gid, text, now, sample_cap=self.cfg.group_ref_sample_size
+                )
+                self.state.save()
+                self.log(f"群 {gid} 心流连发补充→ {text}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 群心流连发补充失败: {e}")
+
     # ─── 后台循环 ───────────────────────────────────────
 
     def _seed_tick(self, force: bool = False) -> None:
@@ -2010,11 +2133,21 @@ class SocialEngine:
             if not rep_umo:
                 lines.append(f"  · {bid}：没有可用的会话来源，无法判定")
                 continue
-            name, _ = await self._persona(rep_umo)
+            name, _ = await self._persona(rep_umo, bid)
             lines.append(f"  · {bid}：{name or '未取到人设（用插件默认口吻）'}")
         if len(bots) > 8:
             lines.append(f"  …另有 {len(bots) - 8} 个角色未列出")
         return "\n".join(lines)
+
+    def _bot_label(self, bid: str) -> str:
+        """把 bot 的账号配上它此刻的人设名，一眼看出是哪个角色在社交。
+
+        人设名取自最近一次用到的缓存（发过主动消息或看过状态后就有）；拿不到就只回账号。
+        """
+        name = str(self._last_persona.get(bid, "") or "").strip()
+        if name and name != bid:
+            return f"{name}·{bid}"
+        return bid
 
     def urge_panel_text(self, limit: int = 6) -> str:
         """列出此刻念头最重的几个人（状态面板用）。"""
@@ -2041,7 +2174,7 @@ class SocialEngine:
             state = {"waiting": "等回复中", "replied": "接了话", "ignored": "没接话"}.get(pend, "")
             bar = "★想说" if urge >= desire.FIRE_THRESHOLD else ""
             lines.append(
-                f"  · {uid}（{bid}）念头 {urge:.2f}/{desire.FIRE_THRESHOLD:.0f}"
+                f"  · {uid}（{self._bot_label(bid)}）念头 {urge:.2f}/{desire.FIRE_THRESHOLD:.0f}"
                 f" 在意 {interest:.2f} 多久没说话 {hours:.1f}h {state}{bar}"
                 f"{self._thread_mark(bid, uid, now)}"
             )
@@ -2091,8 +2224,8 @@ class SocialEngine:
     def last_contact_text(self) -> str:
         """最近一次主动联系的结果与当时否决的理由。"""
         now = self._time()
-        best: Optional[Tuple[float, str, str]] = None
-        skip: Optional[Tuple[float, str, str]] = None
+        best: Optional[Tuple[float, str, str, str]] = None
+        skip: Optional[Tuple[float, str, str, str]] = None
         for bid, bot in self.state.data.get("bots", {}).items():
             for uid, u in (bot.get("users") or {}).items():
                 sent = float(u.get("last_sent", 0) or 0)
@@ -2102,18 +2235,18 @@ class SocialEngine:
                         if m.get("dir") == "out":
                             text = str(m.get("text", ""))[:40]
                             break
-                    best = (sent, uid, text)
+                    best = (sent, bid, uid, text)
                 skipped = float(u.get("last_skip_at", 0) or 0)
                 if skipped and (skip is None or skipped > skip[0]):
-                    skip = (skipped, uid, str(u.get("last_skip_reason", ""))[:60])
+                    skip = (skipped, bid, uid, str(u.get("last_skip_reason", ""))[:60])
         lines: List[str] = []
         if best:
             lines.append(
-                f"  上次主动找：{best[1]}（{int((now - best[0]) / 60)} 分钟前）「{best[2]}」"
+                f"  上次主动找：{best[2]}（{self._bot_label(best[1])} → {int((now - best[0]) / 60)} 分钟前）「{best[3]}」"
             )
         if skip and (best is None or skip[0] > best[0]):
             lines.append(
-                f"  上次想过没说：{skip[1]}（{int((now - skip[0]) / 60)} 分钟前）{skip[2]}"
+                f"  上次想过没说：{skip[2]}（{self._bot_label(skip[1])} → {int((now - skip[0]) / 60)} 分钟前）{skip[3]}"
             )
         return "\n".join(lines) if lines else "  还没有主动联系过任何人"
 
@@ -2142,7 +2275,7 @@ class SocialEngine:
         lines: List[str] = []
         for _last, bid, uid, log in rows[:limit_users]:
             name = str(self.state.user(bid, uid).get("name", "") or uid)
-            lines.append(f"◆ {name}（{uid} @ {bid}）最近 7 天发过 {len(log)} 条：")
+            lines.append(f"◆ {name}（{uid} @ {self._bot_label(bid)}）最近 7 天发过 {len(log)} 条：")
             for e in log[-limit_each:]:
                 try:
                     ts = float(e.get("ts", 0) or 0)
@@ -2177,7 +2310,7 @@ class SocialEngine:
                 idle_txt = f"{idle_h:.1f}h前" if idle_h >= 0 else "未知"
                 rows.append((
                     seen,
-                    f"  {mark} {name}（{gid} @ {bid}）最近 {idle_txt}，样本 {len(g.get('samples') or [])} 条"
+                    f"  {mark} {name}（{gid} @ {self._bot_label(bid)}）最近 {idle_txt}，样本 {len(g.get('samples') or [])} 条"
                     + (f"，隔离中（{g.get('blocked_reason','')[:20]}）" if blocked else "")
                 ))
         if not rows:

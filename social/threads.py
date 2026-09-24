@@ -21,9 +21,9 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .clock import city_epoch, city_now
 from .reasoning import is_leaving, is_thin, last_direction, sleep_signal
 
 # ─── 1. 这一场话还没完 ──────────────────────────────
@@ -206,7 +206,7 @@ _LOOP_REASONS: List[str] = [
 def extract_open_loop(
     text: str,
     now: float,
-    clock_offset_minutes: int = 0,
+    clock_offset_minutes: Optional[int] = None,
     min_hours: float = LOOP_MIN_HOURS,
     max_hours: float = LOOP_MAX_HOURS,
 ) -> Tuple[Optional[str], float]:
@@ -239,7 +239,7 @@ def extract_open_loop(
 
 def _loop_due(
     now: float,
-    clock_offset_minutes: int = 0,
+    clock_offset_minutes: Optional[int] = None,
     min_hours: float = LOOP_MIN_HOURS,
     max_hours: float = LOOP_MAX_HOURS,
 ) -> float:
@@ -247,11 +247,11 @@ def _loop_due(
     low = max(0.5, float(min_hours))
     high = max(low + 0.5, low * 2.2)
     stamp = now + random.uniform(low, min(high, 6.0 if low <= 6.0 else high)) * 3600.0
-    local = datetime.fromtimestamp(stamp + clock_offset_minutes * 60.0)
+    local = city_now(stamp, clock_offset_minutes)
     if local.hour < 9:
         # 凌晨到点的事留到当天上午：真人不会半夜三点问「你面试咋样了」
         moved = local.replace(hour=10, minute=random.randint(0, 50), second=0, microsecond=0)
-        stamp = moved.timestamp() - clock_offset_minutes * 60.0
+        stamp = city_epoch(moved, clock_offset_minutes)
     return min(stamp, now + max_hours * 3600.0)
 
 

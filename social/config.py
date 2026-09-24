@@ -85,12 +85,21 @@ QUIET_END_DEFAULT = 7
 
 MAX_MSG_LEN_MIN = 10
 MAX_MSG_LEN_MAX = 500
-# 200 字是「发一段话」而不是「发条消息」；真人主动开一句大多十几个字。
-MAX_MSG_LEN_DEFAULT = 60
+# 120：够把一件事说完整，而不是被硬砍成一两句。长度本身交给人设与情境，
+# 这里只做防超长的硬上限；配合连发能自然铺开。v1.13.0 从 60 上调（60 常被
+# 反馈为「只能发一两句」）。
+MAX_MSG_LEN_DEFAULT = 120
 
 TOPIC_MEMORY_MIN = 0
 TOPIC_MEMORY_MAX = 20
 TOPIC_MEMORY_DEFAULT = 5
+
+# 生成时注入多少条「最近的对话」当上下文（私聊读会话库、群聊读近期发言）。
+# 含 bot 自己发过的话（看得到自己说过什么）。太少接不上上文、显得生硬；
+# 太多浪费 token 也容易跑题。
+CONTEXT_INJECT_MIN = 0
+CONTEXT_INJECT_MAX = 50
+CONTEXT_INJECT_DEFAULT = 10
 
 ENERGY_THRESHOLD_MIN = 0
 ENERGY_THRESHOLD_MAX = 100
@@ -198,7 +207,7 @@ USER_RETENTION_DEFAULT = 30
 # v1.10.2：global_cooldown_minutes 已废弃（每用户独立调度），不再迁移它。
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "user_cooldown_minutes": {180, 720, 120, 90, 45},
-    "max_message_length": {200},
+    "max_message_length": {200, 60},
     "reply_window_hours": {6},
     "urge_refill_hours": {8, 4, 3, 2},
     "recent_talk_minutes": {45, 30, 25},
@@ -235,7 +244,10 @@ class SocialConfig:
     recent_talk_minutes: int = RECENT_TALK_DEFAULT
     skip_cooldown_minutes: int = SKIP_COOLDOWN_DEFAULT
     llm_gate: bool = True
-    respect_user_rhythm: bool = True
+    # v1.13.0 起默认关：本插件就是用来主动社交的，不该拿「对方现在多半没在线」去压
+    # 主动开口的时机；深夜由 quiet_start/quiet_end 单独兜底，不靠这个。想恢复
+    # 「只在对方常在线的点找 TA」再打开。
+    respect_user_rhythm: bool = False
     cue_followup: bool = True
 
     # 这一场话断了就接一句（追问那件事 / 问一句在不在）。这不等念头攒满
@@ -271,6 +283,8 @@ class SocialConfig:
     # 插件不再保留一份性格配置
     max_message_length: int = MAX_MSG_LEN_DEFAULT
     topic_memory_count: int = TOPIC_MEMORY_DEFAULT
+    # 生成时注入多少条最近对话当上下文（私聊+群聊都用，含 bot 自己的发言）
+    context_inject_count: int = CONTEXT_INJECT_DEFAULT
 
     # 时段加成
     weekend_boost: bool = True
@@ -455,6 +469,10 @@ class SocialConfig:
                 TOPIC_MEMORY_MIN,
                 min(TOPIC_MEMORY_MAX, int(g("topic_memory_count", TOPIC_MEMORY_DEFAULT))),
             ),
+            context_inject_count=max(
+                CONTEXT_INJECT_MIN,
+                min(CONTEXT_INJECT_MAX, int(g("context_inject_count", CONTEXT_INJECT_DEFAULT))),
+            ),
             weekend_boost=bool(g("weekend_boost", True)),
             energy_threshold=max(
                 ENERGY_THRESHOLD_MIN,
@@ -555,7 +573,7 @@ class SocialConfig:
                 min(SKIP_COOLDOWN_MAX, int(g("skip_cooldown_minutes", SKIP_COOLDOWN_DEFAULT))),
             ),
             llm_gate=bool(g("llm_gate", True)),
-            respect_user_rhythm=bool(g("respect_user_rhythm", True)),
+            respect_user_rhythm=bool(g("respect_user_rhythm", False)),
             cue_followup=bool(g("cue_followup", True)),
             followup_enabled=bool(g("followup_enabled", True)),
             followup_after_minutes=followup_after,

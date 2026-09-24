@@ -31,9 +31,17 @@ _DB_FILENAMES = ("data_v4.db", "data_v3.db")
 # 又不至于把数据库里成千上万的旧会话全部拉进插件状态
 _MAX_CONVERSATIONS = 300
 
-# umo 里表示「私聊」的 message_type 写法（各平台不完全统一，全部认）
-_PRIVATE_TYPES = {"private", "p2p", "c2c", "friend", "single", "1:1"}
-_GROUP_TYPES = {"group", "g"}
+# umo 形如 platform:message_type:session_id。AstrBot 的 MessageType 枚举值实际
+# 写的是 `FriendMessage`（私聊）/ `GroupMessage`（群）——官方文档与 napcat/
+# aiocqhttp 实际落库都是这个形式，不是 `private`/`group`。早先的表里只列了
+# 后者，结果 aiocqhttp 的 `FriendMessage` 会被当 unknown：既导不进任何真人（SQL
+# 过滤一个都不匹配），又会把群会话当未知放行。下面把真实枚举值与各
+# 平台/旧写法都认上（全部小写比较；SQL 的 LIKE 对 ASCII 大小写不敏感）。
+_PRIVATE_TYPES = {
+    "friendmessage", "directmessage",
+    "private", "p2p", "c2c", "friend", "single", "1:1",
+}
+_GROUP_TYPES = {"groupmessage", "guildmessage", "group", "g", "guild"}
 
 def _like_pattern(msg_type: str) -> str:
     """转义 LIKE 里的通配符（下划线/百分号），再包上 umo 的 %:msg_type: 结构。

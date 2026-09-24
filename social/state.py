@@ -258,18 +258,44 @@ class SocialState:
         if float(g.get("blocked_until", 0) or 0) > 0:
             g["blocked_until"] = 0.0
             g["blocked_reason"] = ""
-        if not is_bot and store_text:
-            body = str(text or "").strip()
-            if body and not body.startswith("/"):
-                samples = g.setdefault("samples", [])
-                body = body[:CONVERSATION_TRUNCATE_LENGTH]
-                # 跟上一条一模一样就不重复存（复读/刷屏预防）
-                if not samples or str(samples[-1].get("text", "")) != body:
-                    samples.append({"ts": now, "name": str(sender_name or "")[:24], "text": body})
-                    if len(samples) > sample_cap:
-                        del samples[: len(samples) - sample_cap]
+        if is_bot:
+            # bot 自己在群里说的话也存进 samples（标 self）：这样生成上下文里能看到自己
+            # 刚说了什么，接话不至于自说自话/重复。风格参考库会滤掉 self，不学自己。
+            self._append_group_sample(g, text, now, sample_cap, self_flag=True)
+        elif store_text:
+            self._append_group_sample(
+                g, text, now, sample_cap, self_flag=False, name=sender_name
+            )
         self.mark_dirty()
         return g
+
+    @staticmethod
+    def _append_group_sample(
+        g: Dict[str, Any],
+        text: str,
+        now: float,
+        sample_cap: int,
+        *,
+        self_flag: bool = False,
+        name: str = "",
+    ) -> None:
+        """往群的近期发言缓冲追加一条（真人或 bot 自己）。self 条只用于上下文、不进风格库。"""
+        body = str(text or "").strip()
+        if not body or body.startswith("/"):
+            return
+        samples = g.setdefault("samples", [])
+        body = body[:CONVERSATION_TRUNCATE_LENGTH]
+        # 跟上一条一模一样就不重复存（复读/刷屏预防）
+        if samples and str(samples[-1].get("text", "")) == body:
+            return
+        entry: Dict[str, Any] = {"ts": now, "name": str(name or "")[:24], "text": body}
+        if self_flag:
+            entry["self"] = True
+        samples.append(entry)
+        # bot 自己的话也占额度，缓冲放宽一点，别让几句自己的话把群友样本挤没了
+        cap = max(1, int(sample_cap)) + 10
+        if len(samples) > cap:
+            del samples[: len(samples) - cap]
 
     def open_flow(self, bid: str, gid: str, now: float, window_seconds: float) -> None:
         """bot 在这个群说了话（走主链路回复/破冰）：开/续关注窗口。
@@ -282,9 +308,12 @@ class SocialState:
         was_open = float(g.get("flow_open_until", 0) or 0) > now
         g["last_bot_spoke"] = now
         g["flow_open_until"] = now + max(0.0, window_seconds)
-        g["flow_ignored"] = 0
         if not was_open:
+            # 新一轮活跃开窗：上一波「插了没人理」的账一笔勾销，重新开始数。
+            # 但同一波持续活跃里被 @ 回一句不清零 flow_ignored——被叫去回话不代表
+            # 「我随口插的那几句有人接」，那笔账只由真正的接话（note_flow_pickup）勾销。
             g["flow_replies"] = 0
+            g["flow_ignored"] = 0
         self.mark_dirty()
 
     def note_flow_reply(self, bid: str, gid: str, now: float, text: str) -> None:
@@ -299,12 +328,35 @@ class SocialState:
         g["flow_last_reply_at"] = now
         g["last_bot_spoke"] = now
         g["last_flow_reply_text"] = str(text or "")[:120]
+        # 自己插的话也进近期发言缓冲，生成下一句时看得到
+        self._append_group_sample(g, text, now, len(g.get("samples") or []) or 30, self_flag=True)
         bucket = int(now // 3600)
         if int(g.get("flow_hour_bucket", 0) or 0) == bucket:
             g["flow_hour_count"] = int(g.get("flow_hour_count", 0) or 0) + 1
         else:
             g["flow_hour_bucket"] = bucket
             g["flow_hour_count"] = 1
+        self.mark_dirty()
+
+    def note_flow_pickup(self, bid: str, gid: str) -> None:
+        """有人接了 bot 的心流插话（@ 了 bot）：把「连着插没人理」的计数清零，可以继续接。
+
+        这是心流「知道对方接没接话」的关键：没这一步时 flow_ignored 只增不减（除非新
+        开窗），bot 要么插到上限就闷、要么被 @ 回话就误当成「插话受欢迎」继续无脑插。
+        """
+        g = self.group(bid, gid)
+        if int(g.get("flow_ignored", 0) or 0):
+            g["flow_ignored"] = 0
+            self.mark_dirty()
+
+    def record_group_self_text(
+        self, bid: str, gid: str, text: str, now: float, sample_cap: int = 30
+    ) -> None:
+        """记下 bot 自己在群里补发的一句（连发续句）：只进近期发言缓冲供下一句参考，
+        不动 last_seen/msg_count、不过心流闸、不计额。"""
+        g = self.group(bid, gid)
+        g["last_bot_spoke"] = now
+        self._append_group_sample(g, text, now, sample_cap, self_flag=True)
         self.mark_dirty()
 
     def flow_hour_count(self, g: Dict[str, Any], now: float) -> int:
@@ -339,7 +391,9 @@ class SocialState:
             return []
         samples = self.group(bid, gid).get("samples", []) or []
         out: List[str] = []
-        for s in samples[-count:]:
+        # 只拿真人发言当风格参考：bot 自己说的（self 标记）不学，别把自己的腔调越练越浓
+        real = [s for s in samples if not s.get("self")]
+        for s in real[-count:]:
             t = str(s.get("text", "") or "").strip()
             if t:
                 out.append(t)

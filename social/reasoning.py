@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from .clock import city_epoch, city_now
+
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
@@ -296,35 +298,36 @@ CUE_TTL_SECONDS = 14 * 86400
 CUE_LATE_LIMIT = 36 * 3600
 
 
-def _at_days_ahead(now: float, days: int, hour: int, minute: int, offset: int = 0) -> float:
+def _at_days_ahead(now: float, days: int, hour: int, minute: int, offset: Optional[int] = None) -> float:
     """now 往后第 days 天的 hour:minute；若那个时刻已过去则再挨后一天。
 
-    hour:minute 是「她那里」的时刻，所以先按偏移量折成她城市的挂钟时间，再换回 epoch。
+    hour:minute 是「她那里」的时刻，所以先按她城市的挂钟时间算，再换回 epoch
+    （UTC 基准，不受容器时区影响）。
     """
-    base = datetime.fromtimestamp(now + offset * 60.0)
+    base = city_now(now, offset)
     target = (base + timedelta(days=days)).replace(
         hour=hour, minute=minute, second=0, microsecond=0
     )
-    stamp = target.timestamp() - offset * 60.0
+    stamp = city_epoch(target, offset)
     if stamp <= now:
         stamp += 86400.0
     return stamp
 
 
-def _next_weekday(now: float, weekday: int, hour: int = 10, minute: int = 0, offset: int = 0) -> float:
+def _next_weekday(now: float, weekday: int, hour: int = 10, minute: int = 0, offset: Optional[int] = None) -> float:
     """下一个星期 weekday（0=周一）的 hour:minute。今天就是这个星期几且已过点则算下周。"""
-    base = datetime.fromtimestamp(now + offset * 60.0)
+    base = city_now(now, offset)
     delta = (weekday - base.weekday()) % 7
     target = (base + timedelta(days=delta)).replace(
         hour=hour, minute=minute, second=0, microsecond=0
     )
-    stamp = target.timestamp() - offset * 60.0
+    stamp = city_epoch(target, offset)
     if stamp <= now:
         stamp += 7 * 86400.0
     return stamp
 
 
-def _anchor_due(now: float, pattern: str, days: int, hour: int, minute: int, offset: int = 0) -> float:
+def _anchor_due(now: float, pattern: str, days: int, hour: int, minute: int, offset: Optional[int] = None) -> float:
     """把锚点算成一个具体时间点（她所在城市的时间）。"""
     if days == -1:
         return _next_weekday(now, 5, 12, 0, offset)
@@ -336,7 +339,7 @@ def _anchor_due(now: float, pattern: str, days: int, hour: int, minute: int, off
 def extract_cue(
     text: str,
     now: Optional[float] = None,
-    clock_offset_minutes: int = 0,
+    clock_offset_minutes: Optional[int] = None,
 ) -> Tuple[Optional[str], float]:
     """从对方消息里提取可跟进的时间锚点。
 

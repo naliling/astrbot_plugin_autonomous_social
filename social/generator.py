@@ -16,8 +16,9 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from .clock import city_now
 
 from .reasoning import (
     energy_descriptor,
@@ -594,13 +595,28 @@ class MessageGenerator:
             "判断：这话你接得上、接了不尴、能让聊天更热闹就接；接不上、没意思、或会打断别人就别接。",
             "要求：",
             "- 像群里正常一员那样说话，短、口语，可以自然地玩梗/接梗，但别硬玩、别复读别人的话；",
-            "- 一句就够，不要长篇；不要 @ 任何人，除非特别自然；",
+            "- 短、口语，别长篇大论；不要 @ 任何人，除非特别自然；",
             "- 不要每条都接，宁可不接也别尬聊。",
         ]
         if shape:
             instr.append("- " + " ".join(shape))
         instr.append(f"长度不超过 {max_len} 字。")
-        instr.append("输出格式：想接就第一行写 SEND，第二行开始写你要发的话；不想接就只写一行 NO。")
+        allow_burst = bool(getattr(self.cfg, "allow_burst", True)) if self.cfg else True
+        max_parts = (
+            int(getattr(self.cfg, "max_burst_parts", MAX_BURST_PARTS) or MAX_BURST_PARTS)
+            if self.cfg else MAX_BURST_PARTS
+        )
+        max_parts = max(1, min(MAX_BURST_PARTS, max_parts))
+        if allow_burst and max_parts >= 2:
+            instr.append(
+                f"要是你自然想连着发两三句（最多 {max_parts} 段），就在每段之间单独一行写 ---，"
+                "每段都能单独看懂、别硬把一句话从中间劈开；就像真人在群里连着敲几条，不想拆就正常写一段。"
+            )
+            instr.append(
+                "输出格式：想接就第一行写 SEND，第二行开始写要发的话（要拆就用单独一行的 --- 隔开几段）；不想接就只写一行 NO。"
+            )
+        else:
+            instr.append("输出格式：想接就第一行写 SEND，第二行开始写你要发的话；不想接就只写一行 NO。")
         blocks.append("\n".join(instr))
         return "\n\n".join(b for b in blocks if b)
 
@@ -627,7 +643,7 @@ class MessageGenerator:
         # 时刻由引擎传入，保证「现在是几点」与闸门判断用的是同一个时间；
         # 接了 Core 契约时再按她所在城市的时区换算，别拿宿主机时钟当她的白天。
         ref = float(at) if at is not None else time.time()
-        now = datetime.fromtimestamp(ref + (clock_offset or 0) * 60.0)
+        now = city_now(ref, clock_offset)
         slot = time_slot(now.hour)
         # 未完话题那几条与「另起一个话题」要的东西相反：它们就是要问一句
         mode = str((reason_meta or {}).get("mode") or "")
