@@ -174,6 +174,9 @@ class SocialState:
             "proactive_replied": 0,
             "last_proactive_sent": 0.0,
             "last_proactive_replied": True,
+            # 尚未被用户下一次 LLM 请求消费的主动消息原文；只在状态里暂存，
+            # 由 on_llm_request 作为临时内容块注入一次，不写入 AstrBot 会话库。
+            "pending_proactive_context": "",
             # v2: 回复时间统计
             "avg_reply_seconds": 0.0,
             "reply_samples": 0,
@@ -971,9 +974,8 @@ class SocialState:
         u["last_spoken"] = ts
         u["last_spoken_text"] = str(text or "")[:120]
         u["last_spoken_question"] = is_question(str(text or ""))
-        # 保存完整文本，等用户回复时补进 LLM 上下文（主动消息走 context.send_message，
-        # 不经过 respond 阶段，不会自动进会话历史，用户回复时 AI 看不到自己刚说了什么）。
-        # on_llm_request 里消费掉这个字段后清空，避免每条消息都重复注入。
+        # 暂存完整文本，等用户回复时由 on_llm_request 作为本轮临时内容块注入。
+        # 主动消息不再写进 AstrBot 会话库；消费后清空，避免每条消息都重复注入。
         # 连发（burst）时追加而不是覆盖：两条都得让 AI 看得见。
         existing = str(u.get("pending_proactive_context", "") or "")
         if existing and len(existing) < 500:

@@ -94,7 +94,7 @@ TOPIC_MEMORY_MIN = 0
 TOPIC_MEMORY_MAX = 20
 TOPIC_MEMORY_DEFAULT = 5
 
-# 生成时注入多少条「最近的对话」当上下文（私聊读会话库、群聊读近期发言）。
+# 生成时注入多少条「最近的对话」当上下文（私聊合并会话库与插件账本，群聊读近期发言）。
 # 含 bot 自己发过的话（看得到自己说过什么）。太少接不上上文、显得生硬；
 # 太多浪费 token 也容易跑题。
 CONTEXT_INJECT_MIN = 0

@@ -1,6 +1,6 @@
 """自主拟人社交 —— AstrBot 适配层。
 
-v1.14.2：版本号对齐，整体优化检查完成。
+v1.14.3：主动消息上下文改为一次性注入，生成时合并双向对话，回复时临时回填。
 优先读 Humanoid Core v2.14 导出的契约快照（身体轴 + 体感 + 说话形式），
 并把「刚主动找过谁」「被冷落几次」写回独立的信号文件；拿不到契约时退回旧字段。
 """
@@ -56,11 +56,10 @@ if after_message_sent is None:
 else:
     HOOK_AFTER_SENT = True
 
-# on_llm_request 钩子：把主动消息补回 LLM 上下文（兑底路）。
-# 正路是发送后用 conversation_manager 把那句写进会话历史（见 engine._persist_proactive_message）；
-# 写不进去时才由这里补。主动消息走 context.send_message 发出，不经过 respond 阶段，
-# 不会自动进会话历史，用户回复时 AI 看不到自己刚说了什么。老版本没有这个钩子时
-# 跳过——功能照常运行，只是回复主动消息时 AI 不知道自己上条说了啥。
+# on_llm_request 钩子：把主动消息作为本轮临时上下文补回 LLM 请求。
+# 主动消息走 context.send_message，不经过 respond 阶段，因此不会自动进入会话历史。
+# 新版用 TextPart.mark_as_temp()：本轮模型看得到，但 AstrBot 不会把它持久化。
+# 老版本没有临时块 API 时，才退回追加 req.contexts。
 on_llm_request = None
 try:
     from astrbot.api.event.filter import on_llm_request  # type: ignore[assignment]
@@ -91,6 +90,11 @@ try:
     from astrbot.api.provider import ProviderRequest  # type: ignore[assignment]
 except Exception:
     from typing import Any as ProviderRequest  # type: ignore[misc, assignment]
+
+try:
+    from astrbot.core.agent.message import TextPart  # type: ignore[assignment]
+except Exception:
+    TextPart = None  # type: ignore[assignment,misc]
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -242,18 +246,11 @@ class AutonomousSocial(Star):
     async def inject_proactive_context(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """把主动消息补回 LLM 上下文（兑底路）。
+        """把用户回复前主动发出的消息作为本轮临时上下文注入。
 
-        主动消息发送后，引擎会先用 conversation_manager 把它写进会话历史（正路）；
-        写不进去（对方从没跟 bot 走过 LLM、还没有会话）时才轮到这里：把那句
-        pending 的话作为 assistant 消息补进本次请求的上下文。
-
-        注意钩子触发时 req.contexts 里只有已落库的历史，当前这条 user 消息在
-        req.prompt 里、还没进 contexts——所以补的位置是 contexts 末尾，
-        不是「最后一条 user 消息之前」。
-
-        只在私聊中生效：群聊场景更复杂，主动消息通常是对所有人说的，
-        简单插回上下文可能不对。
+        主动消息不会进入 AstrBot 的会话历史；这里用官方临时内容块让模型在
+        本轮看到自己刚说过的话，消费后清空，不会污染后续会话。旧版没有
+        mark_as_temp() 时才退回 req.contexts。
         """
         if self._engine is None:
             return
@@ -263,22 +260,45 @@ class AutonomousSocial(Star):
             if self._engine.cfg.private_only and self._is_group(event):
                 return
             contexts = getattr(req, "contexts", None)
-            if not isinstance(contexts, list):
+            extra_parts = getattr(req, "extra_user_content_parts", None)
+            if not isinstance(contexts, list) and not isinstance(extra_parts, list):
                 return
             bid = self._engine._get_bot_id(event)
             uid = self._engine._get_sender_id(event)
             if not bid or not uid or uid == bid:
                 return
+            temp_factory = getattr(TextPart, "mark_as_temp", None) if TextPart else None
+            can_use_temp = isinstance(extra_parts, list) and callable(temp_factory)
+            if not can_use_temp and not isinstance(contexts, list):
+                return
             text = self._engine.consume_pending_proactive_context(bid, uid)
             if not text:
                 return
-            # 连发的几句各补成一条 assistant 消息，和聊天里实际看到的样子一致
-            for line in text.split("\n"):
-                line = line.strip()
-                if line:
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            if not lines:
+                return
+            hint = (
+                "<autonomous_social_proactive_context>\n"
+                "以下是你在当前对话中刚刚主动发出的原文；这是你已经说过的话，"
+                "不是用户的新消息，只在本次回复中参考：\n"
+                + "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, 1))
+                + "\n</autonomous_social_proactive_context>"
+            )
+            if can_use_temp:
+                extra_parts.append(TextPart(text=hint).mark_as_temp())
+                logger.debug(
+                    f"[autonomous_social] 主动消息已临时注入本轮上下文（{len(text)} 字）: {text[:40]}…"
+                )
+                return
+            if isinstance(contexts, list):
+                for line in lines:
                     contexts.append({"role": "assistant", "content": line})
-            logger.debug(
-                f"[autonomous_social] 主动消息已补入上下文（{len(text)} 字）: {text[:40]}…"
+                logger.warning(
+                    "[autonomous_social] 当前 AstrBot 不支持临时内容块，主动消息已退回写入本轮 contexts"
+                )
+                return
+            logger.warning(
+                "[autonomous_social] 当前请求没有可用的临时内容块或 contexts，主动消息未注入"
             )
         except Exception as exc:
             logger.warning(f"[autonomous_social] 主动消息补入上下文失败: {exc}")

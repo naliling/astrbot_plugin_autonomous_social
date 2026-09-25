@@ -25,15 +25,6 @@ try:
 except ImportError:
     MessageChain = None
 
-# pipeline 处理 LLM 请求时持有的就是这把按会话区分的锁；写会话历史时拿同一把，
-# 避免和主链路「读历史→跑模型→写回」撞车把对方刚聊完的回合覆盖掉。老版本没有就裸写。
-try:
-    from astrbot.core.utils.session_lock import (
-        session_lock_manager as _session_lock_manager,
-    )
-except Exception:
-    _session_lock_manager = None
-
 from . import __version__, desire
 from . import history_ingest
 from .clock import city_now
@@ -369,13 +360,11 @@ class SocialEngine:
         )
 
     def consume_pending_proactive_context(self, bid: str, uid: str) -> str:
-        """取出并清除待补入 LLM 上下文的主动消息文本。
+        """取出并清除待注入本轮 LLM 请求的主动消息文本。
 
-        主动消息走 context.send_message 发出，不经过 AstrBot 的 respond 阶段，
-        因此不会自动进入会话历史。用户回复时 AI 看不到自己刚说了什么，
-        需要在 on_llm_request 钩子里把这条消息作为 assistant 插回上下文。
-
-        消费后立即清空，避免后续每条消息都重复注入。
+        主动消息走 context.send_message，不经过 AstrBot 的 respond 阶段，
+        因此不会自动进入会话历史。用户回复时由 on_llm_request 把它作为临时
+        内容块注入；消费后立即清空，避免后续请求重复注入。
         """
         if not bid or not uid:
             return ""
@@ -387,77 +376,54 @@ class SocialEngine:
         self.state.mark_dirty()
         return text
 
-    def _consume_pending_line(self, bid: str, uid: str, text: str) -> None:
-        """从待注入文本里划掉已经写进会话历史的那一句。
+    def _generation_conversation(
+        self, user: Dict[str, Any], session_history: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """合并用户/正常聊天历史与插件账本，供本次主动消息生成使用。
 
-        连发时 pending 里会累积两句；第一句写库成功、第二句失败的话，只能划掉
-        第一句，剩下那句还得留给 on_llm_request 兑底。
+        AstrBot 会话库是只读来源；插件自己主动发出的消息不再写进会话库，
+        但会留在 state 的 conversation 里。两者按文本去重后合并，避免会话库
+        存在时把 bot 自己的主动消息覆盖掉。
         """
-        u = self.state.user(bid, uid)
-        pending = str(u.get("pending_proactive_context", "") or "")
-        if not pending:
-            return
-        target = str(text or "").strip()
-        lines = [l for l in pending.split("\n") if l.strip() and l.strip() != target]
-        u["pending_proactive_context"] = "\n".join(lines)
-        self.state.mark_dirty()
+        limit = int(getattr(self.cfg, "context_inject_count", 10) or 0)
+        if limit <= 0:
+            return []
 
-    async def _persist_proactive_message(self, umo: str, text: str) -> bool:
-        """把主动发出的那句写进 AstrBot 的会话历史。
-
-        主动消息走 context.send_message，不经过 respond 阶段，AstrBot 不会把它存进
-        会话库——用户回复时模型看不到她自己刚说了什么，靠 on_llm_request 注入只能
-        救当轮，下一轮又失忆。这里用官方 conversation_manager 把它作为 assistant
-        消息追加到该会话当前历史的末尾，之后每一轮请求都自然看得见。
-
-        对方从没跟 bot 走过 LLM（还没有会话）或写入失败时返回 False，调用方保留
-        pending 字段走注入兑底。
-        """
-        cm = getattr(self.context, "conversation_manager", None)
-        if cm is None:
-            logger.info("[autonomous_social] 这个 AstrBot 版本没有 conversation_manager，主动消息写不进会话历史，只能靠注入兑底")
-            return False
-        text = str(text or "").strip()
-        if not umo or not text:
-            return False
-
-        async def _write() -> bool:
-            cid = await cm.get_curr_conversation_id(umo)
-            if not cid:
-                logger.info(f"[autonomous_social] {umo} 还没有当前会话，主动消息写不进历史（转注入兑底）")
-                return False
-            conv = await cm.get_conversation(umo, cid)
-            if conv is None:
-                return False
-            try:
-                history = json.loads(conv.history) if conv.history else []
-            except Exception:
-                history = []
-            if not isinstance(history, list):
-                history = []
-            history.append({"role": "assistant", "content": text})
-            await cm.update_conversation(umo, cid, history=history)
-            logger.info(f"[autonomous_social] 主动消息已写入会话历史（{len(text)} 字）: {text[:30]}…")
-            return True
-
-        try:
-            if _session_lock_manager is not None:
-                async with _session_lock_manager.acquire_lock(umo):
-                    return await _write()
-            return await _write()
-        except Exception as e:
-            logger.warning(
-                f"[autonomous_social] 主动消息写入会话历史失败（转用上下文注入兑底）: {e}"
+        ledger: List[Dict[str, Any]] = []
+        for item in user.get("conversation") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if not text:
+                continue
+            ledger.append(
+                {
+                    "dir": "out" if item.get("dir") == "out" else "in",
+                    "text": text[:300],
+                }
             )
-            return False
+        if not session_history:
+            return ledger[-limit:]
+
+        merged = list(session_history)
+        seen = {
+            (str(item.get("dir", "") or ""), str(item.get("text", "") or ""))
+            for item in merged
+            if isinstance(item, dict)
+        }
+        for item in ledger:
+            key = (item["dir"], item["text"])
+            if key in seen:
+                continue
+            merged.append(item)
+            seen.add(key)
+        return merged[-limit:]
 
     async def _load_session_history(self, umo: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """从 AstrBot 会话库读最近几轮真实聊天（含 bot 自己发的）。
+        """只读 AstrBot 会话库，取最近几轮用户与正常聊天记录。
 
-        插件自己的账本靠 observe/after_message_sent 记，流式回复有已知缺口，
-        主动消息以前也进不来——生成侧只看账本就会「不知道聊过天」，主动消息
-        像凭空触发的任务。会话库是模型真正读的那份历史（含刚写进去的主动消息），
-        有就用它当「最近的对话」。条数由 context_inject_count 控制（limit=None 时）。
+        插件自己主动发出的消息不写入会话库；生成时由 _generation_conversation
+        从 state 的 conversation 合并回来。条数由 context_inject_count 控制。
         """
         if limit is None:
             limit = int(getattr(self.cfg, "context_inject_count", 10) or 0)
@@ -1661,11 +1627,10 @@ class SocialEngine:
         # 以及她此刻正手上的事。拿不到契约时为空，生成器会退回旧的两个标量。
         u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
 
-        # 「最近的对话」优先用会话库里的真实聊天；账本只在拿不到时兜底。
-        # 会话库为空说明这个会话还没聊过，账本里的观察记录仍有参考价值。
+        # 会话库只提供用户与正常聊天历史；主动消息留在插件账本里，合并后
+        # 一起作为本次主动消息生成的上下文，避免 bot 自己的话被覆盖掉。
         session_history = await self._load_session_history(umo)
-        if session_history:
-            u_copy["conversation"] = session_history
+        u_copy["conversation"] = self._generation_conversation(u, session_history)
 
         # 7 天主动消息日志（按 bid,uid 隔离）喂给生成侧防重复：比从会话史里扫 out 更准，
         # 不会把对方的话或别人的话混进来
@@ -1760,8 +1725,6 @@ class SocialEngine:
         sent_ts = self._time()
         msg_type = reason_meta.get("msg_type") if reason_meta else None
         self.state.record_outgoing(bid, uid, parts[0], msg_type)
-        if await self._persist_proactive_message(umo, parts[0]):
-            self._consume_pending_line(bid, uid, parts[0])
         category = str((reason_meta or {}).get("category") or "")
         if category in ("probe", "presence"):
             # 这段沉默已经接过一回了：对方再不回，也不能追第二遍
@@ -1949,8 +1912,6 @@ class SocialEngine:
                 if not ok:
                     return
                 self.state.record_outgoing(bid, uid, text, count_proactive=False)
-                if await self._persist_proactive_message(umo, text):
-                    self._consume_pending_line(bid, uid, text)
                 self.state.save()
                 self.log(f"已连发补充给 {uid}")
         except asyncio.CancelledError:

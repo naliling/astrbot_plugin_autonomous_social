@@ -11,7 +11,7 @@ desc: |
   不合适就先憋着。多个角色各用各人设，装上还能从历史聊天里认出老朋友。
   
   零额外依赖，开箱即用。
-version: "1.14.2"
+version: "1.14.3"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.0.0"

@@ -430,7 +430,7 @@
   "context_inject_count": {
     "type": "int",
     "description": "上下文条数",
-    "hint": "生成时参考多少条最近对话（含Bot自己说的）。10条能接上上文又不太冗长。",
+    "hint": "生成时参考多少条最近的双向对话。私聊会把 AstrBot 会话历史与插件自己的对话账本合并，群聊读近期发言；都包含 bot 自己说过的话。默认 10 条，条数越多，本次生成调用消耗的 token 越多。设 0 则不注入历史上下文。",
     "obvious_hint": true,
     "default": 10,
     "min": 0,

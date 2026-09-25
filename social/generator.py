@@ -682,8 +682,14 @@ class MessageGenerator:
             social_energy_descriptor(se_val) if se_val is not None else None,
         )
 
-        # 对话历史
-        conv_text = self._format_conversation(target.get("conversation", []))
+        # 对话历史：条数真正服从配置，默认 10 条，不再被旧的固定 5 条截断。
+        history_limit = int(
+            getattr(self.cfg, "context_inject_count", MAX_HISTORY_MESSAGES)
+            or 0
+        ) if self.cfg else MAX_HISTORY_MESSAGES
+        conv_text = self._format_conversation(
+            target.get("conversation", []), history_limit
+        )
 
         # 最近聊天是不是处在亲密/露骨氛围：是的话不把露骨正文抹进 prompt（避免触发
         # 模型安全拒绝/乱码），而是用一句中性氛围提示，让她顺着当下的亲密感说下去。
@@ -1196,12 +1202,14 @@ class MessageGenerator:
         return None
 
     @staticmethod
-    def _format_conversation(conv: List[Dict[str, Any]]) -> str:
-        """格式化对话历史为文本。"""
-        if not conv:
+    def _format_conversation(
+        conv: List[Dict[str, Any]], limit: int = MAX_HISTORY_MESSAGES
+    ) -> str:
+        """格式化最近的双向对话为文本。"""
+        if not conv or limit <= 0:
             return ""
 
-        recent = conv[-MAX_HISTORY_MESSAGES:]
+        recent = conv[-limit:]
         lines = []
         for m in recent:
             txt = str(m.get('text', '') or '').strip()
