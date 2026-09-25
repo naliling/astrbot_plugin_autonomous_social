@@ -1,1 +1,531 @@
-ewogICJlbmFibGVkIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5oC75byA5YWzIiwKICAgICJoaW50IjogIuW8gOWQr+WQjkJvdOS8muS4u+WKqOaJvuS6uuiBiuWkqeOAguWFs+mXreWQjuaJgOacieWKn+iDveaaguWBnO+8jOS9huW3suacieaVsOaNruS8muS/neeVmeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgIm1vZGUiOiB7CiAgICAidHlwZSI6ICJzdHJpbmciLAogICAgImRlc2NyaXB0aW9uIjogIui/kOihjOaooeW8jyIsCiAgICAiaGludCI6ICJhdXRv77yI5o6o6I2Q77yJ77ya6Ieq5Yqo5qOA5rWL5piv5ZCm6KOF5LqGSHVtYW5vaWQgQ29yZeW5tuiBlOWKqO+8m2h1bWFub2lk77ya5by65Yi26KaB5rGCQ29yZe+8m3N0YW5kYWxvbmXvvJrlrozlhajni6znq4vov5DooYzjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6ICJhdXRvIgogIH0sCiAgImFjdGl2aXR5X2xldmVsIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLmtLvot4PluqbvvIgxMC05MO+8iSIsCiAgICAiaGludCI6ICLmlbDlgLzotorpq5jotorniLHkuLvliqjor7Tor53jgII3NeaYr+W5s+aXtuivneavlOi+g+WkmuOAgemXsuS4jeS9j+aDs+aJvuS6uuiBiueahOS6uuOAguWkqumrmOS8muaYvuW+l+ivneWkmu+8jOWkquS9juS8muaYvuW+l+WGt+a3oeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNzUsCiAgICAibWluIjogMTAsCiAgICAibWF4IjogOTAKICB9LAogICJ1cmdlX3JlZmlsbF9ob3VycyI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5Li75Yqo6Ze06ZqU77yI5bCP5pe277yJIiwKICAgICJoaW50IjogIuaUkua7oeS4gOasoeaDs+ivtOivneeahOW/teWktOmcgOimgeWkmuS5heOAguaVsOWAvOi2iuWwj+i2iumikee5geOAgjLooajnpLrlv4Pph4zkuIDmnInkuovlsLHmg7Pmib7kurror7TjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDIsCiAgICAibWluIjogMSwKICAgICJtYXgiOiA5NgogIH0sCiAgInJlY2VudF90YWxrX21pbnV0ZXMiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuWImuiBiuWujOmdmem7mOacn++8iOWIhumSn++8iSIsCiAgICAiaGludCI6ICLliJrogYrlrozlpJrkuYXlhoXkuI3lho3lj6botbfmlrDor53popjjgIIxOOWIhumSn+mBv+WFjeivneWImuivtOWujOWPiOadpeS4gOWPpeeahOacuuWZqOS6uuaEn+OAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMTgsCiAgICAibWluIjogNSwKICAgICJtYXgiOiA3MjAKICB9LAogICJsbG1fZ2F0ZSI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIkFJ5Yik5pat6K+l5LiN6K+l5Y+RIiwKICAgICJoaW50IjogIuW8gOWQr+WQjuaooeWei+S8muiHquW3seWIpOaWrSfov5nlj6Xor53njrDlnKjor6XkuI3or6Xor7Qn77yM5aSn5bmF5o+Q5Y2H5ouf5Lq65bqm44CC5by654OI5o6o6I2Q5byA5ZCv44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAic2tpcF9jb29sZG93bl9taW51dGVzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLooqvmi5LlkI7lhrfljbTvvIjliIbpkp/vvIkiLAogICAgImhpbnQiOiAi5qih5Z6L5Yaz5a6a5LiN6K+05LqG5LmL5ZCO77yM5aSa5LmF5YaF5LiN5YaN57qg57uT5ZCM5LiA5Liq5Lq644CCMTDliIbpkp/ovoPnn63vvIzkvJrlv6vpgJ/ph43mlrDogIPomZHjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDEwLAogICAgIm1pbiI6IDUsCiAgICAibWF4IjogNDgwCiAgfSwKICAicmVzcGVjdF91c2VyX3JoeXRobSI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIumhuuWvueaWueS9nOaBryIsCiAgICAiaGludCI6ICLmoLnmja7lr7nmlrnlubPml7bmtLvot4Pml7bmrrXpgInmi6nml7bmnLrjgILlhbPpl63lkI7ku7vkvZXml7blgJnpg73lj6/og73kuLvliqjogZTns7vvvIjmjqjojZDlhbPpl63vvIzorqnlpbnmm7TkuLvliqjvvInjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IGZhbHNlCiAgfSwKICAiY3VlX2ZvbGxvd3VwIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi6K6w5L2P57qm5a6a5pe26Ze0IiwKICAgICJoaW50IjogIuiusOS9j+WvueaWueivtOeahCfmmI7lpKnpnaLor5UnJ+WRqOS6lOS6pOaKpeWRiifvvIzliLDml7bpl7TkuLvliqjpl67lgJnjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJmb2xsb3d1cF9lbmFibGVkIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5Li75Yqo5o6l5pat5o6J55qE6K+dIiwKICAgICJoaW50IjogIuiBiuWkqeS4reaWreaXtuS4u+WKqOaOpeS4gOWPpeOAguWvueaWueaVt+ihjeWwsei/vemXru+8jOeqgeeEtuayoeWjsOWwsemXriflnKjlkJcn44CC5o6o6I2Q5byA5ZCv44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAicHJvYmVfYWZ0ZXJfbWludXRlcyI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5pW36KGN6L+96Zeu6Ze06ZqU77yI5YiG6ZKf77yJIiwKICAgICJoaW50IjogIuWvueaWueWbnuW+l+aVt+ihjeaXtu+8jOmalOWkmuS5hei/vemXruOAgjLliIbpkp/lk43lupTlv6vvvIzlg4/lnKjmhI/lr7nor53jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDIsCiAgICAibWluIjogMSwKICAgICJtYXgiOiAxMjAKICB9LAogICJmb2xsb3d1cF9hZnRlcl9taW51dGVzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLmlq3or53liKTlrprpl7TpmpTvvIjliIbpkp/vvIkiLAogICAgImhpbnQiOiAi5Y+M5pa56YO95LiN6K+06K+d5aSa5LmF566X5pat5LqG44CCNOWIhumSn+i+g+aVj+aEn++8jOS8muabtOW/q+aOpeivneOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNCwKICAgICJtaW4iOiAzLAogICAgIm1heCI6IDI0MAogIH0sCiAgImZvbGxvd3VwX21heF9taW51dGVzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLov73or53mnIDplb/ml7bpmZDvvIjliIbpkp/vvIkiLAogICAgImhpbnQiOiAi6LaF6L+H6L+Z5LmI5LmF5bCx5Yir6L+95LqG77yM6ZqU5aSq5LmF5YOP57+75pen6LSm44CCNzDliIbpkp/mmK/lkIjnkIbkuIrpmZDjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDcwLAogICAgIm1pbiI6IDE1LAogICAgIm1heCI6IDcyMAogIH0sCiAgImZvbGxvd3VwX2Nvb2xkb3duX21pbnV0ZXMiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIui/veivneWGt+WNtO+8iOWIhumSn++8iSIsCiAgICAiaGludCI6ICLkuKTmrKHov73or53kuYvpl7TnmoTmnIDnn63pl7TpmpTjgIIzMOWIhumSn+mYsuatoui/nue7rei/vemXrui/h+S6jumikee5geOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMzAsCiAgICAibWluIjogNSwKICAgICJtYXgiOiA3MjAKICB9LAogICJsb29wX2VuYWJsZWQiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLkuLvliqjpl67lkI7nu60iLAogICAgImhpbnQiOiAi5a+55pa55o+Q6L+H5L2G5rKh6K+057uT5p6c55qE5LqL77yI6Z2i6K+V44CB5L2T5qOA77yJ77yM6L+H5Yeg5bCP5pe25Li75Yqo6ZeuJ+WQjuadpeaAjuS5iOagtyfjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJsb29wX21pbl9ob3VycyI6IHsKICAgICJ0eXBlIjogImZsb2F0IiwKICAgICJkZXNjcmlwdGlvbiI6ICLlm57orr/mnIDnn63pl7TpmpTvvIjlsI/ml7bvvIkiLAogICAgImhpbnQiOiAi6Iez5bCR6ZqU5aSa5LmF5YaN6Zeu44CC5o6o6I2QNOWwj+aXtuOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNC4wLAogICAgIm1pbiI6IDEuMCwKICAgICJtYXgiOiAyNC4wCiAgfSwKICAibG9vcF9tYXhfaG91cnMiOiB7CiAgICAidHlwZSI6ICJmbG9hdCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5Zue6K6/5pyA6ZW/6Ze06ZqU77yI5bCP5pe277yJIiwKICAgICJoaW50IjogIuacgOi/n+WkmuS5heW/hemhu+mXruWHuuWOu++8jOi2hei/h+WwseS4jemXruS6huOAguaOqOiNkDEy5bCP5pe244CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAxMi4wLAogICAgIm1pbiI6IDMuMCwKICAgICJtYXgiOiA0OC4wCiAgfSwKICAiY2xvc2VyX2VuYWJsZWQiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLml6Dkurrlm57ml7boh6rmlLblsL4iLAogICAgImhpbnQiOiAi5Li75Yqo5Y+R55qE6K+d5rKh5Lq65Zue5pe277yM6L+H5LiA6Zi16Ieq5bex5pS25Zy677yIJ+ayoeS6i+Wwsemaj+WPo+S4gOivtCfvvInjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJjbG9zZXJfYWZ0ZXJfaG91cnMiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuaUtuWwvuetieW+heaXtumVv++8iOWwj+aXtu+8iSIsCiAgICAiaGludCI6ICLkuLvliqjlj5HnmoTor53pmpTlpJrkuYXmsqHkurrlm57miY3mlLblsL7jgILmjqjojZAxMOWwj+aXtuOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMTAsCiAgICAibWluIjogMiwKICAgICJtYXgiOiA3MgogIH0sCiAgInRyYWNrX293bl9yZXBsaWVzIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi6K6w5L2P6Ieq5bex6K+06L+H55qE6K+dIiwKICAgICJoaW50IjogIuW8gOWQr+WQjkJvdOefpemBk+iHquW3seS4iuS4gOWPpeivtOS6huS7gOS5iO+8jOi/vemXruaJjeiDveaOpeS4iuOAguW8uueDiOaOqOiNkOW8gOWQr+OAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgInVzZV9jb3JlX2Nsb2NrIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5oyJ6KeS6Imy5pe25Yy66K6h5pe2IiwKICAgICJoaW50IjogIuaMieinkuiJsuaJgOWcqOWfjuW4gueahOaXtumXtOeul++8iOmcgOimgUh1bWFub2lkIENvcmXvvInjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJ1c2VyX2Nvb2xkb3duX21pbnV0ZXMiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuWNleS6uuiBlOezu+WGt+WNtO+8iOWIhumSn++8iSIsCiAgICAiaGludCI6ICLlkIzkuIDkuKrkurrkuKTmrKHooqvkuLvliqjogZTns7vnmoTmnIDnn63pl7TpmpTjgIIzMOWIhumSn+aYr+mYsuWIt+Wxj+aKpOagj++8jOecn+ato+iKguWlj+eUseW/teWktOWGs+WumuOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMzAsCiAgICAibWluIjogMTAsCiAgICAibWF4IjogMjg4MAogIH0sCiAgIm1heF9zZW5kc19wZXJfcm91bmQiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuavj+i9ruacgOWkmuiBlOezu+WHoOS6uiIsCiAgICAiaGludCI6ICLkuIDova7lv4Pot7PvvIg4LTE15YiG6ZKf77yJ5pyA5aSa5Li75Yqo6IGU57O75Yeg5Liq5LiN5ZCM55qE5Lq644CC5o6o6I2QMi0z5Liq44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAyLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogMTAKICB9LAogICJxdWlldF9zdGFydCI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5a6J6Z2Z5pe25q615byA5aeL77yI5bCP5pe277yJIiwKICAgICJoaW50IjogIui/meauteaXtumXtOWHoOS5juS4jeS4u+WKqOivtOivneOAguaOqOiNkDIz54K577yI5pma5LiKMTHngrnvvInjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDIzLAogICAgIm1pbiI6IDAsCiAgICAibWF4IjogMjMKICB9LAogICJxdWlldF9lbmQiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuWuiemdmeaXtuautee7k+adn++8iOWwj+aXtu+8iSIsCiAgICAiaGludCI6ICLlronpnZnml7bmrrXnu5PmnZ/ml7bpl7TjgILmjqjojZA354K577yI5pep5LiKN+eCue+8ieOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNywKICAgICJtaW4iOiAwLAogICAgIm1heCI6IDIzCiAgfSwKICAicHJpdmF0ZV9vbmx5IjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5Y+q5Li75Yqo56eB6IGKIiwKICAgICJoaW50IjogIuW8gOWQr+WQjuWPquS4u+WKqOengeiBiu+8jOS4jeWcqOe+pOmHjOS4u+WKqOivtOivneOAguaOqOiNkOW8gOWQr++8iOe+pOiBiuWIhuWvuOabtOmavuaKiuaPoe+8ieOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgImRlYnVnIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi6L6T5Ye66LCD6K+V5pel5b+XIiwKICAgICJoaW50IjogIuaXpeW/l+S8muaYvuekuifkuLrku4DkuYjlj5Ev5Li65LuA5LmI5LiN5Y+RJ+OAguaOkuafpemXrumimOaXtuW8gOWQr++8jOW5s+aXtuW7uuiuruWFs+mXreOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogZmFsc2UKICB9LAogICJtYXhfbWVzc2FnZV9sZW5ndGgiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuWNleadoea2iOaBr+mVv+W6puS4iumZkO+8iOWtl++8iSIsCiAgICAiaGludCI6ICLljZXmnaHmtojmga/mnIDlpJrlpJrlsJHlrZfjgILmjqjojZAxMDAtMTUw5a2X44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAxMjAsCiAgICAibWluIjogMTAsCiAgICAibWF4IjogNTAwCiAgfSwKICAic3RyaXBfcm9sZXBsYXlfYWN0aW9ucyI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIuWOu+mZpOaLrOWPt+WKqOS9nCIsCiAgICAiaGludCI6ICLljrvmjokn77yI6L276L275oqx5L2g77yJJycq5pG45pG45aS0Kifov5nnsbvliqjkvZzmj4/lhpnjgILmjqjojZDlvIDlkK/vvIjmm7Tlg4/mraPluLjogYrlpKnvvInjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJhbGxvd19lbW9qaSI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIuS/neeVmWVtb2ppIiwKICAgICJoaW50IjogIuaYr+WQpuS/neeVmWVtb2pp6KGo5oOF44CC5o6o6I2Q5YWz6Zet77yI5q+P5Y+l5pyr5bC+5LiA5Liq4p2k77iP5b6I5YOPQUnvvInjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IGZhbHNlCiAgfSwKICAiYWxsb3dfYnVyc3QiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLov57lj5HmqKHlvI8iLAogICAgImhpbnQiOiAi5LiA5qyh6K+06K+d5ouG5oiQMi0z5p2h55+t5Y+l77yM6Ze06ZqUMS0z5YiG6ZKf5Y+R44CC5o6o6I2Q5byA5ZCv77yI5pu05YOP55yf5Lq65omT5a2X77yJ44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAibWF4X2J1cnN0X3BhcnRzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLov57lj5HmnIDlpJrmnaHmlbAiLAogICAgImhpbnQiOiAi5LiA5qyh5pyA5aSa5ouG5oiQ5Yeg5p2h44CC5o6o6I2QMi0z5p2h44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAzLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogMwogIH0sCiAgImdyZWV0aW5nX2VuYWJsZWQiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLml6nmmZrpl67lgJkiLAogICAgImhpbnQiOiAi5Yiw5LqG5pe26Ze05Li75Yqo6K+05pep5a6JL+aZmuWuieOAguaOqOiNkOW8gOWQr+OAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgImdyZWV0aW5nX21vcm5pbmdfc3RhcnQiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIuaXqeWuieW8gOWni+aXtumXtO+8iOWwj+aXtu+8iSIsCiAgICAiaGludCI6ICLml6nlronnqpflj6PlvIDlp4vjgILmjqjojZA3LTjngrnjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDcsCiAgICAibWluIjogMCwKICAgICJtYXgiOiAyMwogIH0sCiAgImdyZWV0aW5nX21vcm5pbmdfZW5kIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLml6nlronnu5PmnZ/ml7bpl7TvvIjlsI/ml7bvvIkiLAogICAgImhpbnQiOiAi5pep5a6J56qX5Y+j57uT5p2f44CC5o6o6I2QMTHngrnjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDExLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogMjQKICB9LAogICJncmVldGluZ19uaWdodF9zdGFydCI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5pma5a6J5byA5aeL5pe26Ze077yI5bCP5pe277yJIiwKICAgICJoaW50IjogIuaZmuWuieeql+WPo+W8gOWni+OAguaOqOiNkDIx54K577yI5pma5LiKOeeCue+8ieOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMjEsCiAgICAibWluIjogMCwKICAgICJtYXgiOiAyMwogIH0sCiAgImdyZWV0aW5nX25pZ2h0X2VuZCI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5pma5a6J57uT5p2f5pe26Ze077yI5bCP5pe277yJIiwKICAgICJoaW50IjogIuaZmuWuieeql+WPo+e7k+adn+OAguaOqOiNkDI054K577yI5Y2I5aSc77yJ44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAyNCwKICAgICJtaW4iOiAxLAogICAgIm1heCI6IDI0CiAgfSwKICAiZ3JvdXBfZmxvd19lbmFibGVkIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi576k6IGK5Li75Yqo5o6l6K+dIiwKICAgICJoaW50IjogIkJvdOWcqOe+pOmHjOivtOi/h+ivneWQju+8jOS8mue7p+e7reWFs+azqOe+pOiBiuW5tuS4u+WKqOaOpeivne+8iOaXoOmcgEDvvInjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJncm91cF9pY2VicmVha19lbmFibGVkIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi576k6IGK5Ya35Zy656C05YawIiwKICAgICJoaW50IjogIue+pOWkquS5heayoeS6uuivtOivneaXtu+8jOS4u+WKqOaKm+S4quivnemimOOAguaOqOiNkOW8gOWQr+OAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgImdyb3VwX3JlZl9saWJfZW5hYmxlZCI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIue+pOiBiumjjuagvOWtpuS5oCIsCiAgICAiaGludCI6ICLlrabkuaDnvqTph4znmoTor7Tor53po47moLzvvIzorqnmjqXor53mm7Toh6rnhLbjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJncm91cF9zdG9yZV9tZXNzYWdlX3RleHQiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLlrZjlgqjnvqTogYrmtojmga8iLAogICAgImhpbnQiOiAi5piv5ZCm5L+d5a2Y576k5Y+L5Y+R6KiA5L2c5Li65Y+C6ICD44CC5YWz6Zet5ZCO5pu06ZqQ56eB77yM5L2G6aOO5qC85a2m5Lmg5Lya5aSx5pWI44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAiZmxvd193aW5kb3dfbWludXRlcyI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi576k6IGK5YWz5rOo56qX5Y+j77yI5YiG6ZKf77yJIiwKICAgICJoaW50IjogIkJvdOivtOivneWQjuWFs+azqOe+pOiBiuWkmuS5heOAguaOqOiNkDEw5YiG6ZKf44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAxMCwKICAgICJtaW4iOiAxLAogICAgIm1heCI6IDYwCiAgfSwKICAiZmxvd19taW5fZ2FwX3NlY29uZHMiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIue+pOiBiuaPkuivnemXtOmalO+8iOenku+8iSIsCiAgICAiaGludCI6ICLkuKTmrKHmj5Lor53mnIDlsJHpl7TpmpTlpJrkuYXjgILmjqjojZA2MOenkuOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNjAsCiAgICAibWluIjogMTAsCiAgICAibWF4IjogNjAwCiAgfSwKICAiZmxvd19tYXhfcmVwbGllc19wZXJfd2luZG93IjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLnqpflj6PlhoXmnIDlpJrmjqXlh6DmrKEiLAogICAgImhpbnQiOiAi5LiA5Liq5YWz5rOo56qX5Y+j5YaF5pyA5aSa5o6l5Yeg5qyh6K+d44CC5o6o6I2QM+asoeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMywKICAgICJtaW4iOiAxLAogICAgIm1heCI6IDEwCiAgfSwKICAiZmxvd19ob3VybHlfY2FwIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLnvqTogYrmr4/lsI/ml7bkuIrpmZAiLAogICAgImhpbnQiOiAi5q+P576k5q+P5bCP5pe25pyA5aSa5o+S6K+d5Yeg5qyh44CC5o6o6I2QNeasoeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNSwKICAgICJtaW4iOiAxLAogICAgIm1heCI6IDYwCiAgfSwKICAiZmxvd19pZ25vcmVkX2V4aXQiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIui/nue7reiiq+W/veeVpeWQjumAgOWHuiIsCiAgICAiaGludCI6ICLov57nu63mj5Lor53lh6DmrKHpg73msqHkurrnkIblsLHlgZzkuIvmnaXjgILmjqjojZAy5qyh44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAyLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogMTAKICB9LAogICJncm91cF9pZGxlX2hvdXJzIjogewogICAgInR5cGUiOiAiZmxvYXQiLAogICAgImRlc2NyaXB0aW9uIjogIuegtOWGsOWGt+WcuuaXtumVv++8iOWwj+aXtu+8iSIsCiAgICAiaGludCI6ICLnvqTlronpnZnlpJrkuYXmiY3ogIPomZHnoLTlhrDjgILmjqjojZA45bCP5pe244CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiA4LjAsCiAgICAibWluIjogMS4wLAogICAgIm1heCI6IDI0MC4wCiAgfSwKICAiaWNlYnJlYWtfZGFpbHlfY2FwIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLmr4/ml6XnoLTlhrDkuIrpmZAiLAogICAgImhpbnQiOiAi5q+P576k5q+P5aSp5pyA5aSa56C05Yaw5Yeg5qyh44CC5o6o6I2QMS0y5qyh44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAxLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogMTAKICB9LAogICJncm91cF9zdGFsZV9kYXlzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLnvqTpgIDlh7rliKTlrprlpKnmlbAiLAogICAgImhpbnQiOiAi5aSa5bCR5aSp5rKh5Zyo576k6YeM6KeB5Yiw5raI5oGv5bCx5b2T5bey6YCA576k44CC5o6o6I2QNeWkqeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNSwKICAgICJtaW4iOiAxLAogICAgIm1heCI6IDkwCiAgfSwKICAiZ3JvdXBfcmVmX3NhbXBsZV9zaXplIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLnvqTogYrlj4LogIPlupPlrrnph48iLAogICAgImhpbnQiOiAi5q+P576k5L+d55WZ5aSa5bCR5p2h576k5Y+L5Y+R6KiA5qC35pys44CC5o6o6I2QMzDmnaHjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDMwLAogICAgIm1pbiI6IDUsCiAgICAibWF4IjogMjAwCiAgfSwKICAiZ3JvdXBfcmVmX3Byb21wdF9jb3VudCI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi6aOO5qC85qC35pys5oq95Y+W5pWwIiwKICAgICJoaW50IjogIueUn+aIkOaXtuWPguiAg+WkmuWwkeadoee+pOWPi+WPkeiogOOAguaOqOiNkDUtOOadoeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogNiwKICAgICJtaW4iOiAwLAogICAgIm1heCI6IDMwCiAgfSwKICAidG9waWNfbWVtb3J5X2NvdW50IjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLor53popjorrDlv4bmlbDph48iLAogICAgImhpbnQiOiAi6K6w5L2P5pyA6L+R5aSa5bCR5Liq6IGK5aSp6K+d6aKY44CC5o6o6I2QNeS4quOAguiuvjDlhbPpl63or53popjorrDlv4bjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDUsCiAgICAibWluIjogMCwKICAgICJtYXgiOiAyMAogIH0sCiAgImNvbnRleHRfaW5qZWN0X2NvdW50IjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLkuIrkuIvmlofmnaHmlbAiLAogICAgImhpbnQiOiAi55Sf5oiQ5pe25Y+C6ICD5aSa5bCR5p2h5pyA6L+R5a+56K+d77yI5ZCrQm906Ieq5bex6K+055qE77yJ44CCMTDmnaHog73mjqXkuIrkuIrmloflj4jkuI3lpKrlhpfplb/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IDEwLAogICAgIm1pbiI6IDAsCiAgICAibWF4IjogNTAKICB9LAogICJ3ZWVrZW5kX2Jvb3N0IjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5ZGo5pyr5pu05rS76LeDIiwKICAgICJoaW50IjogIuWRqOacq+iuqeW/teWktOa2qOW+l+W/q+S4gOS6m++8iMOXMS4yNe+8ieOAguaOqOiNkOW8gOWQr+OAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogdHJ1ZQogIH0sCiAgImVuZXJneV90aHJlc2hvbGQiOiB7CiAgICAidHlwZSI6ICJpbnQiLAogICAgImRlc2NyaXB0aW9uIjogIueyvuWKm+mYiOWAvCIsCiAgICAiaGludCI6ICLnsr7lipvkvY7kuo7mraTlgLzml7blv7XlpLTlh6DkuY7kuI3mtqjjgILmjqjojZAxNeOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogMTUsCiAgICAibWluIjogMCwKICAgICJtYXgiOiAxMDAKICB9LAogICJzb2NpYWxfZW5lcmd5X3RocmVzaG9sZCI6IHsKICAgICJ0eXBlIjogImludCIsCiAgICAiZGVzY3JpcHRpb24iOiAi56S+5Lqk6IO96YeP6ZiI5YC8IiwKICAgICJoaW50IjogIuekvuS6pOiDvemHj+S9juS6juatpOWAvOaXtuS4jeaDs+ivtOivneOAguaOqOiNkDIw44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAyMCwKICAgICJtaW4iOiAwLAogICAgIm1heCI6IDEwMAogIH0sCiAgImFkYXB0aXZlX3JlcGx5X3JhdGUiOiB7CiAgICAidHlwZSI6ICJib29sIiwKICAgICJkZXNjcmlwdGlvbiI6ICLmjInlm57lpI3njofosIPoioIiLAogICAgImhpbnQiOiAi5a+55pa55LiN5o6l6K+d5Lya5oWi5oWi5YeP5bCR5Li75Yqo6aKR546H44CC5o6o6I2Q5byA5ZCv44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAicmVwbHlfd2luZG93X2hvdXJzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLlm57lpI3liKTlrprnqpflj6PvvIjlsI/ml7bvvIkiLAogICAgImhpbnQiOiAi5Li75Yqo5raI5oGv5Y+R5Ye65ZCO5aSa5LmF5YaF5a+55pa55Zue6K+d5omN566XJ+aOpeS9j+S6hifjgILmjqjojZAz5bCP5pe244CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiAzLAogICAgIm1pbiI6IDEsCiAgICAibWF4IjogNDgKICB9LAogICJvd25lcl9vbmx5X2NvbW1hbmRzIjogewogICAgInR5cGUiOiAiYm9vbCIsCiAgICAiZGVzY3JpcHRpb24iOiAi5oyH5Luk5LuF5Li75Lq65Y+v55SoIiwKICAgICJoaW50IjogIifop6blj5HnpL7kuqQnJ+ekvuS6pOeKtuaAgSfnrYnmjIfku6TmmK/lkKbku4XkuLvkurrlj6/nlKjjgILmjqjojZDlvIDlkK/jgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJhbGxvd2VkX3RyaWdnZXJfdWlkcyI6IHsKICAgICJ0eXBlIjogImxpc3QiLAogICAgImRlc2NyaXB0aW9uIjogIuaMh+S7pOeZveWQjeWNlSIsCiAgICAiaGludCI6ICLpmaTkuLvkurrlpJblhYHorrjosIHkvb/nlKjmjIfku6TvvIjloat1c2VyX2lk77yJ44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiBbXQogIH0sCiAgInN0b3JlX21lc3NhZ2VfdGV4dCI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIuWtmOWCqOengeiBiua2iOaBryIsCiAgICAiaGludCI6ICLmmK/lkKbkv53lrZjnp4HogYrmtojmga/mraPmlofjgILlhbPpl63lkI7mm7TpmpDnp4HvvIzkvYblip/og73kvJrliYrlvLHjgIIiLAogICAgIm9idmlvdXNfaGludCI6IHRydWUsCiAgICAiZGVmYXVsdCI6IHRydWUKICB9LAogICJ1c2VyX3JldGVudGlvbl9kYXlzIjogewogICAgInR5cGUiOiAiaW50IiwKICAgICJkZXNjcmlwdGlvbiI6ICLpl7Lnva7nlKjmiLfmuIXnkIblpKnmlbAiLAogICAgImhpbnQiOiAi5aSa5bCR5aSp5rKh6IGU57O755qE55So5oi35Lya6KKr5riF55CG5Y6G5Y+y5pWw5o2u44CC5o6o6I2QNDXlpKnvvIzorr4w5rC45LiN5riF55CG44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiA0NSwKICAgICJtaW4iOiAwLAogICAgIm1heCI6IDM2NTAKICB9LAogICJoaXN0b3J5X2luZ2VzdCI6IHsKICAgICJ0eXBlIjogImJvb2wiLAogICAgImRlc2NyaXB0aW9uIjogIuWvvOWFpeWOhuWPsuS8muivnSIsCiAgICAiaGludCI6ICLku45Bc3RyQm905Lya6K+d5bqT5a+85YWl5LmL5YmN6IGK6L+H55qE5Lq644CC5o6o6I2Q5byA5ZCv77yI6KOF5o+S5Lu25ZCO56uL5Y2z6IO955So77yJ44CCIiwKICAgICJvYnZpb3VzX2hpbnQiOiB0cnVlLAogICAgImRlZmF1bHQiOiB0cnVlCiAgfSwKICAic2VlZF91c2VycyI6IHsKICAgICJ0eXBlIjogImxpc3QiLAogICAgImRlc2NyaXB0aW9uIjogIuS4u+WKqOiupOivhuWQjeWNlSIsCiAgICAiaGludCI6ICLljbPkvb/msqHogYrov4fkuZ/kvJrkuLvliqjogZTns7vnmoR1c2VyX2lk5YiX6KGo44CC5q+P6aG55LiA5LiqSUTvvIzlpoLvvJoxMjM0NSIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogW10KICB9LAogICJzZWVkX3BsYXRmb3JtIjogewogICAgInR5cGUiOiAic3RyaW5nIiwKICAgICJkZXNjcmlwdGlvbiI6ICLpu5jorqTlubPlj7AiLAogICAgImhpbnQiOiAic2VlZF91c2Vyc+eahOm7mOiupOW5s+WPsO+8iOWmgmFpb2NxaHR0cOOAgXdlY2hhdO+8ieOAguaOqOiNkGFpb2NxaHR0cOOAgiIsCiAgICAib2J2aW91c19oaW50IjogdHJ1ZSwKICAgICJkZWZhdWx0IjogImFpb2NxaHR0cCIKICB9Cn0K
+{
+  "enabled": {
+    "type": "bool",
+    "description": "总开关",
+    "hint": "开启后Bot会主动找人聊天。关闭后所有功能暂停，但已有数据会保留。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "mode": {
+    "type": "string",
+    "description": "运行模式",
+    "hint": "auto（推荐）：自动检测是否装了Humanoid Core并联动；humanoid：强制要求Core；standalone：完全独立运行。",
+    "obvious_hint": true,
+    "default": "auto"
+  },
+  "activity_level": {
+    "type": "int",
+    "description": "活跃度（10-90）",
+    "hint": "数值越高越爱主动说话。75是平时话比较多、闲不住想找人聊的人。太高会显得话多，太低会显得冷淡。",
+    "obvious_hint": true,
+    "default": 75,
+    "min": 10,
+    "max": 90
+  },
+  "urge_refill_hours": {
+    "type": "int",
+    "description": "主动间隔（小时）",
+    "hint": "攒满一次想说话的念头需要多久。数值越小越频繁。2表示心里一有事就想找人说。",
+    "obvious_hint": true,
+    "default": 2,
+    "min": 1,
+    "max": 96
+  },
+  "recent_talk_minutes": {
+    "type": "int",
+    "description": "刚聊完静默期（分钟）",
+    "hint": "刚聊完多久内不再另起新话题。18分钟避免话刚说完又来一句的机器人感。",
+    "obvious_hint": true,
+    "default": 18,
+    "min": 5,
+    "max": 720
+  },
+  "llm_gate": {
+    "type": "bool",
+    "description": "AI判断该不该发",
+    "hint": "开启后模型会自己判断'这句话现在该不该说'，大幅提升拟人度。强烈推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "skip_cooldown_minutes": {
+    "type": "int",
+    "description": "被拒后冷却（分钟）",
+    "hint": "模型决定不说了之后，多久内不再纠结同一个人。10分钟较短，会快速重新考虑。",
+    "obvious_hint": true,
+    "default": 10,
+    "min": 5,
+    "max": 480
+  },
+  "respect_user_rhythm": {
+    "type": "bool",
+    "description": "顺对方作息",
+    "hint": "根据对方平时活跃时段选择时机。关闭后任何时候都可能主动联系（推荐关闭，让她更主动）。",
+    "obvious_hint": true,
+    "default": false
+  },
+  "cue_followup": {
+    "type": "bool",
+    "description": "记住约定时间",
+    "hint": "记住对方说的'明天面试''周五交报告'，到时间主动问候。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "followup_enabled": {
+    "type": "bool",
+    "description": "主动接断掉的话",
+    "hint": "聊天中断时主动接一句。对方敷衍就追问，突然没声就问'在吗'。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "probe_after_minutes": {
+    "type": "int",
+    "description": "敷衍追问间隔（分钟）",
+    "hint": "对方回得敷衍时，隔多久追问。2分钟响应快，像在意对话。",
+    "obvious_hint": true,
+    "default": 2,
+    "min": 1,
+    "max": 120
+  },
+  "followup_after_minutes": {
+    "type": "int",
+    "description": "断话判定间隔（分钟）",
+    "hint": "双方都不说话多久算断了。4分钟较敏感，会更快接话。",
+    "obvious_hint": true,
+    "default": 4,
+    "min": 3,
+    "max": 240
+  },
+  "followup_max_minutes": {
+    "type": "int",
+    "description": "追话最长时限（分钟）",
+    "hint": "超过这么久就别追了，隔太久像翻旧账。70分钟是合理上限。",
+    "obvious_hint": true,
+    "default": 70,
+    "min": 15,
+    "max": 720
+  },
+  "followup_cooldown_minutes": {
+    "type": "int",
+    "description": "追话冷却（分钟）",
+    "hint": "两次追话之间的最短间隔。30分钟防止连续追问过于频繁。",
+    "obvious_hint": true,
+    "default": 30,
+    "min": 5,
+    "max": 720
+  },
+  "loop_enabled": {
+    "type": "bool",
+    "description": "主动问后续",
+    "hint": "对方提过但没说结果的事（面试、体检），过几小时主动问'后来怎么样'。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "loop_min_hours": {
+    "type": "float",
+    "description": "回访最短间隔（小时）",
+    "hint": "至少隔多久再问。推荐4小时。",
+    "obvious_hint": true,
+    "default": 4.0,
+    "min": 1.0,
+    "max": 24.0
+  },
+  "loop_max_hours": {
+    "type": "float",
+    "description": "回访最长间隔（小时）",
+    "hint": "最迟多久必须问出去，超过就不问了。推荐12小时。",
+    "obvious_hint": true,
+    "default": 12.0,
+    "min": 3.0,
+    "max": 48.0
+  },
+  "closer_enabled": {
+    "type": "bool",
+    "description": "无人回时自收尾",
+    "hint": "主动发的话没人回时，过一阵自己收场（'没事就随口一说'）。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "closer_after_hours": {
+    "type": "int",
+    "description": "收尾等待时长（小时）",
+    "hint": "主动发的话隔多久没人回才收尾。推荐10小时。",
+    "obvious_hint": true,
+    "default": 10,
+    "min": 2,
+    "max": 72
+  },
+  "track_own_replies": {
+    "type": "bool",
+    "description": "记住自己说过的话",
+    "hint": "开启后Bot知道自己上一句说了什么，追问才能接上。强烈推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "use_core_clock": {
+    "type": "bool",
+    "description": "按角色时区计时",
+    "hint": "按角色所在城市的时间算（需要Humanoid Core）。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "user_cooldown_minutes": {
+    "type": "int",
+    "description": "单人联系冷却（分钟）",
+    "hint": "同一个人两次被主动联系的最短间隔。30分钟是防刷屏护栏，真正节奏由念头决定。",
+    "obvious_hint": true,
+    "default": 30,
+    "min": 10,
+    "max": 2880
+  },
+  "max_sends_per_round": {
+    "type": "int",
+    "description": "每轮最多联系几人",
+    "hint": "一轮心跳（8-15分钟）最多主动联系几个不同的人。推荐2-3个。",
+    "obvious_hint": true,
+    "default": 2,
+    "min": 1,
+    "max": 10
+  },
+  "quiet_start": {
+    "type": "int",
+    "description": "安静时段开始（小时）",
+    "hint": "这段时间几乎不主动说话。推荐23点（晚上11点）。",
+    "obvious_hint": true,
+    "default": 23,
+    "min": 0,
+    "max": 23
+  },
+  "quiet_end": {
+    "type": "int",
+    "description": "安静时段结束（小时）",
+    "hint": "安静时段结束时间。推荐7点（早上7点）。",
+    "obvious_hint": true,
+    "default": 7,
+    "min": 0,
+    "max": 23
+  },
+  "private_only": {
+    "type": "bool",
+    "description": "只主动私聊",
+    "hint": "开启后只主动私聊，不在群里主动说话。推荐开启（群聊分寸更难把握）。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "debug": {
+    "type": "bool",
+    "description": "输出调试日志",
+    "hint": "日志会显示'为什么发/为什么不发'。排查问题时开启，平时建议关闭。",
+    "obvious_hint": true,
+    "default": false
+  },
+  "max_message_length": {
+    "type": "int",
+    "description": "单条消息长度上限（字）",
+    "hint": "单条消息最多多少字。推荐100-150字。",
+    "obvious_hint": true,
+    "default": 120,
+    "min": 10,
+    "max": 500
+  },
+  "strip_roleplay_actions": {
+    "type": "bool",
+    "description": "去除括号动作",
+    "hint": "去掉'（轻轻抱你）''*摸摸头*'这类动作描写。推荐开启（更像正常聊天）。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "allow_emoji": {
+    "type": "bool",
+    "description": "保留emoji",
+    "hint": "是否保留emoji表情。推荐关闭（每句末尾一个❤️很像AI）。",
+    "obvious_hint": true,
+    "default": false
+  },
+  "allow_burst": {
+    "type": "bool",
+    "description": "连发模式",
+    "hint": "一次说话拆成2-3条短句，间隔1-3分钟发。推荐开启（更像真人打字）。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "max_burst_parts": {
+    "type": "int",
+    "description": "连发最多条数",
+    "hint": "一次最多拆成几条。推荐2-3条。",
+    "obvious_hint": true,
+    "default": 3,
+    "min": 1,
+    "max": 3
+  },
+  "greeting_enabled": {
+    "type": "bool",
+    "description": "早晚问候",
+    "hint": "到了时间主动说早安/晚安。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "greeting_morning_start": {
+    "type": "int",
+    "description": "早安开始时间（小时）",
+    "hint": "早安窗口开始。推荐7-8点。",
+    "obvious_hint": true,
+    "default": 7,
+    "min": 0,
+    "max": 23
+  },
+  "greeting_morning_end": {
+    "type": "int",
+    "description": "早安结束时间（小时）",
+    "hint": "早安窗口结束。推荐11点。",
+    "obvious_hint": true,
+    "default": 11,
+    "min": 1,
+    "max": 24
+  },
+  "greeting_night_start": {
+    "type": "int",
+    "description": "晚安开始时间（小时）",
+    "hint": "晚安窗口开始。推荐21点（晚上9点）。",
+    "obvious_hint": true,
+    "default": 21,
+    "min": 0,
+    "max": 23
+  },
+  "greeting_night_end": {
+    "type": "int",
+    "description": "晚安结束时间（小时）",
+    "hint": "晚安窗口结束。推荐24点（午夜）。",
+    "obvious_hint": true,
+    "default": 24,
+    "min": 1,
+    "max": 24
+  },
+  "group_flow_enabled": {
+    "type": "bool",
+    "description": "群聊主动接话",
+    "hint": "Bot在群里说过话后，会继续关注群聊并主动接话（无需@）。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "group_icebreak_enabled": {
+    "type": "bool",
+    "description": "群聊冷场破冰",
+    "hint": "群太久没人说话时，主动抛个话题。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "group_ref_lib_enabled": {
+    "type": "bool",
+    "description": "群聊风格学习",
+    "hint": "学习群里的说话风格，让接话更自然。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "group_store_message_text": {
+    "type": "bool",
+    "description": "存储群聊消息",
+    "hint": "是否保存群友发言作为参考。关闭后更隐私，但风格学习会失效。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "flow_window_minutes": {
+    "type": "int",
+    "description": "群聊关注窗口（分钟）",
+    "hint": "Bot说话后关注群聊多久。推荐10分钟。",
+    "obvious_hint": true,
+    "default": 10,
+    "min": 1,
+    "max": 60
+  },
+  "flow_min_gap_seconds": {
+    "type": "int",
+    "description": "群聊插话间隔（秒）",
+    "hint": "两次插话最少间隔多久。推荐60秒。",
+    "obvious_hint": true,
+    "default": 60,
+    "min": 10,
+    "max": 600
+  },
+  "flow_max_replies_per_window": {
+    "type": "int",
+    "description": "窗口内最多接几次",
+    "hint": "一个关注窗口内最多接几次话。推荐3次。",
+    "obvious_hint": true,
+    "default": 3,
+    "min": 1,
+    "max": 10
+  },
+  "flow_hourly_cap": {
+    "type": "int",
+    "description": "群聊每小时上限",
+    "hint": "每群每小时最多插话几次。推荐5次。",
+    "obvious_hint": true,
+    "default": 5,
+    "min": 1,
+    "max": 60
+  },
+  "flow_ignored_exit": {
+    "type": "int",
+    "description": "连续被忽略后退出",
+    "hint": "连续插话几次都没人理就停下来。推荐2次。",
+    "obvious_hint": true,
+    "default": 2,
+    "min": 1,
+    "max": 10
+  },
+  "group_idle_hours": {
+    "type": "float",
+    "description": "破冰冷场时长（小时）",
+    "hint": "群安静多久才考虑破冰。推荐8小时。",
+    "obvious_hint": true,
+    "default": 8.0,
+    "min": 1.0,
+    "max": 240.0
+  },
+  "icebreak_daily_cap": {
+    "type": "int",
+    "description": "每日破冰上限",
+    "hint": "每群每天最多破冰几次。推荐1-2次。",
+    "obvious_hint": true,
+    "default": 1,
+    "min": 1,
+    "max": 10
+  },
+  "group_stale_days": {
+    "type": "int",
+    "description": "群退出判定天数",
+    "hint": "多少天没在群里见到消息就当已退群。推荐5天。",
+    "obvious_hint": true,
+    "default": 5,
+    "min": 1,
+    "max": 90
+  },
+  "group_ref_sample_size": {
+    "type": "int",
+    "description": "群聊参考库容量",
+    "hint": "每群保留多少条群友发言样本。推荐30条。",
+    "obvious_hint": true,
+    "default": 30,
+    "min": 5,
+    "max": 200
+  },
+  "group_ref_prompt_count": {
+    "type": "int",
+    "description": "风格样本抽取数",
+    "hint": "生成时参考多少条群友发言。推荐5-8条。",
+    "obvious_hint": true,
+    "default": 6,
+    "min": 0,
+    "max": 30
+  },
+  "topic_memory_count": {
+    "type": "int",
+    "description": "话题记忆数量",
+    "hint": "记住最近多少个聊天话题。推荐5个。设0关闭话题记忆。",
+    "obvious_hint": true,
+    "default": 5,
+    "min": 0,
+    "max": 20
+  },
+  "context_inject_count": {
+    "type": "int",
+    "description": "上下文条数",
+    "hint": "生成时参考多少条最近对话（含Bot自己说的）。10条能接上上文又不太冗长。",
+    "obvious_hint": true,
+    "default": 10,
+    "min": 0,
+    "max": 50
+  },
+  "weekend_boost": {
+    "type": "bool",
+    "description": "周末更活跃",
+    "hint": "周末让念头涨得快一些（×1.25）。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "energy_threshold": {
+    "type": "int",
+    "description": "精力阈值",
+    "hint": "精力低于此值时念头几乎不涨。推荐15。",
+    "obvious_hint": true,
+    "default": 15,
+    "min": 0,
+    "max": 100
+  },
+  "social_energy_threshold": {
+    "type": "int",
+    "description": "社交能量阈值",
+    "hint": "社交能量低于此值时不想说话。推荐20。",
+    "obvious_hint": true,
+    "default": 20,
+    "min": 0,
+    "max": 100
+  },
+  "adaptive_reply_rate": {
+    "type": "bool",
+    "description": "按回复率调节",
+    "hint": "对方不接话会慢慢减少主动频率。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "reply_window_hours": {
+    "type": "int",
+    "description": "回复判定窗口（小时）",
+    "hint": "主动消息发出后多久内对方回话才算'接住了'。推荐3小时。",
+    "obvious_hint": true,
+    "default": 3,
+    "min": 1,
+    "max": 48
+  },
+  "owner_only_commands": {
+    "type": "bool",
+    "description": "指令仅主人可用",
+    "hint": "'触发社交''社交状态'等指令是否仅主人可用。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "allowed_trigger_uids": {
+    "type": "list",
+    "description": "指令白名单",
+    "hint": "除主人外允许谁使用指令（填user_id）。",
+    "obvious_hint": true,
+    "default": []
+  },
+  "store_message_text": {
+    "type": "bool",
+    "description": "存储私聊消息",
+    "hint": "是否保存私聊消息正文。关闭后更隐私，但功能会削弱。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "user_retention_days": {
+    "type": "int",
+    "description": "闲置用户清理天数",
+    "hint": "多少天没联系的用户会被清理历史数据。推荐45天，设0永不清理。",
+    "obvious_hint": true,
+    "default": 45,
+    "min": 0,
+    "max": 3650
+  },
+  "history_ingest": {
+    "type": "bool",
+    "description": "导入历史会话",
+    "hint": "从AstrBot会话库导入之前聊过的人。推荐开启（装插件后立即能用）。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "seed_users": {
+    "type": "list",
+    "description": "主动认识名单",
+    "hint": "即使没聊过也会主动联系的user_id列表。每项一个ID，如：12345",
+    "obvious_hint": true,
+    "default": []
+  },
+  "seed_platform": {
+    "type": "string",
+    "description": "默认平台",
+    "hint": "seed_users的默认平台（如aiocqhttp、wechat）。推荐aiocqhttp。",
+    "obvious_hint": true,
+    "default": "aiocqhttp"
+  }
+}

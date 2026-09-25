@@ -1,1 +1,7 @@
-IiIi6Ieq5Li75ouf5Lq656S+5Lqk5o+S5Lu25YaF5qC444CCIiIiCgpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IGFubm90YXRpb25zCgpfX3ZlcnNpb25fXyA9ICIxLjE0LjIiCgpMT0dfUFJFRklYID0gIlthdXRvbm9tb3VzX3NvY2lhbF0iCg==
+"""自主拟人社交插件内核。"""
+
+from __future__ import annotations
+
+__version__ = "1.14.2"
+
+LOG_PREFIX = "[autonomous_social]"

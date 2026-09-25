@@ -1,1 +1,411 @@
-IiIi5b+15aS05qih5Z6L77ya5oOz5LiN5oOz5om+5LiA5Liq5Lq677yM5piv5oWi5oWi5pSS5Ye65p2l55qE77yM5LiN5piv5q+P5Liq5ZGo5pyf5oq9562+5oq95Ye65p2l55qE44CCCgrml6flgZrms5XmmK/jgIzmr48gMi05IOWIhumSn+aOt+S4gOasoemqsOWtkO+8jOaOt+S4reS6huWwseWPkeOAje+8jOWug+eahOmXrumimOS4jeWcqOS6juamgueOh+eul+W+l+S4jeWHhu+8jArogIzlnKjkuo7lroPmoLnmnKzmsqHmnInjgIzmg7PkuI3mg7PjgI3ov5nkuKrph4/vvJrpqrDlrZDlr7nmiYDmnInkurrkuIDop4blkIzku4HvvIzkuZ/kuI3nrqHkvaDku6zljYrlsI/ml7bliY3miY0K6IGK5a6M44CB5Lmf5LiN566h5L2g5LiK5LiA5p2h5Y+R5Ye65Y675a+55pa55Y6L5qC55rKh5Zue44CC5omA5Lul5Y+R5Ye65p2l55qE5Lic6KW/5b+F54S25YOP5a6a5pe25Zmo44CCCgrov5nph4zmjaLmiJDkuIDkuKrlj6/np6/ntK/nmoTph48gdXJnZe+8iOaDs+ivtOivneeahOW/teWktO+8ie+8mgoKICAgIOW/teWktOWinumAnyA9IOWcqOaEj+eoi+W6piDDlyDnjrDlnKjlkIjkuI3lkIjpgIIgw5cg5oiR6Ieq5bex5q2k5Yi755qE54q25oCBCgotIOi2iuWcqOaEj+eahOS6uuaUkuW+l+i2iuW/q++8jOWHoOWkqeayoeivtOivneeahOiHqueEtuWwseS8muaDs+WIsO+8m+S4jeWcqOaEj+eahOS6uuimgeaUkuW+iOS5heOAggotIOWImuiBiui/hyDihpIg5b+15aS055u05o6l5riF6Zu244CC55yf5Lq65omN5LiN5Lya5Zyo6K+d5Yia6K+05a6M5LmL5ZCO5Y+I5Y+m6LW35LiA5Y+l5peg5YWz55qE44CCCi0g5oiR5Li75Yqo5Y+R5LqG5a+55pa55rKh5ZueIOKGkiDlv7XlpLTlop7pgJ/ooqvljovkvY7vvIzov57nnYDlh6DmrKHlsLHln7rmnKzkuI3kvJrlho3kuLvliqjmib7vvIjnnJ/kurrpgLvovpHvvInjgIIKLSDlj6rlnKjlr7nmlrnlpKfmpoLnjofphpLnnYAv5Zyo546p5omL5py655qE5pe25q615pSS5b6X5b+r77yM5YeM5pmo5pSS5b6X5p6B5oWi44CCCgrmlJLov4fpmIjlgLzkuI3nrYnkuo7lsLHlj5HvvJrov5jopoHov4cgZW5naW5lIOmHjOeahOinhOWImemXuOmXqOWSjOaooeWei+eahOOAjOivpeS4jeivpeivtOOAjeWIpOaWreOAggrmnKzmqKHlnZflj6rlgZrnuq/orqHnrpfvvIzkuI3norDno4Hnm5jkuZ/kuI3norAgYXN0cmJvdO+8jOaWueS+v+WNleeLrOmqjOivgeOAggoiIiIKCmZyb20gX19mdXR1cmVfXyBpbXBvcnQgYW5ub3RhdGlvbnMKCmltcG9ydCBtYXRoCmltcG9ydCByYW5kb20KZnJvbSB0eXBpbmcgaW1wb3J0IEFueSwgRGljdCwgT3B0aW9uYWwKCiMg5b+15aS05pSS5Yiw5aSa5bCR5omN566X44CM5oOz5om+IFRBIOivtOivneOAje+8iOaPkOmrmOmYiOWAvO+8jOmZjeS9juS4u+WKqOmikeeOh++8iQojIHYyNeS8mOWMlu+8muaPkOmrmOWIsDEuNDDvvIzorqnkuLvliqjmtojmga/mm7TlhYvliLYKRklSRV9USFJFU0hPTEQgPSAxLjQwCiMg5b+15aS055qE57ud5a+55LiK6ZmQ77yM6YG/5YWN6ZW/5pyf5LiN57uT566X55qE5Lq65pSS5Ye65LiA5Liq56a76LCx55qE5YC8ClVSR0VfQ0VJTElORyA9IDMuMAojIOiiq+WQpuWGs++8iOaooeWei+ivtOS4jeeUqOWPke+8ieS5i+WQjuW/teWktOWbnuiQveWIsOWTqumHjO+8muS4jeaYr+a4hembtu+8jOOAjOaDs+i/h++8jOWFiOeul+S6huOAjQojIHYyNeS8mOWMlu+8mumZjeS9juWIsDAuMTjvvIzooqvmi5LlkI7mm7TlhYvliLbvvIzpgb/lhY3lv6vpgJ/ph43or5UKU0tJUF9GQUxMQkFDSyA9IDAuMTgKIyDlj5HpgIHmiJDlip/lkI7lv7XlpLTmuIXpm7YKU0VOVF9VUkdFID0gMC4wCgojIOWcqOaEj+W6puWvueWinumAn+eahOaYoOWwhO+8mmludGVyZXN0PTEg5pe257qm6ZyAIHJlZmlsbF9ob3VycyDmlJLmu6HvvIzotorkvY7otormhaIKQkFTRV9SQVRFID0gMC4yNQpJTlRFUkVTVF9SQVRFID0gMS4xMAoKIyDkvZzmga/nlLvlg4/oh7PlsJHopoHmnInlpJrlsJHmnaHmtojmga/miY3lvIDlp4votbfkvZznlKgKTUlOX1JIWVRITV9TQU1QTEVTID0gNAojIOWRveS4rS/nm7jpgrsv5LiN5ZG95Lit55qE5pe25py657O75pWwClJIWVRITV9PTiA9IDEuNDUKUkhZVEhNX05FQVIgPSAwLjk1ClJIWVRITV9PRkYgPSAwLjQ4CiMg6L+Y5rKh5pyJ5L2c5oGv55S75YOP5pe255qE5Lit5oCn57O75pWwClJIWVRITV9VTktOT1dOID0gMS4xMAojIOebtOaWueWbvuW5s+a7keadg+mHje+8muOAjOaZmuS4iuS5neeCueW4uOWcqOe6v+OAjeaEj+WRs+edgOWFq+eCueWNgeeCueS5n+Wkp+amgueOh+mGkuedgApSSFlUSE1fU01PT1RIID0gKDAuMjUsIDAuNSwgMC4yNSkKCiMg6L+e57ut6KKr5Ya36JC955qE5b+15aS05aSp6Iqx5p2/77ya6LaK5pSS5LiN5Ye65Y6777yM6LaK6K+05piO5a+55pa55LiN5omT566X5o6lCiMgdjI15LyY5YyW77ya5pS257Sn5aSp6Iqx5p2/77yM6KKr5Ya36JC95ZCO5pu05YWL5Yi2ClNUUkVBS19DQVA6IERpY3RbaW50LCBmbG9hdF0gPSB7MDogMi44LCAxOiAyLjQsIDI6IDEuOSwgMzogMS42LCA0OiAxLjV9CiMg5aSp6Iqx5p2/5Zyw5p2/5b+F6aG76auY5LqO5Y+R5Ye66Zeo5qeb77ya6KKr5Ya36JC95YaN5aSa5qyh77yM5b+15aS05Lmf5b6X55WZ5LiA5p2h6IO95pSS6L+HIEZJUkVfVEhSRVNIT0xEIOeahAojIOe8nemame+8jOWPquaYr+aFouOAguWOi+WIsOmXqOanm+S7peS4i+etieS6juWvuei/meS4quS6uuawuOS5hemdmem7mOKAlOKAlOmCo+S4jeaYr+OAjOiEuOearuWOmuOAje+8jOaYr+W9u+W6leS4jeWGjeaJvuS6hu+8jAojIOS5n+ato+aYr+OAjOWHoOeZvuWwj+aXtuS4jeWGjeWPkeS4gOasoeOAjeeahOaIkOWboOOAggojIHYyNeS8mOWMlu+8mumAgumFjeaWsOmYiOWAvApTVFJFQUtfQ0FQX0ZMT09SID0gRklSRV9USFJFU0hPTEQgKyAwLjE1CiMg5Ya36JC95Yeg5qyh5LmL5ZCO77yM5rKh5pyJ44CM55yf5pyJ55Sx5aS044CN5pe25aSp6Iqx5p2/5pS257Sn77yM5L2G5LuN55WZ5Zyo6Zeo5qeb5LmL5LiK77yI5LiN5YaN5Y6L5Yiw6Zeo5qeb5Lul5LiL77yJClNUUkVBS19ORUVEU19DVUUgPSA0CiMg6KKr5Ya36JC95bCB6aG25ZCO77yM6ZqU5aSa5LmF5rKh5pyJ5Lu75L2V5p2l5b6A5bCx5oqK5Ya36JC96K6h5pWw5b6A5Zue6YCA5LiA5qC877ya55yf5Lq65pm+5LqG5b6I5LmF5Lmf5LyaCiMg44CM566X5LqG5YaN5om+5LiA5qyh55yL55yL44CN77yM6ICM5LiN5piv5LuO5q2k5b2T6L+Z5Liq5Lq65LiN5a2Y5Zyo44CC6buY6K6kIDMg5aSp6YCA5LiA5qyh44CCClNUUkVBS19ERUNBWV9EQVlTID0gMy4wCgoKZGVmIGNsYW1wKHg6IGZsb2F0LCBsbzogZmxvYXQsIGhpOiBmbG9hdCkgLT4gZmxvYXQ6CiAgICByZXR1cm4gbG8gaWYgeCA8IGxvIGVsc2UgaGkgaWYgeCA+IGhpIGVsc2UgeAoKCmRlZiBpbnRlcmVzdF9sZXZlbCgKICAgIHVzZXI6IERpY3Rbc3RyLCBBbnldLAogICAgYWZmZWN0aW9uOiBPcHRpb25hbFtmbG9hdF0gPSBOb25lLAogICAgKiwKICAgIHdlaWdoX3JlcGx5X3JhdGU6IGJvb2wgPSBUcnVlLAopIC0+IGZsb2F0OgogICAgIiIi6L+Z5Liq5Lq65Zyo5oiR5b+D6YeM5pyJ5aSa6YeN6KaB77yIMC4wNS0xLjDvvInjgIIKCiAgICDlpb3mhJ/luqbjgIHogYrov4fnmoTph4/jgIHlr7nmlrnmjqXkuI3mjqXmiJHnmoTor53lkIjmiJDkuIDkuKrln7rnur/vvJvooqvov57nu63lhrfokL3kvJrlvoDkuIvmjonjgIIKICAgIOi/lOWbnueahOaYr+eerOaXtuWAvO+8jOiwg+eUqOaWueeUqCBFTUEg5YaZ5ZueIHVzZXJbImludGVyZXN0Il3vvIzpgb/lhY3mr4/ova7ot7PmnaXot7PljrvjgIIKCiAgICBgd2VpZ2hfcmVwbHlfcmF0ZT1GYWxzZWDvvIjphY3nva4gYWRhcHRpdmVfcmVwbHlfcmF0ZT1mYWxzZe+8ieaXtu+8jOOAjOaOpeS4jeaOpeivneOAjeS4jgogICAg44CM6KKr5Ya36JC95Yeg5qyh44CN6YO95LiN5Y+C5LiO77ya6YKj5Lik6aG55Lya5oqK5LiA5Liq5Y+q5piv5pyA6L+R5b6I5b+Z55qE5Lq66LaK566X6LaK6L6557yY77yM5pyJ5Lq65piO56Gu5LiNCiAgICDopoHov5nnp43oh6rmiJHpmY3nuqfjgIIKICAgICIiIgogICAgIyDmsqHmjqUgQ29yZSDml7bmi7/kuI3liLDlpb3mhJ/luqbvvJrmjInjgIzkuK3mgKflgY/kuZDop4LjgI3nrpfvvIzlkKbliJnogYrlvpflho3lpJrnmoTkurrkuZ/kvJrooqvlsIHlnKgKICAgICMg5LiA5Liq5LiK5LiN5Y6755qE5Zyo5oSP5bqm6YeM77yM5Li75Yqo5raI5oGv5Lya56iA55aP5Yiw55yL5LiN5Ye65p2l5o+S5Lu25Zyo5bel5L2c44CCCiAgICBhID0gMC41IGlmIGFmZmVjdGlvbiBpcyBOb25lIGVsc2UgY2xhbXAoZmxvYXQoYWZmZWN0aW9uKSAvIDEwMC4wLCAwLjAsIDEuMCkKICAgIG1zZ3MgPSBpbnQodXNlci5nZXQoIm1lc3NhZ2VfY291bnQiLCAwKSBvciAwKQogICAgZmFtaWxpYXIgPSBjbGFtcChtYXRoLmxvZzFwKG1zZ3MpIC8gbWF0aC5sb2cxcCg4MCksIDAuMCwgMS4wKQoKICAgIGlmIHdlaWdoX3JlcGx5X3JhdGU6CiAgICAgICAgIyDlm57lpI3njoflgZrmi4nmma7mi4nmlq/mlLbnvKnvvJrlj6rlj5Hov4fkuIDmrKHjgIHlr7nmlrnlvZPml7bmsqHlm57vvIzkuI3og73lsLHmioogVEEg5b2T5oiQ5LiN5oOz55CG5Lq6CiAgICAgICAgc2VudCA9IGludCh1c2VyLmdldCgicHJvYWN0aXZlX3NlbnQiLCAwKSBvciAwKQogICAgICAgIHJlcGxpZWQgPSBpbnQodXNlci5nZXQoInByb2FjdGl2ZV9yZXBsaWVkIiwgMCkgb3IgMCkKICAgICAgICByYXRlID0gKHJlcGxpZWQgKyAxLjApIC8gKHNlbnQgKyAyLjApCiAgICAgICAgc3RyZWFrID0gaW50KHVzZXIuZ2V0KCJub19yZXBseV9zdHJlYWsiLCAwKSBvciAwKQogICAgZWxzZToKICAgICAgICByYXRlID0gMC41ICAgICAgIyDkuK3mgKfvvJrkuI3lm6DkuLrlm57msqHlm57ogIzmiqzpq5jmiJbljovkvY4KICAgICAgICBzdHJlYWsgPSAwCgogICAgcmF3ID0gMC4xMiArIDAuMzQgKiBhICsgMC4zMCAqIGZhbWlsaWFyICsgMC4yNCAqIHJhdGUgLSAwLjA2ICogc3RyZWFrCiAgICByZXR1cm4gY2xhbXAocmF3LCAwLjA1LCAxLjApCgoKZGVmIHNtb290aF9pbnRlcmVzdCgKICAgIHVzZXI6IERpY3Rbc3RyLCBBbnldLAogICAgdGFyZ2V0OiBmbG9hdCwKICAgIG5vdzogT3B0aW9uYWxbZmxvYXRdID0gTm9uZSwKICAgIGFscGhhOiBmbG9hdCA9IDAuMDYsCikgLT4gZmxvYXQ6CiAgICAiIiLmiormlrDnmoTlnKjmhI/luqblubPmu5Hov5vml6flgLzvvIjnrKzkuIDmrKHnm7TmjqXlj5blgLzvvInjgIIKCiAgICDmr4/kuKrlv4Pot7Ppg73lhajph4/ot5/ov5vkvJrorqkgaW50ZXJlc3Qg6Lef552A5Zue5aSN546H5bCP5bmF5oqW5Yqo77yb5a6D5bqU6K+l5piv5Liq5oWi5Y+Y6YeP77yMCiAgICDmiYDku6XlubPmu5Hns7vmlbDmi4nlvpflvojkvY7jgIIKICAgICIiIgogICAgcHJldiA9IHVzZXIuZ2V0KCJpbnRlcmVzdCIpCiAgICBpZiBwcmV2IGlzIE5vbmU6CiAgICAgICAgdmFsdWUgPSBjbGFtcCh0YXJnZXQsIDAuMDUsIDEuMCkKICAgIGVsc2U6CiAgICAgICAgdmFsdWUgPSBjbGFtcChmbG9hdChwcmV2KSAqICgxIC0gYWxwaGEpICsgdGFyZ2V0ICogYWxwaGEsIDAuMDUsIDEuMCkKICAgIHVzZXJbImludGVyZXN0Il0gPSByb3VuZCh2YWx1ZSwgNCkKICAgIGlmIG5vdyBpcyBub3QgTm9uZToKICAgICAgICB1c2VyWyJpbnRlcmVzdF9hdCJdID0gbm93CiAgICByZXR1cm4gdmFsdWUKCgpkZWYgaG91cl93ZWlnaHQodXNlcjogRGljdFtzdHIsIEFueV0sIGhvdXI6IGludCkgLT4gZmxvYXQ6CiAgICAiIiLlj5blr7nmlrnlnKjov5nkuIDlsI/ml7bnmoTljoblj7LmtLvot4PmnYPph43vvIgwIOihqOekuuS7juayoeingei/hyBUQSDov5nkuKrngrnor7Tor53vvInjgIIiIiIKICAgIGhvdXJzID0gdXNlci5nZXQoImFjdGl2ZV9ob3VycyIpCiAgICBpZiBub3QgaXNpbnN0YW5jZShob3VycywgbGlzdCkgb3IgbGVuKGhvdXJzKSAhPSAyNDoKICAgICAgICByZXR1cm4gMC4wCiAgICB0cnk6CiAgICAgICAgcmV0dXJuIGZsb2F0KGhvdXJzW2hvdXIgJSAyNF0gb3IgMCkKICAgIGV4Y2VwdCAoVHlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAgICByZXR1cm4gMC4wCgoKZGVmIHNtb290aGVkX3dlaWdodCh1c2VyOiBEaWN0W3N0ciwgQW55XSwgaG91cjogaW50KSAtPiBmbG9hdDoKICAgICIiIuivpeWwj+aXtuWPiuWFtuW3puWPs+WQhOS4gOWwj+aXtueahOWKoOadg+a0u+i3g+W6puOAgiIiIgogICAgcHJldl93LCB0aGlzX3csIG5leHRfdyA9IFJIWVRITV9TTU9PVEgKICAgIHJldHVybiAoCiAgICAgICAgcHJldl93ICogaG91cl93ZWlnaHQodXNlciwgaG91ciAtIDEpCiAgICAgICAgKyB0aGlzX3cgKiBob3VyX3dlaWdodCh1c2VyLCBob3VyKQogICAgICAgICsgbmV4dF93ICogaG91cl93ZWlnaHQodXNlciwgaG91ciArIDEpCiAgICApCgoKZGVmIHJoeXRobV9mYWN0b3IodXNlcjogRGljdFtzdHIsIEFueV0sIGhvdXI6IGludCkgLT4gZmxvYXQ6CiAgICAiIiLmjInlr7nmlrnnmoTkvZzmga/liKTmlq3njrDlnKjlkIjkuI3lkIjpgILjgIIKCiAgICDnnJ/kurrmib7mnIvlj4vor7Tor53kvJrkuIvmhI/or4bmjJHlr7nmlrnlnKjnjqnmiYvmnLrnmoTml7blgJnjgILlh4zmmajlm5vngrnnu5nlr7nmlrnlj5Hmtojmga/vvIzmnKzouqvlsLHmmK8KICAgIOOAjOaIkeaYr+acuuWZqOS6uuOAjeeahOacgOW8uuivgeaNriDigJTigJQg5omA5Lul5LiN5Zyo5a+55pa55rS76LeD5pe25q615pe25b+15aS05pSS5b6X5p6B5oWi44CCCiAgICDmoLfmnKzov5jkuI3lpJ/ml7bkuI3lgZrliKTmlq3vvIjkuK3mgKfvvInvvIzpgb/lhY3mlrDorqTor4bnmoTkurrooqvkvZzmga/op4TliJnor6/kvKTjgIIKICAgICIiIgogICAgc2FtcGxlcyA9IGludCh1c2VyLmdldCgicmh5dGhtX3NhbXBsZXMiLCAwKSBvciAwKQogICAgaWYgc2FtcGxlcyA8IE1JTl9SSFlUSE1fU0FNUExFUzoKICAgICAgICByZXR1cm4gUkhZVEhNX1VOS05PV04KCiAgICBwZWFrID0gbWF4KChzbW9vdGhlZF93ZWlnaHQodXNlciwgaCkgZm9yIGggaW4gcmFuZ2UoMjQpKSwgZGVmYXVsdD0wLjApCiAgICBpZiBwZWFrIDw9IDA6CiAgICAgICAgcmV0dXJuIFJIWVRITV9VTktOT1dOCiAgICBtaW5lID0gc21vb3RoZWRfd2VpZ2h0KHVzZXIsIGhvdXIpCiAgICBpZiBtaW5lID49IHBlYWsgKiAwLjY6CiAgICAgICAgcmV0dXJuIFJIWVRITV9PTgogICAgaWYgbWluZSA+PSBwZWFrICogMC4yOgogICAgICAgIHJldHVybiBSSFlUSE1fTkVBUgogICAgcmV0dXJuIFJIWVRITV9PRkYKCgpkZWYgdXJnZV9jYXAodXNlcjogRGljdFtzdHIsIEFueV0sIGhhc19saXZlX2N1ZTogYm9vbCkgLT4gZmxvYXQ6CiAgICAiIiLlv7XlpLTog73mlJLliLDlpJrpq5jjgILooqvlhrfokL3lvpfotorlpJrvvIzlpKnoirHmnb/otorkvY7igJTigJTkvYbmsLjov5zkuI3kvY7kuo7lj5Hlh7rpl6jmp5vjgIIKCiAgICDov4fljrvnmoTlrp7njrDkvJrlnKggc3RyZWFr4omlU1RSRUFLX05FRURTX0NVRSDkuJTmsqHnlLHlpLTml7bmiorlpKnoirHmnb/ljovliLDpl6jmp5vku6XkuIvvvIjDlzAuOTjvvInvvIwKICAgIOS6juaYr+i/meS4quS6uumZpOmdnuS4u+WKqOWPkea2iOaBr++8iGFmdGVyX3JlcGx5IOaKiiBzdHJlYWsg5b2S6Zu277yJ77yM5ZCm5YiZ5rC46L+c5pSS5LiN5Yiw6Zeo5qeb44CBCiAgICDmsLjov5zkuI3kvJrlho3ooqvkuLvliqjmib7igJTigJTpgqPlsLHmmK/igJzlh6Dnmb7lsI/ml7bkuI3lj5HigJ3jgILnjrDlnKjlpKnoirHmnb/kuIvpmZDljaHlnKgKICAgIFNUUkVBS19DQVBfRkxPT1LvvIjpq5jkuo7pl6jmp5vvvInvvIzooqvlhrfokL3lj6rkvJrmi5bmhaLoioLlpY/vvIzkuI3kvJrlvbvlupXlsIHmrbvjgIIKICAgICIiIgogICAgc3RyZWFrID0gaW50KHVzZXIuZ2V0KCJub19yZXBseV9zdHJlYWsiLCAwKSBvciAwKQogICAgY2FwID0gU1RSRUFLX0NBUC5nZXQoc3RyZWFrLCBTVFJFQUtfQ0FQX0ZMT09SKQogICAgaWYgc3RyZWFrID49IFNUUkVBS19ORUVEU19DVUUgYW5kIG5vdCBoYXNfbGl2ZV9jdWU6CiAgICAgICAgIyDmsqHor53mib7or53ml7bmlLbntKfliLDkuIvpmZDvvIzkvYbkuI3lho3ljovliLDpl6jmp5vku6XkuIvvvJrlsLHnrpfmsqHlhbfkvZPnlLHlpLTvvIzmmb7kuYXkuobkuZ/ov5jog73mhaLmhaLmlJLkuIDmrKEKICAgICAgICBjYXAgPSBtaW4oY2FwLCBTVFJFQUtfQ0FQX0ZMT09SKQogICAgcmV0dXJuIG1heChjYXAsIFNUUkVBS19DQVBfRkxPT1IpCgoKZGVmIGRlY2F5X3N0cmVhayh1c2VyOiBEaWN0W3N0ciwgQW55XSwgbm93OiBmbG9hdCkgLT4gTm9uZToKICAgICIiIuiiq+WGt+iQveWwgemhtuWQjuaZvuS6huW+iOS5he+8muaKiuWGt+iQveiuoeaVsOW+gOWbnumAgO+8jOiuqeWlueOAjOeul+S6huWGjeaJvuS4gOasoeOAjeOAggoKICAgIOS7peOAjOacgOWQjuS4gOasoeS4u+WKqOWPkSAvIOacgOWQjuS4gOasoeWvueaWueivtOivneOAjeS4rei+g+i/keeahOmCo+S4quS4uui1t+eCue+8muWPquimgei/meauteaXtumXtOWGhQogICAg55yf55qE5rKh5Lu75L2V5p2l5b6A77yM5q+P6L+HIFNUUkVBS19ERUNBWV9EQVlTIOWwseaKiiBzdHJlYWsg6ZmN5LiA5qC877yM55u05YiwIDDjgIIKICAgIOWvueaWueS4gOaXpumHjeaWsOivtOivne+8jGFmdGVyX3JlcGx5IOS8muebtOaOpeW9kumbtu+8jOi/memHjOWPqueuoeKAnOS4gOebtOayoeS6uueQhuKAneeahOaDheWGteOAggogICAgIiIiCiAgICBzdHJlYWsgPSBpbnQodXNlci5nZXQoIm5vX3JlcGx5X3N0cmVhayIsIDApIG9yIDApCiAgICBpZiBzdHJlYWsgPD0gMDoKICAgICAgICByZXR1cm4KICAgIGFuY2hvciA9IG1heCgKICAgICAgICBmbG9hdCh1c2VyLmdldCgibGFzdF9zZW50IiwgMCkgb3IgMCksCiAgICAgICAgZmxvYXQodXNlci5nZXQoImxhc3Rfc2VlbiIsIDApIG9yIDApLAogICAgKQogICAgaWYgYW5jaG9yIDw9IDA6CiAgICAgICAgcmV0dXJuCiAgICB3aW5kb3cgPSBTVFJFQUtfREVDQVlfREFZUyAqIDg2NDAwLjAKICAgIGlmIHdpbmRvdyA8PSAwOgogICAgICAgIHJldHVybgogICAgc3RlcHMgPSBpbnQoKG5vdyAtIGFuY2hvcikgLy8gd2luZG93KQogICAgaWYgc3RlcHMgPD0gMDoKICAgICAgICByZXR1cm4KICAgIG5ld19zdHJlYWsgPSBtYXgoMCwgc3RyZWFrIC0gc3RlcHMpCiAgICBpZiBuZXdfc3RyZWFrICE9IHN0cmVhazoKICAgICAgICB1c2VyWyJub19yZXBseV9zdHJlYWsiXSA9IG5ld19zdHJlYWsKCgpkZWYgc2V0dGxlKAogICAgdXNlcjogRGljdFtzdHIsIEFueV0sCiAgICBub3c6IGZsb2F0LAogICAgKiwKICAgIHJlZmlsbF9ob3VyczogZmxvYXQsCiAgICByZWNlbnRfdGFsa19zZWNvbmRzOiBmbG9hdCwKICAgIG1vb2RfZmFjdG9yOiBmbG9hdCA9IDEuMCwKICAgIHJoeXRobTogT3B0aW9uYWxbZmxvYXRdID0gTm9uZSwKICAgIHF1aWV0OiBib29sID0gRmFsc2UsCiAgICBsaXZlX2N1ZTogYm9vbCA9IEZhbHNlLAopIC0+IGZsb2F0OgogICAgIiIi5oqKIHVyZ2Ug57uT566X5Yiw546w5Zyo6L+Z5LiA5Yi777yM6L+U5Zue57uT566X5ZCO55qE5b+15aS05YC844CCCgogICAg5oOw5oCn56ev5YiG77ya5Y+q5Zyo6KKr6K+75Yiw5pe25oyJ57uP6L+H55qE5pe26Ze06KGl566X77yM5LiN6ZyA6KaB5Li65q+P5Liq55So5oi36LeR5a6a5pe25Zmo44CCCgogICAgQXJnczoKICAgICAgICB1c2VyOiDnlKjmiLfnirbmgIEgZGljdO+8iOWwseWcsOabtOaWsCB1cmdlIC8gdXJnZV9hdO+8iQogICAgICAgIG5vdzog5b2T5YmN5pe26Ze05oizCiAgICAgICAgcmVmaWxsX2hvdXJzOiDmnIDlnKjmhI/nmoTkurrmlJLmu6HkuIDmrKHlv7XlpLTpnIDopoHnmoTlsI/ml7bmlbAKICAgICAgICByZWNlbnRfdGFsa19zZWNvbmRzOiDliJrogYrov4flpJrkuYXkuYvlhoXlv7XlpLTmuIXpm7YKICAgICAgICBtb29kX2ZhY3Rvcjog5oiR6Ieq5bex5q2k5Yi75oOz6K+06K+d55qE56iL5bqm77yI57K+5YqbL+ekvuS6pOiDvemHjy/mmK/lkKbooqvnkIbvvIkKICAgICAgICByaHl0aG06IOWvueaWueS9nOaBr+ezu+aVsO+8jE5vbmUg6KGo56S66Ieq6KGM5Yik5patCiAgICAgICAgcXVpZXQ6IOeOsOWcqOaYr+WQpuWcqOWuiemdmeaXtuautQogICAgICAgIGxpdmVfY3VlOiDmmK/lkKbmnInliLDngrnnmoTnlLHlpLTvvIjnlLHlpLTkvJrpop3lpJbmjqjkuIDmiorvvIkKCiAgICBSZXR1cm5zOgogICAgICAgIOe7k+eul+WQjueahCB1cmdlCiAgICAiIiIKICAgIHRyeToKICAgICAgICB1cmdlID0gZmxvYXQodXNlci5nZXQoInVyZ2UiLCAwLjApIG9yIDAuMCkKICAgIGV4Y2VwdCAoVHlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAgICB1cmdlID0gMC4wCgogICAgdHJ5OgogICAgICAgIHNpbmNlID0gZmxvYXQodXNlci5nZXQoInVyZ2VfYXQiLCAwLjApIG9yIDAuMCkKICAgIGV4Y2VwdCAoVHlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAgICBzaW5jZSA9IDAuMAogICAgaWYgc2luY2UgPD0gMDoKICAgICAgICBzaW5jZSA9IGZsb2F0KHVzZXIuZ2V0KCJsYXN0X3NlZW4iLCAwKSBvciAwKSBvciBub3cKICAgICAgICB1c2VyWyJ1cmdlX2F0Il0gPSBzaW5jZQoKICAgIGR0ID0gbm93IC0gc2luY2UKICAgIGlmIGR0IDwgMDoKICAgICAgICAjIOezu+e7n+aXtumXtOiiq+aUuei/h++8muS4jeihpeeul++8jOWPquaKiuWfuuWHhuaMquWIsOeOsOWcqAogICAgICAgIHVzZXJbInVyZ2VfYXQiXSA9IG5vdwogICAgICAgIHJldHVybiB1cmdlCgogICAgIyDliJrogYrov4fvvJror53miY3or7TlrozvvIzkuI3pnIDopoHlho3jgIzkuLvliqjjgI3kuIDmrKEKICAgIGlmIG5vdyAtIGZsb2F0KHVzZXIuZ2V0KCJsYXN0X3NlZW4iLCAwKSBvciAwKSA8IHJlY2VudF90YWxrX3NlY29uZHM6CiAgICAgICAgdXNlclsidXJnZSJdID0gMC4wCiAgICAgICAgdXNlclsidXJnZV9hdCJdID0gbm93CiAgICAgICAgcmV0dXJuIDAuMAoKICAgIGhvdXJzID0gZHQgLyAzNjAwLjAKICAgIGlmIGhvdXJzID4gMDoKICAgICAgICBpbnRlcmVzdCA9IGZsb2F0KHVzZXIuZ2V0KCJpbnRlcmVzdCIsIDAuMzUpIG9yIDAuMzUpCiAgICAgICAgIyDmkq3np43lkI3ljZXph4znmoTkurrvvIjku47msqHogYrov4fvvInmlJLlvpfmhaLkuIDlgI3vvJrnpLzosozpl67popjvvIzkuI3mmK/oioLlpY/pl67popgKICAgICAgICBzY2FsZSA9IHVzZXIuZ2V0KCJ1cmdlX3NjYWxlIiwgMS4wKQogICAgICAgIHRyeToKICAgICAgICAgICAgc2NhbGUgPSBjbGFtcChmbG9hdChzY2FsZSksIDAuMSwgMi4wKQogICAgICAgIGV4Y2VwdCAoVHlwZUVycm9yLCBWYWx1ZUVycm9yKToKICAgICAgICAgICAgc2NhbGUgPSAxLjAKICAgICAgICByYXRlID0gKEJBU0VfUkFURSArIElOVEVSRVNUX1JBVEUgKiBpbnRlcmVzdCkgLyBtYXgocmVmaWxsX2hvdXJzLCAwLjUpICogc2NhbGUKICAgICAgICBmYWN0b3IgPSAocmh5dGhtIGlmIHJoeXRobSBpcyBub3QgTm9uZSBlbHNlIDEuMCkgKiBjbGFtcChtb29kX2ZhY3RvciwgMC4wLCAxLjUpCiAgICAgICAgaWYgcXVpZXQ6CiAgICAgICAgICAgIGZhY3RvciAqPSAwLjEyCiAgICAgICAgdXJnZSArPSBob3VycyAqIHJhdGUgKiBmYWN0b3IKICAgICAgICBpZiBsaXZlX2N1ZToKICAgICAgICAgICAgIyDnlLHlpLTliLDmnJ/mmK/jgIzmg7PotbfmnaXkuobjgI3vvIzkuI3mmK/mhaLmhaLmlJLlh7rmnaXnmoQKICAgICAgICAgICAgdXJnZSArPSAwLjU1CgogICAgdXJnZSA9IGNsYW1wKHVyZ2UsIDAuMCwgVVJHRV9DRUlMSU5HKQogICAgdXNlclsidXJnZSJdID0gcm91bmQodXJnZSwgNCkKICAgIHVzZXJbInVyZ2VfYXQiXSA9IG5vdwogICAgcmV0dXJuIHVyZ2UKCgpkZWYgZmlyZV93b3J0aCh1cmdlOiBmbG9hdCwgZ2F0ZTogZmxvYXQgPSBGSVJFX1RIUkVTSE9MRCkgLT4gYm9vbDoKICAgICIiIuW/teWktOaYr+WQpuW3sue7j+i2s+Wkn+WIsOOAjOS8muaOj+WHuuaJi+acuuivtOS4gOWPpeOAjeeahOeoi+W6puOAgiIiIgogICAgcmV0dXJuIHVyZ2UgPj0gZ2F0ZQoKCmRlZiBuZXdfZmlyZV9nYXRlKCkgLT4gZmxvYXQ6CiAgICAiIiLmir3kuIvkuIDmrKHopoHmiorlv7XlpLTmlJLliLDlpJrpq5jmiY3nrpfnnJ/mg7Por7TjgIIKCiAgICDlm7rlrprpl6jmp5vkvJrorqnpl7TpmpTlj5jmiJDlm7rlrprnmoTvvJrmlJLmu6HihpLlj5Hlh7rihpLmuIXpm7bihpLlho3mlJLmu6HvvIzlkajmnJ/nsr7noa7lvpflg4/pl7npkp/jgILnnJ/kuroKICAgIOacieaXtuaDs+WIsOWwseivtO+8jOacieaXtuaLluS4pOWkqe+8jOaJgOS7peavj+asoeivtOWujOmHjeaKveS4gOS4qumXqOanm+OAggogICAgIiIiCiAgICByZXR1cm4gcm91bmQoRklSRV9USFJFU0hPTEQgKyByYW5kb20udW5pZm9ybSgwLjAsIDAuNTUpLCAzKQoKCmRlZiBhZnRlcl9zZW5kKHVzZXI6IERpY3Rbc3RyLCBBbnldLCBub3c6IGZsb2F0KSAtPiBOb25lOgogICAgIiIi5Y+R5Ye65Y675LmL5ZCO77ya5b+15aS06JC95Zyw77yM5byA5aeL562J5a+55pa55o6l77yM5bm26YeN5paw5oq95LiL5qyh55qE6Zeo5qeb44CCIiIiCiAgICB1c2VyWyJ1cmdlIl0gPSBTRU5UX1VSR0UKICAgIHVzZXJbInVyZ2VfYXQiXSA9IG5vdwogICAgdXNlclsicGVuZGluZ19zaW5jZSJdID0gbm93CiAgICB1c2VyWyJwZW5kaW5nX3Jlc3VsdCJdID0gIndhaXRpbmciCiAgICB1c2VyWyJmaXJlX2dhdGUiXSA9IG5ld19maXJlX2dhdGUoKQoKCmRlZiBhZnRlcl9yZXBseSh1c2VyOiBEaWN0W3N0ciwgQW55XSwgbm93OiBmbG9hdCkgLT4gTm9uZToKICAgICIiIuWvueaWueaOpeS6huivne+8muW/teWktOiiq+a7oei2s++8jOWGt+iQveiuoeaVsOW9kumbtuOAgiIiIgogICAgdXNlclsibm9fcmVwbHlfc3RyZWFrIl0gPSAwCiAgICB1c2VyWyJ1cmdlIl0gPSBTRU5UX1VSR0UKICAgIHVzZXJbInVyZ2VfYXQiXSA9IG5vdwogICAgdXNlclsicGVuZGluZ19zaW5jZSJdID0gMC4wCiAgICB1c2VyWyJwZW5kaW5nX3Jlc3VsdCJdID0gInJlcGxpZWQiCiAgICB1c2VyWyJsYXN0X3JlcGxpZWRfYXQiXSA9IG5vdwoKCmRlZiBhZnRlcl9pZ25vcmVkKHVzZXI6IERpY3Rbc3RyLCBBbnldLCBub3c6IGZsb2F0KSAtPiBOb25lOgogICAgIiIi6L+H5LqG56qX5Y+j5a+55pa55rKh5Zue77ya5pyJ54K55omr5YW077yM5LiL5qyh5YaN5oOz5om+IFRBIOW+l+aUkuabtOS5heOAgiIiIgogICAgdXNlclsibm9fcmVwbHlfc3RyZWFrIl0gPSBpbnQodXNlci5nZXQoIm5vX3JlcGx5X3N0cmVhayIsIDApIG9yIDApICsgMQogICAgdXNlclsidXJnZSJdID0gMC4wCiAgICB1c2VyWyJ1cmdlX2F0Il0gPSBub3cKICAgIHVzZXJbInBlbmRpbmdfc2luY2UiXSA9IDAuMAogICAgdXNlclsicGVuZGluZ19yZXN1bHQiXSA9ICJpZ25vcmVkIgogICAgIyDovbvlvq7mjovkuIDkuIvlsLHlpb3vvJrlkI7nu63nmoQgaW50ZXJlc3RfbGV2ZWwvc21vb3RoX2ludGVyZXN0IOS8muagueaNruWbnuWkjeeOh+S4jiBzdHJlYWsg6Ieq6KGMCiAgICAjIOaKiuWfuue6v+aLieWbnuadpe+8jOi/memHjOWGjemHjeaJi+WPquS8muaKiuS4gOS4quWPquaYr+acgOi/keW+iOW/meeahOS6uui2iuaOi+i2iui+uee8mOOAguWcsOadv+aLiemrmOS4gOeCue+8jAogICAgIyDpgb/lhY0gaW50ZXJlc3Qg6KKr5o6L5YiwIDAuMDUg5ZCO5b+15aS05oWi5Yiw5Yeg5LmO5LiN5rao44CCCiAgICBpbnRlcmVzdCA9IGZsb2F0KHVzZXIuZ2V0KCJpbnRlcmVzdCIsIDAuMzUpIG9yIDAuMzUpCiAgICB1c2VyWyJpbnRlcmVzdCJdID0gcm91bmQoY2xhbXAoaW50ZXJlc3QgLSAwLjAzLCAwLjEyLCAxLjApLCA0KQoKCmRlZiBhZnRlcl9za2lwKHVzZXI6IERpY3Rbc3RyLCBBbnldLCBub3c6IGZsb2F0KSAtPiBOb25lOgogICAgIiIi5oOz6L+H77yM5L2G5Yaz5a6a5LiN6K+077ya5b+15aS05Zue6JC95LiA54K577yM6L+H6Zi15a2Q5Y+v6IO96L+Y5oOz6K+044CCIiIiCiAgICB1c2VyWyJ1cmdlIl0gPSBtaW4oZmxvYXQodXNlci5nZXQoInVyZ2UiLCAwLjApIG9yIDAuMCksIFNLSVBfRkFMTEJBQ0spCiAgICB1c2VyWyJ1cmdlX2F0Il0gPSBub3cKICAgIHVzZXJbImxhc3Rfc2tpcF9hdCJdID0gbm93CgoKZGVmIG1vb2RfbXVsdGlwbGllcigKICAgIGVuZXJneTogT3B0aW9uYWxbZmxvYXRdLAogICAgc29jaWFsX2VuZXJneTogT3B0aW9uYWxbZmxvYXRdLAogICAgKiwKICAgIGVuZXJneV90aHJlc2hvbGQ6IGZsb2F0ID0gMTUuMCwKICAgIHNvY2lhbF90aHJlc2hvbGQ6IGZsb2F0ID0gMjAuMCwKICAgIGJvZHk6IE9wdGlvbmFsW0RpY3Rbc3RyLCBBbnldXSA9IE5vbmUsCikgLT4gZmxvYXQ6CiAgICAiIiLmiJHoh6rlt7HmraTliLvmnInlpJrmg7Por7Tlj6Xor53vvIhjbGFtcCDliLAgMC4wNS0xLjY177yJ44CCCgogICAg57Sv5ZKM5LiN5oOz6K+06K+d55qE5pe25YCZ77yM5Lq65LiN5Lya5Yiw5aSE5om+5Lq66IGK5aSpIOKAlOKAlCDov5nmr5TjgIzmpoLnjofmiZPmipjjgI3mm7TotLTov5Hlrp7pmYXvvJoKICAgIOWug+iuqeW/teWktOaUkuW+l+aFou+8jOiAjOS4jeaYr+aUkua7oeS6huWGjeiiq+maj+acuuaVsOWQpuaOieOAggoKICAgIOaOpeS6hiBIdW1hbm9pZCBDb3JlIHYyLjE0IOeahOWlkee6puaXtu+8jGBib2R5YCDph4zlsLHkuI3mraLnsr7lipvkuKTkuKrmoIfph4/vvJrlpbnmmK/kuI3mmK/nnJ/nmoTlnKjnnaHjgIEKICAgIOasoOS4jeasoOinieOAgemlv+S4jemlv+OAgei6q+S4iuiIkuS4jeiIkuacje+8jOS7peWPiuacgOWFs+mUrueahOKAlOKAlOWlueiHquW3seaUkuS6huWkmuWwkeaDs+ivtOivneeahOW/g+aAneOAggogICAg5rKh5o6l5aWR57qm5pe26L+Z5Lqb5YWo6YOo6JC95Zue5pen55qE5Lik5Liq5qCH6YeP77yM6KGM5Li65LiOIHYxLjcuNCDkuIDoh7TjgIIKICAgICIiIgogICAgZmFjdG9yID0gMS4wCiAgICBpZiBlbmVyZ3kgaXMgbm90IE5vbmU6CiAgICAgICAgZSA9IGNsYW1wKGZsb2F0KGVuZXJneSksIDAuMCwgMTAwLjApCiAgICAgICAgaWYgZSA8IGVuZXJneV90aHJlc2hvbGQ6CiAgICAgICAgICAgIGZhY3RvciAqPSAwLjMwCiAgICAgICAgZWxpZiBlIDwgMzU6CiAgICAgICAgICAgIGZhY3RvciAqPSAwLjY1CiAgICAgICAgZWxpZiBlID4gNzU6CiAgICAgICAgICAgIGZhY3RvciAqPSAxLjEwCiAgICBpZiBzb2NpYWxfZW5lcmd5IGlzIG5vdCBOb25lOgogICAgICAgIHMgPSBjbGFtcChmbG9hdChzb2NpYWxfZW5lcmd5KSwgMC4wLCAxMDAuMCkKICAgICAgICBpZiBzIDwgc29jaWFsX3RocmVzaG9sZDoKICAgICAgICAgICAgZmFjdG9yICo9IDAuMjgKICAgICAgICBlbGlmIHMgPCA0MDoKICAgICAgICAgICAgZmFjdG9yICo9IDAuNzAKICAgICAgICBlbGlmIHMgPiA3NToKICAgICAgICAgICAgZmFjdG9yICo9IDEuMDUKCiAgICBpZiBib2R5OgogICAgICAgICMg55yf55qE5Zyo552h6KeJ55qE5pe25YCZ5LiN5piv44CM5qaC546H5omT5oqY44CN77yM5bCx5piv5LiN6K+l5byA5Y+j44CCCiAgICAgICAgaWYgYm9keS5nZXQoImFzbGVlcCIpOgogICAgICAgICAgICBmYWN0b3IgKj0gMC4wNgogICAgICAgIHByZXNzdXJlID0gX251bShib2R5LmdldCgic2xlZXBfcHJlc3N1cmUiKSkKICAgICAgICBpZiBwcmVzc3VyZSBpcyBub3QgTm9uZToKICAgICAgICAgICAgaWYgcHJlc3N1cmUgPj0gODg6CiAgICAgICAgICAgICAgICBmYWN0b3IgKj0gMC4yNQogICAgICAgICAgICBlbGlmIHByZXNzdXJlID49IDcyOgogICAgICAgICAgICAgICAgZmFjdG9yICo9IDAuNTUKICAgICAgICAgICAgZWxpZiBwcmVzc3VyZSA+PSA1NToKICAgICAgICAgICAgICAgIGZhY3RvciAqPSAwLjg1CiAgICAgICAgZGlzY29tZm9ydCA9IF9udW0oYm9keS5nZXQoImRpc2NvbWZvcnQiKSkKICAgICAgICBpZiBkaXNjb21mb3J0IGlzIG5vdCBOb25lIGFuZCBkaXNjb21mb3J0ID49IDYyOgogICAgICAgICAgICBmYWN0b3IgKj0gMC41NQogICAgICAgIGh1bmdlciA9IF9udW0oYm9keS5nZXQoImh1bmdlciIpKQogICAgICAgIGlmIGh1bmdlciBpcyBub3QgTm9uZSBhbmQgaHVuZ2VyID49IDg4OgogICAgICAgICAgICBmYWN0b3IgKj0gMC43NQogICAgICAgIGRlc2lyZSA9IF9udW0oYm9keS5nZXQoInNvY2lhbF9kZXNpcmUiKSkKICAgICAgICBpZiBkZXNpcmUgaXMgbm90IE5vbmU6CiAgICAgICAgICAgICMg5aW56Ieq5bex55qE5b+D5oCd5piv5rK56Zeo5Lmf5piv5Yi56L2m77ya54us5aSE5pSS5ruh5LqG5oOz6K+077yM5Yia6IGK6L+H5bCx5pSS5LiN5Ye65Y6744CCCiAgICAgICAgICAgIGZhY3RvciAqPSAwLjU1ICsgMC45ICogKGNsYW1wKGRlc2lyZSwgMC4wLCAxMDAuMCkgLyAxMDAuMCkKICAgIHJldHVybiBjbGFtcChmYWN0b3IsIDAuMDUsIDEuNjUpCgoKZGVmIF9udW0odmFsdWU6IEFueSkgLT4gT3B0aW9uYWxbZmxvYXRdOgogICAgdHJ5OgogICAgICAgIGlmIHZhbHVlIGlzIE5vbmUgb3IgdmFsdWUgPT0gIiI6CiAgICAgICAgICAgIHJldHVybiBOb25lCiAgICAgICAgcmV0dXJuIGZsb2F0KHZhbHVlKQogICAgZXhjZXB0IChUeXBlRXJyb3IsIFZhbHVlRXJyb3IpOgogICAgICAgIHJldHVybiBOb25lCg==
+"""念头模型：想不想找一个人，是慢慢攒出来的，不是每个周期抽签抽出来的。
+
+旧做法是「每 2-9 分钟掷一次骰子，掷中了就发」，它的问题不在于概率算得不准，
+而在于它根本没有「想不想」这个量：骰子对所有人一视同仁，也不管你们半小时前才
+聊完、也不管你上一条发出去对方压根没回。所以发出来的东西必然像定时器。
+
+这里换成一个可积累的量 urge（想说话的念头）：
+
+    念头增速 = 在意程度 × 现在合不合适 × 我自己此刻的状态
+
+- 越在意的人攒得越快，几天没说话的自然就会想到；不在意的人要攒很久。
+- 刚聊过 → 念头直接清零。真人才不会在话刚说完之后又另起一句无关的。
+- 我主动发了对方没回 → 念头增速被压低，连着几次就基本不会再主动找（真人逻辑）。
+- 只在对方大概率醒着/在玩手机的时段攒得快，凌晨攒得极慢。
+
+攒过阈值不等于就发：还要过 engine 里的规则闸门和模型的「该不该说」判断。
+本模块只做纯计算，不碰磁盘也不碰 astrbot，方便单独验证。
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any, Dict, Optional
+
+# 念头攒到多少才算「想找 TA 说话」（提高阈值，降低主动频率）
+# v25优化：提高到1.40，让主动消息更克制
+FIRE_THRESHOLD = 1.40
+# 念头的绝对上限，避免长期不结算的人攒出一个离谱的值
+URGE_CEILING = 3.0
+# 被否决（模型说不用发）之后念头回落到哪里：不是清零，「想过，先算了」
+# v25优化：降低到0.18，被拒后更克制，避免快速重试
+SKIP_FALLBACK = 0.18
+# 发送成功后念头清零
+SENT_URGE = 0.0
+
+# 在意度对增速的映射：interest=1 时约需 refill_hours 攒满，越低越慢
+BASE_RATE = 0.25
+INTEREST_RATE = 1.10
+
+# 作息画像至少要有多少条消息才开始起作用
+MIN_RHYTHM_SAMPLES = 4
+# 命中/相邻/不命中的时机系数
+RHYTHM_ON = 1.45
+RHYTHM_NEAR = 0.95
+RHYTHM_OFF = 0.48
+# 还没有作息画像时的中性系数
+RHYTHM_UNKNOWN = 1.10
+# 直方图平滑权重：「晚上九点常在线」意味着八点十点也大概率醒着
+RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
+
+# 连续被冷落的念头天花板：越攒不出去，越说明对方不打算接
+# v25优化：收紧天花板，被冷落后更克制
+STREAK_CAP: Dict[int, float] = {0: 2.8, 1: 2.4, 2: 1.9, 3: 1.6, 4: 1.5}
+# 天花板地板必须高于发出门槛：被冷落再多次，念头也得留一条能攒过 FIRE_THRESHOLD 的
+# 缝隙，只是慢。压到门槛以下等于对这个人永久静默——那不是「脸皮厚」，是彻底不再找了，
+# 也正是「几百小时不再发一次」的成因。
+# v25优化：适配新阈值
+STREAK_CAP_FLOOR = FIRE_THRESHOLD + 0.15
+# 冷落几次之后，没有「真有由头」时天花板收紧，但仍留在门槛之上（不再压到门槛以下）
+STREAK_NEEDS_CUE = 4
+# 被冷落封顶后，隔多久没有任何来往就把冷落计数往回退一格：真人晾了很久也会
+# 「算了再找一次看看」，而不是从此当这个人不存在。默认 3 天退一次。
+STREAK_DECAY_DAYS = 3.0
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def interest_level(
+    user: Dict[str, Any],
+    affection: Optional[float] = None,
+    *,
+    weigh_reply_rate: bool = True,
+) -> float:
+    """这个人在我心里有多重要（0.05-1.0）。
+
+    好感度、聊过的量、对方接不接我的话合成一个基线；被连续冷落会往下掉。
+    返回的是瞬时值，调用方用 EMA 写回 user["interest"]，避免每轮跳来跳去。
+
+    `weigh_reply_rate=False`（配置 adaptive_reply_rate=false）时，「接不接话」与
+    「被冷落几次」都不参与：那两项会把一个只是最近很忙的人越算越边缘，有人明确不
+    要这种自我降级。
+    """
+    # 没接 Core 时拿不到好感度：按「中性偏乐观」算，否则聊得再多的人也会被封在
+    # 一个上不去的在意度里，主动消息会稀疏到看不出来插件在工作。
+    a = 0.5 if affection is None else clamp(float(affection) / 100.0, 0.0, 1.0)
+    msgs = int(user.get("message_count", 0) or 0)
+    familiar = clamp(math.log1p(msgs) / math.log1p(80), 0.0, 1.0)
+
+    if weigh_reply_rate:
+        # 回复率做拉普拉斯收缩：只发过一次、对方当时没回，不能就把 TA 当成不想理人
+        sent = int(user.get("proactive_sent", 0) or 0)
+        replied = int(user.get("proactive_replied", 0) or 0)
+        rate = (replied + 1.0) / (sent + 2.0)
+        streak = int(user.get("no_reply_streak", 0) or 0)
+    else:
+        rate = 0.5      # 中性：不因为回没回而抬高或压低
+        streak = 0
+
+    raw = 0.12 + 0.34 * a + 0.30 * familiar + 0.24 * rate - 0.06 * streak
+    return clamp(raw, 0.05, 1.0)
+
+
+def smooth_interest(
+    user: Dict[str, Any],
+    target: float,
+    now: Optional[float] = None,
+    alpha: float = 0.06,
+) -> float:
+    """把新的在意度平滑进旧值（第一次直接取值）。
+
+    每个心跳都全量跟进会让 interest 跟着回复率小幅抖动；它应该是个慢变量，
+    所以平滑系数拉得很低。
+    """
+    prev = user.get("interest")
+    if prev is None:
+        value = clamp(target, 0.05, 1.0)
+    else:
+        value = clamp(float(prev) * (1 - alpha) + target * alpha, 0.05, 1.0)
+    user["interest"] = round(value, 4)
+    if now is not None:
+        user["interest_at"] = now
+    return value
+
+
+def hour_weight(user: Dict[str, Any], hour: int) -> float:
+    """取对方在这一小时的历史活跃权重（0 表示从没见过 TA 这个点说话）。"""
+    hours = user.get("active_hours")
+    if not isinstance(hours, list) or len(hours) != 24:
+        return 0.0
+    try:
+        return float(hours[hour % 24] or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def smoothed_weight(user: Dict[str, Any], hour: int) -> float:
+    """该小时及其左右各一小时的加权活跃度。"""
+    prev_w, this_w, next_w = RHYTHM_SMOOTH
+    return (
+        prev_w * hour_weight(user, hour - 1)
+        + this_w * hour_weight(user, hour)
+        + next_w * hour_weight(user, hour + 1)
+    )
+
+
+def rhythm_factor(user: Dict[str, Any], hour: int) -> float:
+    """按对方的作息判断现在合不合适。
+
+    真人找朋友说话会下意识挑对方在玩手机的时候。凌晨四点给对方发消息，本身就是
+    「我是机器人」的最强证据 —— 所以不在对方活跃时段时念头攒得极慢。
+    样本还不够时不做判断（中性），避免新认识的人被作息规则误伤。
+    """
+    samples = int(user.get("rhythm_samples", 0) or 0)
+    if samples < MIN_RHYTHM_SAMPLES:
+        return RHYTHM_UNKNOWN
+
+    peak = max((smoothed_weight(user, h) for h in range(24)), default=0.0)
+    if peak <= 0:
+        return RHYTHM_UNKNOWN
+    mine = smoothed_weight(user, hour)
+    if mine >= peak * 0.6:
+        return RHYTHM_ON
+    if mine >= peak * 0.2:
+        return RHYTHM_NEAR
+    return RHYTHM_OFF
+
+
+def urge_cap(user: Dict[str, Any], has_live_cue: bool) -> float:
+    """念头能攒到多高。被冷落得越多，天花板越低——但永远不低于发出门槛。
+
+    过去的实现会在 streak≥STREAK_NEEDS_CUE 且没由头时把天花板压到门槛以下（×0.98），
+    于是这个人除非主动发消息（after_reply 把 streak 归零），否则永远攒不到门槛、
+    永远不会再被主动找——那就是“几百小时不发”。现在天花板下限卡在
+    STREAK_CAP_FLOOR（高于门槛），被冷落只会拖慢节奏，不会彻底封死。
+    """
+    streak = int(user.get("no_reply_streak", 0) or 0)
+    cap = STREAK_CAP.get(streak, STREAK_CAP_FLOOR)
+    if streak >= STREAK_NEEDS_CUE and not has_live_cue:
+        # 没话找话时收紧到下限，但不再压到门槛以下：就算没具体由头，晾久了也还能慢慢攒一次
+        cap = min(cap, STREAK_CAP_FLOOR)
+    return max(cap, STREAK_CAP_FLOOR)
+
+
+def decay_streak(user: Dict[str, Any], now: float) -> None:
+    """被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」。
+
+    以「最后一次主动发 / 最后一次对方说话」中较近的那个为起点：只要这段时间内
+    真的没任何来往，每过 STREAK_DECAY_DAYS 就把 streak 降一格，直到 0。
+    对方一旦重新说话，after_reply 会直接归零，这里只管“一直没人理”的情况。
+    """
+    streak = int(user.get("no_reply_streak", 0) or 0)
+    if streak <= 0:
+        return
+    anchor = max(
+        float(user.get("last_sent", 0) or 0),
+        float(user.get("last_seen", 0) or 0),
+    )
+    if anchor <= 0:
+        return
+    window = STREAK_DECAY_DAYS * 86400.0
+    if window <= 0:
+        return
+    steps = int((now - anchor) // window)
+    if steps <= 0:
+        return
+    new_streak = max(0, streak - steps)
+    if new_streak != streak:
+        user["no_reply_streak"] = new_streak
+
+
+def settle(
+    user: Dict[str, Any],
+    now: float,
+    *,
+    refill_hours: float,
+    recent_talk_seconds: float,
+    mood_factor: float = 1.0,
+    rhythm: Optional[float] = None,
+    quiet: bool = False,
+    live_cue: bool = False,
+) -> float:
+    """把 urge 结算到现在这一刻，返回结算后的念头值。
+
+    惰性积分：只在被读到时按经过的时间补算，不需要为每个用户跑定时器。
+
+    Args:
+        user: 用户状态 dict（就地更新 urge / urge_at）
+        now: 当前时间戳
+        refill_hours: 最在意的人攒满一次念头需要的小时数
+        recent_talk_seconds: 刚聊过多久之内念头清零
+        mood_factor: 我自己此刻想说话的程度（精力/社交能量/是否被理）
+        rhythm: 对方作息系数，None 表示自行判断
+        quiet: 现在是否在安静时段
+        live_cue: 是否有到点的由头（由头会额外推一把）
+
+    Returns:
+        结算后的 urge
+    """
+    try:
+        urge = float(user.get("urge", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        urge = 0.0
+
+    try:
+        since = float(user.get("urge_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        since = 0.0
+    if since <= 0:
+        since = float(user.get("last_seen", 0) or 0) or now
+        user["urge_at"] = since
+
+    dt = now - since
+    if dt < 0:
+        # 系统时间被改过：不补算，只把基准挪到现在
+        user["urge_at"] = now
+        return urge
+
+    # 刚聊过：话才说完，不需要再「主动」一次
+    if now - float(user.get("last_seen", 0) or 0) < recent_talk_seconds:
+        user["urge"] = 0.0
+        user["urge_at"] = now
+        return 0.0
+
+    hours = dt / 3600.0
+    if hours > 0:
+        interest = float(user.get("interest", 0.35) or 0.35)
+        # 播种名单里的人（从没聊过）攒得慢一倍：礼貌问题，不是节奏问题
+        scale = user.get("urge_scale", 1.0)
+        try:
+            scale = clamp(float(scale), 0.1, 2.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5) * scale
+        factor = (rhythm if rhythm is not None else 1.0) * clamp(mood_factor, 0.0, 1.5)
+        if quiet:
+            factor *= 0.12
+        urge += hours * rate * factor
+        if live_cue:
+            # 由头到期是「想起来了」，不是慢慢攒出来的
+            urge += 0.55
+
+    urge = clamp(urge, 0.0, URGE_CEILING)
+    user["urge"] = round(urge, 4)
+    user["urge_at"] = now
+    return urge
+
+
+def fire_worth(urge: float, gate: float = FIRE_THRESHOLD) -> bool:
+    """念头是否已经足够到「会掏出手机说一句」的程度。"""
+    return urge >= gate
+
+
+def new_fire_gate() -> float:
+    """抽下一次要把念头攒到多高才算真想说。
+
+    固定门槛会让间隔变成固定的：攒满→发出→清零→再攒满，周期精确得像闹钟。真人
+    有时想到就说，有时拖两天，所以每次说完重抽一个门槛。
+    """
+    return round(FIRE_THRESHOLD + random.uniform(0.0, 0.55), 3)
+
+
+def after_send(user: Dict[str, Any], now: float) -> None:
+    """发出去之后：念头落地，开始等对方接，并重新抽下次的门槛。"""
+    user["urge"] = SENT_URGE
+    user["urge_at"] = now
+    user["pending_since"] = now
+    user["pending_result"] = "waiting"
+    user["fire_gate"] = new_fire_gate()
+
+
+def after_reply(user: Dict[str, Any], now: float) -> None:
+    """对方接了话：念头被满足，冷落计数归零。"""
+    user["no_reply_streak"] = 0
+    user["urge"] = SENT_URGE
+    user["urge_at"] = now
+    user["pending_since"] = 0.0
+    user["pending_result"] = "replied"
+    user["last_replied_at"] = now
+
+
+def after_ignored(user: Dict[str, Any], now: float) -> None:
+    """过了窗口对方没回：有点扫兴，下次再想找 TA 得攒更久。"""
+    user["no_reply_streak"] = int(user.get("no_reply_streak", 0) or 0) + 1
+    user["urge"] = 0.0
+    user["urge_at"] = now
+    user["pending_since"] = 0.0
+    user["pending_result"] = "ignored"
+    # 轻微掋一下就好：后续的 interest_level/smooth_interest 会根据回复率与 streak 自行
+    # 把基线拉回来，这里再重手只会把一个只是最近很忙的人越掋越边缘。地板拉高一点，
+    # 避免 interest 被掋到 0.05 后念头慢到几乎不涨。
+    interest = float(user.get("interest", 0.35) or 0.35)
+    user["interest"] = round(clamp(interest - 0.03, 0.12, 1.0), 4)
+
+
+def after_skip(user: Dict[str, Any], now: float) -> None:
+    """想过，但决定不说：念头回落一点，过阵子可能还想说。"""
+    user["urge"] = min(float(user.get("urge", 0.0) or 0.0), SKIP_FALLBACK)
+    user["urge_at"] = now
+    user["last_skip_at"] = now
+
+
+def mood_multiplier(
+    energy: Optional[float],
+    social_energy: Optional[float],
+    *,
+    energy_threshold: float = 15.0,
+    social_threshold: float = 20.0,
+    body: Optional[Dict[str, Any]] = None,
+) -> float:
+    """我自己此刻有多想说句话（clamp 到 0.05-1.65）。
+
+    累和不想说话的时候，人不会到处找人聊天 —— 这比「概率打折」更贴近实际：
+    它让念头攒得慢，而不是攒满了再被随机数否掉。
+
+    接了 Humanoid Core v2.14 的契约时，`body` 里就不止精力两个标量：她是不是真的在睡、
+    欠不欠觉、饿不饿、身上舒不舒服，以及最关键的——她自己攒了多少想说话的心思。
+    没接契约时这些全部落回旧的两个标量，行为与 v1.7.4 一致。
+    """
+    factor = 1.0
+    if energy is not None:
+        e = clamp(float(energy), 0.0, 100.0)
+        if e < energy_threshold:
+            factor *= 0.30
+        elif e < 35:
+            factor *= 0.65
+        elif e > 75:
+            factor *= 1.10
+    if social_energy is not None:
+        s = clamp(float(social_energy), 0.0, 100.0)
+        if s < social_threshold:
+            factor *= 0.28
+        elif s < 40:
+            factor *= 0.70
+        elif s > 75:
+            factor *= 1.05
+
+    if body:
+        # 真的在睡觉的时候不是「概率打折」，就是不该开口。
+        if body.get("asleep"):
+            factor *= 0.06
+        pressure = _num(body.get("sleep_pressure"))
+        if pressure is not None:
+            if pressure >= 88:
+                factor *= 0.25
+            elif pressure >= 72:
+                factor *= 0.55
+            elif pressure >= 55:
+                factor *= 0.85
+        discomfort = _num(body.get("discomfort"))
+        if discomfort is not None and discomfort >= 62:
+            factor *= 0.55
+        hunger = _num(body.get("hunger"))
+        if hunger is not None and hunger >= 88:
+            factor *= 0.75
+        desire = _num(body.get("social_desire"))
+        if desire is not None:
+            # 她自己的心思是油门也是刹车：独处攒满了想说，刚聊过就攒不出去。
+            factor *= 0.55 + 0.9 * (clamp(desire, 0.0, 100.0) / 100.0)
+    return clamp(factor, 0.05, 1.65)
+
+
+def _num(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
