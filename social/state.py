@@ -17,7 +17,19 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from . import desire
-from .reasoning import is_question
+from .reasoning import CUE_LATE_LIMIT, is_question
+from .threads import LOOP_LATE_HOURS
+from .throttle import throttle
+
+from astrbot.api import logger
+
+
+def _safe_ts(value: Any, default: float = 0.0) -> float:
+    """时间戳容错转换。state.json 里的脏数据不该让正常流程抛异常。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 # ─── 常量定义 ───────────────────────────────────────
 
@@ -92,6 +104,10 @@ class SocialState:
         self.path = path
         self.data: Dict[str, Any] = {"version": STATE_VERSION, "bots": {}}
         self._dirty = False
+        # 读不出原来的记忆时上闸门：闸门未解除前拒绝写盘。不上闸门的话，
+        # 内存里已经是空壳，第一条新消息一标脏就会把空状态盖回磁盘。
+        self._load_failed = False
+        self._write_blocked_warned = False
         # 时间源可注入：所有落盘时间戳与调用方的判断必须同源，否则「刚聊过」「超时没回」
         # 这类判断会因为两处各取一次时钟而错位；测试与仿真也需要能推进它。
         self._now = time_source or time.time
@@ -143,10 +159,16 @@ class SocialState:
             "last_replied_at": 0.0,
             "last_skip_at": 0.0,
             "last_skip_reason": "",
-            # v1.7.4 由头：对方话里的时间锚点（「明天面试」）与它的到期时间
+            # v1.7.4 由头：对方话里的时间锚点（「明天面试」）与它的到期时间。
+            # cue_due 是锚点本身（一旦记下就不再改动），cue_expire_at 是它的绝对寿命，
+            # cue_retry_at 只是「最早能再试一次」的重试节奏。三者分开，推迟重试不会
+            # 顺带把寿命也续上——否则同一件事可以每 6 小时重试一次、永不作废。
             "cue": "",
             "cue_due": 0.0,
             "cue_at": 0.0,
+            "cue_expire_at": 0.0,
+            "cue_retry_at": 0.0,
+            "cue_tries": 0,
             # v1.8.0 她在主链路里自己说的话（after_message_sent 记账）：
             # 看不到这些时，插件以为她每说完一句对方都会回，未完话题也就无从判断。
             "last_spoken": 0.0,
@@ -155,10 +177,14 @@ class SocialState:
             # 未完话题：thread_for 记下「为哪一次断点追过」，一段沉默只追一次
             "thread_for": 0.0,
             "thread_at": 0.0,
-            # 隔一阵回访那件事：loop 是没说完的事，loop_due 是大概什么时候再问
+            # 隔一阵回访那件事：loop 是没说完的事，loop_due 是大概什么时候再问。
+            # 与 cue 同一套三字段分工
             "loop": "",
             "loop_due": 0.0,
             "loop_at": 0.0,
+            "loop_expire_at": 0.0,
+            "loop_retry_at": 0.0,
+            "loop_tries": 0,
             # 对方没回也不空着：closer_for 记下「为哪一次没人回收过场」
             "closer_for": 0.0,
             "closer_at": 0.0,
@@ -264,7 +290,10 @@ class SocialState:
         if is_bot:
             # bot 自己在群里说的话也存进 samples（标 self）：这样生成上下文里能看到自己
             # 刚说了什么，接话不至于自说自话/重复。风格参考库会滤掉 self，不学自己。
-            self._append_group_sample(g, text, now, sample_cap, self_flag=True)
+            # 但它同样要受 store_text 约束：这个开关在面板上承诺的是「更隐私」，
+            # 原来只关了一半——群友的话不存了，bot 自己说的每句照样逐条落盘。
+            if store_text:
+                self._append_group_sample(g, text, now, sample_cap, self_flag=True)
         elif store_text:
             self._append_group_sample(
                 g, text, now, sample_cap, self_flag=False, name=sender_name
@@ -295,7 +324,8 @@ class SocialState:
         if self_flag:
             entry["self"] = True
         samples.append(entry)
-        # bot 自己的话也占额度，缓冲放宽一点，别让几句自己的话把群友样本挤没了
+        # bot 自己的话也占额度，缓冲放宽一点，别让几句自己的话把群友样本挤没了。
+        # 上限必须是配置给的固定值：用「当前长度」当上限等于永不裁剪
         cap = max(1, int(sample_cap)) + 10
         if len(samples) > cap:
             del samples[: len(samples) - cap]
@@ -319,11 +349,23 @@ class SocialState:
             g["flow_ignored"] = 0
         self.mark_dirty()
 
-    def note_flow_reply(self, bid: str, gid: str, now: float, text: str) -> None:
+    def note_flow_reply(
+        self,
+        bid: str,
+        gid: str,
+        now: float,
+        text: str,
+        sample_cap: int = 30,
+        store_text: bool = True,
+    ) -> None:
         """记一次心流接话：窗口计数 +1、“连续自说自话”计数 +1、刷小时桶、记下接的话防重复。
 
         flow_ignored 在这里递增：统计“自上次真正被搞话（被@回）以来连着插了几句”。
         插够 flow_ignored_exit 次都没人正式搞你，就安静下来，别自说自话。不延长关注窗口。
+
+        sample_cap 必须是配置里的上限。这里原先传的是 `len(samples) or 30`——也就是
+        “当前长度”，于是每次心流插话的实际上限变成「当前长度+10」，追加一条后永远
+        不触发裁剪，样本只增不减。活跃群里跑几天就能堆到几百条，每次写盘都要全量重写。
         """
         g = self.group(bid, gid)
         g["flow_replies"] = int(g.get("flow_replies", 0) or 0) + 1
@@ -331,8 +373,9 @@ class SocialState:
         g["flow_last_reply_at"] = now
         g["last_bot_spoke"] = now
         g["last_flow_reply_text"] = str(text or "")[:120]
-        # 自己插的话也进近期发言缓冲，生成下一句时看得到
-        self._append_group_sample(g, text, now, len(g.get("samples") or []) or 30, self_flag=True)
+        # 自己插的话也进近期发言缓冲，生成下一句时看得到（同样受隐私开关约束）
+        if store_text:
+            self._append_group_sample(g, text, now, sample_cap, self_flag=True)
         bucket = int(now // 3600)
         if int(g.get("flow_hour_bucket", 0) or 0) == bucket:
             g["flow_hour_count"] = int(g.get("flow_hour_count", 0) or 0) + 1
@@ -353,13 +396,20 @@ class SocialState:
             self.mark_dirty()
 
     def record_group_self_text(
-        self, bid: str, gid: str, text: str, now: float, sample_cap: int = 30
+        self,
+        bid: str,
+        gid: str,
+        text: str,
+        now: float,
+        sample_cap: int = 30,
+        store_text: bool = True,
     ) -> None:
         """记下 bot 自己在群里补发的一句（连发续句）：只进近期发言缓冲供下一句参考，
         不动 last_seen/msg_count、不过心流闸、不计额。"""
         g = self.group(bid, gid)
         g["last_bot_spoke"] = now
-        self._append_group_sample(g, text, now, sample_cap, self_flag=True)
+        if store_text:
+            self._append_group_sample(g, text, now, sample_cap, self_flag=True)
         self.mark_dirty()
 
     def flow_hour_count(self, g: Dict[str, Any], now: float) -> int:
@@ -405,38 +455,62 @@ class SocialState:
     # ─── 加载与迁移 ──────────────────────────────────────────────
 
     def load(self) -> None:
-        """从磁盘加载状态。"""
+        """从磁盘加载状态。
+
+        任何一种「读不出原来那份记忆」的情况都走同一条路：备份原文件、报 error、
+        上写盘闸门。闸门未解除前拒绝写回——否则内存里已经是空壳，第一条新消息一
+        标脏就会把空状态盖回磁盘，把攒下的记忆抹干净且不留任何痕迹。
+        """
         try:
             if not os.path.exists(self.path):
                 return
-
             with open(self.path, encoding="utf-8") as f:
                 x = json.load(f)
+        except FileNotFoundError:
+            return
+        except json.JSONDecodeError as e:
+            self._fail_load(f"状态文件 JSON 损坏（{e}）")
+            return
+        except (OSError, UnicodeDecodeError) as e:
+            # UnicodeDecodeError 是 ValueError 的子类，不会被 json.JSONDecodeError 捕获，
+            # 但性质一样：原文件里的记忆读不出来，绝不能当「没有记忆」处理
+            self._fail_load(f"状态文件读不出来（{type(e).__name__}: {e}）")
+            return
+        except Exception as e:
+            self._fail_load(f"状态文件读取时发生意外错误（{e!r}）")
+            return
 
-            if isinstance(x, dict) and isinstance(x.get("bots"), dict):
-                self.data = x
-                self._migrate()
-                self._dirty = False
-        except json.JSONDecodeError:
-            # JSON 损坏，备份旧文件并重新开始
-            self._backup_corrupted_file()
-            self.data = {"version": STATE_VERSION, "bots": {}}
-            self._dirty = True
-        except OSError:
-            # 读取失败，使用空状态
-            self.data = {"version": STATE_VERSION, "bots": {}}
-            self._dirty = False
-        except Exception:
-            # 其他未知错误
-            self.data = {"version": STATE_VERSION, "bots": {}}
-            self._dirty = False
+        if not (isinstance(x, dict) and isinstance(x.get("bots"), dict)):
+            top = sorted(x)[:8] if isinstance(x, dict) else type(x).__name__
+            self._fail_load(
+                f"状态文件结构不是预期形状（顶层应为含 bots 的对象，实际顶层：{top}）"
+            )
+            return
 
-    def _backup_corrupted_file(self) -> None:
-        """备份损坏的状态文件。"""
+        self.data = x
+        # 先置不脏再迁移：_migrate 只在真的改了数据时才标脏。顺序反了的话，
+        # 迁移的结果会被当成「已落盘」而丢弃，下次启动又重跑一遍
+        self._dirty = False
+        self._migrate()
+
+    def _fail_load(self, reason: str) -> None:
+        """加载失败：备份原文件、报错、上闸门；内存留空壳且不标脏。"""
+        logger.error(f"[autonomous_social] {reason}，路径：{self.path}")
+        self._backup_unreadable()
+        self.data = {"version": STATE_VERSION, "bots": {}}
+        self._dirty = False
+        self._load_failed = True
+
+    def _backup_unreadable(self) -> None:
+        """把读不出来的原文件挪到一边，别让它被空状态覆盖。"""
         try:
-            backup_path = f"{self.path}.corrupted.{int(time.time())}"
+            backup_path = f"{self.path}.unreadable.{int(time.time())}"
             if os.path.exists(self.path):
                 os.rename(self.path, backup_path)
+                logger.error(
+                    f"[autonomous_social] 原状态文件已备份到 {backup_path}，"
+                    "确认后可自行删除；在修好它并重载插件之前，插件不会写回新状态。"
+                )
         except OSError:
             pass
 
@@ -613,7 +687,16 @@ class SocialState:
                     u[key] = ""
                 u["active_hours"] = [0.0] * RETENTION_RHYTHM_HOURS
                 u["rhythm_samples"] = 0
+                u["cue"] = ""
                 u["cue_due"] = 0.0
+                u["cue_expire_at"] = 0.0
+                u["cue_retry_at"] = 0.0
+                u["cue_tries"] = 0
+                u["loop"] = ""
+                u["loop_due"] = 0.0
+                u["loop_expire_at"] = 0.0
+                u["loop_retry_at"] = 0.0
+                u["loop_tries"] = 0
                 pruned += 1
 
         if pruned:
@@ -666,6 +749,10 @@ class SocialState:
 
     def save(self) -> None:
         """立即写入磁盘（原子操作）。"""
+        if self._load_failed:
+            raise RuntimeError(
+                f"状态文件此前读取失败，为免覆盖原数据已暂停写盘：{self.path}"
+            )
         try:
             self._write()
             self._dirty = False
@@ -676,14 +763,30 @@ class SocialState:
         """如果有变更则写入磁盘。适合周期性调用。
 
         Returns:
-            True 表示执行了写入，False 表示没有变更
+            True 表示执行了写入，False 表示没有变更、写入被闸门拦下、或写入失败
         """
+        if self._load_failed:
+            if not self._write_blocked_warned:
+                self._write_blocked_warned = True
+                logger.error(
+                    f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
+                    f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
+                )
+            return False
         if self._dirty:
             try:
                 self._write()
                 self._dirty = False
                 return True
-            except Exception:
+            except Exception as e:
+                # 磁盘满、权限变化之类：_dirty 保持 True 会重试，但必须让人知道
+                # 数据正在丢，不能只默默返回 False。写盘每 30 秒一次，不节流的话
+                # 磁盘满会在几分钟内把日志刷满，反而把「磁盘满」这条关键信息埋掉
+                if throttle.allow("state.write_failed"):
+                    logger.error(
+                        f"[autonomous_social] 状态写盘失败（稍后重试）: {e}"
+                        + throttle.summary("state.write_failed")
+                    )
                 return False
         return False
 
@@ -862,6 +965,10 @@ class SocialState:
         u["cue"] = str(cue)[:CONVERSATION_TRUNCATE_LENGTH]
         u["cue_due"] = due
         u["cue_at"] = ts
+        # 寿命从锚点当场算死，之后无论推迟多少次重试都不动
+        u["cue_expire_at"] = due + CUE_LATE_LIMIT
+        u["cue_retry_at"] = 0.0
+        u["cue_tries"] = 0
 
     def record_spoken(
         self,
@@ -912,6 +1019,9 @@ class SocialState:
         u["loop"] = text[:CONVERSATION_TRUNCATE_LENGTH]
         u["loop_due"] = due
         u["loop_at"] = ts
+        u["loop_expire_at"] = due + LOOP_LATE_HOURS * 3600.0
+        u["loop_retry_at"] = 0.0
+        u["loop_tries"] = 0
 
     def record_outgoing(
         self,
@@ -947,7 +1057,10 @@ class SocialState:
         log = u.setdefault("proactive_log", [])
         log.append({"ts": ts, "text": str(text or "")[:CONVERSATION_TRUNCATE_LENGTH], "cat": str(msg_type or "")})
         cutoff = ts - PROACTIVE_LOG_DAYS * 86400.0
-        pruned = [e for e in log if isinstance(e, dict) and float(e.get("ts", 0) or 0) >= cutoff]
+        # 时间戳容错：state.json 被手改或写入损坏时，一条脏 ts 不该把整个发送流程
+        # 抛穿（抛出去会作废整轮心跳，而且此时 mark_dirty 还没执行，内存里的
+        # conversation 不会被标脏）
+        pruned = [e for e in log if isinstance(e, dict) and _safe_ts(e.get("ts")) >= cutoff]
         u["proactive_log"] = pruned[-PROACTIVE_LOG_MAX:]
 
         # 主动消息统计（仅首条计入冷却与回复率）
@@ -963,6 +1076,9 @@ class SocialState:
                 # 这个由头已经说过了，别再拿它当理由
                 u["cue"] = ""
                 u["cue_due"] = 0.0
+                u["cue_expire_at"] = 0.0
+                u["cue_retry_at"] = 0.0
+                u["cue_tries"] = 0
 
         # 消息类型追踪（反重复）
         if msg_type:
@@ -1000,10 +1116,7 @@ class SocialState:
         for e in u.get("proactive_log", []) or []:
             if not isinstance(e, dict):
                 continue
-            try:
-                ts = float(e.get("ts", 0) or 0)
-            except (TypeError, ValueError):
-                continue
+            ts = _safe_ts(e.get("ts"))
             if ts >= cutoff:
                 out.append(e)
         return out

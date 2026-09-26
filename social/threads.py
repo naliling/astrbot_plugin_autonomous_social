@@ -28,20 +28,7 @@ from .reasoning import is_leaving, is_thin, last_direction, sleep_signal
 
 # ─── 1. 这一场话还没完 ──────────────────────────────
 
-_PROBE_REASONS: List[str] = [
-    "TA就回了那么几个字，刚才那件事明显还没说完，想追问一句。",
-    "你上一句问了TA一件事，TA答得很含糊，听着像是不好意思细说。",
-    "话说到一半突然说得特别短，有点想知道后面怎么样了。",
-    "TA提了个话头就收住了，你想把那个话头接回来。",
-    "刚才那句回答太敷衍了，你想知道是真没事还是不想说。",
-]
 
-_PRESENCE_REASONS: List[str] = [
-    "刚才还在聊，话说到一半TA那边没声了，不知道是不是被什么事打断。",
-    "正说着呢突然安静下来，有点挂心，问一句还在不在。",
-    "聊得好好的突然没人了，担心是自个儿哪句话把天聊死了。",
-    "那段话停在TA那里，手机拿起来又放下了，还是问一句。",
-]
 
 # 至少来回过两句才算「在聊」，否则只是对方偶尔发了一句就走了
 THREAD_CONTEXT_MIN = 2
@@ -120,10 +107,11 @@ def thread_reason(
     thin = bool(recent_in) and is_thin(recent_in)
     # 「她上一句在问事」只用来把 presence 说得更像接话，不当作快速追问的理由：
     # 她问了、对方没回，隔三分钟再追一句就是催，那个得等。
+    # 第二项（reason）一律空串：动机由模型自己产生，插件只决定「这一条属于哪类」
     if thin and silence >= probe_after_seconds:
-        return "probe", random.choice(_PROBE_REASONS)
+        return "probe", ""
     if silence >= presence_after_seconds:
-        return "presence", random.choice(_PRESENCE_REASONS)
+        return "presence", ""
     return "", ""
 
 
@@ -139,17 +127,12 @@ def thread_meta(kind: str, about: str = "", asked: str = "") -> Dict[str, Any]:
             "intent": "followup",
             "mode": "probe",
             "msg_type": "continue_topic",
-        "msg_type_desc": "就着刚才那件事再问一句，问具体的那件，不是问TA在不在",
-        # 纯文本列表：生成器直接拼进 prompt。这里曾经是 (文本, 档位) 元组，
-        # 元组被原样印进提示词（「('后来呢', 0)」），既污染 prompt 又让示例失效。
-        "msg_examples": [
-            "所以到底咋回事",
-            "后来呢",
-            "那你现在打算怎么办",
-            "真的假的",
-            "严重吗",
-        ],
-            "about": about,
+        "msg_type_desc": "就着刚才那件事再问一句",
+        # 原来这里给五条现成的话（「后来呢」「真的假的」…）让模型照着挑。
+        # 那是替她写台词：追问的说法就那么几种，模型每轮都在这几条里轮，
+        # 同一个人的「追问」听起来永远一模一样。现在只给写法要求。
+        "style_hint": "直接问那件事的进展，别绕成寒暄；一两句说完就停，别连着追问",
+        "about": about,
             "asked": asked,
         }
     return {
@@ -157,14 +140,8 @@ def thread_meta(kind: str, about: str = "", asked: str = "") -> Dict[str, Any]:
         "intent": "followup",
         "mode": "presence",
         "msg_type": "check_in",
-        "msg_type_desc": "把说到一半断掉的话接上，问一句还在不在、是不是被什么事打断了",
-        "msg_examples": [
-            "刚才是不是卡了",
-            "人呢",
-            "被啥事叫走了？",
-            "你先忙，忙完说一声",
-            "话没说完就没了？",
-        ],
+        "msg_type_desc": "把说到一半断掉的话接上",
+        "style_hint": "轻轻问一句还在不在就行；别质问、别要求对方解释为什么没回",
         "about": about,
         "asked": asked,
     }
@@ -195,12 +172,6 @@ LOOP_MAX_HOURS = 14.0     # 再晚就不像「记得」，像翻旧账
 LOOP_LATE_HOURS = 40.0    # 过了到期点多久之内还算「想起来问」
 LOOP_TEXT_MAX = 34
 
-_LOOP_REASONS: List[str] = [
-    "TA之前提过这么一句，一直没听到下文，想问问后来怎么样了。",
-    "那件事到现在还没结果，你记着呢，想问一句。",
-    "想起来TA说过有这么个事，不知道顺不顺利。",
-    "这事过去半天了，TA没再提，你有点想知道后来。",
-]
 
 
 def extract_open_loop(
@@ -256,7 +227,7 @@ def _loop_due(
 
 
 def live_loop(user: Dict[str, Any], now: float) -> Optional[str]:
-    """到点且还没回访过的那件事。"""
+    """到点且还没回访过、也没凉过头的那件事。分工同 live_cue。"""
     text = str(user.get("loop", "") or "")
     try:
         due = float(user.get("loop_due", 0) or 0)
@@ -264,7 +235,17 @@ def live_loop(user: Dict[str, Any], now: float) -> Optional[str]:
         return None
     if not text or due <= 0 or now < due:
         return None
-    if now - due > LOOP_LATE_HOURS * 3600.0:
+    try:
+        retry_at = float(user.get("loop_retry_at", 0) or 0)
+    except (TypeError, ValueError):
+        retry_at = 0.0
+    if retry_at > 0 and now < retry_at:
+        return None
+    try:
+        expire_at = float(user.get("loop_expire_at", 0) or 0)
+    except (TypeError, ValueError):
+        expire_at = 0.0
+    if now > (expire_at if expire_at > 0 else due + LOOP_LATE_HOURS * 3600.0):
         return None
     return text
 
@@ -276,27 +257,19 @@ def loop_meta(text: str) -> Dict[str, Any]:
         "mode": "loop",
         "msg_type": "check_in",
         "msg_type_desc": "问一句TA之前提的那件事后来怎么样了",
-        "msg_examples": [
-            "对了你那天那个事后来咋样",
-            "那个有结果了吗",
-            "后来怎么样了",
-            "那个还顺利吗",
-        ],
+        "style_hint": "要明确提到那件事是什么，别只说「那个呢」；问完就停",
         "about": text,
     }
 
 
 def loop_reason(text: str) -> str:
-    return f"TA之前说过「{text}」，一直没听到下文。" + random.choice(_LOOP_REASONS)
+    """回访那件事的动机句。现在返回空串——素材里有「TA提过还没下文的事：xxx」，
+    怎么问是模型自己的事；以前这里给四条现成问法，模型每轮都在里面轮。"""
+    return ""
 
 
 # ─── 3. 没人回也不空着 ──────────────────────────────
 
-_CLOSER_REASONS: List[str] = [
-    "上次你主动找TA，TA没接。隔了这么久，你不想让那句话一直悬着，随口收个尾。",
-    "你之前那句发出去没人回，现在想起来有点好笑，自己接一句把这事揭过去。",
-    "那句没人回的话你记着呢，说点什么把它盖过去，别搞得像在等人道歉。",
-]
 
 # 没人回之后至少隔多久才适合自己收场：太短就成了「你怎么不回我」
 CLOSER_MIN_HOURS = 5.0
@@ -332,7 +305,7 @@ def closer_reason(
     # 永远不接话的人每天被收一次场——收场那句本身会刷新 last_sent。
     if int(user.get("no_reply_streak", 0) or 0) >= MAX_CLOSERS:
         return ""
-    return random.choice(_CLOSER_REASONS)
+    return ""
 
 
 def closer_meta(about: str = "") -> Dict[str, Any]:
@@ -342,12 +315,7 @@ def closer_meta(about: str = "") -> Dict[str, Any]:
         "intent": "closer",
         "mode": "closer",
         "msg_type": "share_thought",
-        "msg_type_desc": "给自己上次那句没人接的话收个尾，说完整、不要求对方回",
-        "msg_examples": [
-            "没事 我就是随口一说",
-            "刚想到个好玩的 不用回",
-            "你忙你的",
-            "也不是啥大事",
-        ],
+        "msg_type_desc": "给自己上次那句没人接的话收个尾",
+        "style_hint": "重点是轻：让TA不用回也没压力；别追问怎么没回，也别道歉",
         "about": about,
     }

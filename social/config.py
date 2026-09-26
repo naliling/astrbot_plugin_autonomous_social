@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
 # 有效运行模式
-VALID_MODES = {"auto", "humanoid", "standalone"}
+# 只有这两种：auto 会自动探测有没有 Core，standalone 则完全不读它。
+# 曾经还有个人为的 "humanoid（强制要求 Core）"，但代码里从来没有对应分支，
+# 选它和 auto 行为完全一样——一个假装存在的档位比没有更误导人。
+VALID_MODES = {"auto", "standalone"}
 
 # 配置范围常量
 ACTIVITY_MIN = 10
@@ -25,10 +28,6 @@ ACTIVITY_MAX = 90
 ACTIVITY_DEFAULT = 75
 
 # 冷却项现在只是护栏（防刷屏），真正的节奏由 urge 决定，所以默认值可以放得很低
-GLOBAL_COOLDOWN_MIN = 5
-GLOBAL_COOLDOWN_MAX = 1440
-GLOBAL_COOLDOWN_DEFAULT = 7
-
 USER_COOLDOWN_MIN = 10
 USER_COOLDOWN_MAX = 2880
 USER_COOLDOWN_DEFAULT = 30
@@ -43,6 +42,12 @@ URGE_REFILL_MAX = 96
 URGE_REFILL_DEFAULT = 2
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
+# 心跳间隔（分钟）。它决定所有分钟级配置的实际精度
+HEARTBEAT_MIN_MINUTES_MIN = 1
+HEARTBEAT_MINUTES_MAX = 120
+HEARTBEAT_MIN_DEFAULT = 8
+HEARTBEAT_MAX_DEFAULT = 15
+
 RECENT_TALK_MIN = 5
 RECENT_TALK_MAX = 720
 RECENT_TALK_DEFAULT = 18
@@ -202,9 +207,9 @@ USER_RETENTION_MAX = 3650
 USER_RETENTION_DEFAULT = 30
 
 # 历史上各版本的默认值。AstrBot 更新 schema 只会补缺失项，从不覆盖已有值，
-# 所以调默认值对老用户完全无效 —— 他们永远停在装插件那一版的行为上。
-# 首次以本版本运行时，如果某项仍然等于某个旧默认值（用户没自己改过），就提升到现在的新默认。
-# v1.10.2：global_cooldown_minutes 已废弃（每用户独立调度），不再迁移它。
+# 所以发新版时老用户确实会继续跑在旧节奏上。但这份表只用来「提醒」，不再用来改写：
+# 它无法区分「用户从没动过」与「用户主动就想要这个值」——把 max_message_length 设成 60
+# 是完全合理的选择，升级后被强行改成 120 就是插件在背后改用户的设置。
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "user_cooldown_minutes": {180, 720, 120, 90, 45},
     "max_message_length": {200, 60},
@@ -219,8 +224,46 @@ LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "followup_max_minutes": {90},
 }
 
-# 迁移标记文件：只跑一次，用户之后主动改回旧值不会被反复覆盖
+# 提示标记文件：同一版本只提醒一次，不反复刷日志
 _BASELINE_FILE = "config_baseline.json"
+
+# ─── 默认值：唯一来源是 _conf_schema.json ──────────────────────
+# 面板里显示的、新装用户拿到的都是 schema 里的值；配置类再自带一份必然漂移。
+# 实测两份曾差 16 项，作者照着三天仿真数据调好的节奏对新装用户一次都没生效过，
+# 而老用户又走迁移落到代码值——于是新老用户跑的是两套参数，谁都说不清当前生效的是什么。
+# 现在默认值只有一个出处。MIN/MAX 那些是「范围」不是默认值，仍由本文件的 clamp 常量负责，
+# 并已与 schema 的 min/max 逐项对齐。
+_SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_conf_schema.json"
+)
+_MISSING = object()
+
+
+def _load_schema_defaults() -> Dict[str, Any]:
+    try:
+        with open(_SCHEMA_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: v.get("default")
+        for k, v in raw.items()
+        if isinstance(v, dict) and "default" in v
+    }
+
+
+_SCHEMA_DEFAULTS: Dict[str, Any] = _load_schema_defaults()
+
+
+def _d(key: str, hard_fallback: Any = None) -> Any:
+    """某配置项的默认值：schema 为准；schema 里缺失或为 null 时才用硬编码兜底。"""
+    v = _SCHEMA_DEFAULTS.get(key, _MISSING)
+    if v is _MISSING or v is None:
+        return hard_fallback
+    return v
+
 
 
 @dataclass
@@ -233,11 +276,12 @@ class SocialConfig:
 
     # 活跃度与护栏冷却（冷却只是防刷屏的下限，真正的节奏由念头攒得多快决定）
     activity_level: int = ACTIVITY_DEFAULT
-    # v1.10.2 起废弃：全局冷却会把所有用户排成一条队（「跟 A 说完要等好久才轮到
-    # B」），已从调度里移除；保留字段仅为兼容旧配置读取，schema 中亦不再出现
-    global_cooldown_minutes: int = GLOBAL_COOLDOWN_DEFAULT
     # 每个人自己的冷却才是节奏的来源：不同用户互不影响
     user_cooldown_minutes: int = USER_COOLDOWN_DEFAULT
+
+    # 心跳间隔（分钟）：一轮跑完后随机等这么久再看一眼
+    heartbeat_min_minutes: int = HEARTBEAT_MIN_DEFAULT
+    heartbeat_max_minutes: int = HEARTBEAT_MAX_DEFAULT
 
     # 念头模型
     urge_refill_hours: int = URGE_REFILL_DEFAULT
@@ -410,192 +454,202 @@ class SocialConfig:
                 return default
 
         # 模式
-        mode = str(g("mode", "auto")).lower().strip()
+        mode = str(g("mode", _d("mode",  "auto"))).lower().strip()
         if mode not in VALID_MODES:
             mode = "auto"
 
         # 跟进窗口必须比「多久算没声」长，否则永远落在空区间里一条也发不出
         followup_after = max(
             FOLLOWUP_AFTER_MIN,
-            min(FOLLOWUP_AFTER_MAX, int(g("followup_after_minutes", FOLLOWUP_AFTER_DEFAULT))),
+            min(FOLLOWUP_AFTER_MAX, int(g("followup_after_minutes", _d("followup_after_minutes",  FOLLOWUP_AFTER_DEFAULT)))),
         )
         probe_after = max(
             PROBE_AFTER_MIN,
-            min(PROBE_AFTER_MAX, int(g("probe_after_minutes", PROBE_AFTER_DEFAULT))),
+            min(PROBE_AFTER_MAX, int(g("probe_after_minutes", _d("probe_after_minutes",  PROBE_AFTER_DEFAULT)))),
         )
         followup_max = max(
             followup_after + 5,
-            max(FOLLOWUP_MAX_MIN, min(FOLLOWUP_MAX_MAX, int(g("followup_max_minutes", FOLLOWUP_MAX_DEFAULT)))),
+            max(FOLLOWUP_MAX_MIN, min(FOLLOWUP_MAX_MAX, int(g("followup_max_minutes", _d("followup_max_minutes",  FOLLOWUP_MAX_DEFAULT))))),
         )
         try:
-            loop_min = max(LOOP_MIN_HOURS_FLOOR, min(LOOP_MIN_HOURS_CEIL, float(g("loop_min_hours", LOOP_MIN_HOURS_DEFAULT))))
+            loop_min = max(LOOP_MIN_HOURS_FLOOR, min(LOOP_MIN_HOURS_CEIL, float(g("loop_min_hours", _d("loop_min_hours",  LOOP_MIN_HOURS_DEFAULT)))))
         except (TypeError, ValueError):
             loop_min = LOOP_MIN_HOURS_DEFAULT
         try:
-            loop_max = max(loop_min + 1.0, float(g("loop_max_hours", LOOP_MAX_HOURS_DEFAULT)))
+            loop_max = max(loop_min + 1.0, float(g("loop_max_hours", _d("loop_max_hours",  LOOP_MAX_HOURS_DEFAULT))))
         except (TypeError, ValueError):
             loop_max = max(loop_min + 1.0, LOOP_MAX_HOURS_DEFAULT)
 
         return cls(
-            enabled=bool(g("enabled", True)),
+            enabled=bool(g("enabled", _d("enabled",  True))),
             mode=mode,
             activity_level=max(
                 ACTIVITY_MIN,
-                min(ACTIVITY_MAX, int(g("activity_level", ACTIVITY_DEFAULT))),
-            ),
-            global_cooldown_minutes=max(
-                GLOBAL_COOLDOWN_MIN,
-                min(GLOBAL_COOLDOWN_MAX, int(g("global_cooldown_minutes", GLOBAL_COOLDOWN_DEFAULT))),
+                min(ACTIVITY_MAX, int(g("activity_level", _d("activity_level",  ACTIVITY_DEFAULT)))),
             ),
             user_cooldown_minutes=max(
                 USER_COOLDOWN_MIN,
-                min(USER_COOLDOWN_MAX, int(g("user_cooldown_minutes", USER_COOLDOWN_DEFAULT))),
+                min(USER_COOLDOWN_MAX, int(g("user_cooldown_minutes", _d("user_cooldown_minutes",  USER_COOLDOWN_DEFAULT)))),
             ),
             quiet_start=max(
                 HOUR_MIN,
-                min(HOUR_MAX, int(g("quiet_start", QUIET_START_DEFAULT))),
+                min(HOUR_MAX, int(g("quiet_start", _d("quiet_start",  QUIET_START_DEFAULT)))),
             ),
             quiet_end=max(
                 HOUR_MIN,
-                min(HOUR_MAX, int(g("quiet_end", QUIET_END_DEFAULT))),
+                min(HOUR_MAX, int(g("quiet_end", _d("quiet_end",  QUIET_END_DEFAULT)))),
             ),
-            private_only=bool(g("private_only", True)),
-            debug=bool(g("debug", False)),
+            private_only=bool(g("private_only", _d("private_only",  True))),
+            debug=bool(g("debug", _d("debug",  False))),
             max_message_length=max(
                 MAX_MSG_LEN_MIN,
-                min(MAX_MSG_LEN_MAX, int(g("max_message_length", MAX_MSG_LEN_DEFAULT))),
+                min(MAX_MSG_LEN_MAX, int(g("max_message_length", _d("max_message_length",  MAX_MSG_LEN_DEFAULT)))),
             ),
             topic_memory_count=max(
                 TOPIC_MEMORY_MIN,
-                min(TOPIC_MEMORY_MAX, int(g("topic_memory_count", TOPIC_MEMORY_DEFAULT))),
+                min(TOPIC_MEMORY_MAX, int(g("topic_memory_count", _d("topic_memory_count",  TOPIC_MEMORY_DEFAULT)))),
             ),
             context_inject_count=max(
                 CONTEXT_INJECT_MIN,
-                min(CONTEXT_INJECT_MAX, int(g("context_inject_count", CONTEXT_INJECT_DEFAULT))),
+                min(CONTEXT_INJECT_MAX, int(g("context_inject_count", _d("context_inject_count",  CONTEXT_INJECT_DEFAULT)))),
             ),
-            weekend_boost=bool(g("weekend_boost", True)),
+            weekend_boost=bool(g("weekend_boost", _d("weekend_boost",  True))),
             energy_threshold=max(
                 ENERGY_THRESHOLD_MIN,
-                min(ENERGY_THRESHOLD_MAX, int(g("energy_threshold", ENERGY_THRESHOLD_DEFAULT))),
+                min(ENERGY_THRESHOLD_MAX, int(g("energy_threshold", _d("energy_threshold",  ENERGY_THRESHOLD_DEFAULT)))),
             ),
             social_energy_threshold=max(
                 SOCIAL_ENERGY_THRESHOLD_MIN,
                 min(
                     SOCIAL_ENERGY_THRESHOLD_MAX,
-                    int(g("social_energy_threshold", SOCIAL_ENERGY_THRESHOLD_DEFAULT)),
+                    int(g("social_energy_threshold", _d("social_energy_threshold",  SOCIAL_ENERGY_THRESHOLD_DEFAULT))),
                 ),
             ),
-            adaptive_reply_rate=bool(g("adaptive_reply_rate", True)),
+            adaptive_reply_rate=bool(g("adaptive_reply_rate", _d("adaptive_reply_rate",  True))),
             reply_window_hours=max(
                 REPLY_WINDOW_MIN,
-                min(REPLY_WINDOW_MAX, int(g("reply_window_hours", REPLY_WINDOW_DEFAULT))),
+                min(REPLY_WINDOW_MAX, int(g("reply_window_hours", _d("reply_window_hours",  REPLY_WINDOW_DEFAULT)))),
             ),
-            allowed_trigger_uids=g("allowed_trigger_uids", None),
-            history_ingest=bool(g("history_ingest", True)),
-            seed_users=g("seed_users", None),
-            seed_platform=str(g("seed_platform", "aiocqhttp") or "aiocqhttp").strip() or "aiocqhttp",
-            store_message_text=bool(g("store_message_text", DEFAULT_STORE_MESSAGE_TEXT)),
+            allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
+            history_ingest=bool(g("history_ingest", _d("history_ingest",  True))),
+            seed_users=g("seed_users", _d("seed_users",  None)),
+            seed_platform=str(g("seed_platform", _d("seed_platform",  "aiocqhttp")) or "aiocqhttp").strip() or "aiocqhttp",
+            store_message_text=bool(g("store_message_text", _d("store_message_text",  DEFAULT_STORE_MESSAGE_TEXT))),
             user_retention_days=max(
                 USER_RETENTION_MIN,
-                min(USER_RETENTION_MAX, int(g("user_retention_days", USER_RETENTION_DEFAULT))),
+                min(USER_RETENTION_MAX, int(g("user_retention_days", _d("user_retention_days",  USER_RETENTION_DEFAULT)))),
             ),
-            allow_burst=bool(g("allow_burst", True)),
+            allow_burst=bool(g("allow_burst", _d("allow_burst",  True))),
             max_burst_parts=max(
                 MAX_BURST_PARTS_MIN,
-                min(MAX_BURST_PARTS_MAX, int(g("max_burst_parts", MAX_BURST_PARTS_DEFAULT))),
+                min(MAX_BURST_PARTS_MAX, int(g("max_burst_parts", _d("max_burst_parts",  MAX_BURST_PARTS_DEFAULT)))),
             ),
             max_sends_per_round=max(
                 MAX_SENDS_PER_ROUND_MIN,
-                min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", MAX_SENDS_PER_ROUND_DEFAULT))),
+                min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", _d("max_sends_per_round",  MAX_SENDS_PER_ROUND_DEFAULT)))),
             ),
-            greeting_enabled=bool(g("greeting_enabled", GREETING_ENABLED_DEFAULT)),
+            greeting_enabled=bool(g("greeting_enabled", _d("greeting_enabled",  GREETING_ENABLED_DEFAULT))),
             greeting_morning_start=max(
-                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_morning_start", GREETING_MORNING_START_DEFAULT)))
+                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_morning_start", _d("greeting_morning_start",  GREETING_MORNING_START_DEFAULT))))
             ),
             greeting_morning_end=max(
-                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_morning_end", GREETING_MORNING_END_DEFAULT)))
+                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_morning_end", _d("greeting_morning_end",  GREETING_MORNING_END_DEFAULT))))
             ),
             greeting_night_start=max(
-                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_night_start", GREETING_NIGHT_START_DEFAULT)))
+                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_night_start", _d("greeting_night_start",  GREETING_NIGHT_START_DEFAULT))))
             ),
             greeting_night_end=max(
-                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_night_end", GREETING_NIGHT_END_DEFAULT)))
+                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_night_end", _d("greeting_night_end",  GREETING_NIGHT_END_DEFAULT))))
             ),
-            group_flow_enabled=bool(g("group_flow_enabled", True)),
-            group_icebreak_enabled=bool(g("group_icebreak_enabled", True)),
-            group_ref_lib_enabled=bool(g("group_ref_lib_enabled", True)),
-            group_store_message_text=bool(g("group_store_message_text", True)),
+            group_flow_enabled=bool(g("group_flow_enabled", _d("group_flow_enabled",  True))),
+            group_icebreak_enabled=bool(g("group_icebreak_enabled", _d("group_icebreak_enabled",  True))),
+            group_ref_lib_enabled=bool(g("group_ref_lib_enabled", _d("group_ref_lib_enabled",  True))),
+            group_store_message_text=bool(g("group_store_message_text", _d("group_store_message_text",  True))),
             flow_window_minutes=max(
-                FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, int(g("flow_window_minutes", FLOW_WINDOW_DEFAULT)))
+                FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, int(g("flow_window_minutes", _d("flow_window_minutes",  FLOW_WINDOW_DEFAULT))))
             ),
             flow_min_gap_seconds=max(
-                FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, int(g("flow_min_gap_seconds", FLOW_MIN_GAP_DEFAULT)))
+                FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, int(g("flow_min_gap_seconds", _d("flow_min_gap_seconds",  FLOW_MIN_GAP_DEFAULT))))
             ),
             flow_max_replies_per_window=max(
                 FLOW_MAX_REPLIES_MIN,
-                min(FLOW_MAX_REPLIES_MAX, int(g("flow_max_replies_per_window", FLOW_MAX_REPLIES_DEFAULT))),
+                min(FLOW_MAX_REPLIES_MAX, int(g("flow_max_replies_per_window", _d("flow_max_replies_per_window",  FLOW_MAX_REPLIES_DEFAULT)))),
             ),
             flow_hourly_cap=max(
-                FLOW_HOURLY_CAP_MIN, min(FLOW_HOURLY_CAP_MAX, int(g("flow_hourly_cap", FLOW_HOURLY_CAP_DEFAULT)))
+                FLOW_HOURLY_CAP_MIN, min(FLOW_HOURLY_CAP_MAX, int(g("flow_hourly_cap", _d("flow_hourly_cap",  FLOW_HOURLY_CAP_DEFAULT))))
             ),
             flow_ignored_exit=max(
                 FLOW_IGNORED_EXIT_MIN,
-                min(FLOW_IGNORED_EXIT_MAX, int(g("flow_ignored_exit", FLOW_IGNORED_EXIT_DEFAULT))),
+                min(FLOW_IGNORED_EXIT_MAX, int(g("flow_ignored_exit", _d("flow_ignored_exit",  FLOW_IGNORED_EXIT_DEFAULT)))),
             ),
             group_idle_hours=max(
-                GROUP_IDLE_HOURS_MIN, min(GROUP_IDLE_HOURS_MAX, float(g("group_idle_hours", GROUP_IDLE_HOURS_DEFAULT)))
+                GROUP_IDLE_HOURS_MIN, min(GROUP_IDLE_HOURS_MAX, float(g("group_idle_hours", _d("group_idle_hours",  GROUP_IDLE_HOURS_DEFAULT))))
             ),
             icebreak_daily_cap=max(
                 ICEBREAK_DAILY_CAP_MIN,
-                min(ICEBREAK_DAILY_CAP_MAX, int(g("icebreak_daily_cap", ICEBREAK_DAILY_CAP_DEFAULT))),
+                min(ICEBREAK_DAILY_CAP_MAX, int(g("icebreak_daily_cap", _d("icebreak_daily_cap",  ICEBREAK_DAILY_CAP_DEFAULT)))),
             ),
             group_stale_days=max(
-                GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", GROUP_STALE_DAYS_DEFAULT)))
+                GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", _d("group_stale_days",  GROUP_STALE_DAYS_DEFAULT))))
             ),
             group_ref_sample_size=max(
                 GROUP_REF_SAMPLE_MIN,
-                min(GROUP_REF_SAMPLE_MAX, int(g("group_ref_sample_size", GROUP_REF_SAMPLE_DEFAULT))),
+                min(GROUP_REF_SAMPLE_MAX, int(g("group_ref_sample_size", _d("group_ref_sample_size",  GROUP_REF_SAMPLE_DEFAULT)))),
             ),
             group_ref_prompt_count=max(
                 GROUP_REF_PROMPT_MIN,
-                min(GROUP_REF_PROMPT_MAX, int(g("group_ref_prompt_count", GROUP_REF_PROMPT_DEFAULT))),
+                min(GROUP_REF_PROMPT_MAX, int(g("group_ref_prompt_count", _d("group_ref_prompt_count",  GROUP_REF_PROMPT_DEFAULT)))),
+            ),
+            heartbeat_min_minutes=max(
+                HEARTBEAT_MIN_MINUTES_MIN,
+                min(
+                    HEARTBEAT_MINUTES_MAX,
+                    int(g("heartbeat_min_minutes", _d("heartbeat_min_minutes",  HEARTBEAT_MIN_DEFAULT))),
+                ),
+            ),
+            heartbeat_max_minutes=max(
+                HEARTBEAT_MIN_MINUTES_MIN,
+                min(
+                    HEARTBEAT_MINUTES_MAX,
+                    int(g("heartbeat_max_minutes", _d("heartbeat_max_minutes",  HEARTBEAT_MAX_DEFAULT))),
+                ),
             ),
             urge_refill_hours=max(
                 URGE_REFILL_MIN,
-                min(URGE_REFILL_MAX, int(g("urge_refill_hours", URGE_REFILL_DEFAULT))),
+                min(URGE_REFILL_MAX, int(g("urge_refill_hours", _d("urge_refill_hours",  URGE_REFILL_DEFAULT)))),
             ),
             recent_talk_minutes=max(
                 RECENT_TALK_MIN,
-                min(RECENT_TALK_MAX, int(g("recent_talk_minutes", RECENT_TALK_DEFAULT))),
+                min(RECENT_TALK_MAX, int(g("recent_talk_minutes", _d("recent_talk_minutes",  RECENT_TALK_DEFAULT)))),
             ),
             skip_cooldown_minutes=max(
                 SKIP_COOLDOWN_MIN,
-                min(SKIP_COOLDOWN_MAX, int(g("skip_cooldown_minutes", SKIP_COOLDOWN_DEFAULT))),
+                min(SKIP_COOLDOWN_MAX, int(g("skip_cooldown_minutes", _d("skip_cooldown_minutes",  SKIP_COOLDOWN_DEFAULT)))),
             ),
-            llm_gate=bool(g("llm_gate", True)),
-            respect_user_rhythm=bool(g("respect_user_rhythm", False)),
-            cue_followup=bool(g("cue_followup", True)),
-            followup_enabled=bool(g("followup_enabled", True)),
+            llm_gate=bool(g("llm_gate", _d("llm_gate",  True))),
+            respect_user_rhythm=bool(g("respect_user_rhythm", _d("respect_user_rhythm",  False))),
+            cue_followup=bool(g("cue_followup", _d("cue_followup",  True))),
+            followup_enabled=bool(g("followup_enabled", _d("followup_enabled",  True))),
             followup_after_minutes=followup_after,
             probe_after_minutes=probe_after,
             followup_max_minutes=followup_max,
             followup_cooldown_minutes=max(
                 FOLLOWUP_COOLDOWN_MIN,
-                min(FOLLOWUP_COOLDOWN_MAX, int(g("followup_cooldown_minutes", FOLLOWUP_COOLDOWN_DEFAULT))),
+                min(FOLLOWUP_COOLDOWN_MAX, int(g("followup_cooldown_minutes", _d("followup_cooldown_minutes",  FOLLOWUP_COOLDOWN_DEFAULT)))),
             ),
-            loop_enabled=bool(g("loop_enabled", True)),
+            loop_enabled=bool(g("loop_enabled", _d("loop_enabled",  True))),
             loop_min_hours=loop_min,
             loop_max_hours=loop_max,
-            closer_enabled=bool(g("closer_enabled", True)),
+            closer_enabled=bool(g("closer_enabled", _d("closer_enabled",  True))),
             closer_after_hours=max(
                 CLOSER_AFTER_MIN,
-                min(CLOSER_AFTER_MAX, int(g("closer_after_hours", CLOSER_AFTER_DEFAULT))),
+                min(CLOSER_AFTER_MAX, int(g("closer_after_hours", _d("closer_after_hours",  CLOSER_AFTER_DEFAULT)))),
             ),
-            track_own_replies=bool(g("track_own_replies", True)),
-            use_core_clock=bool(g("use_core_clock", True)),
-            allow_emoji=bool(g("allow_emoji", False)),
-            strip_roleplay_actions=bool(g("strip_roleplay_actions", True)),
-            owner_only_commands=bool(g("owner_only_commands", True)),
+            track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
+            use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
+            allow_emoji=bool(g("allow_emoji", _d("allow_emoji",  False))),
+            strip_roleplay_actions=bool(g("strip_roleplay_actions", _d("strip_roleplay_actions",  True))),
+            owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
         )
 
     def in_quiet_hours(self, h: int) -> bool:
@@ -633,15 +687,14 @@ _NEW_DEFAULTS: Dict[str, Any] = {
 
 
 def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> List[str]:
-    """把「用户从未改过、但值停在旧默认上」的配置项提升到本版本的新默认。
+    """列出「值仍停在旧版默认上」的配置项，只提示，不改写。
 
-    AstrBot 的 check_config_integrity 只在键缺失时插默认值，已有值一律保留，所以
-    插件调默认值对老用户是一点作用的：他们永远停在装插件那一版的行为上。上一版
-    把冷却从 45/180 调到 90/720、长度从 200 调到 60，老用户实际收到的仍是 45/180/200，
-    表现出来就是「同一个朋友两小时被找一次、每次一长段」。
+    AstrBot 的 check_config_integrity 只在键缺失时插默认值，已有值一律保留，所以发新版
+    时老用户确实会继续跑在旧节奏上。但这份表无法区分「用户从没动过」与「用户主动就
+    想要这个值」：把 max_message_length 设成 60、把 activity_level 压到 55 都是合理的
+    选择，升级后被强行改掉就是插件在背后改用户的设置。旧实现正是这么干的。
 
-    只在首次以本版本运行时跑一次：跑完在数据目录留一个标记，用户之后自己改回
-    旧值不会再被覆盖。
+    现在只把差异摆到日志里，要不要跟着新版走由主人自己在面板决定。同一版本只提一次。
 
     Args:
         config: AstrBot 配置对象（dict 语义）
@@ -649,9 +702,9 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
         version: 当前插件版本
 
     Returns:
-        变更描述列表，供日志输出
+        提示描述列表，每条形如 "key（当前 60 → 本版默认 120）"
     """
-    changes: List[str] = []
+    hints: List[str] = []
     try:
         marker = os.path.join(baseline_dir, _BASELINE_FILE)
         if os.path.exists(marker):
@@ -678,28 +731,19 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
                 pass
             if probe not in legacy_values and current not in legacy_values:
                 continue
-            new_value = _NEW_DEFAULTS[key]
+            new_value = _d(key, _NEW_DEFAULTS.get(key))
             if probe == new_value:
                 continue
-            try:
-                config[key] = new_value
-                changes.append(f"{key}: {probe} → {new_value}")
-            except Exception:
-                continue
+            hints.append(f"{key}（当前 {probe} → 本版默认 {new_value}）")
 
         try:
             os.makedirs(baseline_dir, exist_ok=True)
             with open(marker, "w", encoding="utf-8") as f:
-                json.dump({"version": str(version), "changes": changes}, f, ensure_ascii=False)
+                json.dump(
+                    {"version": str(version), "hints": hints}, f, ensure_ascii=False
+                )
         except OSError:
             pass
-
-        if changes and hasattr(config, "save_config"):
-            # 写回配置文件，让管理面板里看到的就是实际生效的值
-            try:
-                config.save_config()
-            except Exception:
-                pass
     except Exception:
-        return changes
-    return changes
+        return hints
+    return hints

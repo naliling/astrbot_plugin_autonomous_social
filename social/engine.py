@@ -31,6 +31,7 @@ from .clock import city_now
 from .config import SocialConfig
 from .core_bridge import CoreBridge
 from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
+from .throttle import throttle
 from .generator import MessageGenerator
 from .persona import resolve_persona
 from .reasoning import (
@@ -59,9 +60,11 @@ from .threads import (
 
 # ─── 常量定义 ───────────────────────────────────────
 
-# 时间常量（秒）
-MIN_INTERVAL_SECONDS = 480       # 检查间隔最小值（调整到8分钟，避免频繁轮询）
-MAX_INTERVAL_SECONDS = 900       # 检查间隔最大值（调整到15分钟）
+# 上一轮结束后到下一轮开始，随机等这么久（一律秒）。心跳是「想起来看一眼手机」的时机，
+# 它的粒度决定了所有分钟级配置的实际精度：心跳 15 分钟时，把 probe_after_minutes
+# 从 2 调到 3 不会有任何区别。真正的发送节奏由 urge_refill_hours 与各种冷却决定，
+# 心跳变快只是让「到点了」被发现的时机更准，不会凭空多发。
+MIN_HEARTBEAT_SECONDS = 60      # 心跳间隔下限，防止有人把配置填成 0 变成忙循环
 FLUSH_INTERVAL_SECONDS = 30      # 状态刷盘间隔
 HOT_CHAT_THRESHOLD = 900         # 十分钟内还在聊，不插话
 WEEKEND_MOOD_BOOST = 1.25      # 周末人更松，想说话多一点
@@ -77,25 +80,57 @@ PENDING_IGNORE_MIN_HOURS = 12
 # 同一个由头试过一回但没发出去（模型否决/发送失败/对方刚好在说话）之后，往后推多久
 # 再想。不推的话，到点的由头会每个心跳都把人拉回去重试，每半小时发一次同一件事。
 CUE_RETRY_DELAY_SECONDS = 6 * 3600
+# 重试次数上限：每次重试都要跑一遍完整 LLM，不设上限就是持续烧 token。
+# 与 expire_at 双保险——有效期管「多久」，次数管「多少次」
+CUE_MAX_TRIES = 3
 
 # 错误重试
-SEND_RETRY_COUNT = 2
-SEND_RETRY_DELAY = 8.0  # 重试间隔改为8秒，避免快速刷屏
+# 主动消息对时效性不敏感，重试三次意义不大；而 try_once 是串行的：每次失败的发送要
+# 2×8 秒的等待，一轮里遇到几个失败的人就能把整个心跳占住几十秒，期间所有用户都停摆。
+# 宁可少试、快点失败——下一轮心跳本来还会再试。
+SEND_RETRY_COUNT = 1
+SEND_RETRY_DELAY = 3.0
 
-# 发送持续失败（非好友 / 平台不支持主动消息 / 会话失效）后，隔离这个人多久不再试
+# 手动触发最多试几个候选：第一个发不出去就换下一个（回退）
+TRIGGER_CANDIDATE_LIMIT = 3
+
+# 发送失败隔离这个人多久不再试
 SEND_BLOCK_HOURS = 24
-# 发送失败文案里命中这些关键词，就当作“对这个人发不了”而非一次性抵达，隔离他
-# 这些标记命中才判定「对这个目标根本发不了」（非好友/会话失效/平台不支持），
-# 错误把它们隔离 24h。匹配范围必须很窄：风控、限流、网络抖动的临时失败里
-# 也可能含 "blocked"/"friend"/"deleted" 字样，宽匹配会把健康用户误隔离一整天，
-# 表现就是「几百小时才发一条」。
-_UNREACHABLE_ERROR_MARKERS = (
+# 只有平台明确说「这个目标发不了」才隔离该用户。平台级的失败（不支持主动消息、
+# 适配器未就绪、传输层报错）不在此列：那是平台与配置的问题，隔离用户只会让一个
+# 健康的人凭空消失一整天，表现为「几百小时才发一条」。
+# 匹配范围必须很窄：风控、限流、网络抖动的临时失败里也可能含这些字样。
+_PEER_UNREACHABLE_MARKERS = (
     "请添加对方为好友", "添加对方为好友", "不是好友", "非好友", "对方不在你的好友列表",
-    "好友关系不存在", "not friend", "add friend", "unfriend", "friendship",
-    "未找到匹配会话平台", "不支持主动", "qq_official",
-    "会话已失效", "session expired", "session not found",
-    "已被删除", "已删除好友", "删除好友", "拉黑", "已拉黑",
+    "好友关系不存在", "对方不是你的好友", "not friend", "add friend", "unfriend",
+    "friendship", "已被删除", "已删除好友", "删除好友", "拉黑", "已拉黑",
+    "对方已注销", "账号已注销",
 )
+# 平台级原因：只用来把错误说清楚，不用来隔离用户
+_PLATFORM_UNAVAILABLE_MARKERS = (
+    "未找到匹配", "不支持主动", "qq_official", "adapter", "平台未就绪", "平台未连接",
+    "connection refused", "session not found", "session expired", "会话已失效",
+)
+
+
+class _SendFailed(Exception):
+    """发送失败。
+
+    unknown=True：投递结果未知（超时/连接中断），消息可能已经送达，
+    再发一次就是给同一个人发两条一样的。
+    peer_unreachable=True：平台明确说这个目标发不了（非好友/已注销），才值得隔离该用户。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        unknown: bool = False,
+        peer_unreachable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.unknown = unknown
+        self.peer_unreachable = peer_unreachable
 
 # 回访那件事之前，这场话至少凉下来多久：还在你来我往时问「后来呢」太急
 LOOP_QUIET_GAP_SECONDS = 1800.0
@@ -109,6 +144,13 @@ BURST_DELAY_MAX = 180
 # 群聊心流连发：同一个念头拆成几句快速补发（秒）——群里节奏快，不像私聊隔几分钟
 GROUP_BURST_DELAY_MIN = 3
 GROUP_BURST_DELAY_MAX = 9
+
+# 读不到 Core 时，主人面板上必须写清楚「少了什么」，而不是只丢一句「未找到」
+_DEGRADED_NOTE = (
+    "\n   已停用：按她所在城市的时区计时（use_core_clock）、精力/社交能量阈值、"
+    "睡意与作息硬闸、Core 给的句长约束。"
+    "主动消息仍会发，只是少了这些依据。"
+)
 
 # 过期用户数据清理的扫描间隔（秒）
 PRUNE_INTERVAL_SECONDS = 3600
@@ -133,7 +175,13 @@ class SocialEngine:
         self.cfg = SocialConfig.from_astrbot(config)
         # 引擎与状态层共用同一个时间源：判断「刚聊过」「超时没回」时两边取到不同的
         # 时钟会让结论互相矛盾
-        self._time = time_source or time.time
+        self._time_source = time_source or time.time
+        # 墙钟回拨保护：NTP 校正、容器从快照恢复、宿主改时间，都会让 now 小于已经写进
+        # state 的时间戳。而 `now - last_sent < cooldown` 这类判断一旦拿到负数就会同时成立，
+        # 于是所有冷却、热话窗口、被否决冷却**一起**把人永久挡住，直到墙钟追上偏差。
+        # 集中在这里钳一下：回拨时时间相当于停住（所有“距今多久”都变成 0），宁可多等，
+        # 也不会因为一个负数让谁永远静默。逐个改判断点容易漏，这里改一处就覆盖全部 28 处。
+        self._time_high: float = 0.0
 
         if state_path is None:
             state_path = os.path.abspath(
@@ -160,6 +208,9 @@ class SocialEngine:
         # bid -> 她所在城市相对本机的分钟偏移（从 Core 契约里拿）。没有契约时不设，
         # 时段判断退回本机时钟：宁可用错一个时钟，也不能把她的城市当成 UTC。
         self._city_offset: Dict[str, int] = {}
+        # bid -> (她实际的夜起始小时, 结束小时)，来自 Core 按今天日程算出的生物钟。
+        # 安静时段优先用它：夜猫子人格凌晨四点睡，用配置里写死的 23 点去判是判错的。
+        self._night_windows: Dict[str, Tuple[float, float]] = {}
         self._burst_tasks: set = set()
         # 群心流接话的后台任务（观察链路不阻塞）
         self._bg_tasks: set = set()
@@ -180,19 +231,27 @@ class SocialEngine:
                 self.signals.beat()
             except Exception as exc:  # 写不进去不影响启动
                 logger.warning(f"[autonomous_social] 信号文件初始化失败: {exc}")
-        # 启动即播种：读回 AstrBot 会话库里的历史私聊对象 + 应用播种名单，
-        # 不用等装好后再聊一句才开始认识人
-        self._seed_tick(force=True)
         logger.info(f"[autonomous_social] 引擎启动，模式: {self.cfg.mode}")
+        # 启动即播种：读回会话库里的历史私聊对象 + 应用播种名单。放后台任务里跑，
+        # 不阻塞插件加载（这段要扫 sqlite 全表）
+        task = asyncio.create_task(self._seed_tick(force=True), name="social-seed")
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
-    def stop(self) -> None:
-        """停止引擎：取消未发的连发补句，确保状态落盘。"""
+    async def stop(self) -> None:
+        """停止引擎：等后台任务真正结束后再落盘。
+
+        原来这里是同步的：cancel 完任务就立刻 save。若某个连发任务正好卡在
+        「消息已发出、record_outgoing 还没跑」的窗口里被 cancel，这次发送在状态里
+        就完全没有记录——下一轮可能重复发，回复率统计也失真。取消后必须等它退出。
+        """
         self.running = False
-        for task in list(self._burst_tasks):
+        pending = [t for t in (list(self._burst_tasks) + list(self._bg_tasks)) if not t.done()]
+        for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self._burst_tasks.clear()
-        for task in list(self._bg_tasks):
-            task.cancel()
         self._bg_tasks.clear()
         self._flow_inflight.clear()
         try:
@@ -200,6 +259,14 @@ class SocialEngine:
             logger.info("[autonomous_social] 引擎已停止，状态已保存")
         except Exception as e:
             logger.error(f"[autonomous_social] 停止时保存状态失败: {e}")
+
+    def _time(self) -> float:
+        """当前时间（墙钟），带回拨钳制。全引擎只认这一个时间源。"""
+        t = self._time_source()
+        if t < self._time_high:
+            return self._time_high
+        self._time_high = t
+        return t
 
     def log(self, message: str) -> None:
         """调试日志输出。"""
@@ -241,6 +308,11 @@ class SocialEngine:
         # 获取用户 ID
         uid = self._get_sender_id(event)
         if not uid:
+            return
+        # 挡掉 bot 自己的消息。note_spoken 与群聊的 is_bot 都做了这个判断，只有私聊这条
+        # 路漏了：适配器把自消息回灌进 EventMessageType.ALL 时（自消息回环、多端同步），
+        # bot 会被建成一个「用户」，记下指向自己会话的 umo、攒念头、给自己私聊发「我好想你」
+        if uid == bid:
             return
 
         # 获取统一消息来源（用于发送）
@@ -707,6 +779,7 @@ class SocialEngine:
             return
         if not groupflow.flow_prefilter(msg, is_command=False):
             return
+        is_quiet, asleep = self._flow_person_state(bid, now)
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -714,6 +787,8 @@ class SocialEngine:
             hourly_cap=self.cfg.flow_hourly_cap,
             hour_count=self.state.flow_hour_count(g, now),
             ignored_exit=self.cfg.flow_ignored_exit,
+            is_quiet=is_quiet,
+            asleep=asleep,
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -747,6 +822,7 @@ class SocialEngine:
         umo = str(g.get("umo", "") or "")
         if not umo:
             return
+        is_quiet, asleep = self._flow_person_state(bid, now)
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -754,6 +830,8 @@ class SocialEngine:
             hourly_cap=self.cfg.flow_hourly_cap,
             hour_count=self.state.flow_hour_count(g, now),
             ignored_exit=self.cfg.flow_ignored_exit,
+            is_quiet=is_quiet,
+            asleep=asleep,
         )
         if not ok:
             return
@@ -769,22 +847,29 @@ class SocialEngine:
                 at=now, clock_offset=self._clock_offset_for(bid),
             )
         except Exception as e:
-            logger.warning(f"[autonomous_social] 群心流生成失败: {e}")
+            if throttle.allow("flow.generate"):
+                logger.warning(
+                    f"[autonomous_social] 群心流生成失败: {e}" + throttle.summary("flow.generate")
+                )
             return
         if not parts:
             self.log(f"群 {gid} 心流：模型选择不接或生成为空")
             return
         text = parts[0]
-        ok_send, err = await self._send_with_retry(umo, text)
+        ok_send, err, peer_unreachable = await self._send_with_retry(umo, text)
         if not ok_send:
-            if self._is_unreachable_error(err):
+            if peer_unreachable:
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
                 logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
                 self.log(f"群 {gid} 心流发送失败：{err}")
             return
         sent_ts = self._time()
-        self.state.note_flow_reply(bid, gid, sent_ts, text)
+        self.state.note_flow_reply(
+            bid, gid, sent_ts, text,
+            sample_cap=self.cfg.group_ref_sample_size,
+            store_text=self.cfg.group_store_message_text,
+        )
         self.state.save()
         self.log(f"群 {gid} 心流接话→ {text}")
         # 同一句拆成了多段：剩下的快速补发。算同一次插话（不再各自计额/过闸）。
@@ -831,7 +916,7 @@ class SocialEngine:
         if not self.cfg.group_icebreak_enabled:
             return []
         dt = self._moment_of(bid, now)
-        is_quiet = self.cfg.in_quiet_hours(dt.hour)
+        is_quiet = self._quiet_now(bid, dt.hour)
         today = dt.strftime("%Y-%m-%d")
         out: List[Tuple[str, Dict[str, Any]]] = []
         for gid, g in self.state.groups(bid).items():
@@ -866,14 +951,17 @@ class SocialEngine:
                 at=now, clock_offset=self._clock_offset_for(bid),
             )
         except Exception as e:
-            logger.warning(f"[autonomous_social] 群破冰生成失败: {e}")
+            if throttle.allow("icebreak.generate"):
+                logger.warning(
+                    f"[autonomous_social] 群破冰生成失败: {e}" + throttle.summary("icebreak.generate")
+                )
             return False
         if not parts:
             return False
         text = parts[0]
-        ok_send, err = await self._send_with_retry(umo, text)
+        ok_send, err, peer_unreachable = await self._send_with_retry(umo, text)
         if not ok_send:
-            if self._is_unreachable_error(err):
+            if peer_unreachable:
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
                 logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）破冰发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
@@ -963,7 +1051,10 @@ class SocialEngine:
         ) * self.cfg.mood_scale
         if self.cfg.weekend_boost and dt.weekday() >= 5:
             mood *= WEEKEND_MOOD_BOOST
-        quiet = self.cfg.in_quiet_hours(dt.hour)
+        # 记下 Core 算出的生物钟夜：本函数的 bot_state 由 try_once 传进来，
+        # 安静时段要用它判（见 _quiet_now）
+        self._remember_night(bid, bot_state)
+        quiet = self._quiet_now(bid, dt.hour)
         reply_window = self._pending_window()
 
         ready: List[Tuple[str, Dict[str, Any], float]] = []
@@ -1024,14 +1115,14 @@ class SocialEngine:
             if cue:
                 urge = max(urge, desire.FIRE_THRESHOLD)
                 qualified = urge >= min_urge
+            elif min_urge >= desire.FIRE_THRESHOLD:
+                # 自动循环：随机门槛只调节节奏快慢，由 effective_gate 压在天花板之内。
+                # 不能直接拿 fire_gate 比——cap 在下、gate 在上时念头永远够不着，
+                # 而 gate 只在发送成功后重抽，等于把这个人永久锁死。
+                qualified = urge >= desire.effective_gate(u, cap)
             else:
-                try:
-                    gate = float(u.get("fire_gate") or desire.FIRE_THRESHOLD)
-                except (TypeError, ValueError):
-                    gate = desire.FIRE_THRESHOLD
-                # 门槛抖动只服务于自动循环；手动触发（min_urge 降到 0）要把所有人都列出来
-                threshold = max(min_urge, gate) if min_urge >= desire.FIRE_THRESHOLD else min_urge
-                qualified = urge >= threshold
+                # 手动触发（min_urge 降到 0）：把所有人都列出来给主人看
+                qualified = urge >= min_urge
             if qualified:
                 ready.append((uid, u, urge))
 
@@ -1040,15 +1131,111 @@ class SocialEngine:
         ready.sort(key=lambda x: -x[2])
         return ready
 
+    def _heartbeat_range(self) -> Tuple[int, int]:
+        """本轮心跳的等待区间（秒）。
+
+        配置只给分钟，且下界不得大于上界——面板里两个值填反了不应该变成
+        random.randint(抛 ValueError) 直接把后台循环打死。
+        """
+        lo = max(MIN_HEARTBEAT_SECONDS, int(self.cfg.heartbeat_min_minutes) * 60)
+        hi = max(lo, int(self.cfg.heartbeat_max_minutes) * 60)
+        return lo, hi
+
+    def _flow_person_state(self, bid: str, now: float) -> Tuple[bool, bool]:
+        """群心流缺的两道人物侧闸：现在是不是安静时段、她是不是在睡。
+
+        私聊侧五道闸都查了这两项，只有群心流漏了；而群心流是事件驱动的（群消息一到
+        就走，不经过心跳），于是深夜群里有人说话她照样插一句。
+        """
+        asleep = False
+        try:
+            body = self.core.bot_self_state(bid)
+            self._remember_night(bid, body)
+            asleep = bool((body or {}).get("asleep"))
+        except Exception:
+            body = None
+        try:
+            is_quiet = self._quiet_now(bid, self._moment_of(bid, now).hour)
+        except Exception:
+            is_quiet = False
+        return is_quiet, asleep
+
+    def _remember_night(self, bid: str, body: Optional[Dict[str, Any]]) -> None:
+        """记下 Core 算出的生物钟夜。读不到就清掉，退回插件自己的配置。"""
+        window = (body or {}).get("night_window") if isinstance(body, dict) else None
+        key = str(bid or "")
+        if not key:
+            return
+        try:
+            if window and len(window) == 2:
+                self._night_windows[key] = (float(window[0]) % 24.0, float(window[1]) % 24.0)
+            else:
+                self._night_windows.pop(key, None)
+        except (TypeError, ValueError):
+            self._night_windows.pop(key, None)
+
+    def _quiet_now(self, bid: str, hour: int) -> bool:
+        """这个角色现在该不该安静。
+
+        优先用 Core 按她今天日程推出的生物钟夜——那才是她几点睡到几点；
+        拿不到才退回本插件配置的 quiet_start/quiet_end。
+        """
+        window = self._night_windows.get(str(bid or ""))
+        if not window:
+            return self.cfg.in_quiet_hours(hour)
+        start, end = window
+        if abs(start - end) < 1e-9:
+            return False
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
     def _pending_window(self) -> float:
         """多久没回算「没接话」：在回复统计窗口基础上至少给半天。"""
         return max(self.cfg.reply_window_hours, PENDING_IGNORE_MIN_HOURS) * 3600
 
+    def _defer_anchor(self, user: Dict[str, Any], prefix: str) -> None:
+        """由头/挂事这次没说成：把「最早能再试」往后推，次数用完就作废这件事。
+
+        只写 <prefix>_retry_at 与 <prefix>_tries，锚点 <prefix>_due 和寿命
+        <prefix>_expire_at 保持不动。推迟的应该是重试节奏，不是这件事能活多久——
+        寿命由 expire_at 单向把守，推迟多少次都拦不住它凉掉。
+        """
+        try:
+            tries = int(user.get(f"{prefix}_tries", 0) or 0) + 1
+        except (TypeError, ValueError):
+            tries = 1
+        text = str(user.get(prefix, "") or "")
+        if tries > CUE_MAX_TRIES:
+            user[prefix] = ""
+            user[f"{prefix}_due"] = 0.0
+            user[f"{prefix}_expire_at"] = 0.0
+            user[f"{prefix}_retry_at"] = 0.0
+            user[f"{prefix}_tries"] = 0
+            self.state.mark_dirty()
+            logger.info(
+                f"[autonomous_social] 「{text[:20]}」重试 {CUE_MAX_TRIES} 次仍没发成，作废不再试"
+            )
+            return
+        user[f"{prefix}_retry_at"] = self._time() + CUE_RETRY_DELAY_SECONDS
+        user[f"{prefix}_tries"] = tries
+        self.state.mark_dirty()
+
     @staticmethod
     def _is_unreachable_error(err: str) -> bool:
-        """发送失败是不是“对这个人根本发不了”（非好友 / 不支持主动 / 会话失效）。"""
+        """平台是不是明说「这个人发不了」（非好友 / 已注销）。
+
+        只看平台抛出的错误文本，插件自己造的那句「未找到匹配的会话平台」不算——
+        它对任何一种 send_message 失败都会说一遍，匹配它等于把平台故障全归给用户。
+        """
         low = str(err or "").lower()
-        return any(m.lower() in low for m in _UNREACHABLE_ERROR_MARKERS)
+        return any(m.lower() in low for m in _PEER_UNREACHABLE_MARKERS)
+
+    @staticmethod
+    def _platform_problem(err: str) -> bool:
+        """错误是不是平台/配置层面的（不支持主动消息、适配器未就绪等）。"""
+        low = str(err or "").lower()
+        return any(m.lower() in low for m in _PLATFORM_UNAVAILABLE_MARKERS)
 
     def gate_reason(
         self,
@@ -1084,7 +1271,7 @@ class SocialEngine:
         hour = self._moment_of(bid, now).hour
         if self.cfg.respect_user_rhythm and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF:
             return "按TA 平时的作息，这个点 TA 不玩手机"
-        if self.cfg.in_quiet_hours(hour):
+        if self._quiet_now(bid, hour):
             return "现在是安静时段"
         return ""
 
@@ -1108,7 +1295,7 @@ class SocialEngine:
             return "这段沉默已经接过一回了，再问就是催"
         if now - float(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
             return "刚接过一次，给 TA 点时间"
-        if self.cfg.in_quiet_hours(self._moment_of(bid, now).hour):
+        if self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
         return ""
 
@@ -1185,7 +1372,7 @@ class SocialEngine:
             return "她正在睡觉"
         if now - float(u.get("last_sent", 0) or 0) < self.cfg.user_cooldown_minutes * 60:
             return "护栏冷却未过"
-        if self.cfg.in_quiet_hours(self._moment_of(bid, now).hour):
+        if self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
         return ""
 
@@ -1238,7 +1425,7 @@ class SocialEngine:
         """回访那件事的闸门：不看 recent_talk（那件事本来就是聊出来的），但要等这场话凉下来。"""
         if body and body.get("asleep"):
             return "她正在睡觉"
-        if self.cfg.in_quiet_hours(self._moment_of(bid, now).hour):
+        if self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
         if now - self._last_said(u) < LOOP_QUIET_GAP_SECONDS:
             return "还在聊，这会儿问「后来呢」太急"
@@ -1288,7 +1475,7 @@ class SocialEngine:
         if body and body.get("asleep"):
             return "她正在睡觉"
         hour = self._moment_of(bid, now).hour
-        if self.cfg.in_quiet_hours(hour):
+        if self._quiet_now(bid, hour):
             return "现在是安静时段"
         if self.cfg.respect_user_rhythm and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF:
             return "按TA 平时的作息，这个点 TA 不玩手机"
@@ -1350,7 +1537,11 @@ class SocialEngine:
         try:
             name, prompt = await resolve_persona(self.context, umo)
         except Exception as e:
-            logger.warning(f"[autonomous_social] 人格设定读取失败，改用默认口吻: {e}")
+            if throttle.allow("persona.read"):
+                logger.warning(
+                    f"[autonomous_social] 人格设定读取失败，改用默认口吻: {e}"
+                    + throttle.summary("persona.read")
+                )
             return "", ""
         if bid:
             self._last_persona[bid] = name
@@ -1408,11 +1599,21 @@ class SocialEngine:
             try:
                 test_provider = await self.generator._get_provider(test_umo)
                 if test_provider is None:
-                    logger.warning(f"[autonomous_social] Bot {bid} 无法获取LLM provider，可能已离线或未配置，本轮跳过")
+                    # 这条每轮心跳 × 每个 bot 各打一次。provider 没配好是长期状态，
+                    # 不节流就是每 8~15 分钟重复一遍同样的内容
+                    if throttle.allow(f"provider.missing.{bid}"):
+                        logger.warning(
+                            f"[autonomous_social] Bot {bid} 无法获取LLM provider，"
+                            f"可能已离线或未配置，本轮跳过" + throttle.summary(f"provider.missing.{bid}")
+                        )
                     continue
                 available_bots.append(bid)
             except Exception as e:
-                logger.warning(f"[autonomous_social] Bot {bid} provider检测失败: {e}，本轮跳过")
+                if throttle.allow(f"provider.probe.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social] Bot {bid} provider检测失败: {e}，本轮跳过"
+                        + throttle.summary(f"provider.probe.{bid}")
+                    )
                 continue
         
         bots = available_bots
@@ -1658,12 +1859,17 @@ class SocialEngine:
         thread_anchor = self._last_said(u)
 
         def defer_cue() -> None:
-            """这次因由头或挂着的事开口但没说成：往后推，别每个心跳都重试同一件事。"""
+            """这次因由头或挂着的事开口但没说成：往后推重试，别每个心跳都试同一件事。
+
+            推的是 retry_at 而不是 due：due 是锚点、expire_at 是寿命，推它们等于
+            每次都把「这件事已经凉了多久」清零，于是同一个由头可以每 6 小时重试一次、
+            永不作废，而且每次重试都要跑一遍完整 LLM。
+            """
             category = str((reason_meta or {}).get("category") or "")
             if category == "cue":
-                u["cue_due"] = self._time() + CUE_RETRY_DELAY_SECONDS
+                self._defer_anchor(u, "cue")
             elif category == "loop":
-                u["loop_due"] = self._time() + CUE_RETRY_DELAY_SECONDS
+                self._defer_anchor(u, "loop")
 
         parts: Optional[List[str]] = None
         veto_note = ""
@@ -1707,18 +1913,25 @@ class SocialEngine:
             defer_cue()
             return False, "对方刚发了新消息，不插话"
 
-        sent_ok, err = await self._send_with_retry(umo, parts[0])
+        sent_ok, err, peer_unreachable = await self._send_with_retry(umo, parts[0])
         if not sent_ok:
             defer_cue()
-            # 非好友 / 平台不支持主动消息 / 会话失效：不是“这一次没发成”而是“对这个人发不了”，
-            # 把他隔离一段时间，别每个心跳都去撞同一堆“请添加对方为好友”、白燒冷却
-            if self._is_unreachable_error(err):
+            # 只在平台明确说「这个人发不了」（非好友/已注销）时才隔离。平台没就绪、
+            # 不支持主动消息、结果未知这些都不是他的错，隔离只会让一个健康的人
+            # 凭空消失 24 小时，而且被当成「TA 不想理我」写进关系账本
+            if peer_unreachable:
                 self.state.block_send(
                     bid, uid, self._time() + SEND_BLOCK_HOURS * 3600.0, err
                 )
+                if throttle.allow(f"send.blocked.{bid}.{uid}"):
+                    logger.warning(
+                        f"[autonomous_social] {uid}（bid={bid}, umo={umo}）平台报告发不到这个人，"
+                        f"隔离 {SEND_BLOCK_HOURS}h：{err}" + throttle.summary(f"send.blocked.{bid}.{uid}")
+                    )
+            elif self._platform_problem(err) and throttle.allow(f"send.platform.{bid}"):
                 logger.warning(
-                    f"[autonomous_social] {uid}（bid={bid}, umo={umo}）发送持续失败，"
-                    f"隔离 {SEND_BLOCK_HOURS}h：{err}"
+                    f"[autonomous_social] {uid} 发送失败但原因在平台侧（不隔离该用户）：{err}"
+                    + throttle.summary(f"send.platform.{bid}")
                 )
             return False, f"消息写好了但发送失败：{err}"
 
@@ -1735,6 +1948,9 @@ class SocialEngine:
             u["loop"] = ""
             u["loop_due"] = 0.0
             u["loop_at"] = sent_ts
+            u["loop_expire_at"] = 0.0
+            u["loop_retry_at"] = 0.0
+            u["loop_tries"] = 0
         elif category == "closer":
             u["closer_for"] = float(u.get("last_sent", 0) or 0) or sent_ts
             u["closer_at"] = sent_ts
@@ -1758,6 +1974,36 @@ class SocialEngine:
             f"已主动联系 {uid}（类型={msg_type}，念头={urge:.2f}）：\n{parts[0]}{veto_note}"
         )
 
+    def _trigger_precheck(self) -> Tuple[bool, str]:
+        """手动触发的第一道闸：引擎到底在不在正常工作。
+
+        `enabled` 只说明「允许发」，不等于「后台循环活着」：插件刚重载、正在停机、
+        或主循环已抛异常退出时，enabled 仍然是 true。原来的触发路径完全没查这些，
+        于是「插件已经不在正常工作」的时候，手动触发照样把一整轮状态推着往前走——
+        念头结算掉、冷却记上、结果还是发不出去。
+
+        Returns:
+            (是否可以触发, 不能触发时给主人看的说明)
+        """
+        if not self.running:
+            return False, (
+                "引擎没有在运行（插件刚重载、正在停机，或后台循环已退出），不触发。"
+                "在面板里「重载」一次插件即可。"
+            )
+        if not self.cfg.enabled:
+            return False, "插件已停用（enabled=false），不触发。"
+        backoff = 0.0
+        try:
+            backoff = float(self.generator.llm_backoff_remaining())
+        except Exception:
+            backoff = 0.0
+        if backoff > 0:
+            return False, (
+                f"模型正在失败退避中（还剩 {int(backoff)} 秒），现在触发也生成不出内容。"
+                "退避结束后会自动恢复；急用可以先在面板里检查模型配置与 key。"
+            )
+        return True, ""
+
     async def trigger_once(self, bid: str) -> str:
         """手动触发一次主动联系：绕过念头是否攒满，直接挑最想说的人说一句。
 
@@ -1769,8 +2015,9 @@ class SocialEngine:
         Returns:
             结果描述文本（供命令回显）
         """
-        if not self.cfg.enabled:
-            return "插件已停用（enabled=false），无法触发。"
+        ok, why = self._trigger_precheck()
+        if not ok:
+            return why
 
         now = self._time()
         if now - self._last_flush > FLUSH_INTERVAL_SECONDS:
@@ -1791,8 +2038,12 @@ class SocialEngine:
             if core_root:
                 bot_state = self.core.bot_self_state(bid, root=core_root)
                 self._remember_clock(bid, bot_state)
+                self._remember_night(bid, bot_state)
         except Exception as e:
-            logger.warning(f"[autonomous_social] 触发时读 Core 失败: {e}")
+            if throttle.allow("core.read"):
+                logger.warning(
+                    f"[autonomous_social] 触发时读 Core 失败: {e}" + throttle.summary("core.read")
+                )
 
         # min_urge=0：不管攒没攒满都列出来，手动触发挑念头最高的那个
         ranked = self.settle_minds(
@@ -1801,14 +2052,34 @@ class SocialEngine:
         if not ranked:
             return "没有可联系的用户（都没有会话来源，或都还在刚聊完的窗口里）。"
 
-        uid, u, urge = self.pick_best(ranked)
-        seen_gap = now - float(u.get("last_seen", 0) or 0)
-        if seen_gap < HOT_CHAT_THRESHOLD:
-            return f"用户 {uid} 正在热聊（{int(seen_gap / 60)} 分钟前还在说话），为避免打扰未发送。"
-
-        sent, note = await self._speak(bid, uid, u, urge, now, allow_veto=False)
-        self.log(f"手动触发 {uid}：{note}")
-        return note if sent else f"未发送：{note}"
+        # 回退：按念头从高到低挨个试，第一个发不出去就换下一个。
+        # 手动触发的目的是「看一眼效果」，模型挂一次、平台抖一下就直接把失败
+        # 原样甩回给主人，等于白点一次；换个人往往就成了。
+        ordered = sorted(ranked, key=lambda x: x[2], reverse=True)
+        tried: List[str] = []
+        for uid, u, urge in ordered[:TRIGGER_CANDIDATE_LIMIT]:
+            seen_gap = now - float(u.get("last_seen", 0) or 0)
+            if seen_gap < HOT_CHAT_THRESHOLD:
+                tried.append(
+                    f"{uid} 正在热聊（{int(seen_gap / 60)} 分钟前还在说话），跳过"
+                )
+                continue
+            try:
+                sent, note = await self._speak(
+                    bid, uid, u, urge, now, allow_veto=False
+                )
+            except Exception as e:
+                # 单个人失败不该让整次触发报废：记一笔，继续试下一个
+                self.log(f"手动触发 {uid} 异常：{e}")
+                tried.append(f"{uid} 出错：{e}")
+                continue
+            if sent:
+                self.log(f"手动触发 {uid}：{note}")
+                if tried:
+                    return note + f"（前面 {len(tried)} 位没轮到，才轮到 TA）"
+                return note
+            tried.append(f"{uid}：{note}")
+        return "候选都试过了，没发出去：" + "；".join(tried)
     async def _send_message(self, target: str, text: str) -> None:
         """发送消息，兼容多种 API。
 
@@ -1817,43 +2088,60 @@ class SocialEngine:
             text: 消息文本
 
         Raises:
-            Exception: 发送失败时抛出
+            _SendFailed: 发送失败。unknown=True 表示投递结果未知，不能再发一遍
         """
         if not target:
-            raise RuntimeError("unified_msg_origin 为空，无法发送主动消息")
+            raise _SendFailed("unified_msg_origin 为空，无法发送主动消息")
 
         # 方式1: AstrBot 官方主动消息 API —— 优先使用 MessageChain
-        # 注意：官方 send_message 找不到匹配平台时不抛异常而是返回 False
-        # （会话来源失效、或平台不支持主动消息如 qq_official），必须检查返回值。
         if hasattr(self.context, "send_message"):
             if MessageChain is not None:
                 try:
                     message_chain = MessageChain().message(text)
                     ok = await self.context.send_message(target, message_chain)
                     if ok is False:
-                        raise RuntimeError(
-                            "send_message 返回 False：未找到匹配会话平台"
-                            "（unified_msg_origin 可能已失效，或平台不支持主动消息，如 qq_official）"
+                        # 框架只说「没发出去」，没说是谁的問題：可能 umo 失效，也可能平台
+                        # 压根不支持主动消息。这两种都不该当成「这个人发不了」
+                        raise _SendFailed(
+                            "send_message 返回 False：未找到匹配的会话平台"
+                            "（umo 可能已失效，或该平台不支持主动消息）"
                         )
                     return
-                except RuntimeError:
+                except _SendFailed:
                     raise
+                except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                    # 投递结果未知：请求可能已经到了平台并被转发，只是回执没回来。
+                    # 这里回退到纯文本再发一次，就是给用户发两条一样的消息
+                    raise _SendFailed(
+                        f"发送超时或连接中断，结果未知（不重发）: {type(e).__name__}: {e}",
+                        unknown=True,
+                    ) from e
                 except Exception as e:
+                    # 其余异常（多半是 MessageChain 构造失败）才是真的没发出去，可以回退
                     logger.warning(
                         f"[autonomous_social] MessageChain 发送未成功，回退纯文本: {e}"
                     )
-
             # 部分兼容版本可能接受纯文本
             try:
                 ok = await self.context.send_message(target, text)
                 if ok is False:
-                    raise RuntimeError(
-                        "send_message 返回 False：未找到匹配会话平台"
-                        "（unified_msg_origin 可能已失效，或平台不支持主动消息，如 qq_official）"
+                    raise _SendFailed(
+                        "send_message 返回 False：未找到匹配的会话平台"
+                        "（umo 可能已失效，或该平台不支持主动消息）"
                     )
                 return
+            except _SendFailed:
+                raise
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                raise _SendFailed(
+                    f"发送超时或连接中断，结果未知（不重发）: {type(e).__name__}: {e}",
+                    unknown=True,
+                ) from e
             except Exception as e:
-                raise RuntimeError(f"context.send_message 调用失败: {e}") from e
+                raise _SendFailed(
+                    f"context.send_message 调用失败: {e}",
+                    peer_unreachable=self._is_unreachable_error(str(e)),
+                ) from e
 
         # 方式2: 通过 platform 客户端发送（旧版兼容）
         if hasattr(self.context, "platform") and hasattr(self.context.platform, "send_message"):
@@ -1861,25 +2149,40 @@ class SocialEngine:
             return
 
         # 方式3: 兜底
-        raise RuntimeError("无法找到可用的发送消息 API")
+        raise _SendFailed("无法找到可用的发送消息 API")
 
-    async def _send_with_retry(self, target: str, text: str) -> Tuple[bool, str]:
-        """发送一条消息，失败自动重试。返回 (是否成功, 最后错误)。"""
+    async def _send_with_retry(self, target: str, text: str) -> Tuple[bool, str, bool]:
+        """发送一条消息，失败自动重试。返回 (是否成功, 最后错误, 是否「对这个人发不了」)。
+
+        第三个值才决定要不要隔离该用户：它只在平台明确说「不是好友/会话失效」时为真。
+        平台没就绪、adapter 未加载、结果未知这些一概不算——那不是这个人的错。
+
+        「结果未知」的失败不重试：可能已经送到了，再发一次就是给同一个人发两条一样的。
+        """
         last_err = ""
+        peer_unreachable = False
         for attempt in range(SEND_RETRY_COUNT + 1):
             try:
                 await self._send_message(target, text)
-                return True, ""
+                return True, "", False
+            except _SendFailed as e:
+                last_err = str(e)
+                peer_unreachable = peer_unreachable or e.peer_unreachable
+                if e.unknown:
+                    logger.warning(
+                        f"[autonomous_social] 发送结果未知（不重试，避免重复投递）: {e}"
+                    )
+                    return False, last_err, False
             except Exception as e:
                 last_err = str(e)
-                if attempt < SEND_RETRY_COUNT:
-                    logger.warning(
-                        f"[autonomous_social] 发送失败（第{attempt + 1}次），稍后重试: {e}"
-                    )
-                    await asyncio.sleep(SEND_RETRY_DELAY)
-                else:
-                    logger.warning(f"[autonomous_social] 发送失败（已重试{SEND_RETRY_COUNT}次）: {e}")
-        return False, last_err
+            if attempt < SEND_RETRY_COUNT:
+                logger.warning(
+                    f"[autonomous_social] 发送失败（第{attempt + 1}次），稍后重试: {last_err}"
+                )
+                await asyncio.sleep(SEND_RETRY_DELAY)
+            else:
+                logger.warning(f"[autonomous_social] 发送失败（已重试{SEND_RETRY_COUNT}次）: {last_err}")
+        return False, last_err, peer_unreachable
 
     def _schedule_burst(self, bid: str, uid: str, rest: List[str], sent_ts: float) -> None:
         """把连发的后续几条挂成后台任务，不阻塞主循环与命令回显。"""
@@ -1908,7 +2211,7 @@ class SocialEngine:
                 umo = str(u.get("umo", "") or "")
                 if not umo:
                     return
-                ok, _ = await self._send_with_retry(umo, text)
+                ok, _, _ = await self._send_with_retry(umo, text)
                 if not ok:
                     return
                 self.state.record_outgoing(bid, uid, text, count_proactive=False)
@@ -1947,11 +2250,13 @@ class SocialEngine:
                 now = self._time()
                 if self.state.is_group_blocked(bid, gid, now):
                     return
-                ok, _ = await self._send_with_retry(umo, text)
+                ok, _, _ = await self._send_with_retry(umo, text)
                 if not ok:
                     return
                 self.state.record_group_self_text(
-                    bid, gid, text, now, sample_cap=self.cfg.group_ref_sample_size
+                    bid, gid, text, now,
+                    sample_cap=self.cfg.group_ref_sample_size,
+                    store_text=self.cfg.group_store_message_text,
                 )
                 self.state.save()
                 self.log(f"群 {gid} 心流连发补充→ {text}")
@@ -1962,11 +2267,15 @@ class SocialEngine:
 
     # ─── 后台循环 ───────────────────────────────────────
 
-    def _seed_tick(self, force: bool = False) -> None:
+    async def _seed_tick(self, force: bool = False) -> None:
         """播种用户：把还没进插件状态的人补进来（历史导入 + 播种名单）。
 
         历史导入是启动一次 + 每半小时一次：数据库在长，插件状态里的「认识的人」
         要跟上。已经在 state.json 里的用户一律不动，实时数据永远比旧快照新。
+
+        会话库扫描（sqlite 全表 + 逐段 json.loads）搬到线程里跑：这段原本是同步的，
+        而它既跑在启动路径上（卡住插件加载）也跑在心跳里（300 个会话就是几百毫秒到
+        数秒，期间 AstrBot 对所有消息都不响应）。写 state 仍然留在主循环。
         """
         if not (force or self._time() - self._last_seed >= SEED_INTERVAL_SECONDS):
             return
@@ -1986,13 +2295,16 @@ class SocialEngine:
                         "装之前的聊天对象导不进来！"
                     )
                     logger.warning(f"[autonomous_social] {import_diag}")
-                added += history_ingest.seed_from_history(
-                    self.state,
+                rows = await asyncio.to_thread(
+                    history_ingest.collect_from_history,
                     self._data_dir,
                     private_only=self.cfg.private_only,
                     store_text=self.cfg.store_message_text,
+                    existing_uids=history_ingest.existing_uids(self.state),
+                    target_bid=history_ingest.seed_target_bid(self.state),
                     now=self._time(),
                 )
+                added += history_ingest.apply_history_rows(self.state, rows)
             if self.cfg.seed_users:
                 added += history_ingest.apply_seed_list(
                     self.state,
@@ -2049,14 +2361,14 @@ class SocialEngine:
         """后台主循环。"""
         logger.info("[autonomous_social] 后台循环已启动")
         self._prune_expired()
+        lo, hi = self._heartbeat_range()
         while self.running:
             try:
-                # 检查间隔随机（2-9 分钟）
-                await asyncio.sleep(random.randint(MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS))
+                await asyncio.sleep(random.randint(lo, hi))
                 if not self.running:
                     break
                 self._prune_expired()
-                self._seed_tick()
+                await self._seed_tick()
                 await self.try_once()
             except asyncio.CancelledError:
                 logger.info("[autonomous_social] 后台循环被取消")
@@ -2069,17 +2381,22 @@ class SocialEngine:
     # ─── 状态展示 ───────────────────────────────────────
 
     def _core_status_text(self) -> str:
-        """检查 Humanoid Core 联动状态，返回描述文本。"""
+        """检查 Humanoid Core 联动状态，返回描述文本。
+
+        降级必须写清楚「哪些能力停了」。只说「未找到 Core」而不说少了什么，主人
+        看到的就是一个「装了却好像没装」的插件，既不知道少了什么也不知道该做什么。
+        """
+        degraded = _DEGRADED_NOTE
         if self.cfg.mode == "standalone":
-            return "独立模式（不联动 Core）"
+            return "独立模式（不联动 Core）" + degraded
 
         try:
             root = self.core.read_root()
         except Exception as e:
-            return f"❌ Core 读取失败: {e}"
+            return f"❌ Core 读取失败: {e}" + degraded
 
         if not root:
-            return "❌ 未找到 Core state.json"
+            return "❌ 未找到 Core state.json" + degraded
 
         roles = list(root.get("roles", {}).keys())
         our_bots = set(self.state.data.get("bots", {}).keys())
@@ -2087,7 +2404,10 @@ class SocialEngine:
 
         if not matched:
             our_bot_list = list(our_bots)[:3]
-            return f"⚠️ Core 已找到但角色不匹配（Core: {roles[:3]}..., 本插件: {our_bot_list}）"
+            return (
+                f"⚠️ Core 已找到但角色不匹配（Core: {roles[:3]}..., 本插件: {our_bot_list}）"
+                + degraded
+            )
 
         # 读到契约 v1 才能用身体轴；否则只能退回两个标量，主动消息的把关会差一大截。
         contract_v = None
@@ -2099,8 +2419,33 @@ class SocialEngine:
             if view and view.get("contract_v"):
                 contract_v = view["contract_v"]
                 break
-        detail = f"契约 v{contract_v}（身体轴参与决策）" if contract_v else "旧字段，只能看到精力与社交能量（建议升级 Core 到 v2.14+）"
-        return f"✅ 联动正常（Core 角色 {len(roles)} 个，匹配 {len(matched)} 个；{detail}）"
+        if contract_v:
+            return (
+                f"✅ 联动正常（Core 角色 {len(roles)} 个，匹配 {len(matched)} 个；"
+                f"契约 v{contract_v}，身体轴参与决策）"
+            )
+        return (
+            f"⚠️ 联动中但降级：Core 角色 {len(roles)} 个，匹配 {len(matched)} 个，"
+            "但没读到契约快照（旧版 Core），只剩精力与社交能量两个标量。"
+            "升级 Core 到 v2.14+ 才能用上睡意/饥饿/时区/句长约束。"
+        )
+
+    def _llm_status_text(self) -> str:
+        """LLM 调用健康度。退避中要一眼看见，而不是只翻日志。"""
+        gen = self.generator
+        left = 0.0
+        try:
+            left = float(gen.llm_backoff_remaining())
+        except Exception:
+            left = 0.0
+        if left > 0:
+            return f"⚠️ LLM 连续失败，暂停调用中（还剩 {int(left)} 秒）"
+        streak = int(getattr(gen, "_llm_fail_streak", 0) or 0)
+        if streak:
+            return f"⚠️ LLM 上次失败过（连续 {streak} 次）"
+        if self._last_llm_error:
+            return f"⚠️ 上次 LLM 异常：{self._last_llm_error}"
+        return "✅ LLM 调用正常"
 
     async def _persona_by_role_text(self) -> str:
         """按角色列出主动消息实际会用到的 AstrBot 人格。
@@ -2376,7 +2721,9 @@ class SocialEngine:
             f"模式：{self.cfg.mode}\n"
             f"人格（按会话解析，各角色互不影响）：\n{persona_text}\n"
             f"Core 联动：{self._core_status_text()}\n"
-            f"LLM 生成：{self._last_llm_error if self._last_llm_error else '暂无失败记录'}\n"
+            f"LLM 生成：{self._llm_status_text()}\n"
+            f"心跳：每 {self.cfg.heartbeat_min_minutes}~{self.cfg.heartbeat_max_minutes} 分钟一次"
+            f"（分钟级配置的实际精度就是它）\n"
             f"节奏：念头驱动（最在意的人约 {self.cfg.urge_refill_hours} 小时攒满一次；"
             f"刚聊完 {self.cfg.recent_talk_minutes} 分钟内不另起）\n"
             f"发送前把关：{'模型判断该不该说' if self.cfg.llm_gate else '仅规则闸门'}\n"
@@ -2384,7 +2731,7 @@ class SocialEngine:
             f"、{'记得对方说的约定' if self.cfg.cue_followup else '不跟由头'}\n"
             f"活跃度：{self.cfg.activity_level}（整体想说话 ×{self.cfg.mood_scale:.2f}）\n"
             f"当前时段：{slot_names.get(slot, '未知')} {dt.strftime('%H:%M')}"
-            f"{'（安静时段，念头长得极慢）' if self.cfg.in_quiet_hours(dt.hour) else ''}"
+            f"{'（安静时段，念头长得极慢）' if self._quiet_now(ref_bid, dt.hour) else ''}"
             f"　{'按她所在城市' if self._city_offset.get(ref_bid) is not None else '按本机时钟'}\n"
             f"未完话题："
             + (

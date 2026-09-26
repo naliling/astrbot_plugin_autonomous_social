@@ -1,8 +1,11 @@
 """自主拟人社交 —— AstrBot 适配层。
 
-v1.14.3：主动消息上下文改为一次性注入，生成时合并双向对话，回复时临时回填。
+v1.16.0：不再替 AI 说话。删掉 45 条固定例句与约 80 条虚构经历，动机改由模型自己
+产生；新增从真实对话统计的说话习惯画像，并把 Humanoid Core 算好但此前没接上的
+生物钟夜、问句倾向、能否连发接进来。详见 CHANGELOG。
 优先读 Humanoid Core v2.14 导出的契约快照（身体轴 + 体感 + 说话形式），
-并把「刚主动找过谁」「被冷落几次」写回独立的信号文件；拿不到契约时退回旧字段。
+并把「刚主动找过谁」「被冷落几次」写回独立的信号文件；拿不到契约时退回旧字段
+并在 /自主社交状态 里明确列出因此停用的能力。
 """
 
 from __future__ import annotations
@@ -121,19 +124,19 @@ class AutonomousSocial(Star):
         data_dir = self._resolve_data_dir()
         state_path = os.path.join(data_dir, *DATA_SUBDIR, "state.json")
 
-        # 旧配置里停在旧默认值上的项提升一次：AstrBot 只补默认值、从不覆盖已有值，
-        # 不调这一步的话，升级后老用户实际跑的仍是上一版的节奏与长度
+        # 旧配置里停在旧默认值上的项只提示一次：AstrBot 只补默认值、从不覆盖已有值，
+        # 但插件凭什么断定用户没手动改过？擅自改写用户的设置比“节奏没跟上”更糟。
         try:
-            changed = migrate_legacy_defaults(
+            hints = migrate_legacy_defaults(
                 config, os.path.dirname(state_path), __version__
             )
-            if changed:
+            if hints:
                 logger.info(
-                    "[autonomous_social] 这些配置从未被手动改过、但停在旧版本的默认值上，"
-                    "已提升到本版默认：" + "；".join(changed)
+                    "[autonomous_social] 以下配置仍停在本插件旧版本的默认值上（插件不会替你改，"
+                    "想跟新版节奏就在面板里自行调整）：" + "；".join(hints)
                 )
         except Exception as e:
-            logger.warning(f"[autonomous_social] 配置默认值迁移失败（不影响运行）: {e}")
+            logger.warning(f"[autonomous_social] 检查旧默认值失败（不影响运行）: {e}")
 
         self._engine = SocialEngine(
             context=context,
@@ -509,7 +512,7 @@ class AutonomousSocial(Star):
         """停止引擎并清理资源。"""
         if self._engine is not None:
             try:
-                self._engine.stop()
+                await self._engine.stop()
             except Exception as e:
                 logger.error(f"[autonomous_social] 引擎停止出错: {e}")
 

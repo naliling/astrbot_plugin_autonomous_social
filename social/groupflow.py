@@ -56,15 +56,23 @@ def flow_should_consider(
     hourly_cap: int,
     hour_count: int,
     ignored_exit: int,
+    is_quiet: bool = False,
+    asleep: bool = False,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
     比另起话题的闸门更宽（追热聊本来就发生在刚聊完），但有几道防刷屏/防尬聊的硬闸：
+    - 安静时段 / 她正在睡觉——私聊侧五道闸都查了这两项，只有群心流漏了，而它又是
+      事件驱动的（群消息一到就走，不经过心跳），于是深夜群里有人说话她照样插一句；
     - 关注窗口没开（bot 最近没在这个群说过话）——保守档的核心；
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
     - 连续插话没人接，已经到退出阈值。
     """
+    if asleep:
+        return False, "她正在睡觉"
+    if is_quiet:
+        return False, "现在是安静时段"
     if float(group.get("blocked_until", 0) or 0) > now:
         return False, "发送隔离中（被踢/会话失效）"
     if float(group.get("flow_open_until", 0) or 0) <= now:
@@ -137,19 +145,15 @@ def build_style_reference(texts: List[str]) -> str:
     )
 
 
-# ─── 破冰的动机（喂给生成侧，从池子里随机挑一句） ───
-
-_ICEBREAK_REASONS: List[str] = [
-    "群里安静半天了，你闲着想找点话头把气氛暖一下。",
-    "刷了会儿手机没人说话，你想在群里起个轻松的话头。",
-    "群冷了好一阵，你想随口抛个不痛不痒的话题让大家搭句话。",
-    "有点无聊，想在群里开个不需要谁必须回的话头。",
-    "群里没动静，你想起个大家都能接一句的小话题。",
-]
-
+# ─── 破冰的动机 ───
+#
+# 原来这里有五条现成理由（“群里安静半天了，你闲着想找点话头把气氛暖一下”…）
+# 随机挑一句喂给生成侧。那是替她写好一段心理活动，她再顺着写——于是一个人的破冰
+# 永远从那五句里来。现在返回空串：破冰的话由模型自己造，插件只提供群里的事实。
 
 def icebreak_reason() -> str:
-    return random.choice(_ICEBREAK_REASONS)
+    """破冰动机句。现在恒为空——动机由模型自己产生。"""
+    return ""
 
 
 def flow_meta() -> Dict[str, Any]:

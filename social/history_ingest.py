@@ -198,7 +198,7 @@ def iter_conversations(
         return
 
 
-def _seed_target_bid(state: SocialState) -> str:
+def seed_target_bid(state: SocialState) -> str:
     """播种进哪个 bot 名下。
 
     只有一个角色就归 TA；多个角色时归 "default"，等第一条真实消息进来
@@ -215,11 +215,86 @@ def _uid_of(umo: str) -> str:
     return session or str(umo)
 
 
-def _existing_uids(state: SocialState) -> set:
+def existing_uids(state: SocialState) -> set:
+    """state 里已有的 uid 集合。给线程侧做过滤快照用。"""
     out = set()
     for bot in state.data.get("bots", {}).values():
         out.update((bot or {}).get("users", {}).keys())
     return out
+
+
+def collect_from_history(
+    data_dir: Optional[str],
+    *,
+    private_only: bool = True,
+    store_text: bool = True,
+    existing_uids: Optional[set] = None,
+    target_bid: str = "default",
+    now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """只读会话库，产出「待导入条目」。全程不碰 state，可安全丢进线程池。
+
+    拆出来是为了让阻塞的那部分（sqlite 全表扫描 + 逐段 json.loads）能搬到
+    asyncio.to_thread：这段同步跑在事件循环上时，300 个会话就是几百毫秒到数秒，
+    期间 AstrBot 对**所有**消息都不响应。写 state 的部分必须留在主循环。
+    """
+    db_path = find_astrbot_db(data_dir)
+    if not db_path:
+        return []
+    now = float(now if now is not None else time.time())
+    existing = set(existing_uids or ())
+    rows: List[Dict[str, Any]] = []
+    for conv in iter_conversations(db_path, private_only=private_only):
+        umo = conv["umo"]
+        kind = umo_kind(umo)
+        if private_only and kind == "group":
+            continue
+        uid = _uid_of(umo)
+        if not uid or uid in existing:
+            continue
+        existing.add(uid)
+        ts = conv["updated_at"]
+        row: Dict[str, Any] = {
+            "bid": target_bid,
+            "uid": uid,
+            "umo": umo,
+            "last_seen": ts if ts > 0 else now,
+            "urge_at": ts if ts > 0 else now,
+        }
+        content = conv["content"]
+        if content is not None:
+            row["message_count"] = min(count_user_messages(content), 500)
+            if store_text:
+                last = last_user_text(content)
+                if last:
+                    row["last_message"] = last[-500:]
+        rows.append(row)
+    return rows
+
+
+def apply_history_rows(state: SocialState, rows: List[Dict[str, Any]]) -> int:
+    """把 collect_from_history 产出的条目写进状态。返回实际新增人数。"""
+    if not rows:
+        return 0
+    added = 0
+    for row in rows:
+        u = state.user(row["bid"], row["uid"])
+        # 线程读快照、主循环写之间可能已经有人聊过了：以主循环此刻的值为准
+        if u.get("umo"):
+            continue
+        u["umo"] = row["umo"]
+        u["source"] = "history"
+        u["last_seen"] = row["last_seen"]
+        # 念头从「最后聊天的时刻」开始攒：三天前聊过的人，攒不满三个小时就找上门
+        u["urge_at"] = row["urge_at"]
+        if row.get("message_count") is not None:
+            u["message_count"] = row["message_count"]
+        if row.get("last_message"):
+            u["last_message"] = row["last_message"]
+        added += 1
+    if added:
+        state.mark_dirty()
+    return added
 
 
 def seed_from_history(
@@ -230,45 +305,22 @@ def seed_from_history(
     store_text: bool = True,
     now: Optional[float] = None,
 ) -> int:
-    """从 AstrBot 会话数据库导入还没进插件状态的历史用户。
+    """从 AstrBot 会话数据库导入还没进插件状态的历史用户（同步入口）。
 
     已在 state.json 里的用户一律不动：插件装好之后攒下的实时数据永远比数据库里的
-    旧快照新。返回新导入的人数。
+    旧快照新。返回新导入的人数。引擎走的是 collect + apply 两段式，这里保留给
+    同步调用方与测试。
     """
-    db_path = find_astrbot_db(data_dir)
-    if not db_path:
-        return 0
     now = float(now if now is not None else time.time())
-    existing = _existing_uids(state)
-    bid = _seed_target_bid(state)
-    added = 0
-    for conv in iter_conversations(db_path, private_only=private_only):
-        umo = conv["umo"]
-        kind = umo_kind(umo)
-        if private_only and kind == "group":
-            continue
-        uid = _uid_of(umo)
-        if not uid or uid in existing:
-            continue
-        u = state.user(bid, uid)
-        u["umo"] = umo
-        u["source"] = "history"
-        ts = conv["updated_at"]
-        u["last_seen"] = ts if ts > 0 else now
-        # 念头从「最后聊天的时刻」开始攒：三天前聊过的人，攒不满三个小时就找上门
-        u["urge_at"] = ts if ts > 0 else now
-        content = conv["content"]
-        if content is not None:
-            u["message_count"] = min(count_user_messages(content), 500)
-            if store_text:
-                last = last_user_text(content)
-                if last:
-                    u["last_message"] = last[-500:]
-        existing.add(uid)
-        added += 1
-    if added:
-        state.mark_dirty()
-    return added
+    rows = collect_from_history(
+        data_dir,
+        private_only=private_only,
+        store_text=store_text,
+        existing_uids=existing_uids(state),
+        target_bid=seed_target_bid(state),
+        now=now,
+    )
+    return apply_history_rows(state, rows)
 
 
 def seed_diag_snapshot(
@@ -292,7 +344,7 @@ def seed_diag_snapshot(
     if not out["db_path"]:
         out["reason"] = "会话库未找到（data 目录解析不对或还没聊过天）"
         return out
-    existing = _existing_uids(state)
+    existing = existing_uids(state)
     convs = list(iter_conversations(out["db_path"], private_only=True))
     out["private_conversations"] = len(convs)
     out["importable"] = sum(
@@ -356,8 +408,8 @@ def apply_seed_list(
     天花板机制会自然把她压下去。返回新增的人数。
     """
     now = float(now if now is None else time.time())
-    existing = _existing_uids(state)
-    bid = _seed_target_bid(state)
+    existing = existing_uids(state)
+    bid = seed_target_bid(state)
     added = 0
     for entry in normalize_seed_entries(raw_entries, default_platform):
         platform, uid, msg_type = entry

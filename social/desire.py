@@ -24,8 +24,11 @@ import random
 from typing import Any, Dict, Optional
 
 # 念头攒到多少才算「想找 TA 说话」（提高阈值，降低主动频率）
-# v25优化：提高到1.40，让主动消息更克制
 FIRE_THRESHOLD = 1.40
+# 每次说完话重抽门槛时的抖动幅度：门槛落在 FIRE_THRESHOLD~FIRE_THRESHOLD+SPAN 之间。
+# 判定时还会被 effective_gate 压到念头天花板之内，所以这个区间只是「节奏快慢」的
+# 调节量，不再是「能不能发」的生死线。
+FIRE_GATE_SPAN = 0.55
 # 念头的绝对上限，避免长期不结算的人攒出一个离谱的值
 URGE_CEILING = 3.0
 # 被否决（模型说不用发）之后念头回落到哪里：不是清零，「想过，先算了」
@@ -52,10 +55,9 @@ RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 # 连续被冷落的念头天花板：越攒不出去，越说明对方不打算接
 # v25优化：收紧天花板，被冷落后更克制
 STREAK_CAP: Dict[int, float] = {0: 2.8, 1: 2.4, 2: 1.9, 3: 1.6, 4: 1.5}
-# 天花板地板必须高于发出门槛：被冷落再多次，念头也得留一条能攒过 FIRE_THRESHOLD 的
-# 缝隙，只是慢。压到门槛以下等于对这个人永久静默——那不是「脸皮厚」，是彻底不再找了，
-# 也正是「几百小时不再发一次」的成因。
-# v25优化：适配新阈值
+# 天花板地板高于常量门槛。真正保证「被冷落后仍攒得出去」的不是这个地板，而是
+# effective_gate 里的 min()——地板只挡住了把 cap 压到 1.40 以下的极端值，挡不住
+# 随机门槛被抽到 1.40~1.95 的上段。两道保险都得在。
 STREAK_CAP_FLOOR = FIRE_THRESHOLD + 0.15
 # 冷落几次之后，没有「真有由头」时天花板收紧，但仍留在门槛之上（不再压到门槛以下）
 STREAK_NEEDS_CUE = 4
@@ -169,12 +171,12 @@ def rhythm_factor(user: Dict[str, Any], hour: int) -> float:
 
 
 def urge_cap(user: Dict[str, Any], has_live_cue: bool) -> float:
-    """念头能攒到多高。被冷落得越多，天花板越低——但永远不低于发出门槛。
+    """念头能攒到多高。被冷落得越多，天花板越低。
 
     过去的实现会在 streak≥STREAK_NEEDS_CUE 且没由头时把天花板压到门槛以下（×0.98），
     于是这个人除非主动发消息（after_reply 把 streak 归零），否则永远攒不到门槛、
-    永远不会再被主动找——那就是“几百小时不发”。现在天花板下限卡在
-    STREAK_CAP_FLOOR（高于门槛），被冷落只会拖慢节奏，不会彻底封死。
+    永远不会再被主动找——那就是“几百小时不发”。现在天花板不低于 STREAK_CAP_FLOOR，
+    被冷落只会拖慢节奏。能不能真的攒出去由 effective_gate 保证，不要在这里再叠门槛。
     """
     streak = int(user.get("no_reply_streak", 0) or 0)
     cap = STREAK_CAP.get(streak, STREAK_CAP_FLOOR)
@@ -187,17 +189,19 @@ def urge_cap(user: Dict[str, Any], has_live_cue: bool) -> float:
 def decay_streak(user: Dict[str, Any], now: float) -> None:
     """被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」。
 
-    以「最后一次主动发 / 最后一次对方说话」中较近的那个为起点：只要这段时间内
-    真的没任何来往，每过 STREAK_DECAY_DAYS 就把 streak 降一格，直到 0。
-    对方一旦重新说话，after_reply 会直接归零，这里只管“一直没人理”的情况。
+    以「我最后一次主动开口」为起点：只要这段时间里没有再主动过，每过 STREAK_DECAY_DAYS
+    就把 streak 降一格。锚点不能取 last_seen——对方只是正常聊天、没回主动消息时，
+    每次说话都会刷新 last_seen，steps 恒为 0，冷落计数永远不衰减，于是这个人一旦
+    被冷落够次数就再也回不到正常节奏。
+    对方一旦重新接住主动消息，after_reply 会直接归零，这里只管“一直没人理”的情况。
     """
     streak = int(user.get("no_reply_streak", 0) or 0)
     if streak <= 0:
         return
-    anchor = max(
-        float(user.get("last_sent", 0) or 0),
-        float(user.get("last_seen", 0) or 0),
-    )
+    anchor = float(user.get("last_sent", 0) or 0)
+    if anchor <= 0:
+        # 老数据没有 last_sent，退回「最后一次有来往」宁可慢退也不能不退
+        anchor = float(user.get("last_seen", 0) or 0)
     if anchor <= 0:
         return
     window = STREAK_DECAY_DAYS * 86400.0
@@ -299,7 +303,23 @@ def new_fire_gate() -> float:
     固定门槛会让间隔变成固定的：攒满→发出→清零→再攒满，周期精确得像闹钟。真人
     有时想到就说，有时拖两天，所以每次说完重抽一个门槛。
     """
-    return round(FIRE_THRESHOLD + random.uniform(0.0, 0.55), 3)
+    return round(FIRE_THRESHOLD + random.uniform(0.0, FIRE_GATE_SPAN), 3)
+
+
+def effective_gate(user: Dict[str, Any], cap: float) -> float:
+    """这一轮真正生效的发出门槛。
+
+    天花板与门槛是两道独立旋钮：念头被 urge_cap 夹到 cap，而门槛是每次说完话重抽的
+    随机值（FIRE_GATE_SPAN 的抖动）。两者一旦脱节——cap 在下、gate 在上——念头就永远
+    夹在天花板上、够不着门槛，而 gate 只在发送成功后才重抽，于是谁也发不出去：这就是
+    「被冷落够次数后永久不再主动」的自锁。判定一律走这里，把门槛压在天花板之内，
+    随机性只作用在天花板之上的那一段。
+    """
+    try:
+        gate = float(user.get("fire_gate") or FIRE_THRESHOLD)
+    except (TypeError, ValueError):
+        gate = FIRE_THRESHOLD
+    return min(max(gate, FIRE_THRESHOLD), cap)
 
 
 def after_send(user: Dict[str, Any], now: float) -> None:

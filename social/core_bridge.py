@@ -19,11 +19,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 
-# Core state.json 可能的位置（相对 data 目录）
+# Core state.json 可能的位置（相对 data 目录）。这只是快路径：用户可能改过插件目录名，
+# 穷举路径永远会漏，所以找不到时还会做一次有界搜索。
 _STATE_FILENAMES: List[str] = [
     "plugin_data/humanoid_core/state.json",
     "plugin_data/astrbot_plugin_humanoid_core/state.json",
 ]
+
+# 有界搜索的限制。搜索必须有硬上限：在超大目录树上无界遍历会把面板卡死。
+_SEARCH_MAX_DEPTH = 3
+_SEARCH_MAX_ENTRIES = 20000
+_SEARCH_SKIP_DIRS = {
+    "proc", "sys", "dev", "usr", "lib", "lib64", "bin", "sbin", "etc",
+    "var", "snap", "node_modules", "__pycache__", ".git", "venv", "site-packages",
+}
+# 目录名里带这些词才算可能是 Core
+_SEARCH_HINTS = ("humanoid", "core")
 
 
 class CoreBridge:
@@ -36,8 +47,57 @@ class CoreBridge:
         self._warned_no_role: set = set()  # 每个 bid 只警告一次
         self._cache_fingerprint: Optional[Tuple[str, int, int]] = None
         self._cache_root: Optional[Dict[str, Any]] = None
+        # 搜索结果缓存：找到一次就记住路径，不必每次心跳重新搜
+        self._searched = False
+        self._search_hit: Optional[str] = None
 
     # ─── 路径解析 ───────────────────────────────────────
+
+    def _search_for_state(self) -> Optional[str]:
+        """有界搜索 Core 的 state.json：目录名带 humanoid/core 且里面有 state.json。
+
+        只搜 data 目录及其下级（以及进程 cwd），深度和条目数都有硬上限。
+        """
+        if self._searched:
+            return self._search_hit
+        self._searched = True
+        roots: List[str] = []
+        if self._data_dir:
+            roots.append(self._data_dir)
+        roots.append(os.path.abspath("data"))
+        # 去掉重复，并保持顺序
+        seen = set()
+        roots = [r for r in roots if r and not (r in seen or seen.add(r))]
+
+        entries = 0
+        for root in roots:
+            base_depth = root.rstrip(os.sep).count(os.sep)
+            for dirpath, dirnames, filenames in os.walk(root):
+                if entries > _SEARCH_MAX_ENTRIES:
+                    logger.warning(
+                        f"[autonomous_social] 搜索 Humanoid Core 超过 {_SEARCH_MAX_ENTRIES} "
+                        "个目录仍未找到，已停止（不再继续扫盘）"
+                    )
+                    return self._search_hit
+                entries += 1
+                depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= _SEARCH_MAX_DEPTH:
+                    dirnames[:] = []
+                else:
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if d not in _SEARCH_SKIP_DIRS and not d.startswith(".")
+                    ]
+                if "state.json" not in filenames:
+                    continue
+                low = os.path.basename(dirpath).lower()
+                if any(h in low for h in _SEARCH_HINTS):
+                    self._search_hit = os.path.join(dirpath, "state.json")
+                    logger.info(
+                        f"[autonomous_social] 已自动定位到 Humanoid Core 状态文件：{self._search_hit}"
+                    )
+                    return self._search_hit
+        return self._search_hit
 
     def _resolve_path(self) -> Optional[str]:
         """解析 Humanoid Core state.json 的路径。
@@ -58,7 +118,8 @@ class CoreBridge:
                 p = os.path.join(base, rel)
                 if os.path.exists(p):
                     return p
-        return None
+        # 已知路径都没命中：搜一次（结果会缓存，不会每个心跳重扫）
+        return self._search_for_state()
 
     # ─── 磁盘读取 ───────────────────────────────────────
 
@@ -166,6 +227,23 @@ class CoreBridge:
         "last_sleep_hours",
     )
 
+    @staticmethod
+    def _night_window(routine: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """从契约的 routine 里取她真实的作息夜 (起始小时, 结束小时)。
+
+        取不到返回 None——调用方据此退回插件自己的 quiet_start/quiet_end，
+        而不是拿 0 当成「零点开始」。
+        """
+        if not isinstance(routine, dict):
+            return None
+        start, end = routine.get("night_start_hour"), routine.get("night_end_hour")
+        try:
+            if start is None or end is None:
+                return None
+            return float(start) % 24.0, float(end) % 24.0
+        except (TypeError, ValueError):
+            return None
+
     def _self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
 
@@ -183,6 +261,8 @@ class CoreBridge:
             "contract_v": None,
             "clock_offset_minutes": None,
             "routine": {},
+            "night_window": None,
+            "energy_text": "",
             "day": {},
             "persona": "",
         }
@@ -200,6 +280,8 @@ class CoreBridge:
         for key in self._CONTRACT_BODY_KEYS:
             view[key] = body.get(key)
         view["asleep"] = bool(body.get("asleep"))
+        # Core 已经把能量翻成人话了（"精神不错"/"有点发沉"），比自己再翻一遍准
+        view["energy_text"] = str(body.get("energy_text") or "").strip()
         view["feelings"] = contract.get("feelings") or []
         view["form"] = contract.get("form") or {}
         view["activity"] = contract.get("activity") or {}
@@ -212,6 +294,9 @@ class CoreBridge:
         except (TypeError, ValueError):
             view["clock_offset_minutes"] = None
         view["routine"] = contract.get("routine") or {}
+        # 她实际的生物钟夜。Core 从今天的日程推出来的（夜猫子人格凌晨四点睡），
+        # 比本插件配置里的 23:00 硬判准得多——安静时段应该用它，没接上就只能拿默认值。
+        view["night_window"] = self._night_window(view["routine"])
         # 今天这条时线：刚做过什么 / 正在做什么 / 接下来做什么。主动消息靠它说得出
         # 「我刚从健身房回来」，而不是只会说「我在休息」。
         day = contract.get("day") if isinstance(contract.get("day"), dict) else {}

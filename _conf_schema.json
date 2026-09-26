@@ -9,7 +9,7 @@
   "mode": {
     "type": "string",
     "description": "运行模式",
-    "hint": "auto（推荐）：自动检测是否装了Humanoid Core并联动；humanoid：强制要求Core；standalone：完全独立运行。",
+    "hint": "auto：装了 Humanoid Core 就联动作息与身体状态，没装也能独立运行；standalone：完全不读 Core 状态。",
     "obvious_hint": true,
     "default": "auto"
   },
@@ -39,6 +39,24 @@
     "default": 18,
     "min": 5,
     "max": 720
+  },
+  "heartbeat_min_minutes": {
+    "type": "int",
+    "description": "心跳间隔下限（分钟）",
+    "hint": "每一轮结束后随机等这么久再看一眼。默认 8 分钟。想让「沉默 2 分钟就追问」这类分钟级配置真正按分钟生效，就把它调到 1。发不发仍然由念头与冷却决定，心跳快只是让到点被发现的更准。",
+    "obvious_hint": true,
+    "default": 8,
+    "min": 1,
+    "max": 60
+  },
+  "heartbeat_max_minutes": {
+    "type": "int",
+    "description": "心跳间隔上限（分钟）",
+    "hint": "实际间隔在上下界之间随机取，避免节奏精确得像闹钟。不会小于下限。",
+    "obvious_hint": true,
+    "default": 15,
+    "min": 1,
+    "max": 120
   },
   "llm_gate": {
     "type": "bool",
@@ -125,7 +143,7 @@
     "description": "回访最短间隔（小时）",
     "hint": "至少隔多久再问。推荐4小时。",
     "obvious_hint": true,
-    "default": 4.0,
+    "default": 2.5,
     "min": 1.0,
     "max": 24.0
   },
@@ -134,7 +152,7 @@
     "description": "回访最长间隔（小时）",
     "hint": "最迟多久必须问出去，超过就不问了。推荐12小时。",
     "obvious_hint": true,
-    "default": 12.0,
+    "default": 14.0,
     "min": 3.0,
     "max": 48.0
   },
@@ -150,7 +168,7 @@
     "description": "收尾等待时长（小时）",
     "hint": "主动发的话隔多久没人回才收尾。推荐10小时。",
     "obvious_hint": true,
-    "default": 10,
+    "default": 8,
     "min": 2,
     "max": 72
   },
@@ -182,7 +200,7 @@
     "description": "每轮最多联系几人",
     "hint": "一轮心跳（8-15分钟）最多主动联系几个不同的人。推荐2-3个。",
     "obvious_hint": true,
-    "default": 2,
+    "default": 3,
     "min": 1,
     "max": 10
   },
@@ -333,7 +351,7 @@
     "description": "群聊关注窗口（分钟）",
     "hint": "Bot说话后关注群聊多久。推荐10分钟。",
     "obvious_hint": true,
-    "default": 10,
+    "default": 8,
     "min": 1,
     "max": 60
   },
@@ -342,7 +360,7 @@
     "description": "群聊插话间隔（秒）",
     "hint": "两次插话最少间隔多久。推荐60秒。",
     "obvious_hint": true,
-    "default": 60,
+    "default": 45,
     "min": 10,
     "max": 600
   },
@@ -360,7 +378,7 @@
     "description": "群聊每小时上限",
     "hint": "每群每小时最多插话几次。推荐5次。",
     "obvious_hint": true,
-    "default": 5,
+    "default": 6,
     "min": 1,
     "max": 60
   },
@@ -378,7 +396,7 @@
     "description": "破冰冷场时长（小时）",
     "hint": "群安静多久才考虑破冰。推荐8小时。",
     "obvious_hint": true,
-    "default": 8.0,
+    "default": 6.0,
     "min": 1.0,
     "max": 240.0
   },
@@ -387,7 +405,7 @@
     "description": "每日破冰上限",
     "hint": "每群每天最多破冰几次。推荐1-2次。",
     "obvious_hint": true,
-    "default": 1,
+    "default": 2,
     "min": 1,
     "max": 10
   },
@@ -396,7 +414,7 @@
     "description": "群退出判定天数",
     "hint": "多少天没在群里见到消息就当已退群。推荐5天。",
     "obvious_hint": true,
-    "default": 5,
+    "default": 3,
     "min": 1,
     "max": 90
   },
@@ -414,7 +432,7 @@
     "description": "风格样本抽取数",
     "hint": "生成时参考多少条群友发言。推荐5-8条。",
     "obvious_hint": true,
-    "default": 6,
+    "default": 8,
     "min": 0,
     "max": 30
   },
@@ -473,7 +491,7 @@
     "description": "回复判定窗口（小时）",
     "hint": "主动消息发出后多久内对方回话才算'接住了'。推荐3小时。",
     "obvious_hint": true,
-    "default": 3,
+    "default": 2,
     "min": 1,
     "max": 48
   },
@@ -503,7 +521,7 @@
     "description": "闲置用户清理天数",
     "hint": "多少天没联系的用户会被清理历史数据。推荐45天，设0永不清理。",
     "obvious_hint": true,
-    "default": 45,
+    "default": 30,
     "min": 0,
     "max": 3650
   },

@@ -46,187 +46,79 @@ _SLOT_NAMES_CN: Dict[str, str] = {
 
 # ─── 时段理由 ───────────────────────────────────────
 
-_TIME_REASONS: Dict[str, List[str]] = {
-    "early_morning": [
-        "刚醒，脑子还糊着，顺手摸到了手机。",
-        "醒得早，窗外还灰蒙蒙的，没什么事干。",
-        "被闹钟拽起来之前那段最迷糊，想说句话。",
-        "早上头一件事就是刷眼手机。",
-        "醒了就睡不着了，躺着发了会儿呆。",
-        "今天居然没赖床，有点不习惯。",
-        "楼下卖早餐的香味飘上来了，有点饿。",
-        "做了个奇怪的梦，醒过来还记着一点。",
-    ],
-    "morning": [
-        "上午有点走神，手头的事提不起劲。",
-        "刚忙完一小段，喘口气的功夫。",
-        "上午阳光挺好，看着窗外发了会儿呆。",
-        "开了个没什么用的会，出来透透气。",
-        "咖啡喝到第二杯了，还是有点困。",
-        "今天状态还行，就是闲不住想唠两句。",
-        "刚才摸鱼刷到个好玩的东西。",
-        "工位旁边的同事今天话特别多，有点烦。",
-    ],
-    "lunch": [
-        "中午吃完没什么精神，犯困。",
-        "午休刷手机刷到一半，看到个东西。",
-        "今天吃的不太合胃口，心情也一般。",
-        "困得不行，但又不想睡，随便打几个字。",
-        "中午难得闲下来，脑子开始乱飘。",
-        "吃完饭散了会儿步，回来有点想说话。",
-        "今天的外卖送了快一小时才到。",
-        "食堂今天居然有我爱吃的菜。",
-    ],
-    "afternoon": [
-        "事情做到一半卡住了，摸会儿鱼缓缓。",
-        "下午快结束了，松了口气。",
-        "下午的太阳晒得人发懒。",
-        "刚被一堆事轰炸完，终于安静了。",
-        "坐着坐着突然有点无聊。",
-        "今天过得意外的快。",
-        "三点多了，有点想吃下午茶。",
-        "刚才跟人吵架了，心情有点不爽。",
-    ],
-    "evening": [
-        "忙完一天窝着，心里挺松的。",
-        "傍晚的天色挺好看，看了半天。",
-        "吃完饭瘫着，今天过得很快。",
-        "晚风很舒服，在楼下晃了一圈回来。",
-        "心情说不上好也说不上坏，就想说说话。",
-        "剧看到一半，突然想换个脑子。",
-        "今天居然准点下班了，有点不习惯。",
-        "洗了个澡出来，整个人都松了。",
-    ],
-    "late_night": [
-        "还没睡，安静的时候脑子最活跃。",
-        "躺床上刷来刷去，没什么想看的。",
-        "这个点有点感性，话到嘴边就想找个地方说。",
-        "夜宵刚吃完，有点罪恶感。",
-        "戴着耳机随机播放，听到一首老歌。",
-        "明明困了但就是不想先睡。",
-        "窗外还挺亮的，不像深夜。",
-        "有点饿，但又不想起来弄吃的。",
-    ],
-    "deep_night": [
-        "凌晨了，迷迷糊糊还没睡。",
-        "醒了之后睡不着了，轻手轻脚打了几个字。",
-        "这个点醒着的人不多，有种奇怪的安全感。",
-        "半夜饿了，翻完冰箱坐在这发呆。",
-        "睡不着，索性不睡了。",
-        "做了个噩梦，醒过来有点懵。",
-        "外面居然还有人在走路。",
-        "手机刷到没电了，还是不想睡。",
-    ],
+# 以前这里是 7 个时段 × 8 条共 56 句「你现在可能在想什么」——
+# “楼下卖早餐的香味飘上来了”“咖啡喝到第二杯了，还是有点困”“食堂今天居然有我爱吃的菜”。
+# 它被当作动机塞进 prompt，模型就顺着往下编，于是她讲的是根本没发生过的事：
+# 掷一次骰子决定她今天吃了什么、心情如何。这不是拟人，是替她编记忆。
+# 动机现在由模型自己在 decide 阶段产生（见 generator 的输出格式），这里只保留时段本身。
+TIME_SLOT_LABELS = {
+    "early_morning": "清晨",
+    "morning": "上午",
+    "lunch": "午休",
+    "afternoon": "下午",
+    "evening": "傍晚",
+    "late_night": "夜里",
+    "deep_night": "深夜",
 }
+
 
 # ─── 消息类型定义 ────────────────────────────────────
 #
-# 每种类型包含：基础权重、描述（用于 prompt）、示例（引导模型）。
-# 示例为 (文本, 最低关系档位) 元组：低熟络关系下不展示亲昵/越界的示例，
-# 避免「保持分寸」的抽象指令被亲密示例带偏。档位：0刚认识 1一般熟 2朋友 3亲近 4非常亲近。
+# 每种类型只有三样东西：基础权重、描述（这条要干什么）、风格提示（怎么说才对）。
 #
-# 核心设计：大多数类型不是问句。只有约 10% 的消息可能是关心类型带问题。
-# 示例不得与 generator._BAD_PATTERNS 撞车（已互斥清洗）。
+# 这里**不再放例句**。以前每个类型带五六句现成的话（“楼下的猫又在晒太阳”、
+# “脑子突然冒出个念头”…），加上 generator 那边十四条通用正例，一共四十多句交给模型。
+# 那些句子都通用、彼此只差几个字，模型会直接复用，最后每轮都在这几十句里轮着挑——
+# 看着像人，其实在背稿子。style_hint 约束的是感觉和分寸（别铺垫、别硬编、别复述），
+# 具体说什么由模型自己造。
+#
+# 关系档位的影响仍然体现在 weights 上（越亲近越敢表达、吐槽），不需要靠例句演示。
 
 MESSAGE_TYPES: Dict[str, Dict[str, Any]] = {
     "share_thought": {
         "weight": 22,
-        "desc": "分享一个突然冒出来的想法或感受",
-        "examples": [
-            ("刚才看到一个东西挺有意思", 0),
-            ("说实话我现在有点不想动", 0),
-            ("今天也不知道怎么的，心情还行", 0),
-            ("脑子里突然冒出个念头", 0),
-            ("想起之前聊的那个，其实我后来又想了一下", 1),
-            ("你说人是不是都这样", 2),
-        ],
+        "desc": "说一件脑子里刚冒出来的事",
+        "style_hint": "像随手想到什么就说一句；别把它讲成一件大事，也别用「我突然想起」这种开场",
     },
     "express_feeling": {
         "weight": 18,
         "desc": "自然地表达一点情绪或感受",
-        "examples": [
-            ("今天好累啊", 0),
-            ("有点无聊", 0),
-            ("刚才心情不太好，现在好点了", 1),
-            ("突然觉得还挺想跟你说话的", 2),
-            ("突然有点想你了", 3),
-        ],
+        "style_hint": "直接说感受本身，不要铺垫，也不要解释自己为什么会这样",
     },
     "share_daily": {
         "weight": 16,
-        "desc": "分享一件日常小事，像随手拍给对方看的感觉",
-        "examples": [
-            ("楼下的猫又在晒太阳", 0),
-            ("今天的咖啡特别苦", 0),
-            ("刚路过一家店闻着好香", 0),
-            ("外面下雨了 你那边下了吗", 0),
-            ("今天路上看到一只超可爱的狗", 1),
-            ("刚看到个事 你觉得靠谱吗", 1),
-        ],
+        "desc": "分享一件日常小事",
+        "style_hint": "像顺手拍给对方看一眼，有画面就行，不用交代来龙去脉",
     },
     "continue_topic": {
         "weight": 14,
-        "desc": "自然地延续之前聊过的话题",
-        "examples": [
-            ("对了之前那个后来怎么样了", 0),
-            ("那个东西我后来查了一下", 0),
-            ("你上次提的那个事我去看了下", 1),
-            ("那个咋样了", 0),
-            ("你后来去了吗", 1),
-        ],
+        "desc": "接着之前聊过的话题往下说",
+        "style_hint": "直接接上那件事；别重新起个头，也别先复述一遍之前说了什么",
     },
     "casual_hello": {
         "weight": 10,
-        "desc": "不打招呼的招呼，像随口说的一句",
-        "examples": [
-            ("嘿", 0),
-            ("冒个泡", 0),
-            ("也没什么事 就是想说句话", 0),
-            ("突然想跟你说句话", 1),
-            ("吃饭了没", 1),
-        ],
+        "desc": "没什么事，就是随口说一句",
+        "style_hint": "既然真的没什么事，就别硬编一件事出来；一句就够",
     },
     "complain": {
         "weight": 8,
-        "desc": "吐槽一件小事，不是抱怨大道理，就是随口嘟囔",
-        "examples": [
-            ("今天地铁人也太多了", 0),
-            ("公司的午饭越来越难吃", 0),
-            ("刚才被领导叫住说了半天 头都大了", 1),
-            ("今天诸事不顺 喝口水都塞牙", 2),
-            ("你说气不气", 1),
-        ],
+        "desc": "吐槽一件小事",
+        "style_hint": "嘟囔一件具体的小事，别讲大道理、别抱怨人生",
     },
     "check_in": {
         "weight": 6,
-        "desc": "自然的关心，但不要太像问候语",
-        "examples": [
-            ("最近降温了 你那边冷不冷", 0),
-            ("忙完这阵了没", 1),
-            ("你上次说的那个事 后来顺不顺利", 2),
-            ("这周忙不忙", 1),
-            ("最近睡得好吗", 2),
-        ],
+        "desc": "顺口关心一句",
+        "style_hint": "关心得落在具体的事上，别只是「你还好吗」这种空的问候",
     },
     "ask_advice": {
         "weight": 4,
-        "desc": "问个小建议或对方的看法，不是真的需要答案，就是想聊",
-        "examples": [
-            ("你一般失眠的时候都干嘛", 0),
-            ("有没有什么摸鱼的好办法", 0),
-            ("你觉得我要不要染头发", 2),
-            ("你说我该不该去", 1),
-        ],
+        "desc": "问对方一个小意见",
+        "style_hint": "像是真想听听 ta 的想法，问完别自己接着答",
     },
     "react_time": {
         "weight": 2,
-        "desc": "基于当前时间或状态的反应",
-        "examples": [
-            ("这个点了还没睡", 0),
-            ("刚忙完 终于可以歇会了", 0),
-            ("天都快亮了", 0),
-            ("午休终于可以摸会鱼了", 0),
-        ],
+        "desc": "对时间或状态的一句反应",
+        "style_hint": "就这一下，别顺势展开成聊天",
     },
 }
 
@@ -387,7 +279,12 @@ def extract_cue(
 
 
 def live_cue(user: Dict[str, Any], now: float) -> Optional[str]:
-    """有没有已经到点、还没用过的由头。"""
+    """有没有已经到点、还没用过、也没凉过头的由头。
+
+    三个时间各管一件事：cue_due 是锚点本身（记下就不再变），cue_expire_at 是它的绝对
+    寿命，cue_retry_at 只是「上次没发成、最早什么时候再想」。只推迟重试而不动寿命，
+    同一件事才不会被每 6 小时重试一次、永不作废。
+    """
     cue = str(user.get("cue", "") or "")
     try:
         due = float(user.get("cue_due", 0) or 0)
@@ -397,7 +294,17 @@ def live_cue(user: Dict[str, Any], now: float) -> Optional[str]:
         return None
     if now < due:
         return None
-    if now - due > CUE_LATE_LIMIT:
+    try:
+        retry_at = float(user.get("cue_retry_at", 0) or 0)
+    except (TypeError, ValueError):
+        retry_at = 0.0
+    if retry_at > 0 and now < retry_at:
+        return None
+    try:
+        expire_at = float(user.get("cue_expire_at", 0) or 0)
+    except (TypeError, ValueError):
+        expire_at = 0.0
+    if now > (expire_at if expire_at > 0 else due + CUE_LATE_LIMIT):
         return None
     return cue
 
@@ -470,11 +377,16 @@ def last_direction(user: Dict[str, Any]) -> str:
 # ─── 消息类型权重调整 ────────────────────────────────
 
 CONTINUITY_BOOST = 40           # 有可延续话题时的权重加成
-NEW_USER_EXPRESS_WEIGHT = 3    # 新用户表达感受类权重
-NEW_USER_CHECKIN_WEIGHT = 25   # 新用户关心类权重
-NEW_USER_HELLO_WEIGHT = 25     # 新用户招呼类权重
-LONG_ABSENCE_CHECKIN_BOOST = 30  # 长时间未联系时关心类加成
-LONG_ABSENCE_SHARE_BOOST = 10    # 长时间未联系时分享类加成
+NEW_USER_EXPRESS_WEIGHT = 3    # 新用户表达感受类权重上限
+# 新用户：关心类与招呼类要压下去。这两种最容易写出「在吗」「最近怎么样」这类没内容的
+# 开场白，而它们正是 generator._SENTENCE_RULES 里点名的「不带自身信息的问候」
+NEW_USER_CHECKIN_SCALE = 0.4
+NEW_USER_HELLO_SCALE = 0.4
+# 新用户：反过来抬高真正有东西可讲的两种
+NEW_USER_SHARE_BOOST = 1.4
+# 长时间未联系：倍率而不是绝对加成
+LONG_ABSENCE_CHECKIN_BOOST = 3.0   # 关心类 ×(1+3.0)
+LONG_ABSENCE_SHARE_BOOST = 1.0     # 分享想法 ×(1+1.0)
 ANTI_REPEAT_DIVISOR = 3           # 反重复权重除数
 MIN_WEIGHT = 1                    # 最小权重
 
@@ -484,25 +396,7 @@ NEW_USER_THRESHOLD = 3
 LONG_ABSENCE_THRESHOLD = 172800
 
 # 长时间未联系的动机池：之前两条分支各自只有一句话，同一个用户反复命中会生成雷同的消息
-_LONG_ABSENCE_REASONS: List[str] = [
-    "好几天没说话了，想看看对方最近怎么样。",
-    "隔了好几天没聊，刚才提到一半的事突然又想起来了。",
-    "这几天都没动静，不知道对方在忙什么。",
-    "翻手机看到跟TA的聊天记录停在几天前。",
-    "突然想起这个人了，好久没聊了。",
-    "这几天总觉得少了点什么，原来是没跟TA说话。",
-    "刷手机的时候突然想到TA，就想发一句。",
-    "好几天没见人了，有点好奇TA在干嘛。",
-]
 
-_ABSENCE_REASONS: List[str] = [
-    "有一天多没联系了。",
-    "昨天聊到一半就去睡了，今天还没说上话。",
-    "隔了一天，有点想接上前天的话。",
-    "快一天没说话了，有点想找TA说一句。",
-    "昨天聊完之后就没下文了，今天想接着聊聊。",
-    "一整天没见人了，不知道TA今天过得咋样。",
-]
 
 
 # ─── 一句话里有没有「没问完的问题」 ───────────────────
@@ -602,7 +496,11 @@ def greet_reason(kind: str) -> str:
 
 
 def greet_meta(kind: str) -> Dict[str, Any]:
-    """问候的 preset 元数据：跟未完话题同一条路走，交给生成器写台词。"""
+    """问候的 preset 元数据：跟未完话题同一条路走，交给生成器写台词。
+
+    原来这里带四条现成问候（「早 刚醒还迷糊着」「晚安 今天聊得挺开心的」…），
+    那等于每天早上替她写好一句照着念。删掉后只剩写法要求，句子由她自己造。
+    """
     if kind == "night":
         return {
             "category": "greet",
@@ -610,13 +508,8 @@ def greet_meta(kind: str) -> Dict[str, Any]:
             "mode": "greet_night",
             "kind": "night",
             "msg_type": "greeting",
-            "msg_type_desc": "睡前跟TA道一句晚安，可以带一句今天收尾的感觉，不要问句",
-            "msg_examples": [
-                "晚安 今天聊得挺开心的",
-                "先睡了 明天再聊",
-                "困了 晚安好梦",
-                "今天就这样啦 晚安",
-            ],
+            "msg_type_desc": "睡前跟TA道一句晚安",
+            "style_hint": "像今天到此为止一样自然地收尾；别只说晚安两个字，也别解释今天怎么样",
         }
     return {
         "category": "greet",
@@ -624,13 +517,8 @@ def greet_meta(kind: str) -> Dict[str, Any]:
         "mode": "greet_morning",
         "kind": "morning",
         "msg_type": "greeting",
-        "msg_type_desc": "早上跟TA道个早安，带一句刚醒的状态或今天的头一件小事，可以顺势问一句TA今天的安排",
-        "msg_examples": [
-            "早 刚醒还迷糊着",
-            "早安 今天天不错",
-            "醒了 你吃早饭没",
-            "早啊 今天有啥安排",
-        ],
+        "msg_type_desc": "早上跟TA道个早安",
+        "style_hint": "像刚醒没多久随口说的；带一句你自己的状态或今天头一件小事就够，别一上来就问一串",
     }
 
 
@@ -687,13 +575,6 @@ def tier_rank(affection: Optional[float]) -> int:
     """好感度 → 关系档位序数（0-4，未知按 1）。"""
     key, _ = relationship_tier(affection)
     return _TIER_RANK.get(key, 1)
-
-
-def examples_for(msg_type: str, affection: Optional[float]) -> List[str]:
-    """取某消息类型在当前关系档位下可展示的示例文本。"""
-    rank = tier_rank(affection)
-    info = MESSAGE_TYPES.get(msg_type, {})
-    return [t for t, min_rank in info.get("examples", []) if min_rank <= rank]
 
 
 def energy_descriptor(energy: Optional[float]) -> str:
@@ -857,15 +738,26 @@ def select_message_type(
 
     # 新用户（消息少）：避免过于情绪化/亲密的类型
     if msg_count < NEW_USER_THRESHOLD:
-        weights["express_feeling"] = NEW_USER_EXPRESS_WEIGHT
-        weights["check_in"] = NEW_USER_CHECKIN_WEIGHT
-        weights["casual_hello"] = NEW_USER_HELLO_WEIGHT
+        # 这三行原来用的是绝对赋值（=25），把上面按 affection 算好的调整整个覆盖掉了；
+        # 而且 check_in + casual_hello 合计占到总权重一半以上，而这两种恰恰是最容易写出
+        # 「在吗」「最近怎么样」这类没内容的寒暄，正好是 _SENTENCE_RULES 点名的写法。
+        # 注释说的是「避免情绪化」，代码却在猛推寒暄。方向一起改过来。
+        weights["express_feeling"] = min(
+            float(weights.get("express_feeling", NEW_USER_EXPRESS_WEIGHT)),
+            float(NEW_USER_EXPRESS_WEIGHT),
+        )
+        weights["check_in"] *= NEW_USER_CHECKIN_SCALE
+        weights["casual_hello"] *= NEW_USER_HELLO_SCALE
         weights["complain"] = max(MIN_WEIGHT, weights.get("complain", 8) * 0.5)
+        weights["share_daily"] *= NEW_USER_SHARE_BOOST
+        weights["share_thought"] *= NEW_USER_SHARE_BOOST
 
     # 长时间未联系：提升关心类权重
     if age > LONG_ABSENCE_THRESHOLD:
-        weights["check_in"] += LONG_ABSENCE_CHECKIN_BOOST
-        weights["share_thought"] += LONG_ABSENCE_SHARE_BOOST
+        # 原来也是绝对加成（+=30）：久未联系的人几乎必然走「在吗/最近怎么样」这类开场。
+        # 改成按倍数放大，同样偏向关心，但不会压倒其他类型
+        weights["check_in"] *= 1.0 + LONG_ABSENCE_CHECKIN_BOOST
+        weights["share_thought"] *= 1.0 + LONG_ABSENCE_SHARE_BOOST
 
     # 反重复：降低最近使用过的类型权重
     for t in recent_types[-3:]:
@@ -908,55 +800,43 @@ def generate_reason(
         - category: 理由类别
         - msg_type: 选中的消息类型 key
         - msg_type_desc: 消息类型描述（用于 prompt）
-        - msg_examples: 消息类型示例（用于 prompt）
+        - style_hint: 这一类的写法要求（不包含任何例句）
     """
     age = now - float(user_data.get("last_seen", now))
-    msg_count = int(user_data.get("message_count", 0))
     recent_types = user_data.get("recent_msg_types", [])
 
-    # 选择消息类型；示例按当前关系档位过滤（engine 传入的 u_copy 带 _affection）
     msg_type, msg_info = select_message_type(user_data, now, recent_types)
-    examples = examples_for(msg_type, user_data.get("_affection"))
 
     def meta(category: str, **extra: Any) -> Dict[str, Any]:
         m: Dict[str, Any] = {
             "category": category,
             "msg_type": msg_type,
             "msg_type_desc": msg_info["desc"],
-            "msg_examples": examples,
+            "style_hint": msg_info.get("style_hint", ""),
         }
         m.update(extra)
         return m
 
+    # 下面这些分支选的是「这一条属于哪类事」，决定用哪种写法和约束；
+    # 返回的 reason 一律是空串——动机由模型自己在 decide 阶段产生。
+    # 插件能给的只有素材（距上次说话多久、TA 最后说了什么、她今天在干什么），
+    # 至于她此刻想到了什么，那是她自己的事。
+
     # 0. 到点的由头：这才是真人主动开口的常态 —— 想起一件具体的事
     cue = live_cue(user_data, now)
     if cue:
-        return (
-            f"TA 之前说过「{cue}」，现在差不多到点了，想顺嘴问一句后来怎么样。",
-            meta("cue", cue=cue),
-        )
+        return "", meta("cue", cue=cue)
 
     # 1. 对话连续性
-    continuity = _detect_continuity(user_data, now)
-    if continuity:
-        return continuity, meta("continuity")
+    if _detect_continuity(user_data, now):
+        return "", meta("continuity")
 
-    # 2. 长时间未联系（固定句子会让模型每次都写出同一句，改成小池子）
+    # 2. 长时间未联系
     if age > LONG_ABSENCE_THRESHOLD:
-        return random.choice(_LONG_ABSENCE_REASONS), meta("long_absence")
+        return "", meta("long_absence")
     if age > 86400:
-        return random.choice(_ABSENCE_REASONS), meta("absence")
+        return "", meta("absence")
 
-    # 3. 基于时间的理由（用调用方给的时刻，避免与引擎的判断各取一次时钟）
+    # 3. 其余按当时段
     slot = time_slot(hour if hour is not None else datetime.fromtimestamp(now).hour)
-    reason = random.choice(_TIME_REASONS.get(slot, _TIME_REASONS["afternoon"]))
-
-    # 添加熟悉度上下文
-    if msg_count >= 10:
-        reason += " 关系挺熟的，可以很随意。"
-    elif msg_count >= 3:
-        reason += " 算是有点熟了。"
-    else:
-        reason += " 还不太熟。"
-
-    return reason, meta("time", slot=slot)
+    return "", meta("time", slot=slot)
