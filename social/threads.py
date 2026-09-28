@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .clock import city_epoch, city_now
 from .reasoning import is_leaving, is_thin, last_direction, sleep_signal
@@ -31,6 +31,11 @@ from .reasoning import is_leaving, is_thin, last_direction, sleep_signal
 
 
 # 至少来回过两句才算「在聊」，否则只是对方偶尔发了一句就走了
+# 「还在聊」与「说断了」的分界：对方在这段时间里说过这么多条，就不是断点，
+# 是在跟你一来一回。两个人隔着十分钟各说一句，那才可能是话头断了。
+ACTIVE_CHAT_WINDOW = 30 * 60.0
+ACTIVE_CHAT_MIN_MSGS = 2
+
 THREAD_CONTEXT_MIN = 2
 
 
@@ -62,6 +67,7 @@ def thread_reason(
     presence_after_seconds: float,
     max_seconds: float,
     context_seconds: float,
+    presence_floor_seconds: Optional[float] = None,
 ) -> Tuple[str, str]:
     """这一场话是不是说断了。返回 (种类, 动机)，种类为 probe / presence / ""。
 
@@ -71,6 +77,12 @@ def thread_reason(
     两种说法的耐心不一样：追问那件事是有由头的，两三分钟就成立；光问「在吗」得再等会儿，
     不然像在催人。
     """
+    # 「在吗」的门槛取 max(配置值, 两个最小间隔)。对方每小时都在说话的话，
+    # 沉默最长也就一小时，永远够不到这个门槛——**每小时都在聊的人不需要被问
+    # 在不在**。这比「每两小时问一次」合理得多。
+    floor = presence_after_seconds
+    if presence_floor_seconds:
+        floor = max(floor, float(presence_floor_seconds))
     seen = float(user.get("last_seen", 0) or 0)
     spoken = float(user.get("last_spoken", 0) or 0)
     last_said = max(seen, spoken)
@@ -83,7 +95,21 @@ def thread_reason(
     silence = now - last_said
     if silence > max_seconds:
         return "", ""
-    if float(user.get("thread_for", 0) or 0) == last_said:
+    # 这个断点已经追过了吗？
+    #
+    # 判据**不能是「thread_for == last_said」**。last_said = max(对方说的, 她说的)，
+    # 而她每次追问都会把 last_spoken 推到发送时刻——于是这个等式在第二次追问时必然
+    # 不成立，守卫形同虚设。真实表现：一个每小时回一句的用户，7 天被追问 44 次。
+    #
+    # 正确的问法是「**追过一次之后，对方说过新话吗**」：说过 → 是新断点，可以再追；
+    # 没说 → 还是那个断点，别追。跟时间戳是否相等无关。
+    asked_at = float(user.get("thread_asked_at", 0) or 0)
+    if asked_at > 0 and seen <= asked_at:
+        return "", ""
+    # 她**已经回过**、之后双方都没再说话 → 这段已经收尾了，不是新断点。
+    # 以前用 max(seen, spoken) 判断点，把「她刚回完」也算成「对方的话还悬着」，
+    # 于是每一轮主链路回复都会造出一个新断点。
+    if spoken >= seen and (now - spoken) > presence_after_seconds:
         return "", ""
     if str(user.get("pending_result", "") or "") == "waiting":
         # 她上一条主动发的话还悬着：这时候再补一句就是追着人要回复
@@ -91,6 +117,22 @@ def thread_reason(
     last_msg = str(user.get("last_message", "") or "")
     if is_leaving(last_msg) or sleep_signal(user, now):
         return "", ""
+    # 「说断了」不是「对方停了一下」。
+    #
+    # 以前只判「对方沉默了多久」，而 probe_after_minutes 默认 2 分钟——于是对方每发
+    # 一条消息、隔两分钟，她就去问「怎么突然没声了」。仿真里一个每小时回一句的
+    # 用户，7 天被她追问了 44 次。
+    #
+    # 真正的断点是**这场话本来在继续、却停在这儿了**：对方最近还在连着说话
+    # （半小时内两条以上），那就是聊得正热，不是断了。
+    recent_in_count = sum(
+        1 for item in (user.get("conversation") or [])
+        if str(item.get("dir", "")) != "out"
+        and 0 < now - float(item.get("ts", 0) or 0) <= ACTIVE_CHAT_WINDOW
+    )
+    if recent_in_count >= ACTIVE_CHAT_MIN_MSGS:
+        return "", ""
+
     # 得先「在聊」：断点之前还有话挨着，才叫聊到一半
     nearby = [
         item for item in (user.get("conversation") or [])
@@ -110,7 +152,12 @@ def thread_reason(
     # 第二项（reason）一律空串：动机由模型自己产生，插件只决定「这一条属于哪类」
     if thin and silence >= probe_after_seconds:
         return "probe", ""
-    if silence >= presence_after_seconds:
+    # 「在吗」是给「人没了」用的，判据必须是**对方**冷了多久，不是「最后一条距今多久」。
+    # 用 last_said 的话，她自己刚发完的那条会把计时按住，而对方每小时都说话的人
+    # 照样每两小时（最小间隔一过）就收到一句「在吗」——7 天 30 次。
+    # 对方还在说话，就不是人没了。
+    peer_silence = now - seen
+    if peer_silence >= presence_floor_seconds and peer_silence < max_seconds:
         return "presence", ""
     return "", ""
 
@@ -226,28 +273,109 @@ def _loop_due(
     return min(stamp, now + max_hours * 3600.0)
 
 
+# 一个人身上同时记几件「提了但没说结果的事」。以前只记一件，新的直接覆盖旧的——
+# 对方一次说了三件事，就只有最后一件会被跟下去。5 件是够用又不至于变成待办清单的上限。
+LOOP_SLOTS_MAX = 5
+
+# ─── 她自己许下的诺 ────────────────────────────────────────────────
+# 最多同时记几件（按每个用户），以及单件字数上限。
+PROMISE_SLOTS_MAX = 3
+PROMISE_MAX_CHARS = 24
+# 许诺之后多久算「该兑现了」。不是精确日期——模型不写日期，插件也不去猜，
+# 到点她自己会挑一个合适的时机把这件事做了。
+PROMISE_WAIT_SECONDS = 20 * 3600.0
+
+
+def promise_entries(user: Dict[str, Any]) -> list:
+    """她自己许下、还没兑现的那些事。老数据里没有这个字段，返回空列表。"""
+    raw = user.get("promises")
+    out: list = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and str(item.get("about", "") or "").strip():
+                out.append(item)
+    return out
+
+
+def live_promises(user: Dict[str, Any], now: float, limit: int = PROMISE_SLOTS_MAX) -> list:
+    """到点、还没兑现的诺，按到期先后排。"""
+    out: list = []
+    for item in promise_entries(user):
+        due = _num(item.get("due"))
+        if due <= 0 or now < due:
+            continue
+        out.append((due, str(item.get("about", "")).strip(), item))
+    out.sort(key=lambda x: x[0])
+    return out[:max(1, int(limit))]
+
+
+def promise_meta(about: str) -> Dict[str, Any]:
+    """兑现承诺那一类：模型要知道「当初答应的是什么」，并且**这次是要去做它**。"""
+    return {
+        "category": "promise",
+        "intent": "promise",
+        "mode": "promise",
+        "msg_type": "share_daily",
+        "msg_type_desc": "把之前答应过TA的那件事做了给他看",
+        "style_hint": "别写成邀功（我说了我会做到吧），也别解释你为什么现在才做；"
+                      "就当那件事本来就要做，做完顺手说一句",
+        "about": about,
+    }
+
+
+def _num(x: Any) -> float:
+    try:
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def loop_entries(user: Dict[str, Any]) -> list:
+    """这件事的候选条目（老数据里是单条平铺字段，这里读出来统一成列表）。
+
+    老结构（loop/loop_due/...）照旧能读：升级时不必改盘上的文件，跑到这一行才顺手搬。
+    """
+    out: list = []
+    raw = user.get("loops")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and str(item.get("about", "") or "").strip():
+                out.append(item)
+    text = str(user.get("loop", "") or "").strip()
+    if text and not any(str(i.get("about", "")).strip() == text for i in out):
+        out.append({
+            "about": text,
+            "due": _num(user.get("loop_due")),
+            "expire_at": _num(user.get("loop_expire_at")),
+            "retry_at": _num(user.get("loop_retry_at")),
+            "tries": int(_num(user.get("loop_tries"))),
+            "at": _num(user.get("loop_at")),
+        })
+    return out
+
+
+def live_loops(user: Dict[str, Any], now: float, limit: int = LOOP_SLOTS_MAX) -> list:
+    """到点、没在重试冷却里、也没凉过头的那几件事，按到期先后排。"""
+    out: list = []
+    for item in loop_entries(user):
+        due = _num(item.get("due"))
+        if due <= 0 or now < due:
+            continue
+        retry_at = _num(item.get("retry_at"))
+        if retry_at > 0 and now < retry_at:
+            continue
+        expire_at = _num(item.get("expire_at"))
+        if now > (expire_at if expire_at > 0 else due + LOOP_LATE_HOURS * 3600.0):
+            continue
+        out.append((due, str(item.get("about", "")).strip(), item))
+    out.sort(key=lambda x: x[0])
+    return out[:max(1, int(limit))]
+
+
 def live_loop(user: Dict[str, Any], now: float) -> Optional[str]:
     """到点且还没回访过、也没凉过头的那件事。分工同 live_cue。"""
-    text = str(user.get("loop", "") or "")
-    try:
-        due = float(user.get("loop_due", 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    if not text or due <= 0 or now < due:
-        return None
-    try:
-        retry_at = float(user.get("loop_retry_at", 0) or 0)
-    except (TypeError, ValueError):
-        retry_at = 0.0
-    if retry_at > 0 and now < retry_at:
-        return None
-    try:
-        expire_at = float(user.get("loop_expire_at", 0) or 0)
-    except (TypeError, ValueError):
-        expire_at = 0.0
-    if now > (expire_at if expire_at > 0 else due + LOOP_LATE_HOURS * 3600.0):
-        return None
-    return text
+    hits = live_loops(user, now, limit=1)
+    return hits[0][1] if hits else None
 
 
 def loop_meta(text: str) -> Dict[str, Any]:
@@ -305,17 +433,53 @@ def closer_reason(
     # 永远不接话的人每天被收一次场——收场那句本身会刷新 last_sent。
     if int(user.get("no_reply_streak", 0) or 0) >= MAX_CLOSERS:
         return ""
-    return ""
+    # 到这里所有前置条件都过了，却还是 return ""——于是这个函数**永远**返回假值，
+    # 「没人回就自己收个尾」整条链路是死代码：_closer_pick 恒为 None，收场那句
+    # 一次也发不出去，而状态面板用的是另一套条件，照样显示「该收场」。
+    # 返回值在这里只被当作「选不选这个人」的开关（reason 本身自 v1.16.0 起
+    # 已不再进 prompt，动机由模型自己产），所以给一句人能读的说明即可。
+    return f"她上次主动说的那句过了 {int((now - sent) / 3600)} 小时还没人接"
 
 
-def closer_meta(about: str = "") -> Dict[str, Any]:
-    """收场那句：明确不要求对方回复，否则又变成一次索取。"""
+def recent_exchange(u: Dict[str, Any], limit: int = 3) -> List[str]:
+    """最近这几句来回里，对方说过什么。
+
+    「已读续接」要用：对方回过一句（正常聊天链路自己就回了，**不是插件的功劳**）
+    之后又没声了，这时候补一句该接着那几句说，而不是干巴巴一句「没事我就是想说说话」。
+    """
+    out: List[str] = []
+    for item in (u.get("conversation") or [])[-limit * 2:]:
+        if not isinstance(item, dict) or str(item.get("dir", "")) != "in":
+            continue
+        text = str(item.get("text", "") or "").strip()
+        if text:
+            out.append(text)
+    return out[-limit:]
+
+
+def closer_meta(about: str = "", exchange: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """收场/续接那句：明确不要求对方回复，否则又变成一次索取。
+
+    `exchange` 是对方最近说过的话。有它的时候，收场就变成**接着刚才那几句说**，
+    而不是凭空找话——真人「对方回过一句然后又没声了」时，补的通常就是那件事的后续。
+    """
+    turns = [str(t).strip() for t in (exchange or []) if str(t).strip()]
     return {
         "category": "closer",
         "intent": "closer",
         "mode": "closer",
         "msg_type": "share_thought",
-        "msg_type_desc": "给自己上次那句没人接的话收个尾",
-        "style_hint": "重点是轻：让TA不用回也没压力；别追问怎么没回，也别道歉",
+        "msg_type_desc": (
+            f"顺着刚才那几句接着说（对方说过：{'；'.join(turns)}）"
+            if turns else "给自己上次那句没人接的话收个尾"
+        ),
+        "style_hint": (
+            "重点是轻：让TA不用回也没压力；别追问怎么没回，也别道歉。"
+            + ("顺着对方刚才那句往下说，别另起话题" if turns else "")
+        ),
+        # 两边都填：模板用的是 {about}，而 _mode_note 的判据是「该模板实际用到的
+        # 占位符有值」。只填一个时另一处会判成没值，把整句引文丢掉。
         "about": about,
+        "asked": about,
+        "exchange": turns,
     }

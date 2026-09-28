@@ -14,14 +14,31 @@ import re
 import tempfile
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import desire
-from .reasoning import CUE_LATE_LIMIT, is_question
-from .threads import LOOP_LATE_HOURS
+from .reasoning import CUE_LATE_LIMIT
+from .threads import (
+    LOOP_LATE_HOURS,
+    LOOP_SLOTS_MAX,
+    PROMISE_SLOTS_MAX,
+    PROMISE_MAX_CHARS,
+    PROMISE_WAIT_SECONDS,
+    loop_entries,
+    promise_entries,
+)
+from .sanitize import sanitize_state
 from .throttle import throttle
 
 from astrbot.api import logger
+
+
+def _num(value: Any) -> float:
+    """时间戳/计数的容错取值。state.json 里的脏数据不该让正常流程抛异常。"""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _safe_ts(value: Any, default: float = 0.0) -> float:
@@ -39,7 +56,7 @@ DEFAULT_BOT_KEY = "default"
 # 对话历史保留条数
 MAX_CONVERSATION_HISTORY = 10
 # 消息文本截断长度
-MESSAGE_TRUNCATE_LENGTH = 500
+MESSAGE_TRUNCATE_LENGTH = 200
 # 对话历史单条截断长度
 CONVERSATION_TRUNCATE_LENGTH = 200
 # 最近消息类型追踪数量
@@ -51,6 +68,8 @@ PROACTIVE_LOG_DAYS = 7
 PROACTIVE_LOG_MAX = 60
 # 话题提取允许的最大单段长度（超过此长度不提取）
 TOPIC_MAX_CHARS = 6
+# 「为什么发这条」一行最多记多少字
+WHY_MAX_CHARS = 60
 
 # 长期不活跃用户会被重置的历史字段：这些是状态文件里真正占体积的部分。
 # 保留 name/umo/message_count/last_seen 与各回复统计：umo 是主动发送的唯一目标地址，
@@ -76,6 +95,13 @@ _STOP_WORDS = {
     "自己", "别人", "大家", "人家",
     "吃饭", "睡觉", "上班", "下班", "上课", "下课", "出门", "回家",
     "东西", "事情", "问题", "地方", "样子",
+    # 附和与语气词。它们不是话题：以前「好的」「哈哈」会被当成两件事记进 topics，
+    # 于是接下来好几条主动消息的提示词里都挂着「之前聊到的话题：好的、哈哈」，
+    # 模型照着这个"话题"说话，冒出莫名其妙的呼应。
+    "好的", "好哒", "好呀", "好吧", "行吧", "可以", "哈哈", "哈哈哈", "嘻嘻",
+    "真的", "确实", "没错", "是啊", "对", "对的", "嗯", "嗯嗯", "唔", "哦",
+    "噢", "哦哦", "知道了", "收到", "谢了", "谢谢", "客气", "没事", "没关系",
+    "在吗", "怎么", "怎么办", "为啥", "咋了", "什么情况",
 }
 
 # 中文标点分隔符
@@ -173,7 +199,10 @@ class SocialState:
             # 看不到这些时，插件以为她每说完一句对方都会回，未完话题也就无从判断。
             "last_spoken": 0.0,
             "last_spoken_text": "",
-            "last_spoken_question": False,
+            # 由头池：每一次主动开口都要从这里取一件具体的事（anchors.py）
+            "anchors": [],
+            # 验收层上一次判不合格的内容（含清洗前的原始输出），供排障
+            "last_rejected": "",
             # 未完话题：thread_for 记下「为哪一次断点追过」，一段沉默只追一次
             "thread_for": 0.0,
             "thread_at": 0.0,
@@ -491,7 +520,133 @@ class SocialState:
         # 先置不脏再迁移：_migrate 只在真的改了数据时才标脏。顺序反了的话，
         # 迁移的结果会被当成「已落盘」而丢弃，下次启动又重跑一遍
         self._dirty = False
+        self._merge_split_identities_once()
         self._migrate()
+
+    def _merge_split_identities_once(self) -> None:
+        """把「同一个人被拆成多个 uid」的记录合并回一条。
+
+        历史导入按 umo 取 uid，而 WebChat 的 umo 带会话 UUID（`webchat!naliling!<uuid>`），
+        于是每次开新会话都建成一个「新人」：各自攒念头、各自收问候、关系与冷落记录被
+        拆散。修法（history_ingest.stable_uid）只对**新导入**生效，盘上已经拆开的
+        需要在这里合一次。
+
+        合并规则：uid 去掉末段会话标识后相同、且都带 umo 的，归到最短的那个 uid 上；
+        计数类字段求和、最近类字段取新、文本类保留较长的那份。
+        """
+        if self.data.get("_merged_identities_v1"):
+            return
+        try:
+            moved = 0
+            for bot in self.data.get("bots", {}).values():
+                if not isinstance(bot, dict):
+                    continue
+                users = bot.get("users")
+                if not isinstance(users, dict):
+                    continue
+                groups: Dict[str, List[str]] = {}
+                for uid in list(users.keys()):
+                    if not isinstance(uid, str) or "!" not in uid:
+                        continue
+                    head = "!".join(uid.split("!")[:2])
+                    groups.setdefault(head, []).append(uid)
+                for _head, members in groups.items():
+                    if len(members) < 2:
+                        continue
+                    # 最短的那个当主记录（最接近稳定身份）
+                    members.sort(key=lambda x: (len(x), x))
+                    main = members[0]
+                    tm = users.get(main) if isinstance(users.get(main), dict) else {}
+                    for uid in members[1:]:
+                        other = users.get(uid)
+                        if not isinstance(other, dict) or not tm:
+                            continue
+                        self._merge_user(tm, other)
+                        users.pop(uid, None)
+                        moved += 1
+                    users[main] = tm
+            self.data["_merged_identities_v1"] = True
+            self._dirty = True
+            if moved:
+                logger.info(
+                    f"[autonomous_social] 已把 {moved} 条被拆开的同账号记录合并回去"
+                    "（WebChat 每个会话 UUID 曾被当成一个新人）"
+                )
+        except Exception as exc:
+            logger.warning(f"[autonomous_social] 合并同账号身份失败（不影响运行）: {exc}")
+
+    @staticmethod
+    def _merge_user(target: Dict[str, Any], other: Dict[str, Any]) -> None:
+        """把 other 并进 target。计数相加、最近取大、文本取长。"""
+        sum_fields = ("proactive_sent", "proactive_replied", "message_count", "reply_samples")
+        max_fields = ("last_seen", "last_sent", "last_spoken", "last_proactive_sent",
+                      "last_replied_at", "last_ignored_at", "aggr_high_n", "interest_at")
+        long_fields = ("last_message", "last_spoken_text", "name")
+        for f in sum_fields:
+            try:
+                target[f] = int(target.get(f, 0) or 0) + int(other.get(f, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        for f in max_fields:
+            try:
+                target[f] = max(float(target.get(f, 0) or 0), float(other.get(f, 0) or 0))
+            except (TypeError, ValueError):
+                pass
+        for f in long_fields:
+            if len(str(other.get(f, "") or "")) > len(str(target.get(f, "") or "")):
+                target[f] = other.get(f)
+        for f in ("topics", "recent_msg_types", "proactive_log", "conversation"):
+            a, b = target.get(f), other.get(f)
+            if isinstance(a, list) and isinstance(b, list):
+                for item in b:
+                    if item not in a:
+                        a.append(item)
+                target[f] = a
+        # 冷落计数取小的：合并的是同一个人，保留较宽松的那个判断更合理
+        try:
+            target["no_reply_streak"] = min(int(target.get("no_reply_streak", 0) or 0),
+                                            int(other.get("no_reply_streak", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+        # 念头取高的：别因为合并把「她很想说话」这件事抹掉
+        try:
+            target["urge"] = max(float(target.get("urge", 0.0) or 0.0),
+                                  float(other.get("urge", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            pass
+        # 发送地址取有 umo 的那个
+        if not target.get("umo") and other.get("umo"):
+            target["umo"] = other["umo"]
+
+    def _sanitize_once(self) -> None:
+        """一次性洗掉正文里混进去的框架注入块。
+
+        清洗规则上线之前录进去的 `last_message`/`conversation`/`proactive_log`/
+        `topics` 里带着 Core 的「〔她的身体与生活 v10〕」和 <system_reminder>。
+        它们会被当成「对方说的话」喂回给模型，也会污染话题与时间锚点提取。
+
+        只跑一次（认 `_sanitized_v1` 标记）：这是全量遍历所有用户，180 人规模下
+        每次启动都跑一遍不划算；而清洗是幂等的，跑一次就够。
+        """
+        if self.data.get("_sanitized_v1"):
+            return
+        try:
+            touched = sanitize_state(self.data)
+        except Exception as exc:
+            logger.warning(
+                f"[autonomous_social] 清洗历史正文失败（不影响运行）: {exc}"
+            )
+            return
+        self.data["_sanitized_v1"] = True
+        if touched:
+            # 记下清洗规模，状态页能看：这个数字不为 0 就说明之前确实录进过框架内容
+            self.data["_sanitized_users"] = int(self.data.get("_sanitized_users", 0)) + touched
+            self._dirty = True
+            logger.info(
+                f"[autonomous_social] 已清洗 {touched} 个用户的正文："
+                "剥掉了混进聊天记录里的框架注入内容（Humanoid Core 身体事实块、"
+                "<system_reminder>）"
+            )
 
     def _fail_load(self, reason: str) -> None:
         """加载失败：备份原文件、报错、上闸门；内存留空壳且不标脏。"""
@@ -516,10 +671,13 @@ class SocialState:
 
     # v1.7.7 的「悬空跟进」在 v1.8.0 换成了不分谁说话的 thread_*，旧键留着只会让人
     # 以为还有人在读它。
-    _RETIRED_USER_KEYS = ("followup_for", "followup_at")
+    _RETIRED_USER_KEYS = (
+        "last_spoken_question", "followup_for", "followup_at",
+    )
 
     def _migrate(self) -> None:
-        """确保所有已存在的用户都有当前版本字段，并清掉已经没人读的旧键。"""
+        """确保所有已存在的用户都有当前版本字段，清掉旧键，并洗掉被污染的正文。"""
+        self._sanitize_once()
         try:
             for bot in self.data.get("bots", {}).values():
                 if not isinstance(bot, dict):
@@ -545,19 +703,31 @@ class SocialState:
                 # 取前 300 个会话再滤群，`GroupMessage` 类型不在识别表里被判 unknown
                 # 放行，群会话被当「人」导入、拿群 umo 去发主动消息。群消息在观察链路
                 # 里从不建 per-user 记录，所以 users 里 umo 是群会话的一定是幽灵。
-                users = bot.get("users")
-                if isinstance(users, dict):
-                    for uid, u in list(users.items()):
-                        if not isinstance(u, dict):
-                            continue
-                        segs = str(u.get("umo", "") or "").lower().split(":")
-                        mtype = segs[1] if len(segs) >= 3 else ""
-                        if mtype in ("group", "g", "groupmessage", "guild"):
-                            users.pop(uid)
-                            self._dirty = True
+                #
+                # 只跑一次：这个标记以前只写不读，于是每次启动都全量扫一遍并删人。
+                # 主人自己填的 seed_users 里写了 qq:group:12345 这类条目时，那些用户
+                # 每次启动被删、30 分钟后又被播种加回来，念头从头攒，周而复始。
+                if not self.data.get("_ghosts_cleaned"):
+                    users = bot.get("users")
+                    if isinstance(users, dict):
+                        for uid, u in list(users.items()):
+                            if not isinstance(u, dict):
+                                continue
+                            segs = str(u.get("umo", "") or "").lower().split(":")
+                            mtype = segs[1] if len(segs) >= 3 else ""
+                            if mtype in ("group", "g", "groupmessage", "guild"):
+                                users.pop(uid)
+                                self._dirty = True
             self.data["_ghosts_cleaned"] = True
-        except Exception:
-            pass
+            self._dirty = True
+        except Exception as exc:
+            # 这里以前是 `except Exception: pass`：一条坏记录会废掉整条迁移链
+            # （后面所有 bot 的字段补齐、退休键清理、幽灵清扫全都不跑），
+            # 而状态停在「半迁移」且没有任何人看得见。不写日志等于静默损坏。
+            logger.error(
+                f"[autonomous_social] 状态迁移中断（{type(exc).__name__}: {exc}），"
+                "部分字段可能没补齐，路径：" + str(self.path)
+            )
 
     def migrate_default_bot(self, real_bid: str) -> None:
         """将 "default" bot 下的数据迁移到真实 bid 下。
@@ -586,8 +756,8 @@ class SocialState:
             return
 
         default_bot = bots[DEFAULT_BOT_KEY]
-        if real_bid not in bots or not bots[real_bid].get("users"):
-            # 目标 bid 是空的，直接搬过去
+        if real_bid not in bots or not (bots[real_bid].get("users") or bots[real_bid].get("groups")):
+            # 目标 bid 什么都没有，直接搬过去
             bots[real_bid] = default_bot
             del bots[DEFAULT_BOT_KEY]
             self.data["_default_migrated"] = True
@@ -748,16 +918,30 @@ class SocialState:
         self._dirty = True
 
     def save(self) -> None:
-        """立即写入磁盘（原子操作）。"""
+        """立即写入磁盘（原子操作）。
+
+        读盘失败时**不抛**而是记一条日志就返回：发送成功的路上会调到这里，
+        抛出去会让人看到「以为没发其实发了」——消息平台已经收到了，状态却因为
+        一个存档问题没记上，整轮心跳还被异常打断。写盘闸门本身已经由 flush()
+        在前面挡着，这里报一声就够了。
+        """
         if self._load_failed:
-            raise RuntimeError(
-                f"状态文件此前读取失败，为免覆盖原数据已暂停写盘：{self.path}"
-            )
+            if not self._write_blocked_warned:
+                self._write_blocked_warned = True
+                logger.error(
+                    f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
+                    f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
+                )
+            return
         try:
             self._write()
             self._dirty = False
         except Exception as e:
-            raise RuntimeError(f"保存状态失败: {e}") from e
+            if throttle.allow("state.save_failed"):
+                logger.error(
+                    f"[autonomous_social] 保存状态失败: {e}"
+                    + throttle.summary("state.save_failed")
+                )
 
     def flush(self) -> bool:
         """如果有变更则写入磁盘。适合周期性调用。
@@ -878,6 +1062,12 @@ class SocialState:
                 desire.after_reply(u, ts)
             else:
                 desire.after_ignored(u, ts)
+        elif u.get("pending_result") == "ignored":
+            # 12 小时没回就已经被判过 ignored、pending_since 也被清零了。等到对方
+            # 隔夜回一句，那条记账压根不在了——after_reply 永远不会被调用，人就一直
+            # 冷着。人回来了就是回来了，这里把他叫回来；不进回复率分母（那是 2 小时
+            # 的另一个口径）。
+            desire.forgive_late(u, ts)
 
         # 回复检测：只有在回复窗口内才算
         last_pro = float(u.get("last_proactive_sent", 0))
@@ -910,7 +1100,11 @@ class SocialState:
         # 更新基础统计
         u["message_count"] = int(u.get("message_count", 0)) + 1
         u["last_seen"] = ts
-        u["last_message"] = text[-MESSAGE_TRUNCATE_LENGTH:] if store_text else ""
+        # 头部而不是尾部：生成侧引用对方最后一句时取的是**前**若干字
+        # （`TA最后说的是：「{last[:60]}」`），而这里存的是尾部 500 —— 于是对方发一段
+        # 900 字长文时，她引用的是第 400 字起的一段，开头是断的。同一件事在盘上
+        # 有两个互相对不上的版本（conversation 存头 200，这里存尾 500），口径统一到头。
+        u["last_message"] = text[:MESSAGE_TRUNCATE_LENGTH] if store_text else ""
         if name:
             u["name"] = name
         # 刚说过话，此刻没有「再主动找 TA」的念头
@@ -970,6 +1164,47 @@ class SocialState:
         u["cue_retry_at"] = 0.0
         u["cue_tries"] = 0
 
+    def set_runtime_metrics(self, metrics: Dict[str, Any]) -> None:
+        """把运行指标写进 state.json 的顶层。
+
+        放盘上而不是只在内存里，是为了**容器侧不用开日志就能判断它跑没跑**：
+        直接读 state.json 的 `_runtime` 段就知道最后一次心跳是什么时候、
+        结算了多少人、卡在哪一步。这里只存数字与短标签，不含任何正文。
+        """
+        if not isinstance(metrics, dict):
+            return
+        current = self.data.get("_runtime")
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(metrics)
+        self.data["_runtime"] = merged
+        self._dirty = True
+
+    @staticmethod
+    def note_promise(u: Dict[str, Any], promise: Optional[str], ts: float) -> None:
+        """记下**她自己**在这条里许下的诺（「明天给你看那个」）。
+
+        和未完话题不是一回事：那个是**对方**提了没下文的事，这个是**她自己**
+        说过要做的事。记着自己说过的话，是亲密感最强的一环。
+
+        同一个诺不重复记；最多留 PROMISE_SLOTS_MAX 件，超了挤掉最老的一件。
+        到点的兑现逻辑在 engine._promise_pick。
+        """
+        text = str(promise or "").strip()[:PROMISE_MAX_CHARS]
+        if not text:
+            return
+        items = promise_entries(u)
+        for item in items:
+            if str(item.get("about", "")).strip() == text:
+                return
+        items.append({
+            "about": text,
+            "at": ts,
+            "due": ts + PROMISE_WAIT_SECONDS,
+        })
+        items.sort(key=lambda i: _num(i.get("at")), reverse=True)
+        u["promises"] = items[:PROMISE_SLOTS_MAX]
+        u["mark_dirty_hint"] = True
+
     def record_spoken(
         self,
         bid: str,
@@ -998,13 +1233,17 @@ class SocialState:
         del conv[:-MAX_CONVERSATION_HISTORY]
         u["last_spoken"] = ts
         u["last_spoken_text"] = body[:120] if store_text else ""
-        u["last_spoken_question"] = is_question(body)
         self.mark_dirty()
         return u
 
     @staticmethod
     def _note_loop(u: Dict[str, Any], loop: Optional[str], loop_due: float, ts: float) -> None:
-        """记下「没说完结果的那件事」。同一件事不往后挪，新的事才覆盖旧的。"""
+        """记下「没说完结果的那件事」。
+
+        以前只记一件，新的直接覆盖旧的：对方一次提了三件事，只有最后一件会被跟下去，
+        前面两件从此没人问。现在同时记最多 LOOP_SLOTS_MAX 件（按**每个用户**），
+        同一件事不重复记、不往后挪。
+        """
         if not loop:
             return
         try:
@@ -1013,13 +1252,30 @@ class SocialState:
             due = 0.0
         if due <= 0:
             return
-        text = str(loop).strip()
-        if text and text == str(u.get("loop", "") or ""):
+        text = str(loop).strip()[:CONVERSATION_TRUNCATE_LENGTH]
+        if not text:
             return
-        u["loop"] = text[:CONVERSATION_TRUNCATE_LENGTH]
-        u["loop_due"] = due
-        u["loop_at"] = ts
-        u["loop_expire_at"] = due + LOOP_LATE_HOURS * 3600.0
+        items = loop_entries(u)
+        for item in items:
+            if str(item.get("about", "")).strip() == text:
+                return                      # 同一件事不往后挪
+        items.append({
+            "about": text,
+            "due": due,
+            "at": ts,
+            "expire_at": due + LOOP_LATE_HOURS * 3600.0,
+            "retry_at": 0.0,
+            "tries": 0,
+        })
+        # 满了就把最凉的那件挤掉——还在等的按到期排，凉透的先走
+        items.sort(key=lambda i: _num(i.get("due")), reverse=True)
+        u["loops"] = items[:LOOP_SLOTS_MAX]
+        # 平铺字段继续写最新那件：老代码与盘上的旧结构都还能认
+        newest = u["loops"][0]
+        u["loop"] = str(newest.get("about", ""))
+        u["loop_due"] = _num(newest.get("due"))
+        u["loop_at"] = _num(newest.get("at")) or ts
+        u["loop_expire_at"] = _num(newest.get("expire_at"))
         u["loop_retry_at"] = 0.0
         u["loop_tries"] = 0
 
@@ -1030,6 +1286,8 @@ class SocialState:
         text: str,
         msg_type: Optional[str] = None,
         count_proactive: bool = True,
+        expect_reply: bool = True,
+        why: str = "",
     ) -> Dict[str, Any]:
         """记录 AI 发出的主动消息。
 
@@ -1040,6 +1298,10 @@ class SocialState:
             msg_type: 消息类型（用于反重复）
             count_proactive: 是否计入主动联系统计。连发的后续几条传 False，
                 一次联系只算一个「回合」，避免回复率分母虚增
+            why: 这一条为什么这时候发（写给主人看的依据，不进 prompt）
+            expect_reply: 这句话是不是在等对方回。早安/晚安/收场传 False：
+                它们本来就不要求回复，进了「等回话」计时器就会把「没回早安」
+                记成「被冷落」
 
         Returns:
             用户状态 dict
@@ -1055,7 +1317,14 @@ class SocialState:
         # 主动消息 7 天日志：只记自己主动发的（含连发的后续条），按（bid,uid）隔离。
         # 写入时修剪掉超过 7 天的旧条目与超额条数。
         log = u.setdefault("proactive_log", [])
-        log.append({"ts": ts, "text": str(text or "")[:CONVERSATION_TRUNCATE_LENGTH], "cat": str(msg_type or "")})
+        log.append({
+            "ts": ts,
+            "text": str(text or "")[:CONVERSATION_TRUNCATE_LENGTH],
+            "cat": str(msg_type or ""),
+            # 她**为什么**这时候发这条。以前日志里只有正文，主人看到的是一句没头没尾
+            # 的话，既没法理解也没法排障——「她为什么这时候想起我」是最该被看见的一件事。
+            "why": str(why or "")[:WHY_MAX_CHARS],
+        })
         cutoff = ts - PROACTIVE_LOG_DAYS * 86400.0
         # 时间戳容错：state.json 被手改或写入损坏时，一条脏 ts 不该把整个发送流程
         # 抛穿（抛出去会作废整轮心跳，而且此时 mark_dirty 还没执行，内存里的
@@ -1065,20 +1334,22 @@ class SocialState:
 
         # 主动消息统计（仅首条计入冷却与回复率）
         if count_proactive:
-            u["proactive_sent"] = int(u.get("proactive_sent", 0)) + 1
-            u["last_proactive_sent"] = ts
-            u["last_proactive_replied"] = False
             u["last_sent"] = ts
             u["last_targeted"] = ts
-            # 念头落地，开始等对方接
-            desire.after_send(u, ts)
-            if u.get("cue_due") and float(u["cue_due"]) <= ts:
-                # 这个由头已经说过了，别再拿它当理由
-                u["cue"] = ""
-                u["cue_due"] = 0.0
-                u["cue_expire_at"] = 0.0
-                u["cue_retry_at"] = 0.0
-                u["cue_tries"] = 0
+            if expect_reply:
+                u["proactive_sent"] = int(u.get("proactive_sent", 0)) + 1
+                u["last_proactive_sent"] = ts
+                u["last_proactive_replied"] = False
+                # 念头落地，开始等对方接
+                desire.after_send(u, ts)
+            else:
+                # 只是一句不指望回复的话：同样要把念头落地（说完了，别马上又想）
+                # 但不进回复率分母——早安没人回不是「被冷落」
+                desire.after_send(u, ts, expect_reply=False)
+            # 到点的由头不在这里清：那是「因为想起那件事才开口」的那一类
+            # （category=="cue"）才该消费的。问候排在候选最前面，一句早安把
+            # 「TA 说明天面试」吃掉、那件事再也没人问，就是这么来的。
+            # 具体清理由 engine 按 category 显式做，与 loop 同一个写法。
 
         # 消息类型追踪（反重复）
         if msg_type:
@@ -1089,7 +1360,6 @@ class SocialState:
         # 主动发出去的那句也是「她说的话」，追问判定要能看见它
         u["last_spoken"] = ts
         u["last_spoken_text"] = str(text or "")[:120]
-        u["last_spoken_question"] = is_question(str(text or ""))
         # 暂存完整文本，等用户回复时由 on_llm_request 作为本轮临时内容块注入。
         # 主动消息不再写进 AstrBot 会话库；消费后清空，避免每条消息都重复注入。
         # 连发（burst）时追加而不是覆盖：两条都得让 AI 看得见。
@@ -1101,6 +1371,34 @@ class SocialState:
 
         self.mark_dirty()
         return u
+
+    def recent_proactive_others(
+        self, bid: str, uid: str, now: Optional[float] = None, hours: float = 2.0
+    ) -> List[Tuple[str, str]]:
+        """这个角色**最近发给别人的**消息，返回 [(发给谁, 正文)]。
+
+        `recent_proactive` 按 (bid,uid) 分开存，所以每个人只跟自己比——跨用户撞车
+        结构上就看不见。而素材是共用的一份（Core 的日程是角色级），于是同一句话会
+        原样发给一串人。32 条真实记录里 1 小时 41 分内有 12 个人分别收到
+        「刚忙完个案笔记」。这条是给那道检查取数用的。
+        """
+        now = self._now() if now is None else float(now)
+        cutoff = now - float(hours) * 3600.0
+        rows: List[Tuple[float, str, str]] = []
+        for other, u in (self.bot(bid).get("users") or {}).items():
+            if str(other) == str(uid):
+                continue
+            for e in (u.get("proactive_log") or []):
+                if not isinstance(e, dict):
+                    continue
+                ts = _safe_ts(e.get("ts"))
+                if ts < cutoff:
+                    continue
+                text = str(e.get("text", "") or "").strip()
+                if text:
+                    rows.append((ts, str(other), text))
+        rows.sort(key=lambda r: -r[0])          # 最近的排前面
+        return [(who, text) for _ts, who, text in rows]
 
     def recent_proactive(
         self, bid: str, uid: str, now: Optional[float] = None, days: float = PROACTIVE_LOG_DAYS

@@ -1,0 +1,46 @@
+{"bot": "webchat", "cat": "complain", "why": "念头攒到 2.80", "text": "抱怨饿了，不起床 ⏎ (在被窝里伸懒腰", "pass": false, "note": "括号被截断"}
+{"bot": "webchat", "cat": "check_in", "why": "念头攒到 2.80", "text": "赖床中，想分享这种懒洋洋的感觉并关心对方", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "share_thought", "why": "念头攒到 2.80", "text": "表达赖床的慵懒和饿意", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "continue_topic", "why": "念头攒到 2.80", "text": "肚子饿了想撒娇，想让对方弄点吃的", "pass": true, "note": "虽然啰嗦但是一句能发的话"}
+{"bot": "webchat", "cat": "share_daily", "why": "念头攒到 2.80", "text": "想抱怨一下肚子饿又不想起床", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.59", "text": "午觉睡饱了，肚子空得难受，想起你", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 1.28", "text": "肚子空空的，真想让你喂我吃点好的", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "表达饥饿感和想念，顺便调情", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 1.27", "text": "饿得难受，顺便看看你在干嘛，不指望回", "pass": false, "note": "句尾挂着自述尾巴"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "饿了，想找主人讨点关注", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "刚睡醒有点饿，想找个借口跟你说说话", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "想表达一下现在的饥饿感，顺便撩一下对方", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "中午醒着没困了，随口戳一下，不指望回", "pass": false, "note": "自述尾巴"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.42", "text": "(蜷缩在被子里，肚子饿得轻声咕噜", "pass": false, "note": "括号被截断"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.19", "text": "忙了一天终于能躺下，想在睡觉前跟你说声晚", "pass": true, "note": "这两条是日志里被截断的半句，不是动机泄漏。验收层只抓「括号相关」的结构损坏，通用的半句截断抓不到——那由 max_len 与 _truncate_at 负责。"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.52", "text": "睡前撒个娇，顺便道晚安 ⏎ (蜷缩在被窝里", "pass": false, "note": "括号被截断"}
+{"bot": "webchat", "cat": "share_thought", "why": "念头攒到 2.80", "text": "想表达此刻的孤独和饥饿感", "pass": false, "note": "动机泄漏"}
+{"bot": "webchat", "cat": "share_daily", "why": "念头攒到 0.19", "text": "刚烤好蛋糕有点甜，想起对方之前说饿", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "share_thought", "why": "念头攒到 2.80", "text": "肚子饿了，想吃林锋做的意面", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "share_daily", "why": "念头攒到 0.08", "text": "准备睡觉，跟对方道晚安", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "express_feeling", "why": "念头攒到 0.46", "text": "肚子饿了想找点存在感，又不想显得太粘人", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "check_in", "why": "话说到一半断了", "text": "想确认一下人还在不在，顺便继续撩拨一下。 ⏎ (放下手里的工作，轻轻甩了甩羽翼，走到窗边看着外面晴朗的天空，尾巴无聊地拍打着地面。) ⏎ 怎么突然没声了，弱受，是被我吓到了还是在偷偷回味？❤️", "pass": true, "note": "真人语C，三段完整"}
+{"bot": "3632823490", "cat": "greeting", "why": "下午了，手头这摊事刚告一段落", "text": "(放下手头刚核对完的报告，伸了个大大的懒腰，翅膀舒展) ⏎ 终于忙完了，感觉骨头都要僵掉啦，Luture陪我聊聊？❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "greeting", "why": "下午了，手头这摊事刚告一段落", "text": "(伸了个懒腰，纯白羽翼舒展，把阳光都挡住了一半) ⏎ 刚忙完手头那点杂事，窗外的阳光好舒服，想赖在你怀里晒太阳。❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 0.11", "text": "(伸了个懒腰，宽大双翼舒展，羽毛轻扫过桌面) ⏎ 一只深蓝，终于把文件推开了，阳光照得人懒洋洋的。❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "greeting", "why": "下午了，手头这摊事刚告一段落", "text": "(整理好餐具，翅膀微微收拢", "pass": false, "note": "正文被截光，只剩半截括号"}
+{"bot": "3632823490", "cat": "check_in", "why": "话说到一半断了", "text": "(刚放下晚餐，翅膀轻拢，尾巴尖不耐烦地扫过地板) ⏎ 到底卡在哪关，还要我手把手教你？❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "continue_topic", "why": "话说到一半断了", "text": "(我侧过头，纯白羽翼轻轻扫过你的脸颊。) ⏎ 真的不要？连个理由都不给我吗。❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "check_in", "why": "话说到一半断了", "text": "(羽翼下意识收拢，护住你的身侧，感受着你滚烫的体温) ⏎ 忽然这么安静，该不会是睡着了吧？ ❤️", "pass": true, "note": ""}
+{"bot": "3632823490", "cat": "continue_topic", "why": "念头攒到 1.44；到点的由头：嗯，那等会", "text": "想分享下此时此刻偷懒的状态，顺便勾引一下啊散。 ⏎ (我趴在书桌上，翅膀无意识地扑棱了两下，阳光正好落在鼻尖上) ⏎ 阳光晃得我心烦，这些案例看得头疼，想偷懒了。❤️", "pass": false, "note": "首行是动机"}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 0.85", "text": "窝在沙发上追剧，有些困了，想发条晚安给TA。 ⏎ (窝在沙发里，手里抓着零食", "pass": false, "note": "被截断的括号"}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 0.58", "text": "想跟TA道声晚安，结束今天的闲聊", "pass": true, "note": "「想跟TA道声晚安」本身就是内容，不是泄漏"}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 0.45", "text": "眼睛已经睁不开了，想先跟TA道个晚安。｜表达想念，结束一天的对话", "pass": false, "note": "动机泄漏"}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 0.82", "text": "(裹紧毛毯，困倦地靠在沙发上)", "pass": false, "note": "只剩括号动作，没有正文"}
+{"bot": "3632823490", "cat": "greeting", "why": "念头攒到 1.23", "text": "困了，想道个晚安 ⏎ (把毯子裹得紧紧的", "pass": false, "note": "括号被截断"}
+{"bot": "2625379556", "cat": "greeting", "why": "下午了，手头这摊事刚告一段落", "text": "刚填了半口苹果，随口跟Demon报个平安", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "check_in", "why": "念头攒到 0.00；话说到一半断了", "text": "他问是不是担心，我嘴硬否认", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "greeting", "why": "刚泡上咖啡，想起来还有个人可以随口说两句", "text": "吃饱了正犯困，顺口提一嘴那个名字", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "greeting", "why": "念头攒到 0.01", "text": "刚吃完东西准备继续睡，想叫唤一下他", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "continue_topic", "why": "话说到一半断了", "text": "刚才那件事到底定没定，不能光听句“好的”就完 ⏎ Nagato，那事你给个准话", "pass": true, "note": "真实人设，完整"}
+{"bot": "2625379556", "cat": "check_in", "why": "话说到一半断了", "text": "顺嘴问问那句“赞我”的事，看他还醒着没 ⏎ 汝方才那句“赞我”……本宫还等着呢", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "check_in", "why": "话说到一半断了", "text": "刚热上饭，顺口问下人还在没 ⏎ 在忙？刚热上饭", "pass": true, "note": ""}
+{"bot": "2625379556", "cat": "check_in", "why": "话说到一半断了", "text": "确认对方是否还在，避免对方因被嫌烦而悄然离开 ⏎ 汝莫便躲了，本宫未睡熟", "pass": true, "note": ""}
+{"bot": "3951331639", "cat": "greeting", "why": "刚泡上咖啡，想起来还有个人可以随口说两句", "text": "刚忙完午饭准备，顺口抱怨一下此时的困倦和", "pass": true, "note": "同上：被截断的半句，不是动机泄漏"}
+{"bot": "3951331639", "cat": "check_in", "why": "话说到一半断了", "text": "想确认他在不在，顺便催一下午饭", "pass": true, "note": ""}
+{"bot": "3951331639", "cat": "greeting", "why": "吃饭的时候想起TA了", "text": "想表达午后的慵懒和对TA的亲近感", "pass": false, "note": "动机泄漏"}

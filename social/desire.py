@@ -24,15 +24,21 @@ import random
 from typing import Any, Dict, Optional
 
 # 念头攒到多少才算「想找 TA 说话」（提高阈值，降低主动频率）
-FIRE_THRESHOLD = 1.40
+#
+# v1.19.0： 抬高了这一段：原来是 1.40~1.95，配合 2 小时的攒念头周期，一个会回消息的人
+# 一天会收到 7~8 条——那不是「她想起我」，是节拍器。抬到 1.90~2.50 之后，同样的人在
+# 16 个清醒小时里大约 3 条，而且**每一条发出去时念头都更高**（她确实攒了一阵），
+# 提示词里给模型的状态也跟着更足。抬门槛不是让它更保守，是让每次开口都得挣到。
+FIRE_THRESHOLD = 2.10
 # 每次说完话重抽门槛时的抖动幅度：门槛落在 FIRE_THRESHOLD~FIRE_THRESHOLD+SPAN 之间。
 # 判定时还会被 effective_gate 压到念头天花板之内，所以这个区间只是「节奏快慢」的
 # 调节量，不再是「能不能发」的生死线。
-FIRE_GATE_SPAN = 0.55
+FIRE_GATE_SPAN = 0.65
 # 念头的绝对上限，避免长期不结算的人攒出一个离谱的值
 URGE_CEILING = 3.0
-# 被否决（模型说不用发）之后念头回落到哪里：不是清零，「想过，先算了」
-# v25优化：降低到0.18，被拒后更克制，避免快速重试
+# 被否决（模型说不用发）之后保留多少念头。清零式惩罚会让模型不敢说 NO（见 after_skip）
+SKIP_KEEP_RATIO = 0.45
+# 保留旧常量名以免外部引用断掉；新逻辑不再用它
 SKIP_FALLBACK = 0.18
 # 发送成功后念头清零
 SENT_URGE = 0.0
@@ -64,10 +70,30 @@ STREAK_NEEDS_CUE = 4
 # 被冷落封顶后，隔多久没有任何来往就把冷落计数往回退一格：真人晾了很久也会
 # 「算了再找一次看看」，而不是从此当这个人不存在。默认 3 天退一次。
 STREAK_DECAY_DAYS = 3.0
+# 熟络度满格需要的消息条数（chat messages）。用它把「聊过多少」和「最近回不回我」
+# 混成好感度，避免近期热度把相处时长整段抹掉。
+FAMILIARITY_SATURATION = 200
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
+
+
+def familiarity(messages: int) -> float:
+    """聊过多少条换算成 0~1 的熟络度。
+
+    单独拿出来是因为它有第二个用处：在意程度里「TA 回不回我」占了一半，而回不回是
+    近期状态——只用在意程度当好感度时，一个认识两年的人会被连着几次没回整段拉回
+    「刚认识不久」。engine 把它按权重混进好感度，让关系是连续滑动的而不是跳档。
+
+    满格用 200 条而不是几十条：log 在小样本段涨得很快，几十条就封顶的话
+    聊过十句话的新人和聊过半年的熟人会是同一个熟络度。
+    """
+    try:
+        msgs = max(0, int(messages))
+    except (TypeError, ValueError):
+        msgs = 0
+    return clamp(math.log1p(msgs) / math.log1p(FAMILIARITY_SATURATION), 0.0, 1.0)
 
 
 def interest_level(
@@ -89,7 +115,7 @@ def interest_level(
     # 一个上不去的在意度里，主动消息会稀疏到看不出来插件在工作。
     a = 0.5 if affection is None else clamp(float(affection) / 100.0, 0.0, 1.0)
     msgs = int(user.get("message_count", 0) or 0)
-    familiar = clamp(math.log1p(msgs) / math.log1p(80), 0.0, 1.0)
+    familiar = familiarity(msgs)
 
     if weigh_reply_rate:
         # 回复率做拉普拉斯收缩：只发过一次、对方当时没回，不能就把 TA 当成不想理人
@@ -101,7 +127,11 @@ def interest_level(
         rate = 0.5      # 中性：不因为回没回而抬高或压低
         streak = 0
 
-    raw = 0.12 + 0.34 * a + 0.30 * familiar + 0.24 * rate - 0.06 * streak
+    # streak 的权重原来和 rate 一样重，而两者量的是同一个人际信号（TA 回不理会你）。
+    # 一起计的结果是：连着几次没回就直接把一个认识两年的人从「亲密」压到「刚认识
+    # 不久」——消息一条没少，只是更冷，而那种落差本身就不像人。减半，并且熟络度
+    # 单独给一条地板（见 engine 里的 affection 兜底），不让人际热度把时长抹掉。
+    raw = 0.12 + 0.34 * a + 0.30 * familiar + 0.24 * rate - 0.03 * streak
     return clamp(raw, 0.05, 1.0)
 
 
@@ -198,7 +228,12 @@ def decay_streak(user: Dict[str, Any], now: float) -> None:
     streak = int(user.get("no_reply_streak", 0) or 0)
     if streak <= 0:
         return
-    anchor = float(user.get("last_sent", 0) or 0)
+    # 锚点必须是「最后一次被判定为没人理」，不能是 last_sent：只要她还在发，
+    # now - last_sent 就永远小于衰减周期，冷落计数永远降不下来——对那些从不回复的
+    # 联系人就变成无限期保持每天几条。老数据没有这个字段时退回 last_sent。
+    anchor = float(user.get("last_ignored_at", 0) or 0)
+    if anchor <= 0:
+        anchor = float(user.get("last_sent", 0) or 0)
     if anchor <= 0:
         # 老数据没有 last_sent，退回「最后一次有来往」宁可慢退也不能不退
         anchor = float(user.get("last_seen", 0) or 0)
@@ -213,6 +248,32 @@ def decay_streak(user: Dict[str, Any], now: float) -> None:
     new_streak = max(0, streak - steps)
     if new_streak != streak:
         user["no_reply_streak"] = new_streak
+
+
+# 势头：刚聊开的时候攒得快，冷了一阵子会自己慢下来。
+#
+# 以前只有「被冷落」这一个方向——连着被无视之后会退。缺的是另一边：**聊开了是有惯性的**，
+# 真人一旦热起来会连着说一阵子，而她现在是发完一条、下次照样等满一个周期，
+# 于是「连发三条然后消失三天」这种最不像人的节奏照样出得来。
+MOMENTUM_WINDOW_HOURS = 14.0
+MOMENTUM_MAX = 1.45
+MOMENTUM_COOLDOWN_HOURS = 36.0
+
+
+def momentum_factor(user: Dict[str, Any], now: float) -> float:
+    """最近聊得密 → 攒得快（最多 ×1.45）；隔了很久 → 回到 1.0。"""
+    try:
+        last_spoken = float(user.get("last_spoken", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 1.0
+    if last_spoken <= 0:
+        return 1.0
+    hours = (now - last_spoken) / 3600.0
+    if hours < 0 or hours > MOMENTUM_WINDOW_HOURS:
+        return 1.0
+    # 刚说完的那会儿势头最足，几小时后淡掉
+    ratio = 1.0 - (hours / MOMENTUM_WINDOW_HOURS)
+    return 1.0 + (MOMENTUM_MAX - 1.0) * ratio
 
 
 def settle(
@@ -279,6 +340,7 @@ def settle(
             scale = 1.0
         rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5) * scale
         factor = (rhythm if rhythm is not None else 1.0) * clamp(mood_factor, 0.0, 1.5)
+        factor *= momentum_factor(user, now)
         if quiet:
             factor *= 0.12
         urge += hours * rate * factor
@@ -322,13 +384,20 @@ def effective_gate(user: Dict[str, Any], cap: float) -> float:
     return min(max(gate, FIRE_THRESHOLD), cap)
 
 
-def after_send(user: Dict[str, Any], now: float) -> None:
-    """发出去之后：念头落地，开始等对方接，并重新抽下次的门槛。"""
+def after_send(user: Dict[str, Any], now: float, *, expect_reply: bool = True) -> None:
+    """发出去之后：念头落地，重新抽下次的门槛。
+
+    expect_reply=False 用于早安/晚安/收场这类**本来就不指望对方回**的话：
+    它们不点「等一句回话」的计时器。以前早安也点，于是「从来没回过早安」被
+    算成「连着被冷落」，念头天花板被永久压死；而 decay_streak 的锚点又是
+    last_sent，每天问候都刷新它，衰减永远等不到那三天。
+    """
     user["urge"] = SENT_URGE
     user["urge_at"] = now
-    user["pending_since"] = now
-    user["pending_result"] = "waiting"
     user["fire_gate"] = new_fire_gate()
+    if expect_reply:
+        user["pending_since"] = now
+        user["pending_result"] = "waiting"
 
 
 def after_reply(user: Dict[str, Any], now: float) -> None:
@@ -348,6 +417,8 @@ def after_ignored(user: Dict[str, Any], now: float) -> None:
     user["urge_at"] = now
     user["pending_since"] = 0.0
     user["pending_result"] = "ignored"
+    # 冷落计数的衰减锚点用它，不是 last_sent（见 decay_streak）
+    user["last_ignored_at"] = now
     # 轻微掋一下就好：后续的 interest_level/smooth_interest 会根据回复率与 streak 自行
     # 把基线拉回来，这里再重手只会把一个只是最近很忙的人越掋越边缘。地板拉高一点，
     # 避免 interest 被掋到 0.05 后念头慢到几乎不涨。
@@ -355,11 +426,41 @@ def after_ignored(user: Dict[str, Any], now: float) -> None:
     user["interest"] = round(clamp(interest - 0.03, 0.12, 1.0), 4)
 
 
+def forgive_late(user: Dict[str, Any], now: float) -> None:
+    """过了窗口才回的那句，也算「TA 回我了」。
+
+    为什么要单列一个：12 小时没回就会被 settle_pending 判成 ignored，于是 pending_since
+    被清零。等到对方第二天早上回一句，那条记账已经不在了——after_reply 压根不会被调用，
+    冷落计数一路涨、语气越来越冷。用户会明确感到「回复了也没用」。
+    这里只把人叫回来：冷落清零、那件事不再悬着；**不进回复率分母**（分母是 2 小时
+    那个口径，统计归统计）。
+    """
+    user["no_reply_streak"] = 0
+    user["pending_since"] = 0.0
+    user["pending_result"] = "replied"
+    user["last_replied_at"] = now
+
+
 def after_skip(user: Dict[str, Any], now: float) -> None:
-    """想过，但决定不说：念头回落一点，过阵子可能还想说。"""
-    user["urge"] = min(float(user.get("urge", 0.0) or 0.0), SKIP_FALLBACK)
+    """想过，但决定不说。
+
+    原来是压回 SKIP_FALLBACK(0.18)——清零式惩罚。那样「说不」其实很贵：模型会发现
+    说一次 NO 会把攒了半天的念头作废，于是宁可硬挤一句也说 SEND。模型的判断于是不可信。
+
+    改成**部分保留 + 抬高下次的门槛**：「想过但算了」本来就该让下一次开口更难一点
+    （这是真实代价，不是惩罚），但不该把之前的积累作废。这样 decide 的 NO 才是可以
+    放心说的话，攒下的念头也不会因为一次没发成而白扔。
+    """
+    urge = float(user.get("urge", 0.0) or 0.0)
+    user["urge"] = round(max(0.0, urge * SKIP_KEEP_RATIO), 4)
     user["urge_at"] = now
     user["last_skip_at"] = now
+    try:
+        base = float(user.get("fire_gate") or FIRE_THRESHOLD)
+    except (TypeError, ValueError):
+        base = FIRE_THRESHOLD
+    bump = random.uniform(0.0, FIRE_GATE_SPAN * 0.5)
+    user["fire_gate"] = min(base + bump, URGE_CEILING)
 
 
 def mood_multiplier(

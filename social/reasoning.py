@@ -1,6 +1,6 @@
 """上下文推理：由头先行、消息类型选择、多样化理由、反重复机制。
 
-v1.7.4：
+v1.19.0：
 - 新增时间锚点提取（extract_cue）：对方说了「明天面试」，过一天才有得问
 - 新增 live_cue()：由头到点才算「想起来了」，没由头就别没话找话
 - 新增 sleep_signal()：对方说过晚安/要睡了，就别再去催睡或道晚安
@@ -421,11 +421,26 @@ def is_question(text: str) -> bool:
 
 # 对方接话接得太短，基本等于没答：「嗯」「还行」「就那样」。
 _THIN_MAX_CHARS = 8
-_THIN_WORDS = (
-    "嗯", "哦", "噢", "喔", "啊", "额", "呃", "行", "好", "好的", "还行", "还好", "一般",
-    "随便", "都行", "可以", "没事", "没啥", "不知道", "忘了", "算了", "不聊", "先不",
-    "哈哈", "嘿嘿", "呵呵", "emm", "emmm", "ok", "嗯嗯", "是", "对", "有过", "就那样",
+# 「敷衍」词分成两类，判法不同：
+#
+# 1. 短的——必须**整句相等**才算。以前一律用子串匹配，而表里有「行」「好」「是」「对」
+#    这种单字，于是「今天**好**累」「银**行**」「但是」「不**对**」全被判成敷衍，
+#    接着触发一次「对方在敷衍我」的追问。大量正常消息被误判。
+# 2. 长的——本身就有辨识度（「还行」「不知道」「先不聊」），子串匹配没问题。
+_THIN_EXACT = (
+    "嗯", "嗯嗯", "哦", "噢", "喔", "啊", "额", "呃", "行", "好", "好的", "还行", "还好",
+    "一般", "随便", "都行", "可以", "没事", "没啥", "不知道", "忘了", "算了",
+    "不聊", "先不", "哈哈", "嘿嘿", "呵呵", "emm", "emmm", "ok", "是", "对", "有过", "就那样",
+    "还行吧", "随便吧", "都行吧",
 )
+# 有辨识度的短语，子串匹配安全
+_THIN_PHRASES = (
+    "不知道", "不用了", "算了吧", "先不聊", "回头说", "再说吧", "没什么事",
+)
+
+
+# 问句：结尾带问号或疑问语气词。短问句是在求回应，不是敷衍。
+_ASKING = re.compile(r"[?？吗呢么吧?]|吗$|呢$")
 
 
 def is_thin(text: str) -> bool:
@@ -434,8 +449,22 @@ def is_thin(text: str) -> bool:
     if not body:
         return True
     cleaned = body.strip("。！~～. 　")
+    # 纯标点/纯表情不算「敷衍」：「？」只是一个问号、「😭」只是一个表情，它们不是回答，
+    # 但也谈不上把话打发了。以前一律按长度判短，于是对方发个问号、probe_after_minutes
+    # 之后她就收到一句「我想把那件事问清楚」——而「那件事」就是一个问号。
+    if cleaned and not any("\u4e00" <= ch <= "\u9fff" or ch.isalnum() for ch in cleaned):
+        return False
+    # 短**问句**不是敷衍，是对方在等一个回答。
+    #
+    # 以前「两个字就是敷衍」，于是「在吗」被判成打发了人，她转头去追问
+    # 「怎么突然没声了」——对方明明在问话。真实表现：一个每小时回一句「在吗」的
+    # 用户，7 天被她追问了 44 次。
+    if _ASKING.search(cleaned):
+        return False
     if len(cleaned) <= _THIN_MAX_CHARS:
-        if any(word in cleaned for word in _THIN_WORDS):
+        if cleaned in _THIN_EXACT:
+            return True
+        if any(p in cleaned for p in _THIN_PHRASES):
             return True
     return len(cleaned) <= 2
 
@@ -455,6 +484,14 @@ _GREET_REASON_MORNING: List[str] = [
     "闹钟响过了还没完全醒，想跟TA说个早安。",
 ]
 
+_GREET_REASON_MIDDAY: List[str] = [
+    "刚忙完一段，抬头看到消息列表里有TA，顺手说一句。",
+    "吃饭的时候想起TA了。",
+    "下午了，手头这摊事刚告一段落，想跟TA说句话。",
+    "刚泡上咖啡，想起来还有个人可以随口说两句。",
+    "今天还没顾上说话，这会儿想起来补一句。",
+]
+
 _GREET_REASON_NIGHT: List[str] = [
     "今天到最后了，想跟TA道一句晚安。",
     "准备睡了，睡前想跟TA说声晚安。",
@@ -468,31 +505,50 @@ def greeting_window_kind(
     hour: int,
     morning: Tuple[int, int] = GREETING_MORNING_WINDOW,
     night: Tuple[int, int] = GREETING_NIGHT_WINDOW,
+    midday: Optional[Tuple[int, int]] = None,
 ) -> Optional[str]:
-    """她那里的这个钟点落在哪个问候窗口里。返回 'morning' / 'night' / None。"""
-    for start, end in (morning, night):
+    """她那里的这个钟点落在哪个问候窗口里。返回 'morning' / 'midday' / 'night' / None。
+
+    午间窗口是给「早安错过了」兜底的：以前 7~11 点一过就彻底没机会，真人这时候
+    不会再补一句早安，但会顺手打个招呼。给的是**一个正经的午间问候**，不是「补一个
+    早安」——后者听起来像没睡醒。
+    """
+    windows = [(morning, "morning"), (night, "night")]
+    if midday:
+        windows.insert(1, (midday, "midday"))
+    for (start, end), kind in windows:
         if start <= end:
             if start <= hour < end:
-                return "morning" if (start, end) == morning else "night"
+                return kind
         else:  # 跨午夜的窗口（如 22 → 2）
             if hour >= start or hour < end:
-                return "morning" if (start, end) == morning else "night"
+                return kind
     return None
 
 
 def greeting_due(user: Dict[str, Any], day: str, kind: str) -> bool:
-    """这个人今天（按她所在城市算的 day）还有没有这个窗口的问候可发。"""
-    return not (
-        str(user.get("greet_day", "") or "") == day
-        and str(user.get("greet_kind", "") or "") == kind
-    )
+    """这个人今天（按她所在城市算的 day）还有没有这个窗口的问候可发。
+
+    午间是**兜底**不是加餐：今天已经有过一次问候（早安）就不再补午间。
+    原来只按 (day, kind) 判，于是早安、午间、晚安三个窗口每天都各发一条——
+    仿真里 7 天的 28 条里 23 条是问候，把「她主动想起一件事找你聊」挤到 0.7 条/天，
+    那是这个插件的主功能，不能让固定问候吃掉。
+    """
+    if str(user.get("greet_day", "") or "") == day:
+        if str(user.get("greet_kind", "") or "") == kind:
+            return False
+        if kind == "midday":
+            return False
+    return True
 
 
 def greet_reason(kind: str) -> str:
     """问候的动机（从池子里随机挑一句，喂给生成侧）。"""
-    return random.choice(
-        _GREET_REASON_NIGHT if kind == "night" else _GREET_REASON_MORNING
-    )
+    pool = {
+        "night": _GREET_REASON_NIGHT,
+        "midday": _GREET_REASON_MIDDAY,
+    }.get(kind, _GREET_REASON_MORNING)
+    return random.choice(pool)
 
 
 def greet_meta(kind: str) -> Dict[str, Any]:
@@ -510,6 +566,17 @@ def greet_meta(kind: str) -> Dict[str, Any]:
             "msg_type": "greeting",
             "msg_type_desc": "睡前跟TA道一句晚安",
             "style_hint": "像今天到此为止一样自然地收尾；别只说晚安两个字，也别解释今天怎么样",
+        }
+    if kind == "midday":
+        return {
+            "category": "greet",
+            "intent": "greet",
+            "mode": "greet_midday",
+            "kind": "midday",
+            "msg_type": "greeting",
+            "msg_type_desc": "顺口跟TA打个招呼",
+            "style_hint": "像路上碰见随口一句；别提「早安」也别解释为什么现在才说，"
+                          "一句话就够，可以带一句你自己正在干什么",
         }
     return {
         "category": "greet",
@@ -696,7 +763,6 @@ def select_message_type(
     if body and isinstance(body, dict):
         energy = body.get("energy")
         social_desire = body.get("social_desire")
-        sleep_pressure = body.get("sleep_pressure")
         hunger = body.get("hunger")
         discomfort = body.get("discomfort")
 

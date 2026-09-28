@@ -1,6 +1,6 @@
 """社交配置数据类。
 
-v1.7.4：
+v1.19.0：
 - 新增「念头」相关配置：攒满一次念头要多久、刚聊过多久内不另起、发送前是否让模型把关
 - 冷却项语义降为护栏（节奏由念头决定），值不再靠默认生效：旧配置里存的是旧默认时，
   首次以本版本运行会一次性提升（AstrBot 只补默认值，从不覆盖已有值）
@@ -39,12 +39,26 @@ URGE_REFILL_MAX = 96
 # 才发得出一条——那与「插件在跑但永远没动静」基本同义。降到 4；
 # v1.9.0 直接降到下限 2：再配合更低的冷却，主动消息才算真的「频繁」
 # v1.9.x 降到下限 2：更像话多的人，心里一有事就想找人说（URGE_REFILL_DEFAULT 实际为 2）
-URGE_REFILL_DEFAULT = 2
+URGE_REFILL_DEFAULT = 4
+# 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
+CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
+CROSS_USER_REPEAT_HOURS_DEFAULT = 2.0
+# 提示里带上「可以拆成几段」的概率
+BURST_PROBABILITY_DEFAULT = 0.62
+HOURLY_SENDS_CAP_DEFAULT = 12
+HOURLY_SENDS_CAP_MAX = 200
+GREETING_MIDDAY_START_DEFAULT = 12
+GREETING_MIDDAY_END_DEFAULT = 14
+# 两条主动消息的最小间隔（分钟）默认值与范围；
+MIN_GAP_MINUTES_DEFAULT = 120
+MISS_AFFECTION_MIN_DEFAULT = 55
+MISS_DAILY_CAP_DEFAULT = 1
+MIN_GAP_MAX = 720
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
 # 心跳间隔（分钟）。它决定所有分钟级配置的实际精度
 HEARTBEAT_MIN_MINUTES_MIN = 1
-HEARTBEAT_MINUTES_MAX = 120
+HEARTBEAT_MINUTES_MAX = 60
 HEARTBEAT_MIN_DEFAULT = 8
 HEARTBEAT_MAX_DEFAULT = 15
 
@@ -53,12 +67,12 @@ RECENT_TALK_MAX = 720
 RECENT_TALK_DEFAULT = 18
 
 # 这一场话断了：多久之后接一句。追问那件事（有由头）比光问「在吗」可以更早。
-FOLLOWUP_AFTER_MIN = 2
+FOLLOWUP_AFTER_MIN = 3
 FOLLOWUP_AFTER_MAX = 240
-FOLLOWUP_AFTER_DEFAULT = 4
+FOLLOWUP_AFTER_DEFAULT = 30
 PROBE_AFTER_MIN = 1
 PROBE_AFTER_MAX = 120
-PROBE_AFTER_DEFAULT = 2
+PROBE_AFTER_DEFAULT = 12
 # 超过这么久再问就不像接话了，像隔了半天重新打招呼
 FOLLOWUP_MAX_MIN = 15
 FOLLOWUP_MAX_MAX = 720
@@ -73,6 +87,9 @@ LOOP_MIN_HOURS_FLOOR = 1.0
 LOOP_MIN_HOURS_CEIL = 24.0
 LOOP_MIN_HOURS_DEFAULT = 2.5
 LOOP_MAX_HOURS_DEFAULT = 14.0
+# 回访最长间隔的上限（与 _conf_schema.json 的 max 对齐；以前完全没有 clamp，
+# 从旧配置迁移来的异常值会一路进到时间窗计算里）
+LOOP_MAX_HOURS_CEIL = 48.0
 # 收场那句：她主动发的话没人回，隔多久自己冒一句
 CLOSER_AFTER_MIN = 2
 CLOSER_AFTER_MAX = 72
@@ -212,6 +229,7 @@ USER_RETENTION_DEFAULT = 30
 # 是完全合理的选择，升级后被强行改成 120 就是插件在背后改用户的设置。
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "user_cooldown_minutes": {180, 720, 120, 90, 45},
+    "min_gap_minutes": {60, 45, 30},
     "max_message_length": {200, 60},
     "reply_window_hours": {6},
     "urge_refill_hours": {8, 4, 3, 2},
@@ -232,7 +250,8 @@ _BASELINE_FILE = "config_baseline.json"
 # 实测两份曾差 16 项，作者照着三天仿真数据调好的节奏对新装用户一次都没生效过，
 # 而老用户又走迁移落到代码值——于是新老用户跑的是两套参数，谁都说不清当前生效的是什么。
 # 现在默认值只有一个出处。MIN/MAX 那些是「范围」不是默认值，仍由本文件的 clamp 常量负责，
-# 并已与 schema 的 min/max 逐项对齐。
+# 并与 schema 的 min/max 对齐（v2.24.0 前有四处对不上：心跳上限 120 vs 60、追问下限 2 vs 3、
+# 问候开始小时放到 24 vs 23、回访上限完全没夹）。
 _SCHEMA_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_conf_schema.json"
 )
@@ -278,6 +297,19 @@ class SocialConfig:
     activity_level: int = ACTIVITY_DEFAULT
     # 每个人自己的冷却才是节奏的来源：不同用户互不影响
     user_cooldown_minutes: int = USER_COOLDOWN_DEFAULT
+    # 两条主动消息的最小间隔。与 user_cooldown_minutes 的区别：那个是「另起话题」
+    # 的护栏，问候/追问/回访/收场全都绕过了它，于是早安 08:00、追问 08:12 这种
+    # 扎堆从来没被挡过。这个覆盖全部五条路径。
+    min_gap_minutes: int = MIN_GAP_MINUTES_DEFAULT
+    # 「念想」通道：没有正事、只是想 TA 说一句。这一类**不受「刚聊过」阻断**——
+    # 「刚聊完还发一条」是打断，「过了一阵子想你了」不是。
+    miss_affection_min: int = MISS_AFFECTION_MIN_DEFAULT
+    miss_daily_cap: int = MISS_DAILY_CAP_DEFAULT
+    # 每小时最多主动联系几人（按角色算）。安全闸，不是节奏——见 schema 的说明。
+    hourly_sends_cap: int = HOURLY_SENDS_CAP_DEFAULT
+    cross_user_repeat_ratio: float = CROSS_USER_REPEAT_RATIO_DEFAULT
+    cross_user_repeat_hours: float = CROSS_USER_REPEAT_HOURS_DEFAULT
+    cross_user_calibrate: bool = False
 
     # 心跳间隔（分钟）：一轮跑完后随机等这么久再看一眼
     heartbeat_min_minutes: int = HEARTBEAT_MIN_DEFAULT
@@ -363,6 +395,9 @@ class SocialConfig:
 
     # 连发模式：主动消息可自然拆成多条短句逐条补发（间隔 1-3 分钟）
     allow_burst: bool = True
+    # 这一轮要不要「提醒模型可以拆成几段」。模型拆不拆最终由它自己，
+    # 但不给它这个选项它基本不会拆——所以这里调的是**给不给选项**，不是强拆。
+    burst_probability: float = BURST_PROBABILITY_DEFAULT
     # 连发最多拆几条（1-3）
     max_burst_parts: int = MAX_BURST_PARTS_DEFAULT
 
@@ -371,7 +406,10 @@ class SocialConfig:
 
     # 早晚问候（时间性触发）：不靠念头攒，窗口到了、今天还没问候过就说一句
     greeting_enabled: bool = GREETING_ENABLED_DEFAULT
+    greeting_midday_start: int = GREETING_MIDDAY_START_DEFAULT
+    greeting_midday_end: int = GREETING_MIDDAY_END_DEFAULT
     greeting_morning_start: int = GREETING_MORNING_START_DEFAULT
+    # 对方沉默多久才问候。对方还在正常聊还每天收早安，那是刷屏。
     greeting_morning_end: int = GREETING_MORNING_END_DEFAULT
     greeting_night_start: int = GREETING_NIGHT_START_DEFAULT
     greeting_night_end: int = GREETING_NIGHT_END_DEFAULT
@@ -393,23 +431,35 @@ class SocialConfig:
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
 
-    # 输出形状：是否保留 emoji、是否去掉括号动作/旁白
-    allow_emoji: bool = False
-    strip_roleplay_actions: bool = True
+    # 输出形状。用不用 emoji、要不要括号动作，都不在配置里定：那两个是人格说话
+    # 习惯的一部分，该由她自己发出去的消息说话（见 generator._emoji_policy）。
+    # 括号动作原来是一个开关，但无差别删除会吃掉正常中文：「他去（上海）出差了」
+    # 会变成「他去出差了」，「这个（很重要）的事」变成「这个的事」。
 
     # 两个管理指令是否仅机器人主人（全局 admins_id）可用
     owner_only_commands: bool = True
 
     @property
     def mood_scale(self) -> float:
-        """整体想说活的程度：活跃度 45 为 1.0，90 约 1.6，10 约 0.4。"""
+        """整体想说活的程度。公式 0.55 + 活跃度/100×1.25，夹在 0.35~1.7。
+
+        实际取值：10→0.68、45→1.11、75（默认）→1.49、90→1.68。
+        （旧注释写的「45 为 1.0、90 约 1.6、10 约 0.4」三处都对不上，害得调参的人
+        按错的数去反推该填多少。）
+        """
         return max(0.35, min(1.7, 0.55 + (self.activity_level / 100.0) * 1.25))
 
     def greeting_windows(self) -> tuple:
-        """问候窗口（含跨午夜归一化）：(早安窗口, 晚安窗口)。"""
+        """问候窗口（含跨午夜归一化）：(早安, 午间, 晚安)。
+
+        午间是早安窗口错过时的兜底。开始与结束相同就等于关掉。
+        """
         morning = (self.greeting_morning_start % 24, self.greeting_morning_end % 24)
+        midday = None
+        if self.greeting_midday_start % 24 != self.greeting_midday_end % 24:
+            midday = (self.greeting_midday_start % 24, self.greeting_midday_end % 24)
         night = (self.greeting_night_start % 24, self.greeting_night_end % 24)
-        return morning, night
+        return morning, midday, night
 
     def allowed_trigger_uid_set(self) -> set:
         """解析 allowed_trigger_uids 为去重后的集合。
@@ -476,7 +526,10 @@ class SocialConfig:
         except (TypeError, ValueError):
             loop_min = LOOP_MIN_HOURS_DEFAULT
         try:
-            loop_max = max(loop_min + 1.0, float(g("loop_max_hours", _d("loop_max_hours",  LOOP_MAX_HOURS_DEFAULT))))
+            loop_max = min(
+                LOOP_MAX_HOURS_CEIL,
+                max(loop_min + 1.0, float(g("loop_max_hours", _d("loop_max_hours",  LOOP_MAX_HOURS_DEFAULT)))),
+            )
         except (TypeError, ValueError):
             loop_max = max(loop_min + 1.0, LOOP_MAX_HOURS_DEFAULT)
 
@@ -486,6 +539,27 @@ class SocialConfig:
             activity_level=max(
                 ACTIVITY_MIN,
                 min(ACTIVITY_MAX, int(g("activity_level", _d("activity_level",  ACTIVITY_DEFAULT)))),
+            ),
+            min_gap_minutes=max(
+                10, min(MIN_GAP_MAX, int(g("min_gap_minutes", _d("min_gap_minutes",  MIN_GAP_MINUTES_DEFAULT)))),
+            ),
+            miss_affection_min=max(
+                0, min(100, int(g("miss_affection_min", _d("miss_affection_min",  MISS_AFFECTION_MIN_DEFAULT)))),
+            ),
+            miss_daily_cap=max(
+                0, min(10, int(g("miss_daily_cap", _d("miss_daily_cap",  MISS_DAILY_CAP_DEFAULT)))),
+            ),
+            cross_user_repeat_ratio=max(
+                0.1, min(1.0, float(g("cross_user_repeat_ratio", _d("cross_user_repeat_ratio",  CROSS_USER_REPEAT_RATIO_DEFAULT))))
+            ),
+            # 0 = 整道检查关掉（面板上就写着这么用，所以这里得真的认 0，
+            # 钳到 0.5 的话「设 0 关闭」就是一句骗人的话）
+            cross_user_repeat_hours=max(
+                0.0, min(48.0, float(g("cross_user_repeat_hours", _d("cross_user_repeat_hours",  CROSS_USER_REPEAT_HOURS_DEFAULT))))
+            ),
+            cross_user_calibrate=bool(g("cross_user_calibrate", _d("cross_user_calibrate",  False))),
+            hourly_sends_cap=max(
+                0, min(HOURLY_SENDS_CAP_MAX, int(g("hourly_sends_cap", _d("hourly_sends_cap",  HOURLY_SENDS_CAP_DEFAULT)))),
             ),
             user_cooldown_minutes=max(
                 USER_COOLDOWN_MIN,
@@ -540,6 +614,9 @@ class SocialConfig:
                 min(USER_RETENTION_MAX, int(g("user_retention_days", _d("user_retention_days",  USER_RETENTION_DEFAULT)))),
             ),
             allow_burst=bool(g("allow_burst", _d("allow_burst",  True))),
+            burst_probability=max(
+                0.0, min(1.0, float(g("burst_probability", _d("burst_probability",  BURST_PROBABILITY_DEFAULT))))
+            ),
             max_burst_parts=max(
                 MAX_BURST_PARTS_MIN,
                 min(MAX_BURST_PARTS_MAX, int(g("max_burst_parts", _d("max_burst_parts",  MAX_BURST_PARTS_DEFAULT)))),
@@ -550,13 +627,19 @@ class SocialConfig:
             ),
             greeting_enabled=bool(g("greeting_enabled", _d("greeting_enabled",  GREETING_ENABLED_DEFAULT))),
             greeting_morning_start=max(
-                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_morning_start", _d("greeting_morning_start",  GREETING_MORNING_START_DEFAULT))))
+                HOUR_MIN, min(HOUR_MAX, int(g("greeting_morning_start", _d("greeting_morning_start",  GREETING_MORNING_START_DEFAULT))))
             ),
             greeting_morning_end=max(
                 HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_morning_end", _d("greeting_morning_end",  GREETING_MORNING_END_DEFAULT))))
             ),
+            greeting_midday_start=max(
+                HOUR_MIN, min(HOUR_MAX, int(g("greeting_midday_start", _d("greeting_midday_start",  GREETING_MIDDAY_START_DEFAULT))))
+            ),
+            greeting_midday_end=max(
+                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_midday_end", _d("greeting_midday_end",  GREETING_MIDDAY_END_DEFAULT))))
+            ),
             greeting_night_start=max(
-                HOUR_MIN, min(HOUR_MAX + 1, int(g("greeting_night_start", _d("greeting_night_start",  GREETING_NIGHT_START_DEFAULT))))
+                HOUR_MIN, min(HOUR_MAX, int(g("greeting_night_start", _d("greeting_night_start",  GREETING_NIGHT_START_DEFAULT))))
             ),
             greeting_night_end=max(
                 HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_night_end", _d("greeting_night_end",  GREETING_NIGHT_END_DEFAULT))))
@@ -647,8 +730,6 @@ class SocialConfig:
             ),
             track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
             use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
-            allow_emoji=bool(g("allow_emoji", _d("allow_emoji",  False))),
-            strip_roleplay_actions=bool(g("strip_roleplay_actions", _d("strip_roleplay_actions",  True))),
             owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
         )
 
@@ -672,6 +753,10 @@ class SocialConfig:
 # 旧默认值对应的新默认
 _NEW_DEFAULTS: Dict[str, Any] = {
     "user_cooldown_minutes": USER_COOLDOWN_DEFAULT,
+    "min_gap_minutes": MIN_GAP_MINUTES_DEFAULT,
+    "miss_affection_min": MISS_AFFECTION_MIN_DEFAULT,
+    "miss_daily_cap": MISS_DAILY_CAP_DEFAULT,
+    "hourly_sends_cap": HOURLY_SENDS_CAP_DEFAULT,
     "max_message_length": MAX_MSG_LEN_DEFAULT,
     "reply_window_hours": REPLY_WINDOW_DEFAULT,
     "urge_refill_hours": URGE_REFILL_DEFAULT,

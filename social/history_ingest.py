@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .state import SocialState
+from .sanitize import sanitize_incoming
+from .state import CONVERSATION_TRUNCATE_LENGTH, SocialState
 
 # AstrBot 数据目录下的会话数据库文件名：v4 起是 data_v4.db，更早期 4.x 是 data_v3.db
 _DB_FILENAMES = ("data_v4.db", "data_v3.db")
@@ -142,6 +144,72 @@ def _message_text(item: Any) -> str:
     return ""
 
 
+def recent_turns(content: Any, limit: int = 8) -> List[Dict[str, Any]]:
+    """从会话库里取最近 N 条双方消息，灌进插件账本。
+
+    为什么必须有：以前导入只写一条 `last_message`，**一条对话都不灌**。
+    于是那些用户在插件眼里等于「一年没说过话」——生成时能拿到的上下文只有
+    120 个字的一句话，模型没有任何可接的东西，只能反复讲自己身体那点状态。
+    生成时其实会另外去会话库补一段（`_generation_conversation`），但那是临时读的、
+    不落盘：反重复用不了、话题挖不出来、重启就没了。
+    """
+    if not isinstance(content, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).lower()
+        if role not in ("user", "assistant"):
+            continue
+        # 库里存的是拼装后的消息，混着框架注入块，入账前先洗
+        text = sanitize_incoming(_message_text(item))
+        if not text:
+            continue
+        out.append({
+            "dir": "out" if role == "assistant" else "in",
+            "text": text[:CONVERSATION_TRUNCATE_LENGTH],
+            "ts": 0.0,
+        })
+    return out[-max(0, int(limit)):]
+
+
+# 从对方说过的话里挖「一件具体的事」——比 extract_open_loop 宽：
+# 不要求「提过没结果」，只要是一件发生过或即将发生的事就能当由头。
+_ANCHOR_WORDS = (
+    "面试", "体检", "搬家", "考试", "出差", "旅行", "旅游", "看医生", "复查",
+    "牙医", "驾照", "签证", "续签", "入职", "离职", "开学", "放假", "结婚",
+    "报名", "房租", "还书", "买", "订", "参加", "比赛", "演出", "手术",
+    "拿", "交", "取", "寄", "修", "换", "退", "办", "签",
+)
+
+
+def extract_anchors(turns: List[Dict[str, Any]], limit: int = 4) -> List[str]:
+    """从会话账本里挖出可当由头的具体事项（最新在前）。"""
+    out: List[str] = []
+    seen = set()
+    for turn in reversed(list(turns or [])):
+        if not isinstance(turn, dict) or turn.get("dir") != "in":
+            continue
+        text = str(turn.get("text", "") or "").strip()
+        if not text:
+            continue
+        for seg in re.split(r"[，。！？；、,.!?;\s]+", text):
+            seg = seg.strip()
+            if not seg or len(seg) < 2 or len(seg) > 16:
+                continue
+            if not any(w in seg for w in _ANCHOR_WORDS):
+                continue
+            key = seg[:10]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(seg[:16])
+            if len(out) >= max(1, int(limit)):
+                return out
+    return out
+
+
 def count_user_messages(content: Any) -> int:
     """会话里的用户消息条数（驱动「聊过多少」的熟悉度）。"""
     if not isinstance(content, list):
@@ -210,16 +278,45 @@ def seed_target_bid(state: SocialState) -> str:
     return "default"
 
 
+def stable_uid(umo: str) -> str:
+    """从 umo 里取「这个人的稳定身份」。
+
+    WebChat 的 umo 形如 `webchat!naliling!<线程 UUID>`：每次开新会话 UUID 就变。
+    直接拿它当 uid 的话，同一个人会被建成一堆用户——各自攒念头、各自收问候、
+    关系与冷落记录被拆散，看起来像「她在同时追着好几个人说话」。
+
+    所以只取稳定的那一段。发送目标不受影响：真正发出去用的是用户记录上最新的
+    umo（observe 每条消息都会刷新它），身份与地址本来就不是一回事。
+    """
+    text = str(umo or "")
+    if "!" in text:
+        parts = text.split("!")
+        # 平台!身份!会话UUID：丢掉最后一段（会话），身份与平台留着
+        if len(parts) >= 3:
+            return "!".join(parts[:2])
+    _, _, session = parse_umo(text)
+    return session or text
+
+
 def _uid_of(umo: str) -> str:
-    _, _, session = parse_umo(umo)
-    return session or str(umo)
+    return stable_uid(umo)
 
 
 def existing_uids(state: SocialState) -> set:
-    """state 里已有的 uid 集合。给线程侧做过滤快照用。"""
+    """state 里已有的 uid 集合。给线程侧做过滤快照用（历史导入那批）。"""
     out = set()
     for bot in state.data.get("bots", {}).values():
         out.update((bot or {}).get("users", {}).keys())
+    return out
+
+
+def existing_pairs(state: SocialState) -> set:
+    """(角色, uid) 集合。播种名单要用这个：uid 只在**单个平台内**唯一，跨平台
+    同名是不同的人。用裸 uid 判重时，QQ 上聊过的人会让 TG 上同名的人永远加不进来。"""
+    out = set()
+    for bid, bot in (state.data.get("bots", {}) or {}).items():
+        for uid in (bot or {}).get("users", {}) or {}:
+            out.add((str(bid), str(uid)))
     return out
 
 
@@ -265,9 +362,11 @@ def collect_from_history(
         if content is not None:
             row["message_count"] = min(count_user_messages(content), 500)
             if store_text:
-                last = last_user_text(content)
+                # 同上：库里存的是拼装后的消息，入库前先洗掉框架注入块
+                last = sanitize_incoming(last_user_text(content))
                 if last:
-                    row["last_message"] = last[-500:]
+                    row["last_message"] = last[-200:]
+                row["conversation"] = recent_turns(content)
         rows.append(row)
     return rows
 
@@ -291,6 +390,8 @@ def apply_history_rows(state: SocialState, rows: List[Dict[str, Any]]) -> int:
             u["message_count"] = row["message_count"]
         if row.get("last_message"):
             u["last_message"] = row["last_message"]
+        if row.get("conversation"):
+            u["conversation"] = row["conversation"]
         added += 1
     if added:
         state.mark_dirty()
@@ -408,12 +509,12 @@ def apply_seed_list(
     天花板机制会自然把她压下去。返回新增的人数。
     """
     now = float(now if now is None else time.time())
-    existing = existing_uids(state)
+    existing = existing_pairs(state)
     bid = seed_target_bid(state)
     added = 0
     for entry in normalize_seed_entries(raw_entries, default_platform):
         platform, uid, msg_type = entry
-        if uid in existing:
+        if (str(bid), str(uid)) in existing:
             continue
         umo = f"{platform}:{msg_type}:{uid}"
         u = state.user(bid, uid)
@@ -425,7 +526,7 @@ def apply_seed_list(
             u["urge_at"] = now
         # 没聊过的人，攒念头的速度打五折
         u["urge_scale"] = 0.5
-        existing.add(uid)
+        existing.add((str(bid), str(uid)))
         added += 1
     if added:
         state.mark_dirty()

@@ -9,14 +9,18 @@
   "mode": {
     "type": "string",
     "description": "运行模式",
-    "hint": "auto：装了 Humanoid Core 就联动作息与身体状态，没装也能独立运行；standalone：完全不读 Core 状态。",
+    "hint": "跑哪些场景（私聊/群聊）",
     "obvious_hint": true,
+    "options": [
+      "auto",
+      "standalone"
+    ],
     "default": "auto"
   },
   "activity_level": {
     "type": "int",
     "description": "活跃度（10-90）",
-    "hint": "数值越高越爱主动说话。75是平时话比较多、闲不住想找人聊的人。太高会显得话多，太低会显得冷淡。",
+    "hint": "她有多爱主动说话",
     "obvious_hint": true,
     "default": 75,
     "min": 10,
@@ -25,16 +29,16 @@
   "urge_refill_hours": {
     "type": "int",
     "description": "主动间隔（小时）",
-    "hint": "攒满一次想说话的念头需要多久。数值越小越频繁。2表示心里一有事就想找人说。",
+    "hint": "攒够一次主动联系要几小时",
     "obvious_hint": true,
-    "default": 2,
+    "default": 4,
     "min": 1,
     "max": 96
   },
   "recent_talk_minutes": {
     "type": "int",
     "description": "刚聊完静默期（分钟）",
-    "hint": "刚聊完多久内不再另起新话题。18分钟避免话刚说完又来一句的机器人感。",
+    "hint": "刚聊完多久内不另起话题",
     "obvious_hint": true,
     "default": 18,
     "min": 5,
@@ -43,7 +47,7 @@
   "heartbeat_min_minutes": {
     "type": "int",
     "description": "心跳间隔下限（分钟）",
-    "hint": "每一轮结束后随机等这么久再看一眼。默认 8 分钟。想让「沉默 2 分钟就追问」这类分钟级配置真正按分钟生效，就把它调到 1。发不发仍然由念头与冷却决定，心跳快只是让到点被发现的更准。",
+    "hint": "两轮心跳最短间隔",
     "obvious_hint": true,
     "default": 8,
     "min": 1,
@@ -61,14 +65,14 @@
   "llm_gate": {
     "type": "bool",
     "description": "AI判断该不该发",
-    "hint": "开启后模型会自己判断'这句话现在该不该说'，大幅提升拟人度。强烈推荐开启。",
+    "hint": "开启后模型会自己判断'这句话现在该不该说'，大幅提升拟人度",
     "obvious_hint": true,
     "default": true
   },
   "skip_cooldown_minutes": {
     "type": "int",
     "description": "被拒后冷却（分钟）",
-    "hint": "模型决定不说了之后，多久内不再纠结同一个人。10分钟较短，会快速重新考虑。",
+    "hint": "模型决定不说了之后，多久内不再纠结同一个人",
     "obvious_hint": true,
     "default": 10,
     "min": 5,
@@ -77,7 +81,7 @@
   "respect_user_rhythm": {
     "type": "bool",
     "description": "顺对方作息",
-    "hint": "根据对方平时活跃时段选择时机。关闭后任何时候都可能主动联系（推荐关闭，让她更主动）。",
+    "hint": "按对方平时的作息时段挑时间",
     "obvious_hint": true,
     "default": false
   },
@@ -91,25 +95,25 @@
   "followup_enabled": {
     "type": "bool",
     "description": "主动接断掉的话",
-    "hint": "聊天中断时主动接一句。对方敷衍就追问，突然没声就问'在吗'。推荐开启。",
+    "hint": "聊天中断时主动接一句",
     "obvious_hint": true,
     "default": true
   },
   "probe_after_minutes": {
     "type": "int",
-    "description": "敷衍追问间隔（分钟）",
-    "hint": "对方回得敷衍时，隔多久追问。2分钟响应快，像在意对话。",
+    "description": "对方回得敷衍，多久之后追问那件事（分钟）",
+    "hint": "对方说话敷衍，隔多久追一句",
     "obvious_hint": true,
-    "default": 2,
+    "default": 12,
     "min": 1,
     "max": 120
   },
   "followup_after_minutes": {
     "type": "int",
-    "description": "断话判定间隔（分钟）",
-    "hint": "双方都不说话多久算断了。4分钟较敏感，会更快接话。",
+    "description": "话停了多久之后问一句「在吗」（分钟）",
+    "hint": "话断了之后隔多久问一句在不在",
     "obvious_hint": true,
-    "default": 4,
+    "default": 30,
     "min": 3,
     "max": 240
   },
@@ -134,14 +138,14 @@
   "loop_enabled": {
     "type": "bool",
     "description": "主动问后续",
-    "hint": "对方提过但没说结果的事（面试、体检），过几小时主动问'后来怎么样'。推荐开启。",
+    "hint": "对方提过但没说结果的事（面试、体检），过几小时主动问'后来怎么样'",
     "obvious_hint": true,
     "default": true
   },
   "loop_min_hours": {
     "type": "float",
     "description": "回访最短间隔（小时）",
-    "hint": "至少隔多久再问。推荐4小时。",
+    "hint": "至少隔多久再问。推荐2.5小时。",
     "obvious_hint": true,
     "default": 2.5,
     "min": 1.0,
@@ -150,7 +154,7 @@
   "loop_max_hours": {
     "type": "float",
     "description": "回访最长间隔（小时）",
-    "hint": "最迟多久必须问出去，超过就不问了。推荐12小时。",
+    "hint": "最迟多久必须问出去，超过就不问了。推荐14小时。",
     "obvious_hint": true,
     "default": 14.0,
     "min": 3.0,
@@ -166,7 +170,7 @@
   "closer_after_hours": {
     "type": "int",
     "description": "收尾等待时长（小时）",
-    "hint": "主动发的话隔多久没人回才收尾。推荐10小时。",
+    "hint": "主动发的话隔多久没人回才收尾。推荐8小时。",
     "obvious_hint": true,
     "default": 8,
     "min": 2,
@@ -182,32 +186,93 @@
   "use_core_clock": {
     "type": "bool",
     "description": "按角色时区计时",
-    "hint": "按角色所在城市的时间算（需要Humanoid Core）。推荐开启。",
+    "hint": "按她所在城市算时间，而不是本机",
     "obvious_hint": true,
     "default": true
   },
   "user_cooldown_minutes": {
     "type": "int",
     "description": "单人联系冷却（分钟）",
-    "hint": "同一个人两次被主动联系的最短间隔。30分钟是防刷屏护栏，真正节奏由念头决定。",
+    "hint": "同一个人两次被主动联系的最短间隔",
     "obvious_hint": true,
     "default": 30,
     "min": 10,
     "max": 2880
   },
+  "min_gap_minutes": {
+    "type": "int",
+    "description": "中等关系的人，两条主动消息的最小间隔（分钟）",
+    "hint": "中等关系的人两条消息最少隔多久",
+    "obvious_hint": true,
+    "default": 120,
+    "min": 10,
+    "max": 720
+  },
+  "miss_affection_min": {
+    "type": "int",
+    "description": "「念想」通道的好感门槛",
+    "hint": "好感到多少才会说想念",
+    "obvious_hint": true,
+    "default": 55,
+    "min": 0,
+    "max": 100
+  },
+  "miss_daily_cap": {
+    "type": "int",
+    "description": "每天最多几条「念想」",
+    "hint": "每天最多说几句想念",
+    "obvious_hint": true,
+    "default": 1,
+    "min": 0,
+    "max": 10
+  },
   "max_sends_per_round": {
     "type": "int",
     "description": "每轮最多联系几人",
-    "hint": "一轮心跳（8-15分钟）最多主动联系几个不同的人。推荐2-3个。",
+    "hint": "一轮心跳（8-15分钟）最多主动联系几个不同的人。推荐3-3个。",
     "obvious_hint": true,
     "default": 3,
     "min": 1,
     "max": 10
   },
+  "cross_user_repeat_ratio": {
+    "type": "float",
+    "description": "跨用户撞车的相似度上限",
+    "hint": "和最近发给别人的消息太像就不发",
+    "obvious_hint": true,
+    "default": 0.6,
+    "min": 0.1,
+    "max": 1.0
+  },
+  "cross_user_repeat_hours": {
+    "type": "float",
+    "description": "跨用户撞车回看多久（小时）",
+    "hint": "往前比多少小时的记录",
+    "obvious_hint": true,
+    "default": 2.0,
+    "min": 0.5,
+    "max": 48.0
+  },
+  "cross_user_calibrate": {
+    "type": "bool",
+    "description": "记录相似度分布（校准用）",
+    "hint": "记录相似度分布，用来找阈值",
+    "obvious_hint": true,
+    "default": false
+  },
+  "hourly_sends_cap": {
+    "type": "int",
+    "description": "每小时最多主动联系几人（防失控）",
+    "hint": "每小时最多发几条，防一次涌出",
+    "obvious_hint": true,
+    "default": 12,
+    "min": 0,
+    "max": 200
+  },
   "quiet_start": {
     "type": "int",
     "description": "安静时段开始（小时）",
-    "hint": "这段时间几乎不主动说话。推荐23点（晚上11点）。",
+    "hint": "安静时段从几点开始",
     "obvious_hint": true,
     "default": 23,
     "min": 0,
@@ -216,7 +281,7 @@
   "quiet_end": {
     "type": "int",
     "description": "安静时段结束（小时）",
-    "hint": "安静时段结束时间。推荐7点（早上7点）。",
+    "hint": "安静时段到几点结束",
     "obvious_hint": true,
     "default": 7,
     "min": 0,
@@ -232,44 +297,39 @@
   "debug": {
     "type": "bool",
     "description": "输出调试日志",
-    "hint": "日志会显示'为什么发/为什么不发'。排查问题时开启，平时建议关闭。",
+    "hint": "打印决策日志",
     "obvious_hint": true,
     "default": false
   },
   "max_message_length": {
     "type": "int",
     "description": "单条消息长度上限（字）",
-    "hint": "单条消息最多多少字。推荐100-150字。",
+    "hint": "单条消息最长多少字",
     "obvious_hint": true,
     "default": 120,
     "min": 10,
     "max": 500
   },
-  "strip_roleplay_actions": {
-    "type": "bool",
-    "description": "去除括号动作",
-    "hint": "去掉'（轻轻抱你）''*摸摸头*'这类动作描写。推荐开启（更像正常聊天）。",
+  "burst_probability": {
+    "type": "float",
+    "description": "提示里带「可以拆成几段」的概率",
+    "hint": "多常在提示里提「可以拆开」",
     "obvious_hint": true,
-    "default": true
-  },
-  "allow_emoji": {
-    "type": "bool",
-    "description": "保留emoji",
-    "hint": "是否保留emoji表情。推荐关闭（每句末尾一个❤️很像AI）。",
-    "obvious_hint": true,
-    "default": false
+    "default": 0.62,
+    "min": 0.0,
+    "max": 1.0
   },
   "allow_burst": {
     "type": "bool",
-    "description": "连发模式",
-    "hint": "一次说话拆成2-3条短句，间隔1-3分钟发。推荐开启（更像真人打字）。",
+    "description": "主动消息允许分段连发",
+    "hint": "一条消息能否拆成几条连着发",
     "obvious_hint": true,
     "default": true
   },
   "max_burst_parts": {
     "type": "int",
     "description": "连发最多条数",
-    "hint": "一次最多拆成几条。推荐2-3条。",
+    "hint": "一次最多拆成几条。推荐3-3条。",
     "obvious_hint": true,
     "default": 3,
     "min": 1,
@@ -297,6 +357,24 @@
     "hint": "早安窗口结束。推荐11点。",
     "obvious_hint": true,
     "default": 11,
+    "min": 1,
+    "max": 24
+  },
+  "greeting_midday_start": {
+    "type": "int",
+    "description": "午间问候开始（小时）",
+    "hint": "早安窗口错过时的兜底：午间窗口会给一句正经的顺口招呼，不是「补一个早安」",
+    "obvious_hint": true,
+    "default": 12,
+    "min": 0,
+    "max": 23
+  },
+  "greeting_midday_end": {
+    "type": "int",
+    "description": "午间问候结束（小时）",
+    "hint": "设成和开始时间相同就等于关掉午间问候。",
+    "obvious_hint": true,
+    "default": 14,
     "min": 1,
     "max": 24
   },
@@ -342,14 +420,14 @@
   "group_store_message_text": {
     "type": "bool",
     "description": "存储群聊消息",
-    "hint": "是否保存群友发言作为参考。关闭后更隐私，但风格学习会失效。",
+    "hint": "群里要不要保存发言原文",
     "obvious_hint": true,
     "default": true
   },
   "flow_window_minutes": {
     "type": "int",
     "description": "群聊关注窗口（分钟）",
-    "hint": "Bot说话后关注群聊多久。推荐10分钟。",
+    "hint": "Bot说话后关注群聊多久。推荐8分钟。",
     "obvious_hint": true,
     "default": 8,
     "min": 1,
@@ -358,7 +436,7 @@
   "flow_min_gap_seconds": {
     "type": "int",
     "description": "群聊插话间隔（秒）",
-    "hint": "两次插话最少间隔多久。推荐60秒。",
+    "hint": "两次插话最少间隔多久。推荐45秒。",
     "obvious_hint": true,
     "default": 45,
     "min": 10,
@@ -376,7 +454,7 @@
   "flow_hourly_cap": {
     "type": "int",
     "description": "群聊每小时上限",
-    "hint": "每群每小时最多插话几次。推荐5次。",
+    "hint": "每群每小时最多插话几次。推荐6次。",
     "obvious_hint": true,
     "default": 6,
     "min": 1,
@@ -394,7 +472,7 @@
   "group_idle_hours": {
     "type": "float",
     "description": "破冰冷场时长（小时）",
-    "hint": "群安静多久才考虑破冰。推荐8小时。",
+    "hint": "群安静多久才考虑破冰。推荐6小时。",
     "obvious_hint": true,
     "default": 6.0,
     "min": 1.0,
@@ -403,7 +481,7 @@
   "icebreak_daily_cap": {
     "type": "int",
     "description": "每日破冰上限",
-    "hint": "每群每天最多破冰几次。推荐1-2次。",
+    "hint": "每群每天最多破冰几次。推荐2-2次。",
     "obvious_hint": true,
     "default": 2,
     "min": 1,
@@ -412,7 +490,7 @@
   "group_stale_days": {
     "type": "int",
     "description": "群退出判定天数",
-    "hint": "多少天没在群里见到消息就当已退群。推荐5天。",
+    "hint": "多少天没在群里见到消息就当已退群。推荐3天。",
     "obvious_hint": true,
     "default": 3,
     "min": 1,
@@ -430,7 +508,7 @@
   "group_ref_prompt_count": {
     "type": "int",
     "description": "风格样本抽取数",
-    "hint": "生成时参考多少条群友发言。推荐5-8条。",
+    "hint": "生成时参考多少条群友发言。推荐8-8条。",
     "obvious_hint": true,
     "default": 8,
     "min": 0,
@@ -448,7 +526,7 @@
   "context_inject_count": {
     "type": "int",
     "description": "上下文条数",
-    "hint": "生成时参考多少条最近的双向对话。私聊会把 AstrBot 会话历史与插件自己的对话账本合并，群聊读近期发言；都包含 bot 自己说过的话。默认 10 条，条数越多，本次生成调用消耗的 token 越多。设 0 则不注入历史上下文。",
+    "hint": "引用对方的发言样本几条",
     "obvious_hint": true,
     "default": 10,
     "min": 0,
@@ -489,7 +567,7 @@
   "reply_window_hours": {
     "type": "int",
     "description": "回复判定窗口（小时）",
-    "hint": "主动消息发出后多久内对方回话才算'接住了'。推荐3小时。",
+    "hint": "主动消息发出后多久内对方回话才算'接住了'。推荐2小时。",
     "obvious_hint": true,
     "default": 2,
     "min": 1,
@@ -507,19 +585,19 @@
     "description": "指令白名单",
     "hint": "除主人外允许谁使用指令（填user_id）。",
     "obvious_hint": true,
-    "default": []
+    "default": null
   },
   "store_message_text": {
     "type": "bool",
     "description": "存储私聊消息",
-    "hint": "是否保存私聊消息正文。关闭后更隐私，但功能会削弱。",
+    "hint": "要不要保存对方发言原文",
     "obvious_hint": true,
     "default": true
   },
   "user_retention_days": {
     "type": "int",
     "description": "闲置用户清理天数",
-    "hint": "多少天没联系的用户会被清理历史数据。推荐45天，设0永不清理。",
+    "hint": "多少天没联系的用户会被清理历史数据。推荐30天，设0永不清理。",
     "obvious_hint": true,
     "default": 30,
     "min": 0,
@@ -528,21 +606,21 @@
   "history_ingest": {
     "type": "bool",
     "description": "导入历史会话",
-    "hint": "从AstrBot会话库导入之前聊过的人。推荐开启（装插件后立即能用）。",
+    "hint": "从AstrBot会话库导入之前聊过的人",
     "obvious_hint": true,
     "default": true
   },
   "seed_users": {
     "type": "list",
     "description": "主动认识名单",
-    "hint": "即使没聊过也会主动联系的user_id列表。每项一个ID，如：12345",
+    "hint": "即使没聊过也会主动联系的user_id列表",
     "obvious_hint": true,
-    "default": []
+    "default": null
   },
   "seed_platform": {
     "type": "string",
     "description": "默认平台",
-    "hint": "seed_users的默认平台（如aiocqhttp、wechat）。推荐aiocqhttp。",
+    "hint": "只看哪个平台的播种名单",
     "obvious_hint": true,
     "default": "aiocqhttp"
   }

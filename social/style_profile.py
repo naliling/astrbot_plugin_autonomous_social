@@ -17,12 +17,25 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 # 样本少的时候给统计数字是噪声（「TA 平均 7.4 个字」可能只统计了两条）
 MIN_SAMPLES = 3
 # 统计用多少条最近的
 WINDOW = 40
+
+# emoji 习惯的四个档位。unknown 表示她自己没有足够样本可依（这时才去看人设原文）。
+EMOJI_HEAVY = "heavy"
+EMOJI_RARE = "rare"
+EMOJI_NONE = "none"
+EMOJI_UNKNOWN = "unknown"
+
+_EMOJI_BAND_TEXT = {
+    EMOJI_HEAVY: "爱用 emoji",
+    EMOJI_RARE: "偶尔用 emoji",
+    EMOJI_NONE: "不用 emoji",
+}
 
 _SENTENCE_SPLIT = re.compile(r"[。！？!?\n；;…]+")
 _QUESTION_TAIL = re.compile(r"[吗呢吧呗嘛？?]+\s*$")
@@ -96,6 +109,23 @@ def _stat_line(label: str, texts: Sequence[str]) -> str:
     return "；".join(bits)
 
 
+def emoji_habit(texts: Sequence[str]) -> str:
+    """她自己发出去的消息里带 emoji 的频率，落成四档之一。
+
+    这是「她怎么说话」的一部分，不是可调开关：她平时爱用就让她爱用，平时不用就
+    别硬塞。样本不足时返回 unknown，交给调用方去看人设原文。
+    """
+    usable = [t for t in texts if t]
+    if len(usable) < MIN_SAMPLES:
+        return EMOJI_UNKNOWN
+    rate = sum(1 for t in usable if _EMOJI.search(t)) / len(usable)
+    if rate >= 0.3:
+        return EMOJI_HEAVY
+    if rate > 0.0:
+        return EMOJI_RARE
+    return EMOJI_NONE
+
+
 def _habit_line(label: str, texts: Sequence[str]) -> str:
     """标点/换行/emoji 习惯。有明显倾向才说。"""
     if len(texts) < MIN_SAMPLES:
@@ -115,13 +145,9 @@ def _habit_line(label: str, texts: Sequence[str]) -> str:
     if rate(_PERIOD) >= 0.6:
         found.append("习惯用句号收尾")
     # emoji 与称呼分三档：只出现过一两次也是有用的约束（「偶尔用」照样能压住模型乱加）
-    e_rate = rate(_EMOJI)
-    if e_rate >= 0.3:
-        found.append("爱用 emoji")
-    elif e_rate > 0.0:
-        found.append("偶尔用 emoji")
-    else:
-        found.append("不用 emoji")
+    habit = emoji_habit(texts)
+    if habit != EMOJI_UNKNOWN:
+        found.append(_EMOJI_BAND_TEXT[habit])
     multi = sum(1 for t in texts if "\n" in t.strip())
     if multi / n >= 0.3:
         found.append("爱分两三段发")
@@ -151,10 +177,22 @@ def _tone_line(label: str, texts: Sequence[str]) -> str:
     return ""
 
 
+@dataclass
+class StyleProfile:
+    """一次统计的结论：给人看的特征块，加上几个要拿去做判断的字段。"""
+
+    text: str = ""
+    # 她自己发出去的消息里的 emoji 习惯（EMOJI_* 之一）
+    emoji: str = EMOJI_UNKNOWN
+    # 她一条平均多少字；0 表示样本不足
+    avg_chars: int = 0
+    max_chars: int = 0
+
+
 def build_style_profile(
     conversation: Sequence[Dict[str, Any]],
     own_recent: Sequence[str] = (),
-) -> str:
+) -> StyleProfile:
     """产出一段「怎么说话」的数字参考。
 
     Args:
@@ -162,7 +200,7 @@ def build_style_profile(
         own_recent: 自己最近主动发过的消息（补充样本）
 
     Returns:
-        可直接放进 prompt 的特征块；样本不足时返回空串
+        StyleProfile；样本不足时 text 为空串、emoji 为 unknown
     """
     theirs = _texts(conversation, want_out=False)
     mine = _texts(conversation, want_out=True) + [
@@ -178,8 +216,25 @@ def build_style_profile(
     ):
         if text and text not in lines:
             lines.append("- " + text)
+    avg, longest = _length_stats(mine)
     if not lines:
-        return ""
-    return (
-        "【你们平时怎么说话的·只抄感觉别抄句子，句子你自己写】\n" + "\n".join(lines)
+        return StyleProfile("", emoji_habit(mine), avg, longest)
+    return StyleProfile(
+        "【你们平时怎么说话的·只抄感觉别抄句子，句子你自己写】\n" + "\n".join(lines),
+        emoji_habit(mine),
+        avg,
+        longest,
     )
+
+
+def _length_stats(texts: Sequence[str]) -> tuple:
+    """自己发出去的消息的句长统计：(平均字, 最长字)。样本不足返回 (0, 0)。"""
+    if len(texts) < MIN_SAMPLES:
+        return 0, 0
+    lengths: List[int] = []
+    for t in texts:
+        parts = [p.strip() for p in _SENTENCE_SPLIT.split(t) if p.strip()]
+        lengths.extend(len(p) for p in parts)
+    if not lengths:
+        return 0, 0
+    return round(sum(lengths) / len(lengths)), max(lengths)

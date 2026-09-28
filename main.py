@@ -328,6 +328,39 @@ class AutonomousSocial(Star):
             return
         yield event.plain_result(text + "\n" + self._permission_text(event))
 
+    @command("社交自检")
+    async def social_selfcheck(self, event: AstrMessageEvent):
+        """立刻空跑一轮（不发送、不调用模型），回答「链路是通的吗」。
+
+        以前想验证链路只能等一个心跳间隔，而那期间零发送是完全正常的，
+        看不出是正常还是坏了。这个指令几毫秒出结果。
+        """
+        if self._engine is None:
+            yield event.plain_result("自主社交插件未正常初始化。")
+            return
+        allowed, why = self._check_owner(event)
+        if not allowed:
+            if self._is_group(event):
+                logger.info(f"[autonomous_social] 忽略群内自检：{why}")
+                return
+            yield event.plain_result("这个指令只有机器人的主人能用。")
+            return
+        try:
+            m = await self._engine.dry_run()
+        except Exception as e:
+            yield event.plain_result(f"自检失败: {e}")
+            return
+        import time as _time_mod
+        now = _time_mod.time()
+        settled = m.get("last_settled") or 0
+        yield event.plain_result(
+            "自检完成（没有发送任何消息，也没有调用模型）：\n"
+            f"  已认识的人：{m.get('last_settled_users', 0)}\n"
+            f"  念头已攒够、闸门也放行的：{m.get('last_ready', 0)}\n"
+            f"  上次结算：{'还没跑过' if not settled else '刚刚'}\n"
+            f"  说明：{m.get('last_failure') or '链路正常，等下一个心跳就会尝试主动联系'}"
+        )
+
     @command("触发社交")
     async def trigger_social(self, event: AstrMessageEvent):
         """手动触发一次主动联系（绕过念头与冷却），挑最想说的人立即发送。

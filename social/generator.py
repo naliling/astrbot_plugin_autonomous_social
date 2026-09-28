@@ -1,6 +1,6 @@
 """消息生成器：先问「现在该不该说」，再写那句话。
 
-v1.7.4：
+v1.19.0：
 - 新增 decide()：一次 LLM 调用同时完成「要不要发」和「发什么」，模型可以回答 NO。
   旧做法是先抽定要发、再让模型编一个理由，那套流程里根本没有「算了不说了」这个选项。
 - 括号动作/旁白/emoji 清洗：语C 风人格会把主动消息写成「（轻轻抱你）亲爱的…❤️」，
@@ -21,8 +21,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .clock import city_now
-from .style_profile import build_style_profile
+from .style_profile import (
+    EMOJI_NONE,
+    EMOJI_RARE,
+    EMOJI_UNKNOWN,
+    build_style_profile,
+    emoji_habit,
+)
 from .throttle import throttle
+from .verify import strip_title_line
 
 from .reasoning import (
     energy_descriptor,
@@ -41,8 +48,26 @@ from astrbot.api import logger
 LLM_TIMEOUT_SECONDS = 90
 # 连续失败多少次开始退避，以及退避的基数与上限（指数）
 LLM_FAIL_STREAK_BEFORE_BACKOFF = 3
+# 鉴权/额度/限流这类「再等一分钟也是同样的错」的失败，一次就退避。
+# 起步 30 分钟而不是几十秒：心跳本身就要 8~15 分钟一次，退避比心跳短等于没退——
+# key 挂着不动时仍然是每个心跳白打一次请求（实测 5 天 81 次）。失败次数不提供
+# 新信息，所以后面只是拉长窗口，封顶 6 小时（一天 4 次而不是 70 次）。
+LLM_FATAL_BACKOFF_BASE_SECONDS = 1800.0
+LLM_FATAL_BACKOFF_MAX_SECONDS = 21600.0
+# 瞬时故障（超时、连接中断）的退避：起步短，该恢复时尽快恢复；
+# 封顶 3 小时而不是 1 小时。一直超时的模型按 1 小时封顶仍然是每个心跳打一次
+# （5 天 82 次），起步短但封顶高才能真正把「持续坏着」与「抖一下」分开。
 LLM_BACKOFF_BASE_SECONDS = 60.0
-LLM_BACKOFF_MAX_SECONDS = 3600.0
+LLM_BACKOFF_MAX_SECONDS = 10800.0
+
+# provider 明确说了「换一种调用方式也一样会失败」的错。匹配到就立刻停手。
+_FATAL_LLM_MARKERS = (
+    "401", "403", "429", "invalid api key", "incorrect api key", "unauthorized",
+    "authentication", "permission denied", "insufficient_quota", "quota",
+    "exceeded your current quota", "billing", "rate limit", "too many requests",
+    "model not found", "no such model", "does not exist",
+    "api key", "余额不足", "额度", "鉴权", "密钥", "限流", "风控",
+)
 
 # 「调用超时」的哨兵：与「返回了一个异常对象」区分开
 _TIMED_OUT = object()
@@ -147,15 +172,25 @@ _LABEL_PREFIX = re.compile(r"^(?:消息|回复|要发的消息|你说|输出|正
 # 少了这一道，主动消息会真的发出去一句「SEND对了你面试后来咋样」。
 # 英文缩写必须后面跟分隔符：OK/YES 不加限制会把「OK啦今天真累」削成「啦今天真累」
 _SEND_LEADING = re.compile(
-    r"^\s*(?:(?:SEND|YES|OK)\s*[:：]\s*|(?:要发|发这条|可以发)\s*)", re.I
+    r"^\s*(?:(?:SEND|YES|OK|要发|发这条|可以发)\s*[:：]\s*)", re.I
 )
 _SENTENCE_ENDS = "。！？!?。"
 # 句子边界；截断时回到最近一个边界，不把句子切一半
 _CUT_CHARS = "\n，。！？；、,.!?; "
+# 找不到句子边界时，宁可略超长也不切在词中间；只有长到这个倍数才硬切
+TRUNCATE_HARD_RATIO = 1.5
+# 连发分段的分隔符归一化：中文常用的「——」「———」「* * *」都算
+# 破折号常常夹在行内（「我下班早—— 路上买了花—— 回来看到晚霞」），
+# 只认行首会漏掉最常见的那种写法，所以行内行首都收；要求两侧都有内容，
+# 免得把开头结尾的破折号也当分隔。
+_BURST_SEP = re.compile(r"(?:(?<=\S)\s*(?:——{1,}|—{3,}|\*{3,}|={3,})\s*(?=\S))|(?:^\s*(?:——{1,}|—{3,}|\*{3,}|={3,})\s*$)", re.M)
 
-# 语C 式的动作/旁白：（轻轻抱你）、*摸摸头*、【窗外夜色渐深】。微信里没人这么打字。
-_ROLEPLAY_PAREN = re.compile(r"[（(【\[][^（()【\]\[]{1,60}[）)】\]]")
-_ROLEPLAY_STAR = re.compile(r"(?<![A-Za-z0-9])\*{1,2}[^*\n]{1,40}\*{1,2}(?![A-Za-z0-9])")
+# 她自己许下的诺，最多记这么长（八个字左右）
+PROMISE_MAX_CHARS = 24
+
+# 语C 式的动作/旁白（（轻轻抱你）、*摸摸头*）**不再被清洗**：那是人格自己的说话
+# 方式，删掉它不是「更像真人」，是把角色抄平。无差别删除还会吃掉正常中文——
+# 「他去（上海）出差了」会变成「他去出差了」，「这个（很重要）的事」变成「这个的事」。
 # emoji 与变体选择符：偶尔用是真的，每条带个❤️是 AI
 _EMOJI = re.compile(
     "["
@@ -206,6 +241,60 @@ def _response_text(r: Any) -> tuple:
     return None, "返回非文本"
 
 
+def _emoji_policy(style_emoji: str, persona_prompt: str) -> tuple:
+    """她该不该用 emoji：先看她自己真实发出去的消息，人设原文只在没样本时兜底。
+
+    以前这是一个配置开关，于是「她平时用不用 emoji」被人为拉平了：爱用 emoji 的人格
+    和完全不用的人格发出来的东西一模一样，每条末尾还挂同一个 ❤️。emoji 是她说话习惯的
+    一部分，该由她自己发过的那些话说了算，不是面板上一个开关说了算。
+
+    Returns:
+        (清洗时是否保留 emoji, 写进 prompt 的一句交代)
+    """
+    habit = style_emoji
+    if habit == EMOJI_UNKNOWN:
+        # 自己没有足够样本：看人设原文里带不带 emoji，那也是这个人格的一部分
+        habit = EMOJI_RARE if _EMOJI.search(persona_prompt or "") else EMOJI_NONE
+    if habit == "heavy":
+        return True, "你平时爱用 emoji，就照平时的用法来——但别每条都挂同一个表情，看着像模板。"
+    if habit == EMOJI_RARE:
+        return True, "你平时偶尔会用一点 emoji，用不用随你，反正别每条都带。"
+    return False, "你说话不用 emoji。"
+
+
+# 截断后用来判断「正文是不是全没了」
+_PUNCT_ONLY_RE = re.compile(r"[\s，。！？、；：,.!?;:…·~～「」『』]+")
+_OPEN_BRACKETS = "（(【["
+_CLOSE_BRACKETS = "）)】]"
+
+
+def _cut_outside_brackets(head: str) -> str:
+    """把 `head` 末尾可能悬着的半个括号动作整段去掉。
+
+    只处理**末尾**：中间的括号是完整的（后面还有内容），动它只会把话切碎。
+    """
+    text = str(head or "")
+    depth = 0
+    open_at = -1
+    for idx, ch in enumerate(text):
+        if ch in _OPEN_BRACKETS:
+            depth += 1
+            open_at = idx
+        elif ch in _CLOSE_BRACKETS:
+            depth = max(0, depth - 1)
+            if depth == 0:
+                open_at = -1
+    if depth > 0 and open_at >= 0:
+        return text[:open_at].rstrip()
+    return text
+
+
+def _looks_fatal(err: str) -> bool:
+    """这个错是不是「换一种调用方式也一样会失败」（鉴权/额度/限流/模型不存在）。"""
+    low = str(err or "").lower()
+    return any(m in low for m in _FATAL_LLM_MARKERS)
+
+
 @dataclass
 class Decision:
     """模型对「现在要不要说一句」的回答。"""
@@ -214,6 +303,12 @@ class Decision:
     parts: List[str] = field(default_factory=list)
     why_not: str = ""
     raw: str = ""
+    # 这条里她答应了自己或对方的一件事（「明天给你看那个」）。到点她会自己兑现。
+    # 这和「未完话题」不是一回事：那个是**对方**提了没下文的事，这个是**她自己**
+    # 许下的诺。记着自己说过的话，是亲密感最强的那一环。
+    promise: str = ""
+    # 清洗前的原始模型输出。验收层要靠它分辨「模型自己写成这样」还是「清洗弄坏的」
+    raw_text: str = ""
 
 
 def _is_cjk(ch: str) -> bool:
@@ -223,7 +318,7 @@ def _is_cjk(ch: str) -> bool:
 RECENT_OUT_COUNT = 3
 
 # 对话历史展示条数
-MAX_HISTORY_MESSAGES = 5
+MAX_HISTORY_MESSAGES = 10
 
 # 话题展示默认数量（当配置不可用时使用）
 DEFAULT_TOPICS_DISPLAY = 5
@@ -236,7 +331,10 @@ _QUOTE_PAIRS = [
 ]
 
 # 默认消息最大长度
-DEFAULT_MAX_LENGTH = 200
+# 这三个值只在本类拿不到 cfg 时兜底，取值与 _conf_schema.json 的默认值一致。
+# 之前它们各自写着另一套数（200/5/5，schema 是 120/10/5），与「默认值只有一个出处」
+# 那条约定直接矛盾：走不走这条路径取决于调用方有没有传 cfg，于是同一项配置有两个值。
+DEFAULT_MAX_LENGTH = 120
 
 # 单次调用的输入预算。用户要求「一次调用消耗保持在 10000 以内」：这里把输入卡在 6000，
 # 输出由 max_len（最多几百字）与 burst 占去，合计远不触顶。
@@ -276,6 +374,13 @@ PERSONA_SHED_CHARS = 400
 
 # 每一条未完话题都要求不同的东西。写成一段通用的「问一句在不在」，四条路就会长出
 # 一模一样的句子——而真人分得清「追问那件事」「问人呢」「隔半天问后来」「自己收个尾」。
+_MISS_NOTE = (
+    "但这一次**没有任何事要说**——你不是有事，就是想起了这个人。\n"
+    "- 这条要说给 TA 听：可以问 TA 在干嘛、想 TA 了、惦记 TA 说过的事；\n"
+    "- **不要讲你自己今天怎么样**（那是你自己的日记，TA 不关心）；\n"
+    "- 可以只说两句，不必非要把话说满。"
+)
+
 _MODE_NOTES = {
     "probe": (
         "TA刚才那句回得有点敷衍，你想把**那件事**问清楚。\n"
@@ -313,12 +418,26 @@ _MODE_NOTES = {
         "- 不要问句，别让TA觉得必须回你才能睡；\n"
         "- 短一点，晚安本身就是收尾。"
     ),
+    "promise": (
+        "你之前答应过TA一件事，到点了，现在你把它做了。\n"
+        "- **别写成邀功**（「我说过我会做到的吧」「你看我说到做到」），也别解释为什么现在才做；\n"
+        "- 就当那件事本来就要做，做完顺手说一句；\n"
+        "- 东西本身放在前面的素材里，没有素材就别编细节。"
+    ),
+    "greet_midday": (
+        "现在是中午，你手头的事刚告一段落，想顺口跟TA说句话。\n"
+        "- **别提「早安」**，也别解释为什么这个点才说话——那听起来像没睡醒；\n"
+        "- 像路上碰见随口一句，一句话就够；\n"
+        "- 可以带一句你正在干什么，但别借机展开一整段。"
+    ),
 }
 
 _MODE_ASK = {
     "probe": "TA最后说的是：「{about}」。",
     "loop": "TA之前提过、还没听到下文的是：「{about}」。",
-    "closer": "你上次发出去没人接的那句是：「{asked}」。",
+    # 原来占位符是 {asked}，而调用方传进来的是 about，于是整句引文被 _mode_note
+    # 判成「占位符没值」直接丢弃：收场每次都是一句没有上下文的空话。
+    "closer": "你上次发出去没人接的那句是：「{about}」。",
     "presence": "你自己上一句说的是：「{asked}」。",
 }
 
@@ -367,6 +486,12 @@ _DECIDE_NOTES = {
         "但这一次不是没话找话：现在是夜里，你准备睡了，睡前道一句晚安是很自然的事，"
         "一天就这一句。"
     ),
+    "greet_midday": (
+        "但这一次不是没话找话：现在是中午，手头的事刚告一段落，顺口说一句很正常。"
+    ),
+    "promise": (
+        "但这一次不是没话找话：这件事你之前就答应过TA了，现在是你自己去把它做了。"
+    ),
 }
 
 
@@ -392,15 +517,37 @@ def _relationship_line(target: Dict[str, Any]) -> str:
     except (TypeError, ValueError):
         libido = None
     bits: List[str] = []
-    if affection is not None:
+    # 关系档位（高/中/低）先给一句人话，好感度只作参考。
+    #
+    # **为什么不直接拿好感度分档**：有运营为了让用户更好攻略，会把初始好感度设成 40
+    # 之类；聊久了直接飙到 80。只看绝对值的话，那种人和「一直停在 80 但从不回话」的
+    # 人在模型眼里是同一种关系，而该被亲近对待的恰恰是前者。档位是按**涨幅 + 互动 +
+    # 回复率**算的，好感度在里头只占参考。
+    tier_note = target.get("_tier_note")
+    if tier_note:
+        bits.append(str(tier_note))
+    if affection is not None and not tier_note:
         a = float(affection)
         if a <= 34:
             bits.append("对TA态度偏冷淡，说话简短客气")
         elif a >= 72:
             bits.append("对TA比较亲近，语气自然温和")
-    if aggression is not None and aggression >= 28:
-        bits.append("心里有点不满，说话会直接一些")
-    elif libido is not None and libido >= 34 and (aggression or 0) < 15:
+    # 她会记仇——但要有三道限，不然就成了无脑高情绪的神经病：
+    #   1. 阈值抬高：Core 的 aggression 常年 0~20，28 就喊「心里有点不满」等于天天有气；
+    #   2. 要持续：只在**连着两次**采样都高时才起效，单次跳一下不算；
+    #   3. 要有节制：连续两轮不把这件事挂出来（记着，但不次次翻出来说）。
+    # 另外它只是**软**描述里多一句，不新增任何指令——说了「说话会直接一些」就够，
+    # 具体怎么直接由模型按人设自己发挥。
+    # 计数与「最近是不是刚用过」都由引擎在 state 上记账，这里只读（target 是副本，
+    # 在这里改是改不掉的）。
+    try:
+        seen = int(target.get("_aggr_high_n") or 0)
+    except (TypeError, ValueError):
+        seen = 0
+    if aggression is not None and aggression >= 34 and seen >= 2 \
+            and not target.get("_aggr_recently_acted"):
+        bits.append("刚才TA说的话让你有点不舒服，你心里记着这件事")
+    if aggression is None and libido is not None and libido >= 34:
         bits.append("今天想多聊聊")
     streak = int(target.get("no_reply_streak", 0) or 0)
     if streak >= 2:
@@ -442,6 +589,84 @@ def _looks_intimate(*texts: str) -> bool:
     return any(p in blob for p in _INTIMATE_PATTERNS)
 
 
+# 起头统计用多少条最近主动消息（比给原句的窗口长：起头重复的周期更长）
+OPENING_SCAN_COUNT = 12
+# 起头按**首字**归类：中文的开头习惯几乎都落在首字上（「诶」「刚」「我」「对了」）。
+# 取前 2~3 个字会得到「诶你吃」「诶今天」「诶我睡」三个不同词，于是「连着三条都以
+# 诶开头」这件事反而看不出来——那正是要防的那一件。
+OPENING_CHARS = 1
+
+
+def _opening_neurons(recent: List[str]) -> List[str]:
+    """最近主动消息里出现过的开头词（按出现的条数排）。
+
+    这就是「开场结构的记忆」：真人不会连着三条都以「诶」开头，而我们以前只把原句
+    摆给模型、让它自己留意——那等于每轮都要它重新归纳一遍。直接把结论给它，它要做的
+    就只剩「写一个新句子」。
+    """
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for text in list(recent or [])[-OPENING_SCAN_COUNT:]:
+        body = str(text or "").strip()
+        if not body:
+            continue
+        head = body[:OPENING_CHARS]
+        if not head:
+            continue
+        # 纯标点/表情开头的没有「起头」可言，跳过
+        if not any("\u4e00" <= ch <= "\u9fff" for ch in head):
+            continue
+        if head not in counts:
+            order.append(head)
+        counts[head] = counts.get(head, 0) + 1
+    ordered = sorted(order, key=lambda h: (-counts[h], order.index(h)))
+    # 出现两次以上的排前面（那才是真在重复），只出现一次的接在后面
+    return [h for h in ordered if counts[h] >= 2] + [h for h in ordered if counts[h] < 2]
+
+
+def _low_state_day(body: Dict[str, Any]) -> bool:
+    """今天是那种「懒得多说」的一天吗。
+
+    看的是身体轴里三件真正让人不想说话的事：困、饿、不舒服。三样里中了两样以上
+    才算——单看任何一样都会天天命中，那不叫状态差，叫一直不舒服。
+    """
+    if not isinstance(body, dict) or not body:
+        return False
+    hits = 0
+    for key, floor in (("sleep_pressure", 55.0), ("hunger", 75.0), ("discomfort", 55.0)):
+        raw = body.get(key)
+        try:
+            if raw is not None and float(raw) >= floor:
+                hits += 1
+        except (TypeError, ValueError):
+            continue
+    return hits >= 2
+
+
+def _bond_line(target: Dict[str, Any]) -> str:
+    """Core 替她记着的东西：她该怎么叫这个人、这个人此刻什么状态、她有多在意。
+
+    这些以前只躺在 Core 的状态文件里，主动消息一条也没用上——她主动找上门时既不按
+    自己记住的称呼开口，也不知道对方这阵子是什么状态，联动看着就是假的。
+    """
+    bits: List[str] = []
+    nick = str(target.get("_nickname") or "").strip()
+    if nick:
+        bits.append(f"你一直叫TA「{nick}」")
+    tag = str(target.get("_mood_tag") or "").strip()
+    if tag:
+        bits.append(f"TA这会儿的状态是{tag}")
+    try:
+        attention = float(target.get("_attention"))
+    except (TypeError, ValueError):
+        attention = None
+    if attention is not None and attention >= 60:
+        bits.append("你挺在意这个人")
+    if not bits:
+        return ""
+    return "【你记得的·自然地用上，别当成设定复述出来】" + "；".join(bits) + "。"
+
+
 def _body_line(body: Dict[str, Any]) -> str:
     """把 Core 契约里的身体写成一句第一人称近况。
 
@@ -473,6 +698,11 @@ def _body_line(body: Dict[str, Any]) -> str:
             parts.append("已经一个人待挺久，挺想找人说说话")
         elif desire <= 15:
             parts.append("刚聊过不久，其实没什么要说")
+    # 低状态日：累得不想说话的一天。只做**软**调整——句子更短、话更少，
+    # 不去压「要不要发」的频率（那由念头和 decide 决定）；真人状态差的时候
+    # 还是会随手发一句，只是不想多说。
+    if _low_state_day(body):
+        parts.append("今天整个人懒懒的，脑子转不动，回复会短")
     if not parts:
         return ""
     return "你自己身体的感觉（只是感觉，不要在消息里报告它们）：" + "；".join(parts[:3]) + "。"
@@ -481,13 +711,34 @@ def _body_line(body: Dict[str, Any]) -> str:
 class MessageGenerator:
     """主动消息生成器。"""
 
-    def __init__(self, context: Any, config: Optional[Any] = None):
+    def __init__(
+        self,
+        context: Any,
+        config: Optional[Any] = None,
+        time_source: Optional[Any] = None,
+    ):
         self.context = context
         self.cfg = config
-        # 连续失败退避：key 失效、模型下线时，urge 一直高于门槛，不退避就是每个心跳
+        # 与引擎同一个时钟（引擎那边钳制了墙钟回拨）。用裸 time.time() 的话，
+        # 回拨会让「还剩多少秒退避」算错：墙钟往回跳，退避要么提前结束要么拖很久。
+        self._now = time_source or time.time
+        # 下面这些一律**按 provider 拆**。整份插件只有一个生成器实例，而多 Bot 时
+        # 各角色可以用不同的 provider（不同 key、不同 API 版本、不同方法集）。
+        # 拆不开的两个后果都很实在：
+        #   * A 的 key 失效会把 B 一起停掉（退避是全局的）；
+        #   * B 每成功一次就把 A 的失败计数清零，A 永远攒不满退避阈值——
+        #     于是多 Bot 下退避等于没有，每个心跳照样白撞一次 401。
+        # 退避：key 失效、模型下线时，urge 一直高于门槛，不退避就是每个心跳
         # 对每个攒满的人重试一次，token 白烧且日志刷屏
-        self._llm_fail_streak = 0
-        self._llm_skip_until = 0.0
+        self._llm_fail_streak: Dict[str, int] = {}
+        self._llm_skip_until: Dict[str, float] = {}
+        # 上次成功返回文本的调用方式。稳态下只走它，一次生成 = 一次网络请求。
+        self._prefer: Dict[str, str] = {}
+        # 形状对不上的调用方式（签名不对、返回的不是文本）：对这个 provider 而言
+        # 它根本不是正确的用法，试过一次就永久排除，否则每轮都在它上面白打一次。
+        # 按 provider 存是关键：签名是否匹配是 per-provider-class 的属性，
+        # 拿裸方法名存会让 A 的失败把 B 的正确用法一起剔掉，B 每条消息多打 2~4 次。
+        self._unusable: Dict[str, set] = {}
 
     async def generate(
         self,
@@ -512,14 +763,14 @@ class MessageGenerator:
         )
         if prepared is None:
             return None
-        provider, prompt, max_len = prepared
+        provider, prompt, max_len, allow_emoji = prepared
         try:
             result_text = await self._call_llm(provider, prompt)
         except Exception as e:
             logger.warning(f"[autonomous_social] LLM 生成异常: {e}")
             return None
         if result_text:
-            return self._split_parts(result_text, max_len, self.cfg)
+            return self._split_parts(result_text, max_len, self.cfg, allow_emoji)
         return None
 
     async def decide(
@@ -549,7 +800,7 @@ class MessageGenerator:
         )
         if prepared is None:
             return None
-        provider, prompt, max_len = prepared
+        provider, prompt, max_len, allow_emoji = prepared
         try:
             result_text = await self._call_llm(provider, prompt)
         except Exception as e:
@@ -557,7 +808,10 @@ class MessageGenerator:
             return None
         if not result_text:
             return None
-        return self._parse_decision(result_text, max_len, self.cfg)
+        decision = self._parse_decision(result_text, max_len, self.cfg, allow_emoji)
+        if decision is not None:
+            decision.raw_text = result_text
+        return decision
 
     async def group_message(
         self,
@@ -580,14 +834,19 @@ class MessageGenerator:
         if provider is None:
             logger.warning("[autonomous_social] 群聊心流：取不到 LLM provider，本轮不发")
             return None
-        if self.llm_backoff_remaining() > 0:
+        scope = self._scope_of(provider)
+        left = self.llm_backoff_remaining(scope)
+        if left > 0:
             logger.debug(
-                f"[autonomous_social] 群聊心流：LLM 处于失败退避中，本轮跳过"
-                f"（还剩 {int(self.llm_backoff_remaining())} 秒）"
+                f"[autonomous_social][{scope}] 群聊心流：LLM 处于失败退避中，本轮跳过"
+                f"（还剩 {int(left)} 秒）"
             )
             return None
         max_len = int(getattr(self.cfg, "max_message_length", DEFAULT_MAX_LENGTH) or DEFAULT_MAX_LENGTH) if self.cfg else DEFAULT_MAX_LENGTH
         prompt = self._compose_group(mode, group_ctx, persona_prompt, max_len)
+        if prompt is None:
+            return None
+        prompt, allow_emoji = prompt
         try:
             result_text = await self._call_llm(provider, prompt)
         except Exception as e:
@@ -596,12 +855,12 @@ class MessageGenerator:
         if not result_text:
             return None
         if mode == "flow":
-            decision = self._parse_decision(result_text, max_len, self.cfg)
+            decision = self._parse_decision(result_text, max_len, self.cfg, allow_emoji)
             if decision is None or not decision.send:
                 return None
             return decision.parts
         # icebreak：直接当正文（也容错模型多写了 SEND 前缀，_split_parts 里的清洗会处理）
-        return self._split_parts(result_text, max_len, self.cfg)
+        return self._split_parts(result_text, max_len, self.cfg, allow_emoji)
 
     def _compose_group(
         self,
@@ -609,10 +868,12 @@ class MessageGenerator:
         group_ctx: Dict[str, Any],
         persona_prompt: str,
         max_len: int,
-    ) -> str:
-        """拼群聊心流/破冰的 prompt。"""
-        allow_emoji = bool(getattr(self.cfg, "allow_emoji", False)) if self.cfg else False
-        strip_rp = bool(getattr(self.cfg, "strip_roleplay_actions", True)) if self.cfg else True
+    ) -> Optional[tuple]:
+        """拼群聊心流/破冰的 prompt。返回 (prompt, 是否保留 emoji)。"""
+        # 群里也一样：用不用 emoji 看她在**这个群**里自己说过的话，不看配置开关
+        allow_emoji, emoji_note = _emoji_policy(
+            str(group_ctx.get("emoji") or EMOJI_UNKNOWN), persona_prompt
+        )
         blocks: List[str] = []
         if persona_prompt:
             blocks.append("【你是谁】\n" + persona_prompt.strip())
@@ -636,10 +897,7 @@ class MessageGenerator:
         last_flow = str(group_ctx.get("last_flow_text", "") or "").strip()
 
         shape: List[str] = []
-        if not allow_emoji:
-            shape.append("不要用 emoji。")
-        if strip_rp:
-            shape.append("不要写括号里的动作神态旁白（像（笑）、*摸头*那种），群里没人这么打字。")
+        shape.append(emoji_note)
 
         if mode == "icebreak":
             reason = str(group_ctx.get("reason", "") or "").strip()
@@ -658,7 +916,7 @@ class MessageGenerator:
                 body.append("- " + " ".join(shape))
             body.append(f"长度不超过 {max_len} 字。直接写你要发到群里的那句话，不要写别的。")
             blocks.append("\n".join(body))
-            return "\n\n".join(b for b in blocks if b)
+            return "\n\n".join(b for b in blocks if b), allow_emoji
 
         # mode == flow
         if conv_lines:
@@ -687,10 +945,22 @@ class MessageGenerator:
             if self.cfg else MAX_BURST_PARTS
         )
         max_parts = max(1, min(MAX_BURST_PARTS, max_parts))
-        if allow_burst and max_parts >= 2:
+        # 这里也要看 `burst_probability`——**decide 是默认路径**（llm_gate 开着时
+        # 走的就是它），只让 generate 路径看概率的话，用户把值调成 0 也没用：
+        # 默认路径照样每次都在提示里带「可以拆」。
+        if allow_burst and max_parts >= 2 and self._burst_chance():
             instr.append(
-                f"要是你自然想连着发两三句（最多 {max_parts} 段），就在每段之间单独一行写 ---，"
-                "每段都能单独看懂、别硬把一句话从中间劈开；就像真人在群里连着敲几条，不想拆就正常写一段。"
+                f"这条消息**可以**拆成最多 {max_parts} 段发出去。写法：段与段之间单独一行写 ---。",
+                "",
+                "什么时候值得拆：",
+                "· 你想说的其实有两三个各自独立的念头（看到什么 + 想到什么 + 问一句）",
+                "· 一段话塞两件事会显得急，一件一件说更像聊天",
+                "",
+                "什么时候别拆：就一件事、或者后半句是前半句的补充——那就正常写一段。",
+                "",
+                "拆的话每段都要能单独看懂，别把一句话从中间劈断；"
+                "后面几段别用「而且」「还有」「然后」「就是」开头。",
+                "",
             )
             instr.append(
                 "输出格式：想接就第一行写 SEND，第二行开始写要发的话（要拆就用单独一行的 --- 隔开几段）；不想接就只写一行 NO。"
@@ -698,7 +968,7 @@ class MessageGenerator:
         else:
             instr.append("输出格式：想接就第一行写 SEND，第二行开始写你要发的话；不想接就只写一行 NO。")
         blocks.append("\n".join(instr))
-        return "\n\n".join(b for b in blocks if b)
+        return "\n\n".join(b for b in blocks if b), allow_emoji
 
     async def _compose(
         self,
@@ -714,16 +984,20 @@ class MessageGenerator:
         at: Optional[float] = None,
         clock_offset: Optional[int] = None,
     ) -> Optional[tuple]:
-        """拼出 prompt，返回 (provider, prompt, max_len)；provider 拿不到返回 None。"""
-        if self.llm_backoff_remaining() > 0:
-            logger.debug(
-                f"[autonomous_social] LLM 处于失败退避中，本轮跳过生成"
-                f"（还剩 {int(self.llm_backoff_remaining())} 秒）"
-            )
-            return None
+        """拼出 prompt，返回 (provider, prompt, max_len, emoji)；provider 拿不到返回 None。"""
         provider = await self._get_provider(umo)
         if provider is None:
             logger.warning(f"[autonomous_social] 未能获取 LLM provider（umo={umo!r}），跳过本次生成。")
+            return None
+        # 退避按 provider 查：先拿 provider 才知道该问哪一格。先查后拿只能问「所有人里
+        # 最长的那个」，A 的 key 坏掉时会把 B 也一起停掉。
+        scope = self._scope_of(provider)
+        left = self.llm_backoff_remaining(scope)
+        if left > 0:
+            logger.debug(
+                f"[autonomous_social][{scope}] LLM 处于失败退避中，本轮跳过生成"
+                f"（还剩 {int(left)} 秒）"
+            )
             return None
 
         # 时刻由引擎传入，保证「现在是几点」与闸门判断用的是同一个时间；
@@ -735,6 +1009,10 @@ class MessageGenerator:
         mode = str((reason_meta or {}).get("mode") or "")
         is_followup = mode in ("probe", "presence", "loop")
         is_closer = mode == "closer"
+        # 「分享」和「求回应」是两种不同的主动：真人发「这面包超难吃」不需要你回，
+        # 发「你在干嘛」是想你回。以前这两种在提示词里长得一模一样，模型于是给
+        # 每一条都挂个问句——收场那句、午间招呼也一样，看着就像在索取回应。
+        no_reply_needed = mode in ("closer", "promise") or mode.startswith("greet_")
         about = str((reason_meta or {}).get("about") or "").strip()
         asked = str((reason_meta or {}).get("asked") or "").strip()
         max_len = (
@@ -756,12 +1034,29 @@ class MessageGenerator:
             pass
         body_line = _body_line(body)
         relation_line = _relationship_line(target)
+        bond_line = _bond_line(target)
+        # 由头：这次开口的那件事，由插件给定（不叫模型去找话题）
+        _anchor_fact = str((reason_meta or {}).get("anchor_fact") or "").strip() or (
+            "（这次没什么具体的事要说）" if not (reason_meta or {}).get("category")
+            else ""
+        )
+        # 已读续接：对方最近说过的那几句。有它的时候补的这一句该接着它们说，
+        # 而不是凭空找个话头。对方那几句的回复走的是正常聊天链路，不是插件发的。
+        _exchange = [
+            str(t).strip()
+            for t in ((reason_meta or {}).get("exchange") or [])
+            if str(t).strip()
+        ]
 
         # ─── 构建上下文片段 ───
 
-        # 关系等级
+        # 关系等级。**优先用插件算好的档位**（按涨幅+互动算，好感度只作参考），
+        # 拿不到才退回纯按好感度分档——那是旧的、会被「基线设高」骗到的分法。
         affection = target.get("_affection")
-        _, tier_desc = relationship_tier(affection)
+        if target.get("_tier_note"):
+            tier_desc = str(target["_tier_note"])
+        else:
+            _, tier_desc = relationship_tier(affection)
 
         # 语气：时段 + 精力 + 社交能量（冲突时仲裁融合，避免指令自相矛盾）
         energy_val = target.get("_energy")
@@ -820,10 +1115,18 @@ class MessageGenerator:
             ][-RECENT_OUT_COUNT:]
         out_block = ""
         if recent_out:
-            out_block = (
-                "【你最近对TA说过的·别再重复类似的开头和句式】\n"
-                + "\n".join(f"  · {t}" for t in recent_out)
-            )
+            blocks_out = ["【你最近对TA说过的·别再重复类似的开头和句式】"]
+            blocks_out.extend(f"  · {t}" for t in recent_out)
+            # 光给句子不够：模型要自己归纳「你最近都怎么起头的」，那是件费力的事，
+            # 而且归纳出来的结论比它自己重读的印象更硬。这里直接把结论给它。
+            # 句子仍然只给最近几条（占 prompt），开头统计用更长的窗口（7 天日志）。
+            heads = _opening_neurons(target.get("_recent_proactive") or [])
+            if heads:
+                blocks_out.append(
+                    "  你最近开头用过：" + "、".join(heads)
+                    + "（这几个这次都别用了，换个说法起头）"
+                )
+            out_block = "\n".join(blocks_out)
 
         # 话题展示数量（接线配置项 topic_memory_count）
         topic_limit = (
@@ -855,10 +1158,13 @@ class MessageGenerator:
         # 句式约束：固定四条，不需要随机采样
         rules_text = self._format_rules(_SENTENCE_RULES)
         # 风格特征：从真实对话历史统计出来，只给数字与分类，不含任何原句
-        style_text = build_style_profile(
+        style = build_style_profile(
             target.get("conversation") or [],
             [str(t or "") for t in (target.get("_recent_proactive") or [])],
         )
+        style_text = style.text
+        # 用不用 emoji 由她自己的历史说话习惯定，不是配置开关（见 _emoji_policy）
+        allow_emoji, emoji_note = _emoji_policy(style.emoji, personality)
         material_text = self._material_block(target, body, now, ref)
 
         weekday_cn = "一二三四五六日"[now.weekday()]
@@ -884,12 +1190,7 @@ class MessageGenerator:
         if "burst_ok" in form:
             burst_ok = bool(form.get("burst_ok"))
         allow_burst = bool(getattr(self.cfg, "allow_burst", True)) if self.cfg else True
-        want_split = allow_burst and burst_ok and random.random() < BURST_PROBABILITY
-        # 是否剥掉括号动作/旁白：关掉（strip_roleplay_actions=false）时尊重人设本身的说话
-        # 风格（语C 人设靠括号动作表达），不再强制她把动作神态删干净把角色风格抄平。
-        strip_rp = (
-            bool(getattr(self.cfg, "strip_roleplay_actions", True)) if self.cfg else True
-        )
+        want_split = allow_burst and burst_ok and self._burst_chance()
         burst_lines: List[str] = []
         if want_split:
             n = (
@@ -899,11 +1200,28 @@ class MessageGenerator:
             )
             n = max(1, min(MAX_BURST_PARTS, n))
             if n >= 2:
+                # 原来这里写的是「要是你自然想把这条拆开发」——**可选口吻**。
+                # 模型对「可以但不必」这种指令基本无视，于是这一整段等于没写，
+                # 反馈是「他从来不分段回复」。改成把它当成一件正常的事来讲，
+                # 并给出怎么写的形状。
                 burst_lines = [
-                    f"要是你自然想把这条拆开发，就写成最多 {n} 段，中间单独一行只写 ---。",
-                    "每段都得是能单独看懂的完整话，不要把一句话从中间劈断；",
-                    "就像真人连着发几条那样，一段一个念头；",
-                    "后面几段不要以「而且」「还有」「然后」「就是」这类连接词开头，另起一个念头更像真的。",
+                    f"这条消息**可以**拆成最多 {n} 段发出去。写法：段与段之间单独一行写 ---。",
+                    "",
+                    "什么时候值得拆：",
+                    "· 你想说的其实有两三个各自独立的念头（看到什么 + 想到什么 + 问一句）",
+                    "· 一段话塞两件事会显得急，一件一件说更像聊天",
+                    "",
+                    "什么时候别拆：就一件事、或者后半句是前半句的补充——那就正常写一段。",
+                    "",
+                    "拆的话每段都要能单独看懂，别把一句话从中间劈断；",
+                    "后面几段别用「而且」「还有」「然后」「就是」开头，另起一个念头更像真的。",
+                    "",
+                    "例子（三段）：",
+                    "  早安呀，今天太阳挺好的",
+                    "  ---",
+                    "  我刚在楼下看到只橘猫，蹲在快递箱上不肯走",
+                    "  ---",
+                    "  你昨晚说的那事后来怎么样了",
                     "",
                 ]
 
@@ -924,6 +1242,19 @@ class MessageGenerator:
                     ref_lines.append(f"你自己上一句对TA说的是：{spoken[:120]}")
                 if topics_text and "topics" not in dropped:
                     ref_lines.append(f"之前聊到的话题：{topics_text}")
+                # Core 记着的对方原话。这是**她说过的**，不是给她的台词，
+                # 但确实可能被顺着还回去，所以明写一句别复读。
+                said = target.get("_said") or []
+                if said and "history" not in dropped:
+                    quotes = "；".join(
+                        f"「{str(x.get('said', '') or '')[:40]}」"
+                        for x in said[:3]
+                        if str(x.get("said", "") or "").strip()
+                    )
+                    if quotes:
+                        ref_lines.append(
+                            f"你记得TA说过这些：{quotes}（别原样还给她）"
+                        )
                 if conv_text and "history" not in dropped:
                     ref_lines.append("最近的对话：")
                     ref_lines.append(conv_text)
@@ -943,15 +1274,12 @@ class MessageGenerator:
             if persona_text:
                 parts.append(persona_text)
                 parts.append("")
-                if strip_rp:
-                    parts.extend([
-                        "上面是你在 AstrBot 里的人格设定，用这个身份和说话方式来，不要把设定内容本身复述出来。",
-                        "设定里如果有动作描写、神态、旁白那一套，只用来理解性格，发消息时不写那些。",
-                    ])
-                else:
-                    parts.append(
-                        "上面是你在 AstrBot 里的人格设定，就用这个身份和它本来的说话风格来（包括它惯用的语气、动作描写），不要把设定内容本身复述出来。"
-                    )
+                # 人格怎么说话就怎么说。语C 人设本来就用括号写动作神态，删掉它不是
+                # 「更像真人」，是把角色抄平——所以这里只拦住「复述设定本身」。
+                parts.append(
+                    "上面是你在 AstrBot 里的人格设定，就用这个身份和它本来的说话方式来"
+                    "（包括它惯用的语气、动作描写），不要把设定内容本身复述出来。"
+                )
                 parts.extend([
                     "",
                     f"你除了聊天还有自己的日常生活。现在是{when}。",
@@ -964,6 +1292,8 @@ class MessageGenerator:
                 parts.append(body_line)
             if relation_line:
                 parts.append(relation_line)
+            if bond_line:
+                parts.append(bond_line)
             if mind_block and "mind" not in dropped:
                 parts.extend(["", mind_block])
             if material_text and "material" not in dropped:
@@ -972,7 +1302,21 @@ class MessageGenerator:
             if decide:
                 parts.extend([
                     "",
-                    "你现在在想要不要主动给TA发一条消息。不是回复，是你自己想开口。",
+                    # 这两句以前是「不是回复，是你自己想开口」和「不是回复对方，是你主动
+                    # 想说的」。**那是一条指令，不是一个描述**——模型读到「不是回复」就会
+                    # 刻意避开接续，因为接续属于「回复」。结果 229 条真实记录里几乎没一条
+                    # 在接 TA 的话，末尾挂的全是同一句「你今天有什么安排吗」（7 次）。
+                    #
+                    # 而且那 7 条走的是 anchored 通道，那条路径**从来没开过**
+                    # require_about_peer——所以它不是验收逼出来的，是模型只拿到
+                    # 「刚忙完个案笔记」这一句、不知道还能说什么，于是挂个通用问句兜底。
+                    #
+                    # 换成人话：**先摆素材，再问要不要说**。让「想什么」成为对素材的自然
+                    # 反应，而不是凭空造。同时把「主动」和「不许接续」这两件事拆开——
+                    # 她主动发出的消息，内容本来就该接着他们刚聊的那件事。
+                    "下面是 TA 刚才跟你说的话，和你今天刚发生的事。",
+                    "你看一眼：有没有哪一件，让你现在就想说点什么。",
+                    "有就照着那件说；没有就答 NO——真的没有就别硬找话说。",
                     "",
                     # 这里原本列了五条「下面这些情况就别说」：刚聊过、上条没回、这个点 TA 在睡、
                     # 没什么想说的、反复想了好几遍。可这几条引擎的闸门早就逐条查过了——不成立的
@@ -982,18 +1326,62 @@ class MessageGenerator:
                     "时机、间隔、对方是不是在睡、是不是刚聊完——这些插件已经替你查过，"
                     "不合适的那些根本不会走到你这里。所以不用再替自己找理由不发。",
                     "",
-                    "你只需要回答一件事：这一刻你到底想不想说点什么。",
-                    "想说就说；确实没什么想说的，就答 NO。",
+                    "这是一条你**主动发出**的消息（不是TA发来、你回的那条），所以别写成"
+                    "「你刚才说的那句」那种回话的样子。但**内容可以、也应该接着你们刚才聊的"
+                    "那件事说**——TA 说过什么就在上面摆着，你想接哪句就接哪句。",
+                    "实在接不上，就把你今天那件事本身讲给他听，别在末尾挂一句"
+                    "「你今天有什么安排吗」那种谁都能问的话。",
+                    "",
+                    # 追问/在不在/回访/收场这四条路的 meta **不带 anchor_fact**
+                    # （`thread_meta` / `loop_meta` / `closer_meta` 都没这个字段）。
+                    # 原来它们照样走这一段，于是提示词里出现
+                    # 「已经定了…（# 那行就是它）」然后**什么都不给**——
+                    # 模型被告知话题已定且已展示，却什么都没看到，只能自己编。
+                    # 这四条路本来就有明确的事由（对方哪句没接、约的是什么事），
+                    # 那才是这里该写的东西。
+                    (f"这次开口是因为下面这一件事（**已经定了，你不用再去找话题**）：\n"
+                     f"  {_anchor_fact}"
+                     if (reason_meta or {}).get("anchor_fact")
+                     else f"这次开口是因为下面这一件事（已经定了）：\n  {str(reason or '').strip()}"),
+                    "",
+                    "你只需要回答一件事：**这次你要跟 TA 说的是哪一件事**。",
+                    "下面已经给了具体的那件事（# 那行就是它），就照着那件事说。",
+                    "",
+                    "但你手上还有一道否决权，**对谁都成立，不分关系好坏**：",
+                    "看完「你们的关系」和上面的事，如果此刻你根本不会主动找这个人说话，"
+                    "就答 NO，并写一句为什么。",
+                    "  · 关系很冷、你们其实没怎么说过话 —— 那多半不该是你先开口；",
+                    "  · 好感很高，但你对TA的事已经说尽了、没什么新的可讲 —— 也答 NO。",
+                    "**好感高不构成必须发消息的理由**；关系好只是让开口更自然，不是非发不可。"
+                    "反过来，关系冷也不必硬发——插件的门槛已经按关系放行了，能走到这里"
+                    "说明这件事本身有由头，你只要判断此刻开口自不自然。",
+                    "实在没什么可说的，同样答 NO。",
                 ])
                 if is_followup:
                     parts.append(_decide_note(mode))
+                elif mode == "miss":
+                    # 「念想」这一类：她不是有事要说，就是想到了这个人。
+                    # 不点破的话模型会滑回「我今天怎么样」——197 条真实记录里
+                    # 全是那种自己人的日记，没有一条是关于对方的。
+                    parts.append(_MISS_NOTE)
                 elif is_closer:
-                    parts.append(
-                        "但这一次不是要TA回你：你上次主动说的那句没人接，"
-                        "你自己接一句把这事揭过去。这种情况发一句是很自然的。"
-                    )
+                    if _exchange:
+                        parts.append(
+                            "但这一次不是要TA回你：TA 回过你之后又没声了。"
+                            f"TA 刚才说过：「{'」「'.join(_exchange[:3])}」。"
+                            "你就顺着这些接一句——问那句后来怎么样了、或者就自己接上那件事。"
+                            "这是真人最常做的事，不要另起一个话题。"
+                        )
+                    else:
+                        parts.append(
+                            "但这一次不是要TA回你：你上次主动说的那句没人接，"
+                            "你自己接一句把这事揭过去。这种情况发一句是很自然的。"
+                        )
             else:
-                parts.extend(["", "你正准备给一个熟悉的人发消息。不是回复对方，是你主动想说的。"])
+                parts.extend([
+                    "",
+                    "你正准备给一个熟悉的人发一条消息——是你主动开口，不是回TA的那条。",
+                ])
 
             parts.extend([
                 "",
@@ -1015,13 +1403,21 @@ class MessageGenerator:
                     # 直接指向它：有什么说什么，没有就不说。
                     parts.extend([
                         "",
-                        "要拿自己这边的状态说什么，只用上面列出来的——别编素材里没有的经历。",
+                        "上面这些是她现在真的知道的事，**从里面挑一件说**；"
+                        "别编素材里没有的经历，也别把「饿了、困了」当成唯一可说的事。",
                     ])
 
-            parts.append(f"这次你想{msg_type_desc if msg_type_desc else '随便说点什么'}。")
-            if msg_style_hint:
-                parts.append(f"（{msg_style_hint}）")
-            parts.append(_mode_note(mode, about, asked))
+            # 问候类的 mode_note 自带「现在几点、想做什么」的开头，再单独写一遍
+            # msg_type_desc 就是同一句话说两遍，后面 style_hint 与 mode_note 的第二条
+            # 也在说同一件事。一条早安因此多花掉近一整段 token，还把重点冲淡。
+            note = _mode_note(mode, about, asked)
+            if mode in ("greet_morning", "greet_night") and note:
+                parts.append(note)
+            else:
+                parts.append(f"这次你想{msg_type_desc if msg_type_desc else '随便说点什么'}。")
+                if msg_style_hint:
+                    parts.append(f"（{msg_style_hint}）")
+                parts.append(note)
             if "good_examples" not in dropped and style_text:
                 parts.extend(["", style_text])
             if rules_text and "bad_examples" not in dropped:
@@ -1030,18 +1426,24 @@ class MessageGenerator:
                 parts.extend(burst_lines)
 
             parts.append("几件事：")
-            if strip_rp:
-                parts.append("- 你在用手机打字，只打话本身，不写括号里的动作神态、不用星号旁白。")
-            else:
-                parts.append("- 你在用手机打字，按你人设平时的说话方式来就行。")
+            parts.append("- 按你人设平时的说话方式来就行。")
             if is_followup:
                 parts.append("- 就那件事接一句，别重新起头。")
             elif is_closer:
                 parts.append("- 这句不要向TA要回复、不要问句，说完就完。")
+            elif no_reply_needed:
+                parts.append(
+                    "- 这条是**自己想说**，不是要TA回什么：别用问句结尾，"
+                    "也别在结尾问「在吗」「怎么了」。"
+                )
             elif mode == "greet_night":
                 parts.append("- 晚安不要带问句，说完就睡，别让TA觉得必须回。")
             elif mode == "greet_morning":
                 parts.append("- 早安可以带一句问TA今天安排的话，一个就够。")
+            elif mode == "greet_midday":
+                parts.append("- 一句话就够，别问对方在不在、吃了吗这类要人回的话。")
+            elif mode == "promise":
+                parts.append("- 说这件事就行，别问TA好不好、满不满意。")
             else:
                 parts.append(f"- 想接着聊下去的话，自然带一个问句也行，别每次都只是陈述句。")
             # Core 按她这一轮的状态算出的问句倾向：低的时候别老把话头递出去
@@ -1049,10 +1451,18 @@ class MessageGenerator:
                 qb = float(form.get("question_bias")) if form.get("question_bias") is not None else None
             except (TypeError, ValueError):
                 qb = None
-            if qb is not None and qb < QUESTION_BIAS_LOW:
+            if qb is not None and qb < QUESTION_BIAS_LOW and not no_reply_needed:
                 parts.append("- 你这一轮不太想问句，想说什么直接说就行。")
             parts.extend([
                 "- 像平时聊天那样口语化，不用书面语，不用刻意用标点收尾。",
+                f"- {emoji_note}",
+                # 长度以前只在清洗阶段硬截，提示词里一个字没提：Core 判「这一轮不适合
+                # 长回复」把上限压到 40 字时，模型完全不知道自己只剩 40 个字的额度，
+                # 于是写出 60 字再被砍在词中间。
+                f"- 这一条别超过 {max_len} 字。" + (
+                    "（你这会儿状态不适合长回复，写短一点是对的）"
+                    if form.get("long_reply_ok") is False else ""
+                ),
                 "- 不要解释你为什么发消息，不要说\"突然来找你\"这种话。",
                 "- 不要出现「作为AI」「我是机器人」之类的话，也不要把人设设定本身复述出来。",
                 "",
@@ -1063,13 +1473,21 @@ class MessageGenerator:
                     "输出格式（严格照这个来，不要多余的话）：",
                     "  要发：",
                     "    第一行：只写 SEND",
-                    "    第二行：以 # 开头，写一句你此刻到底想说什么（写给自己看的，不会发出去）",
+                    "    第二行：以 # 开头，写那件事的名字（几个字的名词短语，"
+                    "比如「面试」「昨天那家店」「刚忙完的方案」；"
+                    "**不要写成句子**，更不要写成「想表达…」这种描述说话的话）",
                     "    然后另起一行：写你要发出去的那句话",
                     "  不发：",
                     "    第一行：只写 NO",
                     "    第二行：用一句话说明为什么不说",
                     "",
-                    "先自己决定想不想说、想说什么，再写要发的那句：",
+                    "先定下这次说哪件事，再写要发的那句：",
+                    "",
+                    "如果**你刚才那句里答应了自己或 TA 一件事**（「明天给你看那个」"
+                    "「我回头查一下」这种），在正文之后**再单独写一行**：",
+                    "    以 > 开头，写那件事（八个字以内，别写日期，插件自己会定时点）",
+                    "这行不会发出去，到点她会自己想起来把它做了。",
+                    "没答应什么事就**不要写**这一行，别硬凑。",
                 ])
             else:
                 parts.append("只写你要发的那条消息：")
@@ -1101,7 +1519,7 @@ class MessageGenerator:
             )
         if self.cfg is not None and getattr(self.cfg, "debug", False):
             logger.debug(f"[autonomous_social] prompt 长度 {len(prompt)} 字符 ≈{used} token")
-        return provider, prompt, max_len
+        return provider, prompt, max_len, allow_emoji
 
     @staticmethod
     def _format_mind(mind: Optional[Dict[str, Any]]) -> str:
@@ -1149,7 +1567,9 @@ class MessageGenerator:
         return "【你知道的情况（只用来定语气，不要在消息里提这些）】\n" + "\n".join(f"  · {x}" for x in lines)
 
     @classmethod
-    def _parse_decision(cls, text: str, max_len: int, cfg: Any = None) -> Optional[Decision]:
+    def _parse_decision(
+        cls, text: str, max_len: int, cfg: Any = None, allow_emoji: bool = False
+    ) -> Optional[Decision]:
         """解析 SEND / NO 输出。
 
         只认协议：模型没给 SEND/NO 时本轮不发，它的输出多半是「我觉得现在不太合适」
@@ -1205,7 +1625,6 @@ class MessageGenerator:
                 why or "现在不该说",
                 max_len,
                 allow_emoji=True,
-                strip_roleplay=False,
             )
             return Decision(send=False, why_not=cleaned or "现在不该说", raw=raw)
 
@@ -1213,68 +1632,92 @@ class MessageGenerator:
             # 模型没按协议作答。绝不能把它写的任何东西当正文发出去：这种回答写的
             # 往往是「我觉得现在不太合适」「还是算了」这类犹豫说明，发给用户就是
             # 聊天机器人当众自曝思考过程。判为「这次不说」，并留一条可查的日志。
-            logger.warning(
-                "[autonomous_social] 模型未按 SEND/NO 协议作答，本轮不发。输出前 80 字："
-                f"{raw[:80]!r}"
-            )
+            # 这条每轮心跳都可能重复（模型一直不听话时），要节流。
+            if throttle.allow("decide.no_protocol"):
+                logger.warning(
+                    "[autonomous_social] 模型未按 SEND/NO 协议作答，本轮不发。输出前 80 字："
+                    f"{raw[:80]!r}" + throttle.summary("decide.no_protocol")
+                )
             return Decision(
                 send=False, why_not="模型没有按 SEND/NO 协议作答", raw=raw
             )
 
         # 到这里首行确实是 SEND（或中途找到过 SEND）。同行写法的正文已在上面拆进
         # body，body 为空就说明模型只给了一个光秃秃的协议词，没正文可发
-        body = cls._strip_intent(body)
-        parts = cls._split_parts(body, max_len, cfg)
+        body, promise = cls._strip_intent(body)
+        parts = cls._split_parts(body, max_len, cfg, allow_emoji)
         if not parts:
             # 只回了 SEND 没给内容：这是「模型没说清楚」，不是「LLM 不可用」。
             # 返回 None 会被上层记成 provider 故障并归咎于调用链，白白误导排查
-            logger.warning(
-                f"[autonomous_social] 模型只回了 SEND 没有正文，本轮不发。原始输出：{raw[:80]!r}"
-            )
+            if throttle.allow("decide.send_only"):
+                logger.warning(
+                    f"[autonomous_social] 模型只回了 SEND 没有正文，本轮不发。原始输出：{raw[:80]!r}"
+                    + throttle.summary("decide.send_only")
+                )
             return Decision(send=False, why_not="模型只回了 SEND，没有正文", raw=raw)
-        return Decision(send=True, parts=parts, raw=raw)
+        return Decision(send=True, parts=parts, raw=raw, promise=promise, raw_text=raw)
 
     @staticmethod
-    def _strip_intent(body: str) -> str:
-        """剥掉模型自产的动机行（以 # 开头的那一行）。
+    def _strip_intent(body: str) -> tuple:
+        """剥掉模型自产的动机行（正文开头连续的那几行）。
 
         动机改由模型自己想、自己写：插件不再预设「楼下早餐的香味飘上来了」这种
-        编好的理由（那等于替 AI 编一段没发生过的记忆）。这一行是给它自己想的那句，
-        不会发出去，所以必须剥掉。模型不写这行也能正常解析。
+        编好的理由（那等于替 AI 编一段没发生过的记忆）。这几行是给它自己想的那句，
+        不会发出去，所以必须剥掉。
+
+        只剥**开头连续**的那几行：以前是删掉正文里任意一行以 # 开头的，于是模型
+        把 markdown 标题当正文写（`# 今天天气真好`）时会被删空，整轮不发，而念头
+        还被 after_skip 压下去。中间的 # 行（`#1 那条动态`）一律保留。
+
+        动机行是 `#想问他面试` 这种（# 后紧跟文字），markdown 标题是 `# 标题`
+        这种（# 后有空格）。按这个区分两者不会互相误伤；而只有动机行、没给出正文
+        时仍然判协议违例——宁可这一轮不发，也不能把一句「我打算说什么」当消息发给
+        用户看。
+
+        顺带取出她自己的承诺（`> 明天给你看那个` 那行），返回 (正文, 承诺)。
         """
-        if not body or "#" not in body:
-            return body
+        promise = ""
+        if not body:
+            return body, promise
         kept: List[str] = []
+        head_done = False
         for line in body.splitlines():
             stripped = line.strip()
-            # 只剥行首的 #，避免把正文里正常出现的「#话题」标签误删
-            if stripped.startswith("#"):
+            if not head_done and stripped.startswith("#") \
+                    and stripped[1:2] not in ("", " ", "\t"):
                 continue
+            # 承诺行：提示词里写的是「以 > 开头」，所以 `> 明天给你看` 这种带空格的
+            # 才是常态。聊天正文里出现引用块基本不存在，误伤的风险可以忽略。
+            if stripped.startswith(">") and stripped[1:].strip():
+                promise = stripped.lstrip(">").strip()[:PROMISE_MAX_CHARS]
+                continue
+            if stripped:
+                head_done = True
             kept.append(line)
-        return "\n".join(kept).strip()
+        return "\n".join(kept).strip(), promise
 
     @staticmethod
-    def _split_parts(text: str, max_len: int, cfg: Any = None) -> Optional[List[str]]:
+    def _split_parts(
+        text: str, max_len: int, cfg: Any = None, allow_emoji: bool = False
+    ) -> Optional[List[str]]:
         """按 --- 分隔行拆成连发段落（上限取配置 max_burst_parts，至多 3 段）。"""
         if not str(text or "").strip():
             return None
-        allow_emoji = bool(getattr(cfg, "allow_emoji", False)) if cfg is not None else False
-        strip_rp = (
-            bool(getattr(cfg, "strip_roleplay_actions", True)) if cfg is not None else True
-        )
         limit = (
             int(getattr(cfg, "max_burst_parts", MAX_BURST_PARTS) or MAX_BURST_PARTS)
             if cfg is not None
             else MAX_BURST_PARTS
         )
         limit = max(1, min(MAX_BURST_PARTS, limit))
+        # 中文里更常见的分段写法是「——」或「———」，不是 markdown 的 ---。不归一化的话
+        # 模型这么写了就分不开，接着 _join_lines 会把两段拼成一条，中间还可能插进
+        # 多余的空格（「我下班早—— 路上买了花—— 回来看到晚霞」）。
+        text = _BURST_SEP.sub("\n---\n", str(text or "").strip())
         segments = re.split(r"\n\s*-{3,}\s*\n?", text)
         parts = [
             p
             for p in (
-                MessageGenerator._clean_output(
-                    s, max_len, allow_emoji=allow_emoji, strip_roleplay=strip_rp
-                )
+                MessageGenerator._clean_output(s, max_len, allow_emoji=allow_emoji)
                 for s in segments
             )
             if p
@@ -1342,69 +1785,101 @@ class MessageGenerator:
         """
         tried: List[str] = []
         last_err = ""
-        pid = self._provider_id(provider)
+        scope = self._scope_of(provider)
+        candidates = self._candidates(provider, prompt)
 
-        # 方式1（推荐）：4.5.7 起的官方统一入口。能带 system_prompt，且框架会自己
-        # 校验 provider 有效性；provider 对象上拿不到 id 时才退回直调
-        if pid and hasattr(self.context, "llm_generate"):
-            tried.append("llm_generate")
-            r = await self._timed(
-                self.context.llm_generate(chat_provider_id=pid, prompt=prompt),
-                "llm_generate",
-            )
-            if r is not _TIMED_OUT:
-                text, err = _response_text(r)
-                if text is not None:
-                    self._note_llm_ok()
-                    return text
-                last_err = err or "llm_generate 返回非文本"
+        for label, make in candidates:
+            tried.append(label)
+            r = await self._timed(make(), label)
+            # 超时、连接中断、鉴权失败：换一种调用方式不会让同一个请求变得能发出去。
+            # 旧实现在这里会接着把剩下的方式全试一遍，于是「生成一条消息」最多真的
+            # 发出 5 次请求——key 失效时每一路都必然失败，等于把一次故障放大五倍，
+            # 而这个轮次每个心跳还会重来一次。
+            if r is _TIMED_OUT:
+                self._note_llm_failure(scope, f"{label} 调用超时")
+                return None
+            if isinstance(r, BaseException):
+                if isinstance(r, TypeError):
+                    # 签名对不上：这一路根本不是这个签名，属于「换个方式试试」而不是故障
+                    self._unusable.setdefault(scope, set()).add(label)
+                    last_err = f"{label} 签名不匹配: {r}"
+                    continue
+                self._note_llm_failure(
+                    scope, f"{label} 抛出异常: {r}", fatal=_looks_fatal(str(r))
+                )
+                return None
+            text, err = _response_text(r)
+            if text is not None:
+                self._note_llm_ok(scope)
+                self._prefer[scope] = label
+                return text
+            last_err = err or f"{label} 返回非文本"
+            if getattr(r, "role", None) == "err":
+                # provider 自己说了「这次调用失败了」。它没给理由不代表换一个调用方式
+                # 会成功——同一个 key、同一个模型，换条路去问还是同样的结果。
+                # 这里不靠错误文案判断：role=err 本身就是「这一路确实调用过了而且失败了」。
+                self._note_llm_failure(
+                    scope, last_err, fatal=_looks_fatal(last_err)
+                )
+                return None
+            if _looks_fatal(last_err):
+                self._note_llm_failure(scope, last_err, fatal=True)
+                return None
+            # 空串 / 返回的不是文本：对不上这个 provider 的正确用法，换下一路
+            self._unusable.setdefault(scope, set()).add(label)
 
-        # 方式2: provider.text_chat（AstrBot 主路径）
-        if hasattr(provider, "text_chat"):
-            tried.append("text_chat")
-            r = await self._timed(provider.text_chat(prompt=prompt), "text_chat")
-            if r is not _TIMED_OUT:
-                text, err = _response_text(r)
-                if text is not None:
-                    self._note_llm_ok()
-                    return text
-                last_err = err or "text_chat 返回非文本"
-
-        # 方式3: chat
-        if hasattr(provider, "chat"):
-            tried.append("chat")
-            r = await self._timed(provider.chat(prompt), "chat")
-            if r is not _TIMED_OUT:
-                if isinstance(r, str):
-                    self._note_llm_ok()
-                    return r
-                last_err = "chat 返回非文本"
-
-        # 方式4: generate / complete / ask
-        for method_name in ("generate", "complete", "ask"):
-            if hasattr(provider, method_name):
-                tried.append(method_name)
-                r = await self._timed(getattr(provider, method_name)(prompt), method_name)
-                if r is not _TIMED_OUT:
-                    if isinstance(r, str):
-                        self._note_llm_ok()
-                        return r
-                    last_err = f"{method_name} 返回非文本"
-
-        if not tried:
+        if not candidates:
             if throttle.allow("llm.no_method"):
                 logger.error(
                     "[autonomous_social] LLM provider 无可用调用方法"
                     "（llm_generate/text_chat/chat/generate/complete/ask 都没有），无法生成消息。"
                     + throttle.summary("llm.no_method")
                 )
-        elif throttle.allow("llm.failed"):
+        elif throttle.allow(f"llm.failed.{scope}"):
             logger.error(
                 f"[autonomous_social] LLM 调用失败，已尝试 {tried}，最后错误：{last_err}"
-                + throttle.summary("llm.failed")
+                + throttle.summary(f"llm.failed.{scope}")
             )
-        self._note_llm_failure(last_err)
+        self._note_llm_failure(scope, last_err)
         return None
+
+    def _candidates(self, provider: Any, prompt: str) -> List[tuple]:
+        """排好序的候选调用方式：上次成功的那一路排最前，形状对不上的直接剔除。
+
+        记住成功的那一路，是把「稳态下一次生成 = 一次网络请求」落到实处的关键；
+        形状不对的永久剔除，是为了不出现「它不工作 → 换下一个 → 下一个也不工作 →
+        一路试完」又回到五次请求的老路。
+        """
+        pid = self._provider_id(provider)
+        found: List[tuple] = []
+        if pid and hasattr(self.context, "llm_generate"):
+            found.append((
+                "llm_generate",
+                lambda: self.context.llm_generate(chat_provider_id=pid, prompt=prompt),
+            ))
+        if hasattr(provider, "text_chat"):
+            found.append(("text_chat", lambda: provider.text_chat(prompt=prompt)))
+        if hasattr(provider, "chat"):
+            found.append(("chat", lambda: provider.chat(prompt)))
+        for name in ("generate", "complete", "ask"):
+            if hasattr(provider, name):
+                found.append((name, lambda n=name: getattr(provider, n)(prompt)))
+        scope = self._scope_of(provider)
+        bad = self._unusable.get(scope, set())
+        usable = [item for item in found if item[0] not in bad]
+        if not usable and found:
+            # 全被剔光了：多半是 provider 热更新换了形状，清一次重新认
+            self._unusable[scope] = set()
+            usable = found
+        prefer = self._prefer.get(scope, "")
+        usable.sort(key=lambda item: 0 if item[0] == prefer else 1)
+        return usable
+
+    def _scope_of(self, provider: Any) -> str:
+        """退避与调用方式的归属键。优先用 provider 的配置 id（那是 key/额度所在的
+        那一格），拿不到时退回 id()：两个不同的 provider 对象至少不会互相污染。"""
+        pid = self._provider_id(provider)
+        return pid or f"obj{id(provider)}"
 
     @staticmethod
     def _provider_id(provider: Any) -> str:
@@ -1443,30 +1918,51 @@ class MessageGenerator:
                 )
             return e
 
-    def _note_llm_ok(self) -> None:
-        self._llm_fail_streak = 0
-        self._llm_skip_until = 0.0
-        # 恢复正常后清掉节流计数：故障已经结束，下一次再坏时应该立刻能打出第一条
+    def _note_llm_ok(self, scope: str) -> None:
+        self._llm_fail_streak[scope] = 0
+        self._llm_skip_until[scope] = 0.0
+        # 恢复正常后清掉节流计数：故障已经结束，下一次再坏时应该立刻能打出第一条。
+        # 只清自己这一格：以前是全局清，B 的一次成功就把 A 刚建立的日志窗口拆掉了。
         for key in ("llm.failed", "llm.exception", "llm.timeout", "llm.backoff"):
-            throttle.reset(key)
+            throttle.reset(f"{key}.{scope}")
 
-    def _note_llm_failure(self, reason: str) -> None:
-        """连续失败就指数退避，避免 key 失效时每个心跳重试烧 token。"""
-        self._llm_fail_streak += 1
-        if self._llm_fail_streak < LLM_FAIL_STREAK_BEFORE_BACKOFF:
+    def _note_llm_failure(self, scope: str, reason: str, *, fatal: bool = False) -> None:
+        """连续失败就指数退避，避免 key 失效时每个心跳重试烧 token。
+
+        fatal 表示「等一会儿也是同样的错」（鉴权/额度/限流）：这种只失败一次就直接
+        退避，而且起步更久——等 60 秒再打一次还是 401，那次请求纯属白花。
+        """
+        streak = self._llm_fail_streak.get(scope, 0) + 1
+        self._llm_fail_streak[scope] = streak
+        threshold = 1 if fatal else LLM_FAIL_STREAK_BEFORE_BACKOFF
+        if streak < threshold:
             return
-        delay = min(LLM_BACKOFF_BASE_SECONDS * (2 ** (self._llm_fail_streak - LLM_FAIL_STREAK_BEFORE_BACKOFF)), LLM_BACKOFF_MAX_SECONDS)
-        self._llm_skip_until = time.time() + delay
-        if throttle.allow("llm.backoff", window=120.0):
+        base = (
+            LLM_FATAL_BACKOFF_BASE_SECONDS if fatal else LLM_BACKOFF_BASE_SECONDS
+        )
+        cap = LLM_FATAL_BACKOFF_MAX_SECONDS if fatal else LLM_BACKOFF_MAX_SECONDS
+        delay = min(base * (2 ** (streak - threshold)), cap)
+        self._llm_skip_until[scope] = self._now() + delay
+        if throttle.allow(f"llm.backoff.{scope}", window=120.0):
+            hint = (
+                "（改好 key/额度后会继续；想立刻验证可先在面板里检查模型配置）"
+                if fatal else ""
+            )
             logger.error(
-                f"[autonomous_social] LLM 已连续失败 {self._llm_fail_streak} 次"
-                f"（{reason or '原因未知'}），暂停调用 {int(delay)} 秒。请检查模型配置与 key。"
-                + throttle.summary("llm.backoff")
+                f"[autonomous_social][{scope}] LLM 已连续失败 {streak} 次"
+                f"（{reason or '原因未知'}），暂停调用 {int(delay / 60)} 分钟。"
+                f"请检查模型配置与 key。{hint}"
+                + throttle.summary(f"llm.backoff.{scope}")
             )
 
-    def llm_backoff_remaining(self) -> float:
-        """当前还剩多少秒退避时间（0 = 可以正常调）。"""
-        return max(0.0, self._llm_skip_until - time.time())
+    def llm_backoff_remaining(self, scope: str = "") -> float:
+        """还剩多少秒退避（0 = 可以正常调）。scope 为空时取所有里最长的那个。"""
+        now = self._now()
+        if scope:
+            return max(0.0, self._llm_skip_until.get(scope, 0.0) - now)
+        if not self._llm_skip_until:
+            return 0.0
+        return max(0.0, max(self._llm_skip_until.values()) - now)
 
     @staticmethod
     def _format_conversation(
@@ -1568,20 +2064,16 @@ class MessageGenerator:
 
     @staticmethod
     def _join_lines(text: str) -> str:
-        """把多行输出折叠成一条聊天消息。
+        """去掉空行与行首尾空白，但**保留换行**。
 
-        想分段的话应该走连发拆两条，而不是一条消息里带换行；中文之间直接拼，
-        英文/数字交界保留一个空格。
+        以前是把多行硬拼成一条，中文之间不加分隔。结果是「早\\n\\n起了」→「早起了」、
+        「第一段想说这个\\n第二段说这个」→「第一段想说这个第二段说这个」——换行在中文里
+        就是一个停顿，拼掉等于把话连在一起说。反过来，QQ/微信里的聊天消息本来就是
+        分行的，而且 style_profile 会统计出「她爱分两三段发」，把换行删掉等于自己
+        推翻自己刚统计出来的习惯。
         """
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if len(lines) <= 1:
-            return lines[0] if lines else ""
-        out = lines[0]
-        for ln in lines[1:]:
-            left, right = out[-1], ln[0]
-            sep = "" if (_is_cjk(left) or _is_cjk(right)) else " "
-            out += sep + ln
-        return out
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+        return "\n".join(lines)
 
     @staticmethod
     def _strip_markdown(text: str) -> str:
@@ -1591,15 +2083,55 @@ class MessageGenerator:
         text = _MD_BULLET.sub("", text)
         return text
 
+    def _burst_chance(self) -> bool:
+        """这一轮要不要在提示里带上「可以拆成几段」。
+
+        **两条路径（decide / generate）必须用同一个判断**。原来只有 generate 看概率，
+        而 decide 才是默认路径——用户把 `burst_probability` 调成 0，默认路径照样每次
+        都带着那句「可以拆」，配置等于没用。
+        """
+        prob = BURST_PROBABILITY
+        if self.cfg is not None:
+            try:
+                prob = float(getattr(self.cfg, "burst_probability", BURST_PROBABILITY))
+            except (TypeError, ValueError):
+                prob = BURST_PROBABILITY
+        return random.random() < max(0.0, min(1.0, prob))
+
     @staticmethod
     def _truncate_at(text: str, max_len: int) -> str:
-        """超长时回到最近的句子边界，而不是字面切一半。"""
+        """超长时回到最近的句子边界，而不是字面切一半。
+
+        找不到边界时**宁可不截**：中文一口气说完不带标点很常见，硬切会在词中间
+        断开（「前两天买苹果、香蕉、橘」这种没头没尾的清单）。略超长只是长一点，
+        切在词中间则是句子不通——所以真找不到边界就放过，只有长到离谱
+        （TRUNCATE_HARD_RATIO 倍）才动手。
+
+        ## 切点不得落在未闭合的括号里
+
+        真实 197 条记录里，`(把毯子裹得紧紧的`、`(整理好餐具，翅膀微微收拢`、
+        `(窝在沙发上丢掉零食袋` 这类**有左括号没右括号**的有十几条，其中绝大多数
+        出现在人设爱写长括号动作的角色上（QQ 那几个 bot 更严重，不是 webchat 独有）。
+
+        之前一直找不到真凶，因为清洗链里**没有任何一处会删 `）`**——think 块、
+        markdown、emoji、标签前缀、引号、换行，全都不碰括号。真凶就在这里：
+        切点落在括号内部，括号的后半截连同 `）` 一起被切掉了。所以切之前
+        要回退到**该括号打开之前**，宁可少发半句，也不发一个残缺的括号。
+        """
         if len(text) <= max_len:
             return text
         window = text[:max_len]
         for i in range(len(window) - 1, max(max_len // 2, 0) - 1, -1):
             if window[i] in _CUT_CHARS:
-                return window[:i].rstrip(_CUT_CHARS)
+                cut = window[:i]
+                safe = _cut_outside_brackets(cut)
+                if not _PUNCT_ONLY_RE.sub("", safe).strip():
+                    # 切完正文全没了，只剩半截括号动作——宁可不发
+                    return ""
+                return safe.rstrip(_CUT_CHARS)
+        if len(text) <= int(max_len * TRUNCATE_HARD_RATIO):
+            safe = _cut_outside_brackets(text)
+            return safe if safe.strip() else text.rstrip(_CUT_CHARS)
         return window.rstrip(_CUT_CHARS)
 
     @staticmethod
@@ -1608,15 +2140,13 @@ class MessageGenerator:
         max_len: int,
         *,
         allow_emoji: bool = False,
-        strip_roleplay: bool = True,
     ) -> Optional[str]:
         """清理 LLM 输出文本。
 
         Args:
             text: 原始输出
             max_len: 最大长度
-            allow_emoji: 保留 emoji（默认去掉：每条带个❤️是典型的 AI 痕迹）
-            strip_roleplay: 去掉括号动作/旁白（语C 风人格最容易交回这种东西）
+            allow_emoji: 保留 emoji。由她自己发出去的消息统计得出，不看配置开关
 
         Returns:
             清理后的文本，无效返回 None
@@ -1632,9 +2162,6 @@ class MessageGenerator:
         t = MessageGenerator._strip_markdown(t).strip()
         if not t:
             return None
-
-        if strip_roleplay:
-            t = MessageGenerator._strip_roleplay(t)
 
         if not allow_emoji:
             t = _EMOJI.sub("", t)
@@ -1652,6 +2179,14 @@ class MessageGenerator:
 
         # 多行折叠成一条
         t = MessageGenerator._join_lines(t)
+        # 剥掉「为什么现在说这件事」被当成标题的那一行。
+        #
+        # 229 条真实记录里 26 条是 `标题\n(动作)\n正文`，首行全是 anchor_fact 的原话
+        # （刚忙完醒神 / 早餐时刻 / 处理完个案笔记…）——由头在提示词里是「你已经要说的
+        # 那件事」，模型把它提上来当开场白了。对话框里那行像系统消息，不像人开口。
+        #
+        # 这里剥而不退回：退回只会让它换个标题再来一遍。
+        t = strip_title_line(t)
         # 清洗后可能留下双空格或行首标点
         t = re.sub(r" {2,}", " ", t).strip(" \u3000")
         if not t:
@@ -1668,13 +2203,8 @@ class MessageGenerator:
 
     @staticmethod
     def _strip_roleplay(text: str) -> str:
-        """去掉（轻轻抱你）、*摸摸头*、【窗外夜色】这类动作/旁白。
+        """已下线：括号动作/星号旁白不再被清洗，入口是 `_clean_output`。
 
-        人格设定是语C 风时，模型几乎会把每条主动消息写成带括号动作的段落，而这在
-        微信里根本不会出现。全删干净后什么都不剩时退回原文：宁可发一条带括号的，
-        也不能发一条空的。
+        保留这个空壳只为让可能存在的旧调用方不崩。
         """
-        out = _ROLEPLAY_PAREN.sub("", text)
-        out = _ROLEPLAY_STAR.sub("", out)
-        out = out.strip()
-        return out if out else text.strip()
+        return text

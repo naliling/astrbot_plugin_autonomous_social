@@ -36,6 +36,10 @@ _SEARCH_SKIP_DIRS = {
 # 目录名里带这些词才算可能是 Core
 _SEARCH_HINTS = ("humanoid", "core")
 
+# 从 Core 拉「对方说过什么」时最多取几条。Core 那边自己也有上限，这里再卡一道：
+# 这是塞进 prompt 的素材，不是给人看的完整历史。
+CORE_SAID_MAX = 3
+
 
 class CoreBridge:
     """Humanoid Core 状态桥接（只读）。"""
@@ -47,6 +51,10 @@ class CoreBridge:
         self._warned_no_role: set = set()  # 每个 bid 只警告一次
         self._cache_fingerprint: Optional[Tuple[str, int, int]] = None
         self._cache_root: Optional[Dict[str, Any]] = None
+        # 每个角色只算一次自身视图。settle_minds 会对该角色下**每个用户**调一次
+        # load_snapshot，_speak 又会再调一次——1000 人的时候一遍心跳就要重建上千遍
+        # 同一个视图，而它的输入（角色自身状态）压根没变。read_root 换文件时清空。
+        self._view_cache: Dict[str, Dict[str, Any]] = {}
         # 搜索结果缓存：找到一次就记住路径，不必每次心跳重新搜
         self._searched = False
         self._search_hit: Optional[str] = None
@@ -178,6 +186,7 @@ class CoreBridge:
 
         self._cache_fingerprint = fingerprint
         self._cache_root = root
+        self._view_cache.clear()
         return root
 
     # ─── 快照生成 ───────────────────────────────────────
@@ -245,6 +254,15 @@ class CoreBridge:
             return None
 
     def _self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
+        """角色自身的身体视图。同一份 root 下只算一次，调用方只能读不能改。"""
+        cached = self._view_cache.get(bot_id)
+        if cached is not None:
+            return cached
+        view = self._build_self_view(selfs, bot_id)
+        self._view_cache[bot_id] = view
+        return view
+
+    def _build_self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
 
         Core v2.14 会在 `self.contract` 里导出带版本号的身体快照。读到就用它（能拿到
@@ -359,12 +377,60 @@ class CoreBridge:
         if isinstance(last_msg, dict):
             last_msg = last_msg.get("text", "")
 
+        # 这几个字段 Core 一直在记，而且在自己的契约里把它们列为稳定路径
+        # （paths.user_nickname / user_said），社交层却从来没读过：
+        # 于是她主动找人说话，既不按记住的称呼叫 TA，也不知道 TA 这阵子说过什么。
+        said: List[Dict[str, Any]] = []
+        said_raw = user.get("said")
+        if isinstance(said_raw, list):
+            for item in said_raw[:CORE_SAID_MAX]:
+                if isinstance(item, dict):
+                    text = str(item.get("said", "") or "").strip()
+                    if text:
+                        said.append({"said": text, "at": item.get("at")})
+                elif str(item or "").strip():
+                    said.append({"said": str(item).strip(), "at": 0.0})
+        attention = user.get("attention")
+        # 基线与「认识多久了」。
+        #
+        # 有运营为了让用户更好攻略，会把初始好感度设成 40 之类；聊久了直接飙到 80。
+        # 只看**绝对值**的话，这种人和「一直停在 80 但从不回话」的人是同一档——
+        # 而该被多找的恰恰是前者。Core 自己存着 base_affection 和 user 级 first_met
+        # （prune 会搬、不会丢），所以**涨幅和认识时长**是拿得到的。
+        base_aff = None
+        if isinstance(mood_data, dict):
+            raw_base = mood_data.get("base_affection")
+            if raw_base is None:
+                raw_base = selfs.get("base_affection")
+            try:
+                base_aff = float(raw_base) if raw_base is not None else None
+            except (TypeError, ValueError):
+                base_aff = None
+        try:
+            first_met = float(user.get("first_met") or 0) or None
+        except (TypeError, ValueError):
+            first_met = None
         return {
             **self._self_view(selfs, str(bot_id)),
             "mood": mood_data,
             "affection": affection,
+            "base_affection": base_aff,
+            "first_met": first_met,
             "last_message": last_msg,
             "last_interaction": user.get("last_interaction"),
+            # 她该怎么称呼这个人（Core 从 TA 自报的昵称里认定，改口会跟着变）
+            "nickname": str(user.get("nickname", "") or "").strip(),
+            "nickname_src": str(user.get("nickname_src", "") or "").strip(),
+            # 她自己记着对方说过什么（原话、最新在前）
+            "said": said,
+            # 对方此刻的状态标签（Core 情绪分析出的短标签）
+            "mood_tag": str(user.get("mood_tag", "") or "").strip(),
+            # 她有多在意这个人
+            "attention": (
+                float(attention.get("care"))
+                if isinstance(attention, dict) and attention.get("care") is not None
+                else None
+            ),
         }
 
     # ─── 紧凑输出 ───────────────────────────────────────
@@ -384,7 +450,12 @@ class CoreBridge:
         parts: List[str] = []
 
         energy = s.get("energy")
-        if energy is not None and energy != "":
+        # Core 已经把能量翻成人话了（“精神不错”/“有点发沉”），直接用它的；
+        # 没拿到契约时才退回数字。
+        energy_text = str(s.get("energy_text") or "").strip()
+        if energy_text:
+            parts.append(f"状态: {energy_text}")
+        elif energy is not None and energy != "":
             parts.append(f"能量: {energy}")
 
         social = s.get("social_energy")
@@ -422,7 +493,9 @@ class CoreBridge:
 
         weather = s.get("weather")
         if isinstance(weather, dict) and weather:
-            w = weather.get("weather", "")
+            # 契约路径写的是 {"env": ...}，旧字段路径写的是 {"weather": ..., "env": ...}。
+            # 原来只读 "weather"，于是接了 Core 的新契约时天气这一行恒为空。
+            w = weather.get("env") or weather.get("weather") or ""
             if w:
                 parts.append(f"天气: {w}")
 
