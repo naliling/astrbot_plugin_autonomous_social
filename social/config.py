@@ -107,10 +107,16 @@ QUIET_END_DEFAULT = 7
 
 MAX_MSG_LEN_MIN = 10
 MAX_MSG_LEN_MAX = 500
-# 120：够把一件事说完整，而不是被硬砍成一两句。长度本身交给人设与情境，
-# 这里只做防超长的硬上限；配合连发能自然铺开。v1.13.0 从 60 上调（60 常被
-# 反馈为「只能发一两句」）。
-MAX_MSG_LEN_DEFAULT = 120
+# 60：没人用一条消息发小作文，分段发的时候每段更短才对。容器实测一条 110 字
+# 4 句的主动消息里，模型自己数了三遍「一二三」当分隔符，读起来是清单不是人话。
+# v1.13.0 从 60 上调到 120 是因为「只能发一两句」，但那时的 60 其实是把整条
+# 压扁了，不是分段更短——v1.24.1 改回 60，同时把连发的每段上限留着。
+MAX_MSG_LEN_DEFAULT = 60
+
+# 精力低于这个值就不主动开口。做得成闸是因为「累」是硬事实：累到坐不住的人
+# 不会先去想「我该不该找 TA 说话」。设高了会把「有点倦」也当成累，于是白天
+# 大量本该说的话被挡掉。
+GATE_ENERGY_FLOOR_DEFAULT = 35
 
 TOPIC_MEMORY_MIN = 0
 TOPIC_MEMORY_MAX = 20
@@ -319,6 +325,7 @@ class SocialConfig:
     urge_refill_hours: int = URGE_REFILL_DEFAULT
     recent_talk_minutes: int = RECENT_TALK_DEFAULT
     skip_cooldown_minutes: int = SKIP_COOLDOWN_DEFAULT
+    gate_energy_floor: int = GATE_ENERGY_FLOOR_DEFAULT
     llm_gate: bool = True
     # v1.13.0 起默认关：本插件就是用来主动社交的，不该拿「对方现在多半没在线」去压
     # 主动开口的时机；深夜由 quiet_start/quiet_end 单独兜底，不靠这个。想恢复
@@ -710,6 +717,9 @@ class SocialConfig:
                 min(SKIP_COOLDOWN_MAX, int(g("skip_cooldown_minutes", _d("skip_cooldown_minutes",  SKIP_COOLDOWN_DEFAULT)))),
             ),
             llm_gate=bool(g("llm_gate", _d("llm_gate",  True))),
+            gate_energy_floor=max(
+                0, min(100, int(g("gate_energy_floor", _d("gate_energy_floor", GATE_ENERGY_FLOOR_DEFAULT))))
+            ),
             respect_user_rhythm=bool(g("respect_user_rhythm", _d("respect_user_rhythm",  False))),
             cue_followup=bool(g("cue_followup", _d("cue_followup",  True))),
             followup_enabled=bool(g("followup_enabled", _d("followup_enabled",  True))),

@@ -526,6 +526,109 @@ def _relationship_line(target: Dict[str, Any]) -> str:
     tier_note = target.get("_tier_note")
     if tier_note:
         bits.append(str(tier_note))
+    # 「有多在意这个人」——**per-user，且不依赖 Core 有没有建档**。
+    #
+    # 为什么必须单独给：关系档在拿不到 Core 情绪档案时只会给一句固定的
+    # 「关系未知，保持自然的社交距离」。实测 41 分钟里 12 个不同的人收到逐字相同的
+    # 「刚忙完个案笔记」——同一个人设、同一个模型、同一段 prompt，字面自然也一样。
+    # 那不是复读，那是 12 个人读了同一行字幕。`interest` 是插件自己按「聊过多少、
+    # 接不接话、被冷落几次」算出来的，**每个人都不一样**，拿它当第二条 per-user
+    # 通道，同一件事就能说出不同的意思。
+    #
+    # 刻意不写数字：写成「在意度 0.62」模型只会照着复述，变成状态播报。
+    # 写成人话，它才会自己翻译成语气。
+    # 拼成**一句**关系定位，不是三条并列事实。
+    #
+    # 这条是回退出来的。v1.25.0 把「在意度 / 聊过多少 / 回话快慢」拆成三个
+    # 独立陈述塞进提示词，差异化确实上来了（12 个人从 1 种说法变 11 种），
+    # **但模型手上于是有了三条可复述的事实**，和日程、精力、时段摆在一起时
+    # 它会一条条念出来——实测发出的消息长这样：
+    #
+    #     宝宝摸摸头，今天吃的好饱，好想你啊
+    #
+    # 三段并列，每段对应提示词里的一条事实，读着像念台词。**把以前「太散」的
+    # 问题倒成了「太齐」**：以前她不知道该说什么，现在她知道得太多、于是照着说。
+    #
+    # 所以并成一句，保持 v1.24.1 那个形态（一句关系定位），但内容由三个
+    # per-user 信号拼出来——区分度留住，条数不增加。
+    _iv = None
+    try:
+        if interest := target.get("_interest"):
+            _iv = float(interest)
+    except (TypeError, ValueError):
+        _iv = None
+    _msgs = None
+    try:
+        if raw_msgs := target.get("_message_count"):
+            _msgs = int(raw_msgs)
+    except (TypeError, ValueError):
+        _msgs = None
+    _fast = False
+    try:
+        _rs = float(target.get("_avg_reply_seconds") or 0.0)
+        _fast = _rs > 0 and _rs <= 90
+    except (TypeError, ValueError):
+        _rs = 0.0
+
+    # 同一档里给多种说法，**而不是多给一句**。
+    # 差异化靠措辞不靠条数：条数一多，模型就当成清单念出来（见上面那段注释）。
+    # 取舍点：`_p` 是从 per-user 的连续量取出来的，同一档里的两个人也会落到
+    # 不同说法上，而输出仍然只有一句。
+    _p = (int(_msgs or 0) * 7 + int(_rs or 0) // 60 + int((_iv or 0) * 100)) % 4
+
+    def _pick(options):
+        return options[_p % len(options)]
+
+    def _pick2(options):
+        """二级分档的取法。**必须用另一个偏移**——上面那层已经用过 `_p`。
+
+        写成 `(_p // len(options) + _p) % len(options)` 会在只有一项时越界：
+        `_p // 1 == _p`，加上 `_p` 之后对 1 取模还是 0，看起来对，但 `options`
+        的长度同时出现在分子和分母，任何一项的列表都会踩到。直接 `max(1, ...)` 兜住。
+        """
+        n = max(1, len(options))
+        return options[((_p // n) + _p) % n]
+
+    if _msgs is not None and _msgs <= 2:
+        bits.append(_pick(("跟TA还不算认识，说什么都还收着",
+                           "和TA说过没几句，还不太敢放开",
+                           "刚跟TA熟起来，讲话还有点客气")))
+    elif _iv is not None and _iv < 0.22:
+        bits.append(_pick(("最近跟TA有点生疏，不太主动往心里去",
+                           "和TA不太热络，话不多",
+                           "这阵子跟TA淡了些")))
+    elif _iv is not None and _iv >= 0.72:
+        if _fast:
+            bits.append(_pick2(("挺惦记TA的，而且说什么都接得上",
+                                "想到TA就忍不住想说两句")))
+        else:
+            bits.append(_pick(("挺惦记TA的，说话不用太客气",
+                               "总会想起TA，说话自然就亲了些",
+                               "在TA跟前不用端着")))
+    elif _iv is not None and _iv >= 0.45:
+        if _msgs is not None and _msgs > 60:
+            if _fast:
+                bits.append(_pick2(("和TA挺熟，而且说什么都接得上",
+                                    "跟TA说话不费劲")))
+            else:
+                bits.append(_pick(("和TA有几分挂心，说话挺随意",
+                                   "跟TA处得不错，聊天不用绕弯子",
+                                   "在TA面前比较松快")))
+        else:
+            bits.append(_pick(("和TA还算不上生，但也不见外",
+                               "跟TA有来有回，还不算生分",
+                               "和TA处得一般，但话还聊得下去")))
+    elif _msgs is not None and _msgs > 150:
+        bits.append(_pick(("和TA是熟人，不用客套", "跟TA不用绕弯子", "和TA熟到能开玩笑")))
+    else:
+        # 兜底。分档是 `>=` 比较，而在意度是连续量——0.4475 这种「离 0.45 差
+        # 一点点」的值会从所有分支之间漏下去，于是**这个人一句关系定位都拿不到**。
+        # 而拿不到是最糟的：提示词里没有关系信息时，模型退回按日程和精力说话，
+        # 那正是「12 个人收到同一句话」的成因。所以宁可给一句泛的。
+        bits.append(_pick(("和TA还在熟悉起来的阶段",
+                           "跟TA不算熟，但也不生分",
+                           "和TA还在互相试探")))
+
     if affection is not None and not tier_note:
         a = float(affection)
         if a <= 34:

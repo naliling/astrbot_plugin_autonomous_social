@@ -582,6 +582,21 @@ def mark_failed(u: Dict[str, Any], about: str, now: float) -> None:
         return
 
 
+def drop_anchor(u: Dict[str, Any], about: str, now: float) -> None:
+    """把这条由头立刻作废，让开位置。
+
+    给「同一件事刚发给过别人」用：那种情况不是「这次没写成」，是**这件事本身**
+    该换一件，所以不等 `ANCHOR_MAX_TRIES` 试满，当场让位。
+    """
+    kept = []
+    for a in load_anchors(u):
+        if _s(a.get("about")) == _s(about) and not _f(a.get("used_at")):
+            a["used_at"] = now
+            a["reason"] = "跨用户撞车，换一件事"
+        kept.append(a)
+    u["anchors"] = kept
+
+
 # ── 关系向的由头 ────────────────────────────────────────────────
 #
 # 真实 197 条记录里最扎手的一条：**没有一条是关于「你」或「你们」的**。

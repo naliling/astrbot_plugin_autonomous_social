@@ -189,14 +189,14 @@ class FakePlatform:
 
 
 # ─── 假 Core 状态 ─────────────────────────────────────────────────
-def write_core_state(path: Path, persona="小夜", nickname="阿澈", said=None):
+def write_core_state(path: Path, persona="小夜", nickname="阿澈", said=None, energy=62.0):
     path.parent.mkdir(parents=True, exist_ok=True)
     now = 1_700_000_000.0
     state = {
         "roles": {
             "bot1": {
                 "self": {
-                    "energy": 62.0,
+                    "energy": energy,
                     "social_energy": 55.0,
                     "current_cycle_day": 3,
                     "daily_schedule": [],
@@ -205,8 +205,9 @@ def write_core_state(path: Path, persona="小夜", nickname="阿澈", said=None)
                         "core_version": "2.23.3",
                         "time": {"utc_offset_minutes": 480, "city": "上海", "is_night": False},
                         "body": {
-                            "energy": 62.0,
-                            "energy_text": "精神还不错",
+                            "energy": energy,
+                            "energy_text": ("精神还不错" if energy >= 50 else
+                                            ("有点发沉" if energy >= 30 else "累得不行")),
                             "sleep_pressure": 30.0,
                             "sleep_debt": 0.0,
                             "hunger": 40.0,
@@ -361,13 +362,14 @@ class Sim:
 
     def __init__(self, name, *, llm_script, send_script, days=3, users=("u1",),
                  persona="小夜", nickname="阿澈", said=None, verbose=False,
-                 own_history=None, persona_prompt="你是小夜，说话简短随意。"):
+                 own_history=None, persona_prompt="你是小夜，说话简短随意。", energy=62.0):
         self.name = name
         self.days = days
         self.verbose = verbose
         self.tmp = Path(tempfile.mkdtemp(prefix="socialsim-"))
         self.core_path = self.tmp / "core" / "state.json"
-        write_core_state(self.core_path, persona=persona, nickname=nickname, said=said)
+        write_core_state(self.core_path, persona=persona, nickname=nickname, said=said,
+                         energy=energy)
 
         self.provider = FakeLLM(llm_script, tag=name)
         # send_script 可以是一个固定档位（FakePlatform.OK），也可以是按次决策的函数
@@ -616,6 +618,7 @@ async def multibot():
 # ─── 跑 ───────────────────────────────────────────────────────────
 SCENARIOS = [
     ("正常", script_normal, FakePlatform.OK),
+    ("精力耗尽（该一句都不发）", script_normal, FakePlatform.OK, dict(energy=18.0)),
     ("emoji 人格（她本来就爱用）", script_emoji_persona, FakePlatform.OK),
     ("平台整体挂掉（发不出去）", script_normal, FakePlatform.PLATFORM_DOWN),
     ("key 失效（provider 报鉴权错）", script_bad_key, FakePlatform.OK),
@@ -642,12 +645,17 @@ async def main():
     args = ap.parse_args()
 
     rows = []
-    for name, llm, send in SCENARIOS:
+    for entry in SCENARIOS:
+        name, llm, send = entry[0], entry[1], entry[2]
+        # 第四项是这一场景特有的额外参数（比如把她的精力调到很低），
+        # 和 EXTRA 里的 persona/said 一样直接透给 Sim。
+        extra = dict(EXTRA.get(name, {}))
+        if len(entry) > 3:
+            extra.update(entry[3])
         if args.only and args.only not in name:
             continue
         CAPTURE.reset()
-        sim = Sim(name, llm_script=llm, send_script=send, days=args.days,
-                  **EXTRA.get(name, {}))
+        sim = Sim(name, llm_script=llm, send_script=send, days=args.days, **extra)
         try:
             await sim.run()
         except Exception as exc:  # 场景本身崩了也算结果

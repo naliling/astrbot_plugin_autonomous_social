@@ -256,6 +256,18 @@ class SocialEngine:
         # 集中在这里钳一下：回拨时时间相当于停住（所有“距今多久”都变成 0），宁可多等，
         # 也不会因为一个负数让谁永远静默。逐个改判断点容易漏，这里改一处就覆盖全部 28 处。
         self._time_high: float = 0.0
+        # 每个 (bot, 用户) 一把锁。
+        #
+        # 为什么要：`settle_minds` 遍历所有用户、循环里有 await（读 Core 快照、算窗口），
+        # 而 `observe` 可以在任意一个 await 点插进来改**同一个** user dict。不加锁的后果
+        # 不是崩，是数据慢慢漂：urge 少加一点、last_seen 被覆盖、conversation 顺序错乱。
+        # 锁是 per-user 而不是全局——全局锁会把 176 个用户的结算串成一条。
+        #
+        # 不像 Core 那样用 WeakValueDictionary：那里的锁存在服务对象上、只有调用栈
+        # 持有强引用，所以必须担心回收。这里 `self._user_locks` 自己就持有强引用，
+        # 锁的生命周期跟着引擎走，不存在「刚建好就被回收」那个坑。代价是长期运行会
+        # 按用户数留锁，量级和 state 里的用户条目相同，可以接受。
+        self._user_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
         if state_path is None:
             state_path = os.path.abspath(
@@ -306,6 +318,25 @@ class SocialEngine:
             "sent_total": 0,            # 累计主动消息
             "blocked_reasons": {},      # 各闸门各拦下多少（近 N 轮滚动）
         }
+        # 累计类指标从上次落盘的地方接上。`last_*` 那几个不接——它们本来就该是
+        # 「最近一次」，接了会让人以为这一轮刚跑过。
+        try:
+            _prev = self.state.runtime_metrics()
+        except Exception:
+            _prev = {}
+        for _key in ("rounds", "sent_total", "rejected_total", "rule_total",
+                     "veto_total", "anchor_cross_user_total"):
+            try:
+                self._m[_key] = int(_prev.get(_key, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        _prev_blocked = _prev.get("blocked_reasons")
+        if isinstance(_prev_blocked, dict):
+            self._m["blocked_reasons"] = {
+                str(k): int(v or 0) for k, v in _prev_blocked.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+
         # 最近一次播种/导入的结果（仅用于状态展示，不落盘）
         self._last_import_note = ""
         # bid -> 本周期实际用到的人格名（仅用于状态展示，不落盘）
@@ -1421,6 +1452,64 @@ class SocialEngine:
         low = str(err or "").lower()
         return any(m.lower() in low for m in _PEER_UNREACHABLE_MARKERS)
 
+    # 拦截理由 → 稳定分类。
+    #
+    # 为什么要这个：以前九道闸各返回一句中文，只逐人 log 一行。跑完一轮如果一条
+    # 都没发出去，从指标里看不出**是哪道防线在起作用**——只知道「否决了 4 次」，
+    # 不知道是「刚聊上」「冷却没到」还是「她说此刻不该说」。于是阈值调不动：
+    # 凭感觉调，改完也不知道有没有用。
+    #
+    # 用**子串**匹配而不是给每道闸加个 code：闸有九道、散在三个方法里，逐个加 code
+    # 意味着以后新增闸的人很容易忘；集中在这里，漏了新闸只会多出一个「其它」，
+    # 不会静默丢掉。
+    #
+    # 刻意用「包含」而不是「开头匹配」：理由文本是人话，会变。写死前缀的话
+    # 「现在是安静时段」改一个字就掉进「其它」——踩过一次。
+    _BLOCK_CATEGORIES = (
+        ("刚聊上", "刚聊上"),
+        ("不久前才说过话", "刚聊过"),
+        ("还没回", "没被接住"),
+        ("护栏冷却", "冷却未过"),
+        ("决定不说", "刚跳过"),
+        ("要去睡", "TA要睡了"),
+        ("作息", "作息时间"),
+        ("安静时段", "安静时段"),
+        ("太累", "她太累"),
+        ("正在睡", "她在睡"),
+        ("没有可用的会话来源", "投不出"),
+        ("发送侧熔断", "发送熔断"),
+        ("没有由头", "没由头"),
+    )
+
+    @classmethod
+    def _block_category(cls, reason: str) -> str:
+        text = str(reason or "").strip()
+        if not text:
+            return "未说明"
+        # 长短语排前面：「刚想过一次决定不说」和「刚跳过」都要命中，
+        # 顺序反了会被短的那个先吃掉。
+        for needle, key in sorted(cls._BLOCK_CATEGORIES, key=lambda kv: -len(kv[0])):
+            if needle in text:
+                return key
+        return "其它"
+
+    def _count_block(self, reason: str) -> None:
+        """记一次「本来要发但没发」。同一轮里反复撞同一道闸会重复计——"""
+        cat = self._block_category(reason)
+        # 用 `blocked_reasons` 这个已有字段：它从 v1.x 就声明在初始 metrics 里、
+        # 注释写着「各闸门各拦下多少」，但**从来没有代码写过它**——一个空壳。
+        # 这次把它填上，不再另起一个名字。
+        table = self._m.setdefault("blocked_reasons", {})
+        table[cat] = int(table.get(cat, 0) or 0) + 1
+
+    def _user_lock(self, bid: str, uid: str) -> asyncio.Lock:
+        key = (str(bid or ""), str(uid or ""))
+        lock = self._user_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[key] = lock
+        return lock
+
     @staticmethod
     def _platform_problem(err: str) -> bool:
         """错误是不是平台/配置层面的（不支持主动消息、适配器未就绪等）。"""
@@ -1444,6 +1533,8 @@ class SocialEngine:
         # 作息与安静时段同样的教训：这类东西做成权重会漏，必须是闸。
         if body and body.get("asleep"):
             return "她正在睡觉"
+        # 「累」的闸不在这里，而在 `_speak`：那里才是所有开口的唯一收口。
+        # 放这儿只挡住了有由头的那一路（实测 61 条里过了 57 条）。
         seen = float(u.get("last_seen", 0) or 0)
         if now - seen < HOT_CHAT_THRESHOLD:
             return "刚聊上，不插话"
@@ -2271,12 +2362,33 @@ class SocialEngine:
             """发一条、记账、记账后稍隔几秒。发不出（被否决/失败）不耗配额。"""
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 return False
-            sent, result = await self._speak(
-                bid, uid, u, urge, now, preset=preset,
-                require_about_peer=require_about_peer,
-            )
+            # 锁在这一层，而不是每个调用点：`_speak` 里有 LLM 调用（秒级），这段时间里
+            # `observe` 可以从另一个协程插进来改**同一个** user dict（收到新消息会清
+            # urge、刷 last_seen、追加 conversation）。不锁的后果不是崩，是慢慢漂：
+            # urge 少加一点、last_seen 被覆盖、conversation 顺序错乱。
+            # 锁是 per-(bot,uid) 的，所以发 A 的时候不会把发 B 一起堵住。
+            async with self._user_lock(bid, uid):
+                # 拿到锁之后重新取一次 u：等锁期间 observe 可能已经改过它，
+                # 继续用等锁前那个引用就是在写一份过期的快照。
+                u = self.state.user(bid, uid)
+                if preset is not None:
+                    _sent_txt, preset_meta = preset
+                    # per-user 差异化的第二条通道。与 `_tier_note` 一起构成
+                    # 「同一个人设、同一件事，对不同的人说出不同的话」所需的全部差异。
+                    # 放在这里而不是各个 meta 构造点：那样六条通道要各写一遍，漏一条
+                    # 那条就退回共享字幕。
+                    preset_meta.setdefault("_interest", u.get("interest"))
+                    preset_meta.setdefault("_message_count", u.get("message_count", 0))
+                    preset_meta.setdefault("_avg_reply_seconds", u.get("avg_reply_seconds", 0.0))
+                sent, result = await self._speak(
+                    bid, uid, u, urge, now, preset=preset,
+                    require_about_peer=require_about_peer,
+                )
             self.log(f"{note}{uid} → {result}")
             if not sent:
+                # 模型自己否决的另记在 veto_total；这里记的是「这一条最终没发出去」。
+                # 两者会重叠，但方向不同：一个说「她不想说」，一个说「没发成」。
+                self._count_block(result)
                 return False
             budget[bid] -= 1
             served.add((bid, uid))
@@ -2355,6 +2467,7 @@ class SocialEngine:
                 continue
             why = self.gate_reason(bid, uid, u, now, bodies.get(bid))
             if why:
+                self._count_block(why)
                 self.log(f"有由头但没说（{uid}）：{why}")
                 continue
             await speak(
@@ -2444,6 +2557,22 @@ class SocialEngine:
         breaker = self.send_breaker_left(bid)
         if breaker > 0:
             return False, f"发送侧熔断中（还剩 {int(breaker / 60)} 分钟），本轮不生成任何内容"
+
+        # 累到没力气说话：这里才是**唯一**收口。
+        # 原来把这条闸加在 `gate_reason` 里，只挡住了有由头的那一路（实测 61 条里
+        # 过了 57 条）——问候/追问/回访/收场各自走自己的检查，根本不经过它。
+        # 判据得落在所有开口都要经过的地方。
+        try:
+            body = self.core.bot_self_state(bid)
+        except Exception:
+            body = None
+        try:
+            energy = float((body or {}).get("energy"))
+        except (TypeError, ValueError):
+            energy = 100.0
+        if energy < self.cfg.gate_energy_floor:
+            self.log(f"没发（{uid}）：她太累了（精力 {energy:.0f}）")
+            return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
 
         # 最小间隔：不管哪一种主动开口（问候/追问/回访/另起话题/收场），两条之间至少
         # 隔这么久。以前只有「另起话题」查 30 分钟护栏，其余四条全都绕过了它，
@@ -2678,6 +2807,33 @@ class SocialEngine:
         # 笔记」这句话对同一 bot 下所有人**逐字相同**。32 条真实记录里 16:10~16:51
         # 这 1 小时 41 分里有 12 个不同的人分别收到它——那不是复读，是 12 个人读了
         # 同一行字幕，在用户眼里就是群发。这道结构上不可能被那道复读检查抓到。
+        # ── 事件级跨用户护栏 ────────────────────────────────────
+        #
+        # 下面那道是**措辞级**的（比文本相似度），而撞车真正发生在「哪件事」这一层：
+        # 同一个「刚忙完个案笔记」可以用完全不同的说法派给 12 个人，文本相似度只有
+        # 0.02~0.06，措辞级那条永远抓不到（实测 33 分钟里「刚忙完歇着/刚忙完窝着」
+        # 派了 3 次给 3 个人，cross_user_ratios 全是 0.02~0.06）。
+        #
+        # 所以这里比的是**由头原文**：同一件事在窗口内派给别人过了就不派。
+        # 不依赖任何阈值，也不会因为换个说法就漏掉。
+        if ok and self.cfg.cross_user_repeat_hours > 0:
+            _about = str((reason_meta or {}).get("about") or "")
+            _a2 = (reason_meta or {}).get("anchor")
+            if not _about and isinstance(_a2, dict):
+                _about = str(_a2.get("about") or "")
+            if _about:
+                _used_by = self.state.anchor_recent_users(
+                    bid, self._time(), hours=self.cfg.cross_user_repeat_hours
+                ).get(_about, [])
+                if _used_by and uid not in _used_by:
+                    self._m["anchor_cross_user_total"] = int(
+                        self._m.get("anchor_cross_user_total", 0)) + 1
+                    ok = False
+                    self._m["last_failure"] = (
+                        f"[{bid}]「{_about[:16]}」刚发给过别人了，换一个"
+                    )
+                    # 换个由头再试一次，而不是直接放弃这一轮
+                    self.state.drop_anchor(u, _about)
         if ok and self.cfg.cross_user_repeat_hours > 0:
             others = self.state.recent_proactive_others(
                 bid, uid, self._time(), hours=self.cfg.cross_user_repeat_hours
@@ -2769,8 +2925,14 @@ class SocialEngine:
         # 问候与收场本来就不要求对方回：它们不进「等一句回话」的计时器，
         # 否则「从来没回过早安」会被当成「连着被冷落」，念头天花板永久压死，
         # 而衰减的锚点（last_sent）又每天被问候刷新，永远等不到。
+        _sent_about = str((reason_meta or {}).get("about") or "")
+        if not _sent_about:
+            _a = (reason_meta or {}).get("anchor")
+            if isinstance(_a, dict):
+                _sent_about = str(_a.get("about") or "")
         self.state.record_outgoing(
             bid, uid, parts[0], msg_type,
+            about=_sent_about,
             expect_reply=category not in ("greet", "closer"),
             why=self._why_now(bid, u, category, reason, reason_meta, sent_ts),
         )
@@ -3686,6 +3848,14 @@ class SocialEngine:
             last_rej = str(m.get("last_rejected") or "")
             if last_rej:
                 lines.append(f"  最近一条被拦的是：{last_rej[:60]}")
+        # 没发出去的都去了哪：按理由分组。这是唯一能回答「这一轮为什么一条都没发」
+        # 的地方——以前只知道总数，调阈值全凭感觉。
+        blocked = m.get("blocked_reasons") or {}
+        if isinstance(blocked, dict) and blocked:
+            total_blocked = sum(int(v or 0) for v in blocked.values())
+            lines.append(f"没发出去的去向（累计 {total_blocked} 次）：")
+            for cat, cnt in sorted(blocked.items(), key=lambda kv: -int(kv[1] or 0))[:8]:
+                lines.append(f"  {cat}：{int(cnt)} 次")
         # 关系档位与「多久没回」
         tier_rows = []
         for bid in sorted(self.state.data.get("bots", {})):

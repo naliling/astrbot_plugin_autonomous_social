@@ -1164,6 +1164,17 @@ class SocialState:
         u["cue_retry_at"] = 0.0
         u["cue_tries"] = 0
 
+    def runtime_metrics(self) -> Dict[str, Any]:
+        """读回上次的运行指标。
+
+        `set_runtime_metrics` 一直只写不读，于是**每次重启累计值都从零开始**。
+        别的指标无所谓（`last_*` 本来就该是「最后一次」），但 `blocked_reasons`、
+        `sent_total`、`rejected_total` 这几个是**累计**语义——重启一次归零，
+        「累计拦下 37 次」就变成了「这一轮 37 次」，而界面上写的是累计。
+        """
+        cur = self.data.get("_runtime")
+        return dict(cur) if isinstance(cur, dict) else {}
+
     def set_runtime_metrics(self, metrics: Dict[str, Any]) -> None:
         """把运行指标写进 state.json 的顶层。
 
@@ -1285,6 +1296,7 @@ class SocialState:
         uid: str,
         text: str,
         msg_type: Optional[str] = None,
+        about: str = "",
         count_proactive: bool = True,
         expect_reply: bool = True,
         why: str = "",
@@ -1324,6 +1336,10 @@ class SocialState:
             # 她**为什么**这时候发这条。以前日志里只有正文，主人看到的是一句没头没尾
             # 的话，既没法理解也没法排障——「她为什么这时候想起我」是最该被看见的一件事。
             "why": str(why or "")[:WHY_MAX_CHARS],
+            # 这次开口说的**是哪件事**（由头原文）。跨用户撞车就在这一层发生：
+            # 同一件事可以用完全不同的措辞发给不同的人，文本相似度只有 0.02~0.06，
+            # 靠比措辞是抓不到的。有了它才能判「这件事最近已经派给别人了」。
+            "about": str(about or "")[:60],
         })
         cutoff = ts - PROACTIVE_LOG_DAYS * 86400.0
         # 时间戳容错：state.json 被手改或写入损坏时，一条脏 ts 不该把整个发送流程
@@ -1371,6 +1387,30 @@ class SocialState:
 
         self.mark_dirty()
         return u
+
+    def anchor_recent_users(self, bid: str, now: float, hours: float = 2.0) -> dict:
+        """这个角色最近把哪些由头派给了谁。`{about: [uid, ...]}`。
+
+        跨用户撞车真正发生在**「哪件事」这一层**，不在「怎么说的」那一层：
+        同一个「刚忙完个案笔记」可以派给 12 个人，措辞各不相同，文本相似度只有 0.02~0.06，
+        靠比措辞是抓不到的（`cross_user_repeat_ratio` 那个阈值就是为这件事准备的，
+        但它比错了东西）。
+        """
+        cutoff = now - float(hours) * 3600.0
+        out: dict = {}
+        for uid, u in (self.bot(bid).get("users") or {}).items():
+            for e in (u.get("proactive_log") or []):
+                if not isinstance(e, dict):
+                    continue
+                if _safe_ts(e.get("ts")) < cutoff:
+                    continue
+                about = str(e.get("about") or "").strip()
+                if not about:
+                    continue
+                out.setdefault(about, [])
+                if uid not in out[about]:
+                    out[about].append(uid)
+        return out
 
     def recent_proactive_others(
         self, bid: str, uid: str, now: Optional[float] = None, hours: float = 2.0

@@ -78,6 +78,11 @@
     "min": 5,
     "max": 480
   },
+  "gate_energy_floor": {
+    "type": "int",
+    "default": 35,
+    "hint": "精力低于这个值就不主动开口（0=不按精力拦）。「累到坐不住」做成硬闸，不再交给模型自己判断——它每次给的理由都不一样，拦不稳"
+  },
   "respect_user_rhythm": {
     "type": "bool",
     "description": "顺对方作息",
@@ -306,7 +311,7 @@
     "description": "单条消息长度上限（字）",
     "hint": "单条消息最长多少字",
     "obvious_hint": true,
-    "default": 120,
+    "default": 60,
     "min": 10,
     "max": 500
   },

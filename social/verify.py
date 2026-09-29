@@ -96,6 +96,21 @@ def strip_actions(text: str) -> str:
     return _ACTION_BLOCKS.sub("", str(text or "")).strip()
 
 
+# 「现在就回我」这类：要求对方**立刻**给出回应。
+# 「回我」不能单独当成要求——「你还好吗，回我一句就行」是给对方台阶，
+# 「我想起你昨天回我的那句话」更是叙述。缺了「快/必须」这类急迫词就不算催。
+_DEMAND_NOW = re.compile(
+    r"(快|赶紧|立刻|马上|现在就|快点)[^。！？\n]{0,6}回"
+    r"|(必须|一定|得)[^。！？\n]{0,4}回"
+    r"|(催|逼)[^。！？\n]{0,4}回"
+)
+# 「你一直不回我」这类：把「对方没回」当成一件对方欠的事。
+_SILENCE_CHARGE = re.compile(
+    r"(一直|整天|一天|一晚上|半天|好久|从来|老是|多少次)[^。！？\n]{0,8}(没|不|未)[^。！？\n]{0,2}回"
+    r"|(你|都)[^。！？\n]{0,8}(不理我|不理|不回我|不回|没回我|没回|没理我|没理)"
+)
+
+
 def _s(x: Any) -> str:
     try:
         return str(x or "").strip()
@@ -353,6 +368,28 @@ def _check_protocol_residue(text: str) -> Optional[str]:
 _PEER_REF = re.compile(r"你|您|TA|ta|他|她|咱|大家|人呢|宝宝|亲爱的|老公|老婆")
 
 
+def _check_pressure(text: str) -> str:
+    """拒「把自己的情绪负担推给对方」。
+
+    容器实测拿到过这么一条（110 字 4 句）：她因为对方一晚上没回消息而发这一串，
+    里面有「快回我一句」。这不是她想说的话，是她在**要债**——把自己的不安
+    变成对方的任务，对方不接就成了她的问题。
+
+    按**结构**判，不按词表：「要求对方立刻回应」并且「拿没回消息说事」，
+    两个都在才拦。单独一个「回我一个字」在真生气的语境里是合理的，
+    只在它变成要债的载体时才该拒。
+    """
+    body = strip_actions(text)
+    demands_now = _DEMAND_NOW.search(body)
+    if not demands_now:
+        return ""
+    # 「她今天一天没理我，可我这边一直等着」——有期待，所以催一下是合理的；
+    # 「我等了一晚上你都不回」——把等待的时间算到对方头上，要债。
+    if not _SILENCE_CHARGE.search(body):
+        return ""
+    return "把自己的不安推给对方（催回+计较没回）"
+
+
 def verify_message(
     text: str,
     *,
@@ -380,6 +417,9 @@ def verify_message(
     if reason:
         return False, reason
     reason = _check_protocol_residue(text)
+    if reason:
+        return False, reason
+    reason = _check_pressure(text)
     if reason:
         return False, reason
     # 剥掉标题行之后**还是**标题样子的，说明整条只有一句标题没有正文。
