@@ -1493,6 +1493,26 @@ class SocialEngine:
                 return key
         return "其它"
 
+    # 关系档的分界。`interest` 是插件自己算的「这个人在我心里有多重要」
+    # （好感 + 互动量 + 接不接话 + 冷落衰减），已经在 `settle_minds` 里写进
+    # `u["interest"]`，所以拿它排序不额外花钱。
+    #
+    # 分 5 档而不是直接用连续值：直接用连续值等于「按好感精确排名」，
+    # 高分那几个人会把低分的人彻底饿死——那正是要避免的。分档让**同档内**
+    # 仍然是纯粹的轮转。
+    _REL_BUCKETS = (0.20, 0.32, 0.45, 0.58, 0.72)
+
+    @classmethod
+    def _relation_bucket(cls, user: Dict[str, Any]) -> int:
+        try:
+            iv = float(user.get("interest") or 0.35)
+        except (TypeError, ValueError):
+            iv = 0.35
+        for idx, floor in enumerate(cls._REL_BUCKETS):
+            if iv < floor:
+                return idx
+        return len(cls._REL_BUCKETS)
+
     def _count_block(self, reason: str) -> None:
         """记一次「本来要发但没发」。同一轮里反复撞同一道闸会重复计——"""
         cat = self._block_category(reason)
@@ -2400,6 +2420,12 @@ class SocialEngine:
         # 优先级：问候（有时间窗，错过就没了）> 追问（话正热着）> 回访（到点的事）
         # > 另起话题（念头攒满）> 收场。收场排最后：前三条都是「有正事说」，
         # 收场是「没正事也别冷着」。
+        #
+        # 但**每轮必须给「另起话题」留一个名额**。原来每轮只有 max_sends_per_round
+        # （默认 3）条，前三条通道各有一个名额就吃光了——于是「她想找某个人说话」
+        # 这个主通道整轮一条都发不出。那条通道恰恰是**关系最亲的人**唯一会走的
+        # 通路（问候只有早/晚两个时间窗），所以表现是「好感最高的那个人一天收不到
+        # 一条」。前三条有窗口期、错过还有下一次，另起话题没有——它攒的是念头。
         # 问候：没有正事，随口说一句，看 TA 回不回。
         #
         # 触发不再是「到点了 + 今天还没问候过」——那是日历，真人打招呼看的是
@@ -2461,7 +2487,26 @@ class SocialEngine:
         # 另外 166 个人一条没收到。原因：**不回复的人的念头会一路涨到封顶 2.80，
         # 每轮都排第一**；会回复的人发完就清零，永远排在后面。插件等于只在跟
         # 从不回复的人说话。按 last_sent 升序就能把它摊开。
-        anchored.sort(key=lambda x: (float(x[2].get("last_sent", 0) or 0), -x[3]))
+        # 排序分两层：**先关系档，同档内再按「最久没联系」。
+        #
+        # 原来只有后一层，而每轮只有 3 条、队列里有 176 个人——于是好感 100 的那位
+        # 和陌生人在同一个队列里排队，她一天可能一条都收不到。这是「她不知道自己在
+        # 对谁上心」的直接后果：**她算得出好感，算完却不用在选人上。**
+        #
+        # 为什么不是直接按好感排：那样就回到「6 个人霸占 100 多条、166 个人一条没有」
+        # 那个更早的问题（念头涨到封顶的人每轮都排第一）。**同档内保持 last_sent
+        # 轮转**，于是同一档里没人会被饿死，各档之间又按亲疏分出先后。
+        anchored.sort(key=lambda x: (
+            -self._relation_bucket(x[2]),
+            float(x[2].get("last_sent", 0) or 0),
+            -x[3],
+        ))
+        # 走「另起话题」之前，把配额还回来一点：上面三条通道各有窗口期，错过还有
+        # 下一次；这一条攒的是念头，**没有下一次**——它要是被吃光，关系最亲的那个人
+        # 就一整天收不到任何东西。所以从每条通道的额度里各让出一条给这里。
+        for _b in budget:
+            if budget[_b] > 1:
+                budget[_b] -= 1
         for bid, uid, u, urge, a in anchored:
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 continue

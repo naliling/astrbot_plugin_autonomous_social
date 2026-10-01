@@ -482,3 +482,67 @@ class BlockedReasonsAreCounted(unittest.TestCase):
         self.assertEqual(second._m["blocked_reasons"], {"安静时段": 1, "冷却未过": 1},
                          "重启后累计归零 = 界面上那个「累计」是假的")
         self.assertEqual(second._m["sent_total"], 5)
+
+
+class MainUserIsActuallyServed(unittest.TestCase):
+    """好感最高的那个人，一天下来不能一条都收不到。
+
+    这是从容器反馈来的：**好感最高的那位基本收不到消息，也聊不起来。**
+    两个结构原因，都不是「阈值调错了」那种。
+
+    一、选人不看好感。排序只有 `(last_sent 升序)`，每轮 3 条、队列 176 个人，
+       于是她和陌生人在同一个队列里排队。她算得出好感，算完却不用在选人上。
+
+    二、主通道的配额被吃光。发送顺序是 线程 → 回访 → 问候 → 另起话题 → …，
+       而另起话题**排第 4**。前三条各有一个名额就吃满 3 条，于是「她想找某个人
+       说话」整轮一条都发不出。那恰恰是关系最亲的人唯一会走的通路——问候只有
+       早/晚两个时间窗。
+    """
+
+    def test_relation_buckets_are_ordered_by_affection(self):
+        from social.engine import SocialEngine as E
+        self.assertLess(E._relation_bucket({"interest": 0.10}),
+                        E._relation_bucket({"interest": 0.95}),
+                        "好感高的人必须在更靠前的档")
+
+    def test_bucket_falls_back_when_interest_is_missing(self):
+        from social.engine import SocialEngine as E
+        self.assertEqual(E._relation_bucket({}), E._relation_bucket({"interest": 0.35}),
+                         "没有 interest 时按中性算，不能当成最低档")
+
+    def test_high_affection_beats_a_longer_silence(self):
+        """好感高的人不该因为「刚聊过不久」就被排到 176 人队尾。"""
+        from social.engine import SocialEngine as E
+        main = {"interest": 0.95, "last_sent": 3600.0}
+        stranger = {"interest": 0.12, "last_sent": 0.0}
+        order = sorted([("陌生人", stranger), ("我", main)],
+                       key=lambda kv: (-E._relation_bucket(kv[1]), float(kv[1]["last_sent"])))
+        self.assertEqual(order[0][0], "我",
+                         "刚聊过一小时的好友被排在从没聊过的陌生人后面")
+
+    def test_within_a_bucket_it_is_still_rotation(self):
+        """同档内仍按 last_sent 轮转——不然就回到「6 个人霸占」那个老问题。"""
+        from social.engine import SocialEngine as E
+        a = {"interest": 0.50, "last_sent": 100.0}
+        b = {"interest": 0.51, "last_sent": 900.0}
+        order = sorted([("a", a), ("b", b)],
+                       key=lambda kv: (-E._relation_bucket(kv[1]), float(kv[1]["last_sent"])))
+        self.assertEqual(order[0][0], "a", "同档里久没联系的先来，这就是轮转")
+
+    def test_anchored_channel_gets_a_reserved_slot(self):
+        """「另起话题」必须拿到至少一条，否则主通道整轮哑火。"""
+        import inspect
+        from social.engine import SocialEngine
+        src = inspect.getsource(SocialEngine.try_once)
+        # 必须是 `self.`。写成裸名的话单测全绿（单测调的是类方法，走类作用域），
+        # 而 `try_once` 里走的是局部作用域 —— 仿真一跑就是
+        # NameError: name '_relation_bucket' is not defined。
+        # 同一个坑踩过两次：v2.25.0 往 `__init__` 中间插方法定义，把后半截截断了。
+        self.assertIn("self._relation_bucket(x[2])", src,
+                      "裸名在 try_once 的作用域里取不到，单测会假绿")
+        i_anchor = src.index("for bid, uid, u, urge, a in anchored:")
+        before = src[:i_anchor]
+        self.assertIn("budget[_b] -= 1", before,
+                      "让出配额的代码必须在 anchored 之前——它抢不到就是白写")
+        self.assertIn("budget[_b] > 1", before,
+                      "只在还有富余时才让一条，不能把配额减到 0")
