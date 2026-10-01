@@ -84,6 +84,44 @@ class SignalsWriter:
         self._dirty = True
         self.flush()
 
+    def note_ignored(self, target_uid: str, streak: int, bid: str = "") -> None:
+        """「主动消息发出去、没被回」——**按人记**。
+
+        原来只有角色级的 `ignored_streak`（她被冷落了几次），而好感是**用户级**的：
+        Core 那边能把冷落接到身体（社交能量）上，接不到具体某个人。
+        少了这个 per-user 计数，「被冷落」就没法换算成「对 TA 的好感下降」——
+        只能知道「我最近有点冷清」，不知道是谁。
+        """
+        uid = str(target_uid or "").strip()
+        if not uid:
+            return
+        try:
+            value = max(0, int(streak))
+        except (TypeError, ValueError):
+            return
+        slot = self._slot(bid)
+        per = slot.get("ignored_by")
+        if not isinstance(per, dict):
+            per = {}
+        before = int(per.get(uid) or 0)
+        if before == value:
+            return
+        per[uid] = value
+        slot["ignored_by"] = per
+        self._dirty = True
+        self.flush()
+
+    def ignored_by_uid(self, uid: str, bid: str = "") -> int:
+        """给 Core 读：这个人在社交层的累计「没理我」次数。"""
+        slot = self._slot(bid)
+        per = slot.get("ignored_by")
+        if not isinstance(per, dict):
+            return 0
+        try:
+            return max(0, int(per.get(str(uid or "")) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def set_ignored_streak(self, streak: int, bid: str = "") -> None:
         try:
             value = max(0, int(streak))

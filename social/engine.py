@@ -2333,6 +2333,16 @@ class SocialEngine:
                 self.signals.set_ignored_streak(
                     self.state.max_no_reply_streak(bid), bid
                 )
+                # **按人**也记一份。角色级的 streak 只说得清「我最近有点冷清」，
+                # 说不清是谁——而好感是用户级的，Core 那边要把被冷落换算成
+                # 「对 TA 的好感下降」，必须知道是谁没理她。
+                for uid, u in (self.state.bot(bid).get("users") or {}).items():
+                    try:
+                        streak = int(u.get("no_reply_streak", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if streak > 0:
+                        self.signals.note_ignored(uid, streak, bid)
             self.signals.set_role_count(len(bots))
             # 无条件重写：Core 那边靠 mtime 判信号是否过期（900 秒），而心跳默认
             # 8~15 分钟才一次，靠「内容没变就跳过」是撑不到那个阈值的。
