@@ -34,7 +34,7 @@ import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent / "astrabot_plugin_autonomous_social"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent / "astrbot_plugin_autonomous_social"
 
 
 # ─── 最小 astrbot 桩 ──────────────────────────────────────────────

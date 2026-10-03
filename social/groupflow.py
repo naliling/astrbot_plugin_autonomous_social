@@ -58,6 +58,7 @@ def flow_should_consider(
     ignored_exit: int,
     is_quiet: bool = False,
     asleep: bool = False,
+    hold_seconds: float = 0.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -65,6 +66,8 @@ def flow_should_consider(
     - 安静时段 / 她正在睡觉——私聊侧五道闸都查了这两项，只有群心流漏了，而它又是
       事件驱动的（群消息一到就走，不经过心跳），于是深夜群里有人说话她照样插一句；
     - 关注窗口没开（bot 最近没在这个群说过话）——保守档的核心；
+    - 自己刚在主链路说完话后的冷却期（hold_seconds）——不然「被 @ 回一句」后马上又接，
+      观感是同一个她在连续刷屏；
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
     - 连续插话没人接，已经到退出阈值。
@@ -77,6 +80,8 @@ def flow_should_consider(
         return False, "发送隔离中（被踢/会话失效）"
     if float(group.get("flow_open_until", 0) or 0) <= now:
         return False, "关注窗口没开（bot 最近没在这个群说话）"
+    if float(group.get("flow_hold_until", 0) or 0) > now:
+        return False, "她自己刚说完话，先缓一下"
     if int(group.get("flow_ignored", 0) or 0) >= max(1, ignored_exit):
         return False, "连着插话没人接，先安静下来"
     if int(group.get("flow_replies", 0) or 0) >= max(1, max_replies):

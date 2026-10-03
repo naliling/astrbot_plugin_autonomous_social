@@ -43,16 +43,23 @@ URGE_REFILL_DEFAULT = 4
 # 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
 CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
 CROSS_USER_REPEAT_HOURS_DEFAULT = 2.0
-# 提示里带上「可以拆成几段」的概率
+# 提示里带上「可以拆成几段」的概率——已废弃：拆不拆跟框架分段设置走。
 BURST_PROBABILITY_DEFAULT = 0.62
 HOURLY_SENDS_CAP_DEFAULT = 12
 HOURLY_SENDS_CAP_MAX = 200
 GREETING_MIDDAY_START_DEFAULT = 12
 GREETING_MIDDAY_END_DEFAULT = 14
+# 中档好感门槛。「念想」这道门的绝对值本来就不可靠（基线设 40 的人聊久了到 80），
+# 真正的档位换算在 _miss_floor：高档 ×0.45、中档 ×1.0、低档 ×1.6。
+# 55 → 42：反馈「每句话都得有件事、不像想找他聊天」——门槛压在 55 时，
+# 大多数真实用户（Core 实测中位 30、均值 37）永远收不到一句没有正事的「想你」。
+MISS_AFFECTION_MIN_DEFAULT = 42
+# 「念想」（没有正事、就是想找你）每人每天的条数上限。
+# 1 → 2：反馈是「每一次发言都有事情，感觉不像想跟他聊天」——一天一条且门槛高，
+# 「就是想你了」几乎从来没发生过；两句日常聊天里的黏糊话该是正常频率。
+MISS_DAILY_CAP_DEFAULT = 2
 # 两条主动消息的最小间隔（分钟）默认值与范围；
 MIN_GAP_MINUTES_DEFAULT = 120
-MISS_AFFECTION_MIN_DEFAULT = 55
-MISS_DAILY_CAP_DEFAULT = 1
 MIN_GAP_MAX = 720
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
@@ -156,10 +163,10 @@ MAX_SENDS_PER_ROUND_MIN = 1
 MAX_SENDS_PER_ROUND_MAX = 10
 MAX_SENDS_PER_ROUND_DEFAULT = 3
 
-# 连发：一次主动开口最多拆成几条消息（1-3）
+# 连发拆段上限：跟框架分段设置走，只留一个硬护栏防刷屏。
 MAX_BURST_PARTS_MIN = 1
-MAX_BURST_PARTS_MAX = 3
-MAX_BURST_PARTS_DEFAULT = 3
+MAX_BURST_PARTS_MAX = 4
+MAX_BURST_PARTS_DEFAULT = 4
 
 # ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
@@ -174,7 +181,14 @@ FLOW_WINDOW_DEFAULT = 8            # 分钟
 # 两次心流插话之间的最短间隔（秒）：别人一句我一句地刷屏不像人
 FLOW_MIN_GAP_MIN = 10
 FLOW_MIN_GAP_MAX = 600
-FLOW_MIN_GAP_DEFAULT = 45
+# 两条心流接话之间的最小间隔（秒）。45 → 120：45 秒在群里几乎等于没有间隔，
+# 同一个人前一秒接一句、后一分钟再次插一句，群友看到的就是「bot 一直在说话」。
+FLOW_MIN_GAP_DEFAULT = 120
+# 主链路回复后的冷却期（秒）。拉长的理由：45 秒的 min_gap 配上 8 分钟的窗口，
+# 「被@回完→群里有人接话→马上再插一句」几乎必然发生，观感变成她在连续说话。
+FLOW_HOLD_MIN = 0
+FLOW_HOLD_MAX = 1800
+FLOW_HOLD_DEFAULT = 120
 
 # 一个关注窗口内最多主动接几条
 FLOW_MAX_REPLIES_MIN = 1
@@ -400,13 +414,10 @@ class SocialConfig:
     # 连续这么多天没再说过话的用户，丢掉历史对话正文/话题，只留统计与发送目标（0 = 永不清理）
     user_retention_days: int = USER_RETENTION_DEFAULT
 
-    # 连发模式：主动消息可自然拆成多条短句逐条补发（间隔 1-3 分钟）
+    # 连发模式：主动消息可拆成多条短句逐条补发。拆法与间隔跟这个 Bot 在 AstrBot
+    # 里的「分段回复」设置走（见 pacing.py）；这里只是总开关——关掉后无论框架怎么配
+    # 都只发一整条。
     allow_burst: bool = True
-    # 这一轮要不要「提醒模型可以拆成几段」。模型拆不拆最终由它自己，
-    # 但不给它这个选项它基本不会拆——所以这里调的是**给不给选项**，不是强拆。
-    burst_probability: float = BURST_PROBABILITY_DEFAULT
-    # 连发最多拆几条（1-3）
-    max_burst_parts: int = MAX_BURST_PARTS_DEFAULT
 
     # 每轮心跳每个角色最多主动发几条（对不同用户；同一用户仍走自己的冷却）
     max_sends_per_round: int = MAX_SENDS_PER_ROUND_DEFAULT
@@ -429,6 +440,9 @@ class SocialConfig:
     group_store_message_text: bool = True
     flow_window_minutes: int = FLOW_WINDOW_DEFAULT
     flow_min_gap_seconds: int = FLOW_MIN_GAP_DEFAULT
+    # 主链路回复后的心流冷却（秒）：自己刚说完话，先缓一下再接别人的话。
+    # 没开分段的 Bot 只发一整条时，这段冷却就是「别跟自己的上一句连成一串」的全部保障。
+    flow_hold_seconds: int = FLOW_HOLD_DEFAULT
     flow_max_replies_per_window: int = FLOW_MAX_REPLIES_DEFAULT
     flow_hourly_cap: int = FLOW_HOURLY_CAP_DEFAULT
     flow_ignored_exit: int = FLOW_IGNORED_EXIT_DEFAULT
@@ -621,13 +635,6 @@ class SocialConfig:
                 min(USER_RETENTION_MAX, int(g("user_retention_days", _d("user_retention_days",  USER_RETENTION_DEFAULT)))),
             ),
             allow_burst=bool(g("allow_burst", _d("allow_burst",  True))),
-            burst_probability=max(
-                0.0, min(1.0, float(g("burst_probability", _d("burst_probability",  BURST_PROBABILITY_DEFAULT))))
-            ),
-            max_burst_parts=max(
-                MAX_BURST_PARTS_MIN,
-                min(MAX_BURST_PARTS_MAX, int(g("max_burst_parts", _d("max_burst_parts",  MAX_BURST_PARTS_DEFAULT)))),
-            ),
             max_sends_per_round=max(
                 MAX_SENDS_PER_ROUND_MIN,
                 min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", _d("max_sends_per_round",  MAX_SENDS_PER_ROUND_DEFAULT)))),
@@ -660,6 +667,9 @@ class SocialConfig:
             ),
             flow_min_gap_seconds=max(
                 FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, int(g("flow_min_gap_seconds", _d("flow_min_gap_seconds",  FLOW_MIN_GAP_DEFAULT))))
+            ),
+            flow_hold_seconds=max(
+                FLOW_HOLD_MIN, min(FLOW_HOLD_MAX, int(g("flow_hold_seconds", _d("flow_hold_seconds",  FLOW_HOLD_DEFAULT))))
             ),
             flow_max_replies_per_window=max(
                 FLOW_MAX_REPLIES_MIN,

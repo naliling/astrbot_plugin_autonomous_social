@@ -312,6 +312,11 @@ class SocialState:
             g["name"] = str(name)[:60]
         g["last_seen"] = now
         g["msg_count"] = int(g.get("msg_count", 0) or 0) + 1
+        if not is_bot:
+            # 群友（非 bot）最近一次发言的时刻。连发补发任务用它判断
+            # 「我话还没发完，群里已经有人接着说上了」——那种情况下继续补旧句
+            # 就是自说自话。
+            g["last_human_at"] = now
         # 收到群消息说明这个群现在能通：清掉之前的发送隔离
         if float(g.get("blocked_until", 0) or 0) > 0:
             g["blocked_until"] = 0.0
@@ -377,6 +382,25 @@ class SocialState:
             g["flow_replies"] = 0
             g["flow_ignored"] = 0
         self.mark_dirty()
+
+    def hold_flow(self, bid: str, gid: str, now: float, hold_seconds: float) -> None:
+        """给自己刚说完话后的心流设一段「先别接」冷却。
+
+        与 open_flow 分开：开窗是「等群友继续聊」，冷却才是「我自己先缓一口气」。
+        没有这一层时，bot 被 @ 回完一句、群里紧接着有人说话，45 秒间隔一到它就
+        又接一句——在群里看就是两个人格里的同一个她连着说话，像主动代理在刷存在。
+        """
+        try:
+            hold = max(0.0, float(hold_seconds))
+        except (TypeError, ValueError):
+            return
+        if hold <= 0:
+            return
+        g = self.group(bid, gid)
+        until = now + hold
+        if float(g.get("flow_hold_until", 0) or 0) < until:
+            g["flow_hold_until"] = until
+            self.mark_dirty()
 
     def note_flow_reply(
         self,
@@ -1100,6 +1124,10 @@ class SocialState:
         # 更新基础统计
         u["message_count"] = int(u.get("message_count", 0)) + 1
         u["last_seen"] = ts
+        # TA 开口了：“TA 沉默期的主动条数”归零。
+        # 这个计数比 `no_reply_streak` 灵敏——后者要等 12 小时回复窗口过了才 +1，
+        # 于是「连发好几条没人回」要等好多小时才看得出来（实测 4 天才到 2）。
+        u["silent_sent"] = 0
         # 头部而不是尾部：生成侧引用对方最后一句时取的是**前**若干字
         # （`TA最后说的是：「{last[:60]}」`），而这里存的是尾部 500 —— 于是对方发一段
         # 900 字长文时，她引用的是第 400 字起的一段，开头是断的。同一件事在盘上
@@ -1352,6 +1380,14 @@ class SocialState:
         if count_proactive:
             u["last_sent"] = ts
             u["last_targeted"] = ts
+            # TA 沉默期里她主动发了几条（每条主动消息都算，不论等不等回）。
+            # 它比 `no_reply_streak` 灵敏：后者要等回复窗口过了才 +1，
+            # 于是「一直发、他一句不回」要好多小时后才显形。这个实时，
+            # 用来做「连着好几条没回应就静下来」。
+            try:
+                u["silent_sent"] = int(u.get("silent_sent", 0) or 0) + 1
+            except (TypeError, ValueError):
+                u["silent_sent"] = 1
             if expect_reply:
                 u["proactive_sent"] = int(u.get("proactive_sent", 0)) + 1
                 u["last_proactive_sent"] = ts

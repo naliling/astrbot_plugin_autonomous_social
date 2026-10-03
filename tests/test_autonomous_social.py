@@ -19,14 +19,14 @@ from unittest import TestCase as _TC
 from pathlib import Path
 
 # 插件根目录。两种摆法都认：
-#   · 开发时：tests/ 在工作区根，插件在旁边 → parent.parent / "astrabot_plugin_autonomous_social"
+#   · 开发时：tests/ 在工作区根，插件在旁边 → parent.parent / "astrbot_plugin_autonomous_social"
 #   · 打包后：tests/ 就在插件里面            → parent.parent 本身就是插件根
 #     （Core 那边 473 项测试是随包发布的，social 这边也改成一样，所以两种摆法都得能跑）
 _HERE = Path(__file__).resolve().parent
 if (_HERE.parent / "_conf_schema.json").is_file():
     PLUGIN_ROOT = _HERE.parent                     # tests/ 就在插件里
 else:
-    PLUGIN_ROOT = _HERE.parent / "astrabot_plugin_autonomous_social"
+    PLUGIN_ROOT = _HERE.parent / "astrbot_plugin_autonomous_social"
 
 
 # ─── 最小 astrbot 桩 ──────────────────────────────────────────────
@@ -2254,18 +2254,40 @@ class TestNoFloodToActiveUsers(unittest.TestCase):
         self.assertNotIn(kind, ("presence", "probe"),
                          "对方刚说过话还要被追问")
 
-    def test_greeting_is_silence_driven_not_calendar(self):
-        """问候按「距上次说上话多久」触发，不是「到点了 + 今天还没问候过」。
+    def test_greeting_fires_only_in_its_window_once_a_day(self):
+        """问候只在早/午/晚窗口内发，且每天每窗口一次。
 
-        真人打招呼看的是隔了多久，不是日历——一天说几次由关系档和这句话当下的分量决定，
-        不受「一天一次」的框。绑死在早/午/晚三个窗口上，是上一版他一周只收到 2 条的原因。
+        v1.27.1 修的真 bug：`_greet_pick` 原来既不查窗口、也不读它自己写的
+        `greet_day`/`greet_kind`，还漏了总开关 `greeting_enabled`——结果关不掉，
+        用户完全不回时 5 天里 7 条全是问候、间隔 30~40 分钟。
+        现在窗口判定与「每天各一次」用现成的 `reasoning.greeting_window_kind` /
+        `greeting_due`（这两个函数早写好、也早被 import，却从没被调用）。
         """
         src_txt = Path(engine_mod.__file__).read_text(encoding="utf-8")
         i = src_txt.index("def _greet_pick")
         body = src_txt[i:src_txt.index("def loop_gate", i)]
+        self.assertIn("greeting_window_kind", body, "问候没有按窗口触发")
+        self.assertIn("greeting_due", body, "问候没有「每窗口每天一次」")
+        self.assertIn("greeting_enabled", body, "问候的总开关没接线")
         self.assertIn("_gap_left", body, "问候没有按档位的间隔")
         self.assertIn("_quiesced", body, "问候没有「停发」这道限制")
-        self.assertNotIn("greet_silence_hours", body, "问候还绑着那道日历限制")
+
+    def test_greeting_window_kind_and_due(self):
+        """窗口判定与「每天各一次」的语义（现成函数，直接测）。"""
+        from social import reasoning
+        # 默认窗口：早 7~11、晚安 21~24、午间 12~14；凌晨 0~7 不开窗口（不该道晚安）
+        self.assertEqual(reasoning.greeting_window_kind(7, (7, 11), (21, 24), (12, 14)), "morning")
+        self.assertEqual(reasoning.greeting_window_kind(12, (7, 11), (21, 24), (12, 14)), "midday")
+        self.assertEqual(reasoning.greeting_window_kind(22, (7, 11), (21, 24), (12, 14)), "night")
+        self.assertIsNone(reasoning.greeting_window_kind(1, (7, 11), (21, 24), (12, 14)),
+                          "凌晨不在任何问候窗口")
+        self.assertIsNone(reasoning.greeting_window_kind(15, (7, 11), (21, 24), (12, 14)))
+        # 每天每窗口一次；午间是兜底，今天已问候过就不再补
+        u = {"greet_day": "2023-11-15", "greet_kind": "morning"}
+        self.assertFalse(reasoning.greeting_due(u, "2023-11-15", "morning"))
+        self.assertFalse(reasoning.greeting_due(u, "2023-11-15", "midday"))
+        self.assertTrue(reasoning.greeting_due(u, "2023-11-15", "night"))
+        self.assertTrue(reasoning.greeting_due(u, "2023-11-16", "morning"))
 
     def test_miss_channel_is_reachable_in_try_once(self):
         """早退条件必须逐个列出所有候选桶——漏一个，那条通道就永远走不到。
@@ -2285,6 +2307,28 @@ class TestNoFloodToActiveUsers(unittest.TestCase):
         i = src_txt.index("def _miss_pick")
         body = src_txt[i:src_txt.index("def _affection_of", i)]
         self.assertIn("logger.warning", body, "派发失败只 log 一句，排查时看不到线索")
+
+    def test_cold_silence_gate_lives_in_the_speak_choke_point(self):
+        """TA 一直不回时，非问候的主动开口要在唯一收口处被挡下来。
+
+        实测：完全不回时 2 天 6 条（每 30 分钟换一种由头）。根因是
+        `pending_result=="waiting"` 只在 gate_reason/loop_gate 查，问候/念想/分享
+        全绕过了它。这道闸必须落在所有通道的交汇处—`_speak`。
+        """
+        src_txt = Path(engine_mod.__file__).read_text(encoding="utf-8")
+        i = src_txt.index("async def _speak")
+        j = src_txt.index("\n    def _why_now", i)
+        body = src_txt[i:j]
+        self.assertIn("silent_sent", body, "_speak 没有「一直不回就静下来」的闸")
+        self.assertIn("pending_result", body, "_speak 没有「上一条还没回」的闸")
+        self.assertIn("is_greet", body, "问候应当豁免静默（早/晚安不指望回）")
+
+    def test_icebreak_prompt_carries_her_own_recent_lines(self):
+        """破冰 prompt 要带上她自己最近在群里说过的话，否则会逐字重复。"""
+        src_txt = Path(generator_mod.__file__).read_text(encoding="utf-8")
+        i = src_txt.index('if mode == "icebreak"')
+        body = src_txt[i:src_txt.index("# mode == flow", i)]
+        self.assertIn("own_recent", body, "破冰没带「自己说过什么」的防重复")
 
 
 if __name__ == "__main__":
@@ -2657,7 +2701,8 @@ class TestMissFloorByTier(unittest.TestCase):
         low = eng._miss_floor("low")
         self.assertLess(high, mid, "关系热的人门槛要更低")
         self.assertGreater(low, mid, "说「想你了」给没怎么说过话的人很怪")
-        self.assertEqual(mid, 55.0, "配置值当��档用")
+        # 中档直接取配置值（默认 42）；不写死数字，否则改默认值就要改测试
+        self.assertEqual(mid, float(eng.cfg.miss_affection_min), "配置值当中间档用")
 
     def test_high_tier_lets_mid_values_in(self):
         """基线被设成 40、现在 55 的人——关系真的热，不该被 55 挡在外面。"""
@@ -2810,7 +2855,7 @@ class TestTitleLineStripping(unittest.TestCase):
     def test_first_person_and_fillers_are_not_titles(self):
         """「短+无人称+无句末标点」这个判据本身太松，会把人在开口说话当成小标题。
 
-        实测被误伤的：���我先说」「嗯嗯」「说起来」「对了」。加一道否决：
+        实测被误伤的：「我先说」「嗯嗯」「说起来」「对了」。加一道否决：
         以第一人称/语气词/连接词开头的一律不当标题。
         """
         cases = {
@@ -2837,42 +2882,57 @@ class TestTitleLineStripping(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-class TestBurstProbabilityBothPaths(unittest.TestCase):
-    """`burst_probability` 必须在 decide 和 generate 两条路径上都生效。
+class TestBurstFollowsFrameworkConfig(unittest.TestCase):
+    """拆段跟随 AstrBot 每个 Bot 的「分段回复」设置（v1.27.0）。
 
-    只让 generate 看概率的时候它等于没用——llm_gate 开着时走的是 decide，
-    用户把值调成 0，默认路径照样每次都在提示里带「可以拆」。
+    旧行为：插件用 burst_probability=0.62 / max_burst_parts=3 自己掷骰子拆段，
+    与框架配置无关——没开分段的 Bot 也拆（连续说话），开了分段的 Bot 被拆两层
+    （连续说话 + 一大堆输出）。现在拆法与间隔全部交给 pacing。
     """
 
-    def _gen(self, prob):
-        g = generator.MessageGenerator.__new__(generator.MessageGenerator)
-        cfg = SocialConfig()
-        cfg.burst_probability = prob
-        g.cfg = cfg
-        return g
+    class _Ctx:
+        def __init__(self, seg):
+            self._seg = seg
+        def get_config(self, umo=None):
+            return {"platform_settings": {"segmented_reply": self._seg}}
 
-    def test_zero_never_fires(self):
-        for _ in range(50):
-            self.assertFalse(self._gen(0.0)._burst_chance(), "概率 0 还触发")
+    def test_disabled_framework_keeps_one_message(self):
+        from social import pacing
+        ctx = self._Ctx({"enable": False})
+        segs, waits = pacing.plan_parts("第一句。第二句。", "umo", ctx, allow_burst=True)
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0], "第一句。第二句。")
+        self.assertEqual(waits, [])
 
-    def test_one_always_fires(self):
-        for _ in range(50):
-            self.assertTrue(self._gen(1.0)._burst_chance(), "概率 1 却不触发")
+    def test_enabled_framework_splits_by_its_regex(self):
+        from social import pacing
+        ctx = self._Ctx({"enable": True, "split_mode": "regex",
+                         "regex": r".*?[。？！~…]+|.+$",
+                         "words_count_threshold": 150})
+        segs, waits = pacing.plan_parts("第一句。第二句。", "umo", ctx, allow_burst=True)
+        self.assertEqual(len(segs), 2)
+        self.assertEqual(len(waits), 1)
 
-    def test_mid_is_roughly_half(self):
-        g = self._gen(0.5)
-        hits = sum(1 for _ in range(400) if g._burst_chance())
-        self.assertGreater(hits, 140)
-        self.assertLess(hits, 260)
+    def test_plugin_switch_overrides_framework(self):
+        from social import pacing
+        ctx = self._Ctx({"enable": True, "split_mode": "regex",
+                         "regex": r".*?[。？！~…]+|.+$"})
+        segs, waits = pacing.plan_parts("第一句。第二句。", "umo", ctx, allow_burst=False)
+        self.assertEqual(len(segs), 1, "插件总开关关掉后不该再拆")
 
-    def test_both_paths_call_the_same_helper(self):
+    def test_long_text_not_split(self):
+        from social import pacing
+        ctx = self._Ctx({"enable": True, "split_mode": "regex",
+                         "regex": r".*?[。？！~…]+|.+$",
+                         "words_count_threshold": 5})
+        segs, _w = pacing.plan_parts("这一句超长会被框架整条直发。", "umo", ctx, allow_burst=True)
+        self.assertEqual(len(segs), 1)
+
+    def test_generator_no_longer_rolls_dice(self):
         src = Path(generator_mod.__file__).read_text(encoding="utf-8")
-        self.assertEqual(
-            src.count("self._burst_chance()"), 2,
-            "decide 与 generate 两处都该调它；只有一处就说明另一条路径绕过了配置",
-        )
-        self.assertNotIn("random.random() < prob", src,
-                         "还留着手写的概率判断，说明有一条路径没用共用的")
+        self.assertNotIn("self._burst_chance()", src,
+                         "插件还在自己掷骰子决定拆不拆，说明没跟随框架配置")
+        self.assertNotIn("burst_probability", src)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ except ImportError:
 
 from . import __version__, anchors, anchors as anchor_mod, desire
 from . import history_ingest
+from . import pacing
 from .clock import city_now
 from .config import SocialConfig
 from .core_bridge import CoreBridge
@@ -203,12 +204,16 @@ LOOP_QUIET_GAP_SECONDS = 1800.0
 # 早晚问候只对最近有来往的人发：几天没说话的人每天收一句早安，那不是问候是群发
 GREET_FRESH_SECONDS = 4 * 86400.0
 
-# 连发：后续每条的补发间隔（秒）
-BURST_DELAY_MIN = 60
-BURST_DELAY_MAX = 180
-# 群聊心流连发：同一个念头拆成几句快速补发（秒）——群里节奏快，不像私聊隔几分钟
-GROUP_BURST_DELAY_MIN = 3
-GROUP_BURST_DELAY_MAX = 9
+# TA 一直没开口、她自己已经主动发了这么多条之后，「没有正事」的主动开口（分享/念想/
+# 另起话题）就静下来，只留问候（早/晚安，本来就不指望回）与到点的由头，直到 TA 再次开口。
+#
+# 真人不会一直追一个不回话的人：发两三条没回应，就会等对方先开。
+# 用 `silent_sent`（TA 沉默期内的主动条数）而不是 `no_reply_streak`：后者要等
+# 回复窗口（12 小时）过了才 +1，实测「一直发、他一句不回」 4 天才涨到 2，太迟钝。
+COLD_SILENCE_SENT = 3
+
+# 连发补发间隔不再用插件自己的常量：拆段与间隔都跟 AstrBot 每个 Bot 的
+# 「分段回复」设置走（见 social/pacing.py）。下面这两个旧常量已无引用。
 
 # 读不到 Core 时，主人面板上必须写清楚「少了什么」，而不是只丢一句「未找到」
 _DEGRADED_NOTE = (
@@ -576,6 +581,12 @@ class SocialEngine:
                         bid, gid, umo, "", "", text, True, now, store_text=False
                     )
                     self.state.open_flow(bid, gid, now, self.cfg.flow_window_minutes * 60.0)
+                    # 自己刚在主链路回了话：给心流一个「刚说完，先别接」的冷却。
+                    # 开窗是为了「等群友继续聊」，不是「立刻找下一句接」——这两件事
+                    # 混在一起时，观感就是「bot 前脚回完，后脚又插一句」，像主动代理。
+                    self.state.hold_flow(
+                        bid, gid, now, self.cfg.flow_hold_seconds
+                    )
             return
         user = self.state.user(bid, uid)
         # 同一条消息可能被分几条发：跟上一条重复就不另记一次
@@ -948,6 +959,7 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
+            hold_seconds=self.cfg.flow_hold_seconds,
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -996,10 +1008,13 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
+            hold_seconds=self.cfg.flow_hold_seconds,
         )
         if not ok:
             return
         group_ctx = self._build_group_ctx(bid, gid, g)
+        group_ctx["now"] = now
+        group_ctx["clock_offset"] = self._clock_offset_for(bid)
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
         except Exception as e:
@@ -1019,8 +1034,15 @@ class SocialEngine:
         if not parts:
             self.log(f"群 {gid} 心流：模型选择不接或生成为空")
             return
-        text = parts[0]
-        ok_send, err, peer_unreachable = await self._send_with_retry(umo, text, bid)
+        # 拆不拆、隔多久：跟这个 Bot 的分段回复设置。模型已经分过的段（---）也一并
+        # 交给它定：主人没开分段就合并回一条，开了才按框架的拆法与间隔发。
+        segments, waits = pacing.plan_segments(
+            parts, umo, self.context,
+            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+        )
+        if not segments:
+            return
+        ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
             if peer_unreachable:
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
@@ -1030,15 +1052,15 @@ class SocialEngine:
             return
         sent_ts = self._time()
         self.state.note_flow_reply(
-            bid, gid, sent_ts, text,
+            bid, gid, sent_ts, segments[0],
             sample_cap=self.cfg.group_ref_sample_size,
             store_text=self.cfg.group_store_message_text,
         )
         self.state.save()
-        self.log(f"群 {gid} 心流接话→ {text}")
+        self.log(f"群 {gid} 心流接话→ {segments[0]}")
         # 同一句拆成了多段：剩下的快速补发。算同一次插话（不再各自计额/过闸）。
-        if len(parts) > 1:
-            self._schedule_group_burst(bid, gid, umo, parts[1:], sent_ts)
+        if len(segments) > 1:
+            self._schedule_group_burst(bid, gid, umo, segments[1:], waits, sent_ts)
 
     def _build_group_ctx(self, bid: str, gid: str, g: Dict[str, Any]) -> Dict[str, Any]:
         """给生成侧凑群上下文：风格参考 + 最近几条群友发言 + 上一句心流接的话。"""
@@ -1058,6 +1080,31 @@ class SocialEngine:
             style_ref = groupflow.build_style_reference(
                 self.state.group_samples(bid, gid, self.cfg.group_ref_prompt_count)
             )
+        # 她自己最近在这个群里说过的话（最新在前）。以前只传最后一条
+        # `last_flow_reply_text`，连发的后续句读不到——模型以为自己上一句还是第一条，
+        # 于是接话要么重复、要么跟自己的最新句对不上。
+        own_recent: List[str] = []
+        for s in reversed(samples):
+            if not s.get("self"):
+                continue
+            text = str(s.get("text", "") or "").strip()
+            if not text:
+                continue
+            if text in own_recent:
+                continue
+            own_recent.append(text)
+            if len(own_recent) >= 3:
+                break
+        # 最新一条群友发言（不是她自己的）：接话建议要指向它。
+        latest: Dict[str, Any] = {}
+        for s in reversed(samples):
+            if s.get("self"):
+                continue
+            text = str(s.get("text", "") or "").strip()
+            if not text:
+                continue
+            latest = {"name": str(s.get("name", "") or ""), "text": text}
+            break
         return {
             "recent": recent,
             "style_ref": style_ref,
@@ -1066,6 +1113,8 @@ class SocialEngine:
                 [str(s.get("text", "") or "") for s in samples if s.get("self")]
             ),
             "last_flow_text": str(g.get("last_flow_reply_text", "") or ""),
+            "own_recent": own_recent,
+            "latest": latest,
             "group_name": str(g.get("name", "") or ""),
         }
 
@@ -1109,6 +1158,8 @@ class SocialEngine:
         if self.send_breaker_left(bid) > 0:
             return False
         group_ctx = self._build_group_ctx(bid, gid, g)
+        group_ctx["now"] = now
+        group_ctx["clock_offset"] = self._clock_offset_for(bid)
         group_ctx["reason"] = groupflow.icebreak_reason()
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
@@ -1128,8 +1179,14 @@ class SocialEngine:
             return False
         if not parts:
             return False
-        text = parts[0]
-        ok_send, err, peer_unreachable = await self._send_with_retry(umo, text, bid)
+        # 破冰也服从这个 Bot 的分段设置（模型分过的段一并交过去）
+        segments, waits = pacing.plan_segments(
+            parts, umo, self.context,
+            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+        )
+        if not segments:
+            return False
+        ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
             if peer_unreachable:
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
@@ -1141,8 +1198,17 @@ class SocialEngine:
         self.state.note_icebreak(bid, gid, sent_ts, self._moment_of(bid, sent_ts).strftime("%Y-%m-%d"))
         # 破冰也是“bot 在群里说了话”：开心流关注窗口，后面有人搭话就能接
         self.state.open_flow(bid, gid, sent_ts, self.cfg.flow_window_minutes * 60.0)
+        # 把破冰内容记进她的近期发言：下一次破冰的 prompt 靠 `own_recent`
+        # 看到「前几回抛过什么话头」，否则会逐字重复。
+        self.state.record_group_self_text(
+            bid, gid, segments[0], sent_ts,
+            sample_cap=self.cfg.group_ref_sample_size,
+            store_text=self.cfg.group_store_message_text,
+        )
         self.state.save()
-        self.log(f"群 {gid} 破冰→ {text}")
+        self.log(f"群 {gid} 破冰→ {segments[0]}")
+        if len(segments) > 1:
+            self._schedule_group_burst(bid, gid, umo, segments[1:], waits, sent_ts)
         return True
 
     # ─── 她的时钟 ─────────────────────────────────────
@@ -1688,6 +1754,28 @@ class SocialEngine:
             return "现在是安静时段"
         return ""
 
+    @staticmethod
+    def _miss_sent_today(u: Dict[str, Any], day: str) -> int:
+        """今天已经发过几条「念想」。
+
+        旧状态里只有 `miss_day`（日期字符串）——那等于「今天发过 1 条」；
+        新状态用 `miss_day_count` 支持一天多条（配置上限调大时生效）。
+        """
+        if str(u.get("miss_day", "") or "") != day:
+            return 0
+        try:
+            return max(0, int(u.get("miss_day_count", 1) or 0))
+        except (TypeError, ValueError):
+            return 1
+
+    @classmethod
+    def _miss_mark_today(cls, u: Dict[str, Any], day: str) -> int:
+        """记下今天又多发了一条念想，返回今天累计条数。"""
+        count = cls._miss_sent_today(u, day) + 1
+        u["miss_day"] = day
+        u["miss_day_count"] = count
+        return count
+
     def _miss_floor(self, tier: str) -> float:
         """「念想」这一类按关系档位各要多少好感。
 
@@ -1774,17 +1862,24 @@ class SocialEngine:
         body: Optional[Dict[str, Any]],
         core_root: Optional[Dict[str, Any]],
     ) -> List[Tuple[str, Dict[str, Any], str]]:
-        """问候：没事干的时候随口说一句，看 TA 回不回。
+        """问候：到早/午/晚的窗口时道一句，看 TA 回不回。
 
-        触发条件不是「到点了 + 今天还没问候过」——那是日历。真人打招呼看的是
-        **距上次说上话多久了**，所以这里是纯静音时长驱动：隔了够久就可以说，
-        一天说几次、说什么，由关系档和这句话当下的分量决定，不受「一天一次」的框。
+        **总开关 `greeting_enabled`**：以前这个开关只在状态文本里出现过，
+        `_greet_pick` 从不检查它——关掉早晚问候照样发（用户在面板上关了没用）。
+
+        **窗口判定与「每天各一次」用现成的 `reasoning.greeting_window_kind` /
+        `greeting_due`**：这两个函数早就写好、也早被 import，却从来没被调用过——
+        引擎里另写了一份内联判断，于是「每人每天每窗口各一次」从未生效。
 
         「她有多长时间没回我」记在 ``reply_gap_hours`` 里，每轮刷新，写进运行指标。
         """
+        if not self.cfg.greeting_enabled:
+            return []
         out: List[Tuple[str, Dict[str, Any], str]] = []
         dt = self._moment_of(bid, now)
         hour = dt.hour
+        today = dt.strftime("%Y-%m-%d")
+        morning, midday, night = self.cfg.greeting_windows()
         for uid, u in list(self.state.bot(bid).get("users", {}).items()):
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
@@ -1795,19 +1890,20 @@ class SocialEngine:
             # 只问候最近有来往的人：对素未谋面或早就不聊的人道早安，像定时群发
             if now - self._last_said(u) > GREET_FRESH_SECONDS:
                 continue
+            kind = greeting_window_kind(hour, morning, night, midday)
+            if not kind:
+                continue  # 不落在任何问候窗口：这不是该问候的时候
+            if not greeting_due(u, today, kind):
+                continue  # 今天这个窗口已问候过（午间还额外受「先有早安」约束）
             tier, _aff, _warmth = self._tier_of(bid, uid, u, core_root, now)
             if self._gap_left(u, tier, now) > 0:
                 continue
-            if self.greet_gate(bid, uid, u, now, body, kind=self._greet_kind(hour, u)):
+            if self.greet_gate(bid, uid, u, now, body, kind=kind):
                 continue
             if self._quiesced(u):
                 continue
-            out.append((uid, u, self._greet_kind(hour, u)))
+            out.append((uid, u, kind))
         return out
-
-    def _greet_kind(self, hour: int, u: Dict[str, Any]) -> str:
-        """这一刻该打招呼还是道晚安。按她的钟点，不看日历。"""
-        return "night" if hour >= 20 or hour < 5 else "morning"
 
     @staticmethod
     def _quiesced(u: Dict[str, Any]) -> bool:
@@ -1936,7 +2032,7 @@ class SocialEngine:
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
-            if str(u.get("miss_day", "") or "") == day:
+            if self._miss_sent_today(u, day) >= cap:
                 continue
             if body and body.get("asleep"):
                 continue
@@ -2551,9 +2647,10 @@ class SocialEngine:
                 f"念想「{a.get('about')}」 ",
                 require_about_peer=True,
             ):
-                # 每天只有这么几条，记上日子
+                # 记上今天已发几条。上限不再是一天一条（那让「没有正事就是想找你」
+                # 变成稀有事件，用户反馈里「每次发言都有事」的一半原因就在这）。
                 st_u = self.state.user(bid, uid)
-                st_u["miss_day"] = self._moment_of(bid, self._time()).strftime("%Y-%m-%d")
+                st_u["miss_day"] = self._miss_mark_today(st_u, self._moment_of(bid, self._time()).strftime("%Y-%m-%d"))
                 self.state.mark_dirty()
 
         for bid, uid, u, reason in closers:
@@ -2648,6 +2745,29 @@ class SocialEngine:
         _tier, _aff, _warmth = self._tier_of(bid, uid, u, core_root, self._time())
         if self._quiesced(u):
             return False, "已经决定不再主动找 TA 了（等 TA 先开口）"
+
+        # 上一条主动消息还悬着（发出去了、还没回）：别追着说。
+        #
+        # 这道闸以前只在 `gate_reason`（另起话题）与 `loop_gate`（回访）里查，
+        # **问候、念想、分享全绕过了它**——用户完全不回时，她会每 30 分钟换一种
+        # 由头接着发（实测 2 天 7 条，其中 2 条「想你」）。判据得落在所有开口的
+        # 唯一收口上。
+        #
+        # 两类豁免：问候（早/晚安本来不指望回）、到点的由头（她想起一件具体的事）。
+        # 「很想说」不豁免——连着两三次都没回应时，再“想说”也该等对方先开口。
+        category = str((preset[1] or {}).get("category") or "") if preset else ""
+        is_greet = category == "greet"
+        has_cue = bool(live_cue(u, self._time()) if self.cfg.cue_followup else False)
+        if not (is_greet or has_cue):
+            try:
+                silent_sent = int(u.get("silent_sent", 0) or 0)
+            except (TypeError, ValueError):
+                silent_sent = 0
+            if silent_sent >= COLD_SILENCE_SENT:
+                return False, f"TA 一直没回、她已经主动发了 {silent_sent} 条，先等 TA 开口"
+            if str(u.get("pending_result", "") or "") == "waiting":
+                return False, "上一条主动发的还没回，现在再发就是追着说"
+
         gap_left = self._gap_left(u, _tier, self._time())
         if gap_left > 0 and not self._urge_is_eager(u):
             return False, f"离上一条才过 {int(gap_left / 60)} 分钟，这次先不开口"
@@ -2922,7 +3042,16 @@ class SocialEngine:
 
         # 由头在**真的发出去**这一刻才消费。前面任何一步失败都不算——
         # 一次模型抽风不该让这个话题冷掉 7 天。
-        sent_ok, err, peer_unreachable = await self._send_with_retry(umo, parts[0], bid)
+        #
+        # 拆段与间隔不在这里猜：交给该 Bot 在 AstrBot 里的「分段回复」设置。
+        # 没开分段的 Bot：多段合并为整条发；开了的：按它的拆分法与间隔逐段发。
+        segments, waits = pacing.plan_segments(
+            parts, umo, self.context,
+            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+        )
+        if not segments:
+            return False, "拆段规划为空"
+        sent_ok, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not sent_ok:
             # 发送失败是可以重试的（换一轮心跳、换个时间再来），但不该拿掉这件事
             # 本身——所以推的是 retry_at，寿命 expire_at 不动。
@@ -3036,12 +3165,12 @@ class SocialEngine:
         bot["last_global_send"] = sent_ts
         self.state.save()
         self.signals.note_proactive(uid, sent_ts, bid)
-        if len(parts) > 1:
-            self._schedule_burst(bid, uid, parts[1:], sent_ts)
-            veto_note = f"\n（稍后还会自然补 {len(parts) - 1} 条）"
+        if len(segments) > 1:
+            self._schedule_burst(bid, uid, segments[1:], waits, sent_ts)
+            veto_note = f"\n（按这个 Bot 的分段设置，稍后还会补 {len(segments) - 1} 条）"
         self._last_llm_error.pop(bid, None)
         return True, (
-            f"已主动联系 {uid}（类型={msg_type}，念头={urge:.2f}）：\n{parts[0]}{veto_note}"
+            f"已主动联系 {uid}（类型={msg_type}，念头={urge:.2f}）：\n{segments[0]}{veto_note}"
         )
 
     def _track_aggression(
@@ -3507,24 +3636,26 @@ class SocialEngine:
         u["send_fail_until"] = self._time() + delay
         self.state.mark_dirty()
 
-    def _schedule_burst(self, bid: str, uid: str, rest: List[str], sent_ts: float) -> None:
+    def _schedule_burst(self, bid: str, uid: str, rest: List[str],
+                        waits: List[float], sent_ts: float) -> None:
         """把连发的后续几条挂成后台任务，不阻塞主循环与命令回显。"""
-        task = asyncio.create_task(self._send_burst_followup(bid, uid, rest, sent_ts))
+        task = asyncio.create_task(self._send_burst_followup(bid, uid, rest, waits, sent_ts))
         self._burst_tasks.add(task)
         task.add_done_callback(self._burst_tasks.discard)
 
     async def _send_burst_followup(
-        self, bid: str, uid: str, rest: List[str], sent_ts: float
+        self, bid: str, uid: str, rest: List[str],
+        waits: List[float], sent_ts: float,
     ) -> None:
-        """隔 1-3 分钟逐条补发连发的剩余消息；期间对方回了话或插件停止则停下。
+        """按该 Bot 分段设置的间隔逐条补发剩余段；对方回话或插件停止则停下。
 
-        v1.10.2 之前只补发第二条（第三条起直接丢弃）：模型把一件事拆成三段时，
-        对方永远只收到前两段，后半句悬在空中。对方回了话就停——TA 已经接上了，
-        再把剩下的旧话发过去就是答非所问。
+        隔多久由 `pacing.part_interval`（框架同款算法）算好；对方回了话就停——TA 已经
+        接上了，再把剩下的旧话发过去就是答非所问。
         """
         try:
-            for text in rest:
-                await asyncio.sleep(random.randint(BURST_DELAY_MIN, BURST_DELAY_MAX))
+            for idx, text in enumerate(rest):
+                wait = waits[idx] if idx < len(waits) else random.uniform(1.5, 3.5)
+                await asyncio.sleep(max(0.0, wait))
                 if not self.running:
                     return
                 if self.send_breaker_left(bid) > 0:
@@ -3548,34 +3679,43 @@ class SocialEngine:
             logger.warning(f"[autonomous_social] 连发补充失败: {e}")
 
     def _schedule_group_burst(
-        self, bid: str, gid: str, umo: str, rest: List[str], sent_ts: float
+        self, bid: str, gid: str, umo: str, rest: List[str],
+        waits: List[float], sent_ts: float,
     ) -> None:
         """把群聊心流连发的后续几句挂成后台任务，不阻塞观察链路。"""
         task = asyncio.create_task(
-            self._send_group_burst_followup(bid, gid, umo, rest, sent_ts)
+            self._send_group_burst_followup(bid, gid, umo, rest, waits, sent_ts)
         )
         self._burst_tasks.add(task)
         task.add_done_callback(self._burst_tasks.discard)
 
     async def _send_group_burst_followup(
-        self, bid: str, gid: str, umo: str, rest: List[str], sent_ts: float
+        self, bid: str, gid: str, umo: str, rest: List[str],
+        waits: List[float], sent_ts: float,
     ) -> None:
-        """隔几秒逐条补发心流连发的剩余句子（同一个念头拆成的）。
+        """按该 Bot 的分段间隔逐条补发心流连发的剩余句子。
 
         这几句不再各自过心流闸/计额（算同一次插话），只写进自己的近期发言供下一句参考。
         插件停了、群被隔离就不再补。
+
+        **群里有人新说话就停**：连发是同一个念头的拆分，群里别人插话后继续补旧句，
+        观感就是“她不管别人说什么，自己一口气发一堆”——私聊侧早就有这道闸，群侧漏了。
         """
         try:
-            for text in rest:
-                await asyncio.sleep(
-                    random.randint(GROUP_BURST_DELAY_MIN, GROUP_BURST_DELAY_MAX)
-                )
+            for idx, text in enumerate(rest):
+                wait = waits[idx] if idx < len(waits) else random.uniform(1.5, 3.5)
+                await asyncio.sleep(max(0.0, wait))
                 if not self.running or not self.cfg.enabled:
                     return
                 if self.send_breaker_left(bid) > 0:
                     return
                 now = self._time()
                 if self.state.is_group_blocked(bid, gid, now):
+                    return
+                # 群里有人（非 bot）在本次连发首句之后说过话：取消剩下的补发
+                g = self.state.group(bid, gid)
+                if float(g.get("last_human_at", 0) or 0) > sent_ts:
+                    self.log(f"群 {gid} 有新群友发言，取消连发补充")
                     return
                 ok, _, _ = await self._send_with_retry(umo, text, bid)
                 if not ok:
@@ -4155,10 +4295,11 @@ class SocialEngine:
                 return f"  {want}：最近 7 天没给 TA 发过主动消息"
             return "  最近 7 天还没给任何人发过主动消息"
         rows.sort(key=lambda x: -x[0])
-        lines: List[str] = []
+        lines: List[str] = ["【最近 7 天主动消息】按用户隔离"]
         for _last, bid, uid, log in rows[:limit_users]:
             name = str(self.state.user(bid, uid).get("name", "") or uid)
-            lines.append(f"◆ {name}（{uid} @ {self._bot_label(bid)}）最近 7 天发过 {len(log)} 条：")
+            lines.append("")
+            lines.append(f"◆ {name}（{uid}·{self._bot_label(bid)}）共 {len(log)} 条")
             for e in log[-limit_each:]:
                 try:
                     ts = float(e.get("ts", 0) or 0)
@@ -4167,21 +4308,25 @@ class SocialEngine:
                 when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "??"
                 text = str(e.get("text", "") or "").strip()
                 why = str(e.get("why", "") or "").strip()
-                lines.append(f"    {when}  {text}" + (f"\n              ↳ {why}" if why else ""))
+                lines.append(f"   {when}　{text}")
+                if why:
+                    lines.append(f"           └ {why}")
         if len(rows) > limit_users:
-            lines.append(f"  …另有 {len(rows) - limit_users} 人未列出（用「主动消息记录 <用户ID>」看单个人）")
+            lines.append("")
+            lines.append(f"…另有 {len(rows) - limit_users} 人未列出（用「主动消息记录 <用户ID>」看单个人）")
         return "\n".join(lines)
 
     def group_status_text(self, limit: int = 20) -> str:
         """列出各角色在管的群：最近活跃、心流窗口、是否被隔离，供主人核对“精准识别”与踢群是否真停。"""
         now = self._time()
         self._refresh_clocks()
-        head = (
-            "群聊心流："
-            + ("开" if self.cfg.group_flow_enabled else "关")
-            + " / 破冰：" + ("开" if self.cfg.group_icebreak_enabled else "关")
-            + " / 参考库：" + ("开" if self.cfg.group_ref_lib_enabled else "关")
-        )
+        on, off = "开", "关"
+        lines = [
+            "【群聊主动】",
+            f"- 心流接话：{on if self.cfg.group_flow_enabled else off}"
+            f"　破冰：{on if self.cfg.group_icebreak_enabled else off}"
+            f"　发言参考库：{on if self.cfg.group_ref_lib_enabled else off}",
+        ]
         rows: List[Tuple[float, str]] = []
         for bid, bot in self.state.data.get("bots", {}).items():
             for gid, g in (bot.get("groups") or {}).items():
@@ -4190,19 +4335,24 @@ class SocialEngine:
                 flow_open = float(g.get("flow_open_until", 0) or 0) > now
                 blocked = float(g.get("blocked_until", 0) or 0) > now
                 name = str(g.get("name", "") or gid)
-                mark = "🔕" if blocked else ("🟢" if flow_open else "・")
-                idle_txt = f"{idle_h:.1f}h前" if idle_h >= 0 else "未知"
+                mark = "⛔" if blocked else ("🟢" if flow_open else "○")
+                idle_txt = f"{idle_h:.1f} 小时前" if idle_h >= 0 else "未知"
+                extra = "　隔离中（" + str(g.get('blocked_reason', ''))[:20] + "）" if blocked else ""
                 rows.append((
                     seen,
-                    f"  {mark} {name}（{gid} @ {self._bot_label(bid)}）最近 {idle_txt}，样本 {len(g.get('samples') or [])} 条"
-                    + (f"，隔离中（{g.get('blocked_reason','')[:20]}）" if blocked else "")
+                    f"  {mark} {name}（{gid}·{self._bot_label(bid)}）\n"
+                    f"      最近说话 {idle_txt}　样本 {len(g.get('samples') or [])} 条{extra}",
                 ))
         if not rows:
-            return head + "\n  还没在任何群里观察到消息（群里有人说话后才会出现在这里）。"
+            lines.append("- 还没在任何群里观察到消息（群里有人说话后才会出现在这里）。")
+            return "\n".join(lines)
         rows.sort(key=lambda x: -x[0])
-        body = "\n".join(r for _s, r in rows[:limit])
-        more = f"\n  …另有 {len(rows) - limit} 个群未列出" if len(rows) > limit else ""
-        return head + "\n" + body + more
+        lines.append(f"【在管的群】共 {len(rows)} 个")
+        lines.append("（🟢 关注窗口开着　○ 静着　⛔ 被隔离）")
+        lines.extend(r for _s, r in rows[:limit])
+        if len(rows) > limit:
+            lines.append(f"  …另有 {len(rows) - limit} 个群未列出")
+        return "\n".join(lines)
 
     def _recognition_text(self) -> str:
         """状态面板的「识别」一行：历史导入到底认没认出人、卡在什么地方。
@@ -4258,28 +4408,41 @@ class SocialEngine:
 
         persona_text = await self._persona_by_role_text()
 
-        return (
+        # 分段拼排：每段一个主题，行首统一符号，行内用全角空格断句。
+        # 此前是一把 30+ 行的流水，排查时要逐行读；重排后按「你想知道什么」找段就行。
+        sections: List[str] = []
+        sections.append(
             f"自主拟人社交 v{__version__}\n"
-            f"状态：{'启用' if self.cfg.enabled else '停用'}\n"
-            f"模式：{self.cfg.mode}\n"
-            f"人格（按会话解析，各角色互不影响）：\n{persona_text}\n"
-            f"Core 联动：{self._core_status_text()}\n"
-            f"运行指标：\n{self._metrics_text()}\n"
-            f"写回 Core：{self._signals_status_text()}\n"
-            f"LLM 生成：{self._llm_status_text()}\n"
-            f"发送通道：{self._send_status_text()}\n"
-            f"心跳：每 {self.cfg.heartbeat_min_minutes}~{self.cfg.heartbeat_max_minutes} 分钟一次"
-            f"（分钟级配置的实际精度就是它）\n"
-            f"节奏：念头驱动（最在意的人约 {self.cfg.urge_refill_hours} 小时攒满一次；"
-            f"刚聊完 {self.cfg.recent_talk_minutes} 分钟内不另起）\n"
-            f"发送前把关：{'模型判断该不该说' if self.cfg.llm_gate else '仅规则闸门'}\n"
-            f"时机：{'按对方作息挑点' if self.cfg.respect_user_rhythm else '不看作息'}"
-            f"、{'记得对方说的约定' if self.cfg.cue_followup else '不跟由头'}\n"
-            f"活跃度：{self.cfg.activity_level}（整体想说话 ×{self.cfg.mood_scale:.2f}）\n"
-            f"当前时段：{slot_names.get(slot, '未知')} {dt.strftime('%H:%M')}"
+            f"- 状态：{'🟢 启用' if self.cfg.enabled else '⏸ 停用'}"
+            f"　模式：{self.cfg.mode}"
+            f"　活跃度：{self.cfg.activity_level}（×{self.cfg.mood_scale:.2f}）\n"
+            f"- 当前时段：{slot_names.get(slot, '未知')} {dt.strftime('%H:%M')}"
             f"{'（安静时段，念头长得极慢）' if self._quiet_now(ref_bid, dt.hour) else ''}"
-            f"　{'按她所在城市' if self._city_offset.get(ref_bid) is not None else '按本机时钟'}\n"
-            f"未完话题："
+            f"　{'按她所在城市' if self._city_offset.get(ref_bid) is not None else '按本机时钟'}"
+        )
+        sections.append(
+            "【人格】按会话解析，各角色互不影响\n" + persona_text
+        )
+        sections.append(
+            "【联动】\n"
+            f"- Core：{self._core_status_text()}\n"
+            f"- 写回：{self._signals_status_text()}\n"
+            f"- 模型：{self._llm_status_text()}\n"
+            f"- 发送：{self._send_status_text()}"
+        )
+        sections.append("【运行指标】\n" + self._metrics_text())
+        sections.append(
+            "【触发与节奏】\n"
+            f"- 心跳：每 {self.cfg.heartbeat_min_minutes}~{self.cfg.heartbeat_max_minutes} 分钟一次"
+            f"（分钟级配置的实际精度就是它）\n"
+            f"- 节奏：念头驱动（最在意的人约 {self.cfg.urge_refill_hours} 小时攒满一次；"
+            f"刚聊完 {self.cfg.recent_talk_minutes} 分钟内不另起）\n"
+            f"- 把关：{'模型判断该不该说' if self.cfg.llm_gate else '仅规则闸门'}"
+            f"　时机：{'按对方作息挑点' if self.cfg.respect_user_rhythm else '不看作息'}"
+            f"、{'记得对方说的约定' if self.cfg.cue_followup else '不跟由头'}\n"
+            f"- 护栏：同一人 {self.cfg.user_cooldown_minutes} 分钟 / "
+            f"每轮每角色最多 {self.cfg.max_sends_per_round} 条（不同人互不排队）\n"
+            f"- 未完话题："
             + (
                 f"开（对方答得敷衍 {self.cfg.probe_after_minutes} 分钟就追问那件事；"
                 f"聊到一半断了 {self.cfg.followup_after_minutes} 分钟问一句；一段沉默只接一次）"
@@ -4288,55 +4451,57 @@ class SocialEngine:
             )
             + "\n"
             + (
-                f"回访挂事：开（提过没说结果的事，隔 {self.cfg.loop_min_hours:g}~"
+                f"- 回访挂事：开（提过没说结果的事，隔 {self.cfg.loop_min_hours:g}~"
                 f"{self.cfg.loop_max_hours:g} 小时问后来）"
                 if self.cfg.loop_enabled
-                else "回访挂事：关"
+                else "- 回访挂事：关"
             )
             + "\n"
             + (
-                f"没人回收场：开（她主动发的话 {self.cfg.closer_after_hours} 小时没人回，"
+                f"- 没人回收场：开（她主动发的话 {self.cfg.closer_after_hours} 小时没人回，"
                 "自己冒一句揭过去）"
                 if self.cfg.closer_enabled
-                else "没人回收场：关"
+                else "- 没人回收场：关"
             )
             + "\n"
             + (
-                "看得见她说过的话：开"
+                "- 看得见她说过的话：开"
                 if self.cfg.track_own_replies
-                else "看得见她说过的话：关（未完话题的判定会明显变弱）"
+                else "- 看得见她说过的话：关（未完话题的判定会明显变弱）"
             )
             + "\n"
             + (
-                f"早晚问候：开（早安 {self.cfg.greeting_morning_start}~{self.cfg.greeting_morning_end} 点、"
+                f"- 早晚问候：开（早安 {self.cfg.greeting_morning_start}~{self.cfg.greeting_morning_end} 点、"
                 f"晚安 {self.cfg.greeting_night_start}~{self.cfg.greeting_night_end % 24} 点，"
                 "每人每天每窗口一次）"
                 if self.cfg.greeting_enabled
-                else "早晚问候：关"
+                else "- 早晚问候：关"
             )
-            + "\n"
+        )
+        sections.append(
+            "【群聊主动】\n"
             + (
-                f"群聊心流：开（bot 在群里说过话后 {self.cfg.flow_window_minutes} 分钟内无需@接话；"
+                f"- 心流：开（bot 在群里说过话后 {self.cfg.flow_window_minutes} 分钟内无需@接话；"
+                f"自己说完静 {self.cfg.flow_hold_seconds} 秒；接话间隔 {self.cfg.flow_min_gap_seconds} 秒；"
                 f"同群同小时最多 {self.cfg.flow_hourly_cap} 条）"
                 if self.cfg.group_flow_enabled
-                else "群聊心流：关"
+                else "- 心流：关"
             )
-            + f"　破冰{'开' if self.cfg.group_icebreak_enabled else '关'}"
-            + f"　参考库{'开' if self.cfg.group_ref_lib_enabled else '关'}"
-            + f"　在管群 {sum(len(b.get('groups') or {}) for b in self.state.data.get('bots', {}).values())} 个（详见「群社交状态」）"
-            + "\n"
-            + f"护栏冷却：同一人 {self.cfg.user_cooldown_minutes} 分钟 / "
-            + f"每轮每角色最多 {self.cfg.max_sends_per_round} 条（不同人互不排队）\n"
-            + f"播种：历史导入{'开' if self.cfg.history_ingest else '关'}　"
-            + f"名单 {len(history_ingest.normalize_seed_entries(self.cfg.seed_users, self.cfg.seed_platform))} 人（没聊过也能找）\n"
-            + self._recognition_text() + "\n"
-            + f"记录 bot：{len(bots)}（{bot_list}）\n"
-            + f"候选用户：{users}\n"
-            + f"主动消息发送/回复：{reply_rate}\n"
-            + f"回复窗口：{self.cfg.reply_window_hours}小时\n"
-            + f"连发：{'开' if self.cfg.allow_burst else '关'}　"
-            + "括号动作/emoji：看她自己的说话习惯\n"
-            + f"各角色：\n{self._per_bot_status_text()}\n"
-            + f"念头面板：\n{self.urge_panel_text()}\n"
-            + f"最近联系：\n{self.last_contact_text()}"
+            + f"\n- 破冰：{'开' if self.cfg.group_icebreak_enabled else '关'}"
+            + f"　参考库：{'开' if self.cfg.group_ref_lib_enabled else '关'}"
+            + f"　在管群 {sum(len(b.get('groups') or {}) for b in bots.values())} 个（详见「群社交状态」）"
         )
+        sections.append(
+            "【识别与投递】\n"
+            f"- {self._recognition_text()}\n"
+            f"- 播种：历史导入{'开' if self.cfg.history_ingest else '关'}"
+            f"　名单 {len(history_ingest.normalize_seed_entries(self.cfg.seed_users, self.cfg.seed_platform))} 人（没聊过也能找）\n"
+            f"- 记录 bot：{len(bots)}（{bot_list}）　候选用户：{users}\n"
+            f"- 发送/回复：{reply_rate}　回复窗口：{self.cfg.reply_window_hours} 小时\n"
+            f"- 连发：{'开' if self.cfg.allow_burst else '关'}（拆法跟 AstrBot 的分段回复设置）"
+            f"　括号动作/emoji：看她自己的说话习惯"
+        )
+        sections.append("【各角色】\n" + self._per_bot_status_text())
+        sections.append("【念头】\n" + self.urge_panel_text())
+        sections.append("【最近联系】\n" + self.last_contact_text())
+        return "\n\n".join(s for s in sections if s.strip())

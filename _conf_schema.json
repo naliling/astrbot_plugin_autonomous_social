@@ -216,18 +216,18 @@
   "miss_affection_min": {
     "type": "int",
     "description": "「念想」通道的好感门槛",
-    "hint": "好感到多少才会说想念",
+    "hint": "好感到多少才会说想念（关系档位会在此基础上换算：热络的×0.45）",
     "obvious_hint": true,
-    "default": 55,
+    "default": 42,
     "min": 0,
     "max": 100
   },
   "miss_daily_cap": {
     "type": "int",
     "description": "每天最多几条「念想」",
-    "hint": "每天最多说几句想念",
+    "hint": "每天最多说几句想念（没有正事、就是想找TA）",
     "obvious_hint": true,
-    "default": 1,
+    "default": 2,
     "min": 0,
     "max": 10
   },
@@ -315,30 +315,12 @@
     "min": 10,
     "max": 500
   },
-  "burst_probability": {
-    "type": "float",
-    "description": "提示里带「可以拆成几段」的概率",
-    "hint": "多常在提示里提「可以拆开」",
-    "obvious_hint": true,
-    "default": 0.62,
-    "min": 0.0,
-    "max": 1.0
-  },
   "allow_burst": {
     "type": "bool",
     "description": "主动消息允许分段连发",
-    "hint": "一条消息能否拆成几条连着发",
+    "hint": "总开关：开则按 AstrBot「分段回复」的设置拆段；关则无论那边怎么配都只发一整条",
     "obvious_hint": true,
     "default": true
-  },
-  "max_burst_parts": {
-    "type": "int",
-    "description": "连发最多条数",
-    "hint": "一次最多拆成几条。推荐3-3条。",
-    "obvious_hint": true,
-    "default": 3,
-    "min": 1,
-    "max": 3
   },
   "greeting_enabled": {
     "type": "bool",
@@ -441,11 +423,20 @@
   "flow_min_gap_seconds": {
     "type": "int",
     "description": "群聊插话间隔（秒）",
-    "hint": "两次插话最少间隔多久。推荐45秒。",
+    "hint": "两次插话最少间隔多久。45 秒太短，群友看她像一直在说话",
     "obvious_hint": true,
-    "default": 45,
+    "default": 120,
     "min": 10,
     "max": 600
+  },
+  "flow_hold_seconds": {
+    "type": "int",
+    "description": "自己说完后的冷却（秒）",
+    "hint": "Bot 被回完一句后，先静多久再接话（防自己跟自己连成一串）",
+    "obvious_hint": true,
+    "default": 120,
+    "min": 0,
+    "max": 1800
   },
   "flow_max_replies_per_window": {
     "type": "int",
