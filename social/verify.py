@@ -199,12 +199,15 @@ def _check_structure(text: str) -> Optional[str]:
     return None
 
 
-def _check_thin(text: str, called: str = "") -> Optional[str]:
-    """空泛：去掉括号与标点之后几乎不剩字。"""
+def _check_thin(text: str, called: str = "", allow_short: bool = False) -> Optional[str]:
+    """空泛：去掉括号与标点之后几乎不剩字。
+
+    `allow_short` 给群心流开：「嗯」「哈哈」这类短应和是群聊常态，不该一律拦下。
+    """
     body = _PUNCT_ONLY.sub("", strip_actions(text)).strip()
     if not body:
         return None                       # 已由 _check_structure 拦
-    if len(body) <= 2:
+    if len(body) <= 2 and not allow_short:
         if called and called in body:
             return None
         return f"空泛（正文只有 {body!r}）"
@@ -396,11 +399,13 @@ def verify_message(
     recent: Sequence[str] = (),
     called: str = "",
     require_about_peer: bool = False,
+    allow_short: bool = False,
 ) -> Tuple[bool, str]:
     """验收一条即将发出的消息。返回 (通过, 原因)。
 
     `require_about_peer` 只给「念想」通道开：那一类本来就是「闲下来想起一个人」，
     整条却没有第二人称就说明它在讲自己——那正是 197 条记录里最扎手的问题。
+    `allow_short` 只给群心流开：群里「嗯」「哈哈」这类短应和是常态。
     """
     if not _s(text):
         return False, "空消息"
@@ -410,7 +415,7 @@ def verify_message(
     reason = _check_intent_leak(text)
     if reason:
         return False, reason
-    reason = _check_thin(text, called)
+    reason = _check_thin(text, called, allow_short=allow_short)
     if reason:
         return False, reason
     reason = _check_repeat(text, recent)

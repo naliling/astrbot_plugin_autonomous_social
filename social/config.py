@@ -399,6 +399,10 @@ class SocialConfig:
     # 手动触发白名单：管理面板里逐条添加的列表；留空则回退到 AstrBot 管理员（全局配置 admins_id）
     allowed_trigger_uids: Any = None
 
+    # 关系档手动覆盖：逐条 "uid:high/mid/low"。设了的人不再按好感涨幅推算档位，
+    # 直接按指定的档走（最小间隔、由头池大小、念想门槛都以它为准）。
+    tier_override: Any = None
+
     # 播种：启动时从 AstrBot 会话库（data/data_v4.db 的 conversations 表）读回装插件
     # 之前就聊过的人，不用等插件装好后先聊一句才认识
     history_ingest: bool = True
@@ -418,6 +422,12 @@ class SocialConfig:
     # 里的「分段回复」设置走（见 pacing.py）；这里只是总开关——关掉后无论框架怎么配
     # 都只发一整条。
     allow_burst: bool = True
+
+    # 输入状态（正在输入）：她写主动消息的那几秒，QQ 会给对方显示她在输入。
+    # 只在 NapCat（aiocqhttp）私聊里生效；interval/timeout 与 Core 那边同一套口径。
+    input_state_enabled: bool = True
+    input_state_interval_seconds: float = 0.5
+    input_state_timeout_seconds: float = 120.0
 
     # 每轮心跳每个角色最多主动发几条（对不同用户；同一用户仍走自己的冷却）
     max_sends_per_round: int = MAX_SENDS_PER_ROUND_DEFAULT
@@ -459,6 +469,9 @@ class SocialConfig:
 
     # 两个管理指令是否仅机器人主人（全局 admins_id）可用
     owner_only_commands: bool = True
+    # 多台 bot 同群时，群内「触发社交」默认要求消息 @ 了本 bot——哪台被 @ 就只触发哪台。
+    # 关掉则退回到旧行为：群里一发指令，每台 bot 都会各自触发（只适合单台部署）。
+    trigger_group_requires_at: bool = True
 
     @property
     def mood_scale(self) -> float:
@@ -481,6 +494,45 @@ class SocialConfig:
             midday = (self.greeting_midday_start % 24, self.greeting_midday_end % 24)
         night = (self.greeting_night_start % 24, self.greeting_night_end % 24)
         return morning, midday, night
+
+    def tier_override_for(self, uid: Any) -> str:
+        """这个人的关系档手动覆盖值（"high"/"mid"/"low"），没设返回空。
+
+        接受 "uid:high"、"high:uid" 两种写法：UID 纯数字，档位就是那三个词，
+        哪边是 UID 一看便知，不用要求固定顺序。
+        """
+        target = str(uid or "").strip()
+        if not target:
+            return ""
+        raw = self.tier_override
+        if isinstance(raw, str):
+            items = raw.replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            # 列表元素本身也可能是「a:high,b:low」这种带分隔符的写法（面板列表里手填），
+            # 一样按逗号/分号再拆一次，不然整个元素会被当成一项丢掉。
+            items = []
+            for item in raw:
+                if isinstance(item, str):
+                    items.extend(
+                        item.replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+                    )
+                else:
+                    items.append(item)
+        else:
+            items = [raw] if raw is not None else []
+        valid = {"high", "mid", "low"}
+        for item in items:
+            if item is None:
+                continue
+            parts = [p.strip() for p in str(item).replace("：", ":").split(":")]
+            if len(parts) != 2:
+                continue
+            left, right = parts
+            level = left.lower() if left.lower() in valid else (right.lower() if right.lower() in valid else "")
+            who = right if left.lower() in valid else left
+            if level and who and who == target:
+                return level
+        return ""
 
     def allowed_trigger_uid_set(self) -> set:
         """解析 allowed_trigger_uids 为去重后的集合。
@@ -596,6 +648,13 @@ class SocialConfig:
             ),
             private_only=bool(g("private_only", _d("private_only",  True))),
             debug=bool(g("debug", _d("debug",  False))),
+            input_state_enabled=bool(g("input_state_enabled", _d("input_state_enabled", True))),
+            input_state_interval_seconds=max(
+                0.1, min(10.0, float(g("input_state_interval_seconds", _d("input_state_interval_seconds", 0.5))) )
+            ),
+            input_state_timeout_seconds=max(
+                10.0, min(600.0, float(g("input_state_timeout_seconds", _d("input_state_timeout_seconds", 120.0))) )
+            ),
             max_message_length=max(
                 MAX_MSG_LEN_MIN,
                 min(MAX_MSG_LEN_MAX, int(g("max_message_length", _d("max_message_length",  MAX_MSG_LEN_DEFAULT)))),
@@ -626,6 +685,7 @@ class SocialConfig:
                 min(REPLY_WINDOW_MAX, int(g("reply_window_hours", _d("reply_window_hours",  REPLY_WINDOW_DEFAULT)))),
             ),
             allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
+            tier_override=g("tier_override", _d("tier_override",  None)),
             history_ingest=bool(g("history_ingest", _d("history_ingest",  True))),
             seed_users=g("seed_users", _d("seed_users",  None)),
             seed_platform=str(g("seed_platform", _d("seed_platform",  "aiocqhttp")) or "aiocqhttp").strip() or "aiocqhttp",
@@ -751,6 +811,7 @@ class SocialConfig:
             track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
             use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
             owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
+            trigger_group_requires_at=bool(g("trigger_group_requires_at", _d("trigger_group_requires_at",  True))),
         )
 
     def in_quiet_hours(self, h: int) -> bool:

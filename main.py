@@ -367,6 +367,11 @@ class AutonomousSocial(Star):
 
         默认仅机器人主人（全局配置 admins_id）可用；需要放开给别人就在配置里关掉
         owner_only_commands 并填入白名单。
+
+        多台 bot 同群时（trigger_group_requires_at，默认开）：群里只有被 @ 的那台
+        才执行——不然一条「/触发社交」会同时叫醒群里所有 bot，每台各自发一条，
+        直观上就是「三四个 Bot 同时串台」。被 @ 的是别人、或谁都没 @ 时，
+        本台静默跳过（只记日志，不在群里回绝）。
         """
         if self._engine is None:
             yield event.plain_result("自主社交插件未正常初始化。")
@@ -382,11 +387,61 @@ class AutonomousSocial(Star):
             bid = self._engine._get_bot_id(event)
         except Exception:
             bid = "default"
+        # 群内定向检查：@ 了本 bot 才执行；@ 了别的 id 或谁都没 @ 都跳过。
+        # 只对群聊生效，私聊保持原样（私聊天然只会送到一台）。
+        if self._is_group(event) and self._engine.cfg.trigger_group_requires_at:
+            try:
+                targets = self._engine._at_targets(event)
+            except Exception:
+                targets = []
+            # @全体成员也算命中：它本来就该叫醒群里所有 bot。
+            if not targets or not ("all" in targets or str(bid) in {str(t) for t in targets}):
+                logger.info(
+                    f"[autonomous_social] 忽略群内手动触发（bid={bid}）："
+                    f"消息 @ 的是 {targets or '没有人'}，不是本台（可在配置里关掉「群内触发须@本bot」）"
+                )
+                return
         try:
             result = await self._engine.trigger_once(bid)
         except Exception as e:
             logger.error(f"[autonomous_social] 手动触发失败: {e}")
             yield event.plain_result(f"触发失败: {e}")
+            return
+        yield event.plain_result(result)
+
+    @command("主动消息预览")
+    async def preview_proactive(self, event: AstrMessageEvent):
+        """只生成、不发送：看一眼她此刻打算对谁说什么。仅机器人主人可用。
+
+        可选带一个用户 ID：「主动消息预览 12345」只看那个人。
+        全程不开「正在输入」、不消费由头、不计账——生成完毕即丢，方便调提示词。
+        """
+        if self._engine is None:
+            yield event.plain_result("自主社交插件未正常初始化。")
+            return
+        allowed, why = self._check_owner(event)
+        if not allowed:
+            if self._is_group(event):
+                logger.info(f"[autonomous_social] 忽略群内主动消息预览：{why}")
+                return
+            yield event.plain_result("这个指令只有机器人的主人能用。")
+            return
+        uid_filter = ""
+        try:
+            parts = str(getattr(event, "message_str", "") or "").strip().split(None, 1)
+            if len(parts) > 1:
+                uid_filter = parts[1].strip()
+        except Exception:
+            uid_filter = ""
+        try:
+            bid = self._engine._get_bot_id(event)
+        except Exception:
+            bid = "default"
+        try:
+            result = await self._engine.preview_once(bid, uid_filter)
+        except Exception as e:
+            logger.error(f"[autonomous_social] 主动消息预览失败: {e}")
+            yield event.plain_result(f"预览失败: {e}")
             return
         yield event.plain_result(result)
 

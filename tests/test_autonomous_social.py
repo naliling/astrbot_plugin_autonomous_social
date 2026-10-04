@@ -2331,10 +2331,7 @@ class TestNoFloodToActiveUsers(unittest.TestCase):
         self.assertIn("own_recent", body, "破冰没带「自己说过什么」的防重复")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-# ─── v1.22：关系热度分档 · 有效期 · 问候 · 停发 ──────────────────────
+# ─── v1.22：关系热度分档 · 有效期 · 问候 · 停发 ──────────────────
 
 
 class TestRelationTier(unittest.TestCase):
@@ -2879,9 +2876,6 @@ class TestTitleLineStripping(unittest.TestCase):
         self.assertIn("strip_title_line", src, "生成层没接剥标题")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class TestBurstFollowsFrameworkConfig(unittest.TestCase):
     """拆段跟随 AstrBot 每个 Bot 的「分段回复」设置（v1.27.0）。
 
@@ -2933,6 +2927,524 @@ class TestBurstFollowsFrameworkConfig(unittest.TestCase):
         self.assertNotIn("self._burst_chance()", src,
                          "插件还在自己掷骰子决定拆不拆，说明没跟随框架配置")
         self.assertNotIn("burst_probability", src)
+
+
+# ─── 多 bot 隔离（v1.27.4） ───────────────────────────────────────
+
+class At:
+    """模拟 AstrBot 的 At 消息段：类名必须就是 At（解析靠 __name__）。"""
+
+    def __init__(self, qq):
+        self.qq = qq
+
+
+class AtAll:
+    """模拟 AstrBot 的 AtAll。"""
+
+
+class _MsgObj:
+    def __init__(self, chain):
+        self.message = chain
+
+
+class _AtEvent:
+    """只带消息链的事件，足够验证 _at_targets / _mentions_bot。"""
+
+    def __init__(self, chain):
+        self.message_obj = _MsgObj(chain)
+
+
+class TestAtTargets(unittest.TestCase):
+    """@ 目标解析是「是不是在叫我」的唯一硬依据，多 bot 同群全靠它分家。"""
+
+    def test_collects_and_dedups_targets(self):
+        ev = _AtEvent([At("1001"), "你好", At("1002"), At("1001")])
+        self.assertEqual(SocialEngine._at_targets(ev), ["1001", "1002"])
+
+    def test_at_all_counts_as_a_target(self):
+        ev = _AtEvent([AtAll(), "公告"])
+        self.assertEqual(SocialEngine._at_targets(ev), ["all"])
+
+    def test_no_at_is_empty(self):
+        self.assertEqual(SocialEngine._at_targets(_AtEvent(["随便聊聊"])), [])
+
+    def test_mentions_bot_matches_only_self(self):
+        ev = _AtEvent([At("1002"), "在吗"])
+        self.assertTrue(SocialEngine._mentions_bot(ev, "1002"))
+        self.assertFalse(SocialEngine._mentions_bot(ev, "1001"),
+                         "@ 的是别人时不该算「在叫我」")
+
+    def test_mentions_bot_all_is_not_self(self):
+        ev = _AtEvent([AtAll()])
+        self.assertFalse(SocialEngine._mentions_bot(ev, "1001"),
+                         "@全体不算 @ 了本 bot")
+
+
+class TestSiblingBots(unittest.TestCase):
+    """多台 bot 同进程时，别把兄弟 bot 当成群友。"""
+
+    def test_sibling_set_excludes_self_and_default(self):
+        e = _SiblingEngine()
+        e.state.bot("botA")
+        e.state.bot("botB")
+        e.state.bot("default")
+        self.assertEqual(e._sibling_bots("botA"), {"botB"})
+
+    def test_single_bot_deployment_has_no_siblings(self):
+        e = _SiblingEngine()
+        e.state.bot("botA")
+        self.assertEqual(e._sibling_bots("botA"), set())
+
+    def test_sibling_message_does_not_open_flow(self):
+        """兄弟 bot 发言不能触发本台的心流接话（这就是串台的起点）。"""
+        e = _SiblingEngine()
+        e.state.bot("botB")
+        self.assertTrue(e._is_sibling("botB"))
+        self.assertFalse(e._is_sibling("u1"))
+
+
+class _SiblingEngine:
+    _sibling_bots = SocialEngine._sibling_bots
+
+    def __init__(self):
+        self.state = SocialState(os.path.join(tempfile.mkdtemp(), "s.json"))
+
+    def _is_sibling(self, uid):
+        return uid in self._sibling_bots("botA")
+
+
+# ─── 输入状态（正在输入）:主动消息生成期间上报 ───────────────────
+
+class TestInputState(unittest.TestCase):
+    """做法与 Core 同源，唯一区别是客户端要从 umo 反查平台实例。"""
+
+    def _notifier(self, ctx, enabled=True):
+        from social.input_state import InputStateNotifier
+        cfg = type("C", (), {"input_state_enabled": enabled})()
+        return InputStateNotifier(ctx, lambda: cfg, _QuietLog(), time_source=lambda: __import__("time").monotonic())
+
+    def test_reports_private_napcat_and_stops(self):
+        ctx = _FakeCtx(platform_name="aiocqhttp")
+        n = self._notifier(ctx)
+        n.interval = 0.01
+        n.timeout = 5.0
+
+        async def go():
+            await n.start("aiocqhttp:FriendMessage:12345", "12345")
+            await asyncio.sleep(0.05)
+            await n.stop("aiocqhttp:FriendMessage:12345")
+
+        asyncio.run(go())
+        calls = ctx.inst.client.api.calls
+        self.assertTrue(calls, "私聊 + NapCat 时应该上报")
+        self.assertTrue(all(c["action"] == "set_input_status" for c in calls))
+        self.assertTrue(all(c["user_id"] == "12345" for c in calls), "user_id 必须是字符串")
+        self.assertTrue(all(c["event_type"] == 1 for c in calls))
+
+    def test_group_and_other_platform_and_disabled_are_skipped(self):
+        cases = [
+            (_FakeCtx(platform_name="aiocqhttp"), "aiocqhttp:GroupMessage:999", True),
+            (_FakeCtx(platform_name="qq_official"), "qq_official:FriendMessage:1", True),
+            (_FakeCtx(platform_name="aiocqhttp"), "aiocqhttp:FriendMessage:1", False),
+        ]
+        for ctx, umo, enabled in cases:
+            n = self._notifier(ctx, enabled=enabled)
+            n.interval = 0.01
+
+            async def go(n=n, umo=umo):
+                await n.start(umo, "1")
+                await asyncio.sleep(0.03)
+                await n.stop(umo)
+
+            asyncio.run(go())
+            self.assertEqual(ctx.inst.client.api.calls, [], f"{umo}（enabled={enabled}）不该上报")
+            self.assertEqual(n._tasks, {})
+
+    def test_no_platform_instance_does_not_crash(self):
+        ctx = _FakeCtx(platform_name="aiocqhttp", missing=True)
+        n = self._notifier(ctx)
+        n.interval = 0.01
+
+        async def go():
+            await n.start("aiocqhttp:FriendMessage:1", "1")  # 不该抛
+            await n.stop("aiocqhttp:FriendMessage:1")
+
+        asyncio.run(go())
+        self.assertEqual(n._tasks, {})
+
+    def test_speak_wrapper_stops_typing_on_every_path(self):
+        """_speak 的 finally 要覆盖所有退出路：正常返回、抛异常，都要停一次。"""
+        for mode in ("ok", "raise"):
+            stopped = {"n": 0}
+
+            class FakeInputState:
+                async def start(self, umo, uid): pass
+                async def stop(self, umo): stopped["n"] += 1
+
+            class E:
+                _speak = SocialEngine._speak
+
+                def __init__(self):
+                    self.input_state = FakeInputState()
+
+                    async def inner(*a, **k):
+                        if mode == "raise":
+                            raise RuntimeError("炸了")
+                        return False, "想过，但觉得现在不该说"
+
+                    self._speak_inner = inner
+
+            e = E()
+            u = {"umo": "aiocqhttp:FriendMessage:1"}
+            if mode == "ok":
+                ok, _note = _run(e._speak("bot1", "1", u, 2.0, 1000.0))
+                self.assertFalse(ok)
+            else:
+                with self.assertRaises(RuntimeError):
+                    _run(e._speak("bot1", "1", u, 2.0, 1000.0))
+            self.assertEqual(stopped["n"], 1, f"{mode}：不管走哪条路退出都要停一次")
+
+
+class _QuietLog:
+    def debug(self, *a): pass
+    def info(self, *a): pass
+    def warning(self, *a): pass
+    def error(self, *a): pass
+
+
+class _PlatformInst:
+    def __init__(self, name):
+        self._name = name
+        self.client = _Client()
+
+    def meta(self):
+        return type("M", (), {"name": self._name})()
+
+    def get_client(self):
+        return self.client
+
+
+class _Client:
+    def __init__(self):
+        self.api = self
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append({"action": action, **params})
+
+
+class _FakeCtx:
+    def __init__(self, platform_name="aiocqhttp", missing=False):
+        self.inst = None if missing else _PlatformInst(platform_name)
+        self._platform_name = platform_name
+
+    def get_platform_inst(self, platform_id):
+        return self.inst
+
+
+# ─── v1.27.6 新增：关系档手动覆盖 / 主动消息预览 ───────────────────
+
+class TestTierOverride(unittest.TestCase):
+    """手动指定关系档：设了的人不再按好感涨幅推算。"""
+
+    def test_parses_both_spellings(self):
+        cfg = SocialConfig.from_astrbot({"tier_override": ["12345:high", "low:67890"]})
+        self.assertEqual(cfg.tier_override_for("12345"), "high")
+        self.assertEqual(cfg.tier_override_for("67890"), "low")
+        self.assertEqual(cfg.tier_override_for("999"), "")
+
+    def test_accepts_list_and_full_width_colon(self):
+        cfg = SocialConfig.from_astrbot({"tier_override": ["777：mid"]})
+        self.assertEqual(cfg.tier_override_for("777"), "mid")
+
+    def test_ignores_garbage_entries(self):
+        cfg = SocialConfig.from_astrbot(
+            {"tier_override": ["不是一对", "123:不是档位", None]})
+        self.assertEqual(cfg.tier_override_for("123"), "")
+
+    def test_engine_tier_of_respects_override(self):
+        """覆盖值直接进 _tier_of：低好感的人也能被指定成高档。"""
+
+        class Core:
+            def load_snapshot(self, bid, uid, root=None):
+                return {"affection": 10.0, "base_affection": 10.0}
+
+        e = _FakeEngine(clock_ref=lambda: 1_700_000_000.0)
+        e.cfg = SocialConfig.from_astrbot({"tier_override": ["u1:high"]})
+        e.core = Core()
+        e._tier_of = SocialEngine._tier_of.__get__(e, _FakeEngine)
+        root = {"roles": {}}  # 非空即会去读 snapshot
+        tier, _aff, _warmth = e._tier_of("bot1", "u1", {}, root, 1_700_000_000.0)
+        self.assertEqual(tier, "high", "手动指定的高档被低好感覆盖了")
+        tier2, _aff2, _w2 = e._tier_of("bot1", "u2", {}, root, 1_700_000_000.0)
+        self.assertEqual(tier2, "low", "没被指定的人应当按低好感落到低档")
+
+
+class TestProactivePreview(unittest.TestCase):
+    """`/主动消息预览`：只生成、不发送、不消费由头、不动冷却。"""
+
+    def _engine(self, ranked=None, reply="预览内容"):
+        e = _PreviewEngine(ranked=ranked or [], reply=reply)
+        return e
+
+    def test_preview_returns_text_and_does_not_send(self):
+        e = self._engine(ranked=_ranked())
+        out = _run(e.preview_once("bot1"))
+        self.assertIn("预览", out)
+        self.assertIn("预览内容", out)
+        self.assertEqual(e.sent, [], "预览路径不允许发送任何消息")
+
+    def test_preview_can_target_one_user(self):
+        e = self._engine(ranked=_ranked())
+        out = _run(e.preview_once("bot1", "u2"))
+        self.assertIn("u2", out)
+        self.assertNotIn("u1", out.split("\n")[0])
+
+    def test_preview_reports_unknown_target(self):
+        e = self._engine(ranked=_ranked())
+        out = _run(e.preview_once("bot1", "nobody"))
+        self.assertIn("nobody", out)
+
+    def test_preview_does_not_consume_anchor(self):
+        """验收不过的由头进冷却 7 天——预览连一次都不该消耗。"""
+        e = self._engine(ranked=_ranked())
+        u = e.state.user("bot1", "u1")
+        anchors.add_anchor(u, anchors.KIND_MISS, "有点想你了", now=e._time())
+        before = [dict(a) for a in anchors.load_anchors(u)]
+        _run(e.preview_once("bot1"))
+        after = [dict(a) for a in anchors.load_anchors(u)]
+        self.assertEqual(before, after, "预览动了由头池")
+
+    def test_preview_refuses_when_engine_not_running(self):
+        e = self._engine()
+        e.running = False
+        out = _run(e.preview_once("bot1"))
+        self.assertIn("没有在运行", out)
+
+    def test_preview_uses_generate_when_gate_off(self):
+        """关掉 llm_gate 时走 generate 分支，同样只拿文本不发送。"""
+        e = self._engine(ranked=_ranked())
+        e.cfg.llm_gate = False
+        out = _run(e.preview_once("bot1"))
+        self.assertIn("预览内容", out)
+        self.assertEqual(e.generator.generate_calls, 1)
+        self.assertEqual(e.generator.decide_calls, 0)
+
+
+class _PreviewEngine:
+    """只拼 preview_once/_preview_one 用到的那几个依赖。"""
+
+    _trigger_precheck = SocialEngine._trigger_precheck
+    _remember_clock = SocialEngine._remember_clock
+    _remember_night = SocialEngine._remember_night
+    _representative_umo = SocialEngine._representative_umo
+    _user_lock = SocialEngine._user_lock
+    _generation_conversation = SocialEngine._generation_conversation
+    _load_session_history = SocialEngine._load_session_history
+    _mind = SocialEngine._mind
+    _tier_of = SocialEngine._tier_of
+    preview_once = SocialEngine.preview_once
+    _preview_run = SocialEngine._preview_run
+    _preview_one = SocialEngine._preview_one
+    _verify_all_segments = staticmethod(SocialEngine._verify_all_segments)
+
+    def __init__(self, ranked, reply):
+        import tempfile as _tf
+
+        self.running = True
+        self.cfg = SocialConfig.from_astrbot({})
+        self.core = _NullCore()
+        self.context = None
+        self._last_persona = {}
+        self._city_offset = {}
+        self._night_windows = {}
+        self._user_locks = {}
+        self.state = SocialState(os.path.join(_tf.mkdtemp(), "state.json"))
+        self._ranked = ranked
+        self._reply = reply
+        self.sent = []
+        self._last_flush = 1.0
+        self.generator = _PreviewGen(reply)
+        for uid, _u, _g in ranked:
+            self.state.user("bot1", uid)["umo"] = f"aiocqhttp:FriendMessage:{uid}"
+
+    async def _get_provider(self, umo):
+        return None
+
+    def _time(self):
+        return 1_700_000_000.0
+
+    def _moment_of(self, bid, now):
+        import datetime
+
+        return datetime.datetime(2023, 11, 15, 14, 0)
+
+    def _clock_offset_for(self, bid):
+        return None
+
+    async def _persona(self, umo, bid=""):
+        return "", ""
+
+    def settle_minds(self, bid, now, dt, root, bot_state, min_urge=0.0):
+        return self._ranked
+
+    def log(self, _msg):
+        pass
+
+
+class _PreviewGen:
+    """预览路径的生成器替身：decide 与 generate 都直接返回预设内容。"""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.decide_calls = 0
+        self.generate_calls = 0
+
+    class _D:
+        def __init__(self, reply):
+            self.send = True
+            self.parts = [reply]
+            self.why_not = ""
+
+    def _scope_of(self, provider):
+        return "p1"
+
+    def llm_backoff_remaining(self, scope=""):
+        return 0.0
+
+    async def decide(self, *a, **k):
+        self.decide_calls += 1
+        return self._D(self.reply)
+
+    async def generate(self, *a, **k):
+        self.generate_calls += 1
+        return [self.reply]
+
+
+# ─── v1.27.7 回归：死配置 / 预览无副作用 / 逐段验收 / 兄弟 bot 名单 ─────────
+
+class TestInputStateConfigure(unittest.TestCase):
+    """面板上的 interval/timeout 要真的吃到，不然永远按构造默认值跑。"""
+
+    def test_panel_values_reach_the_notifier(self):
+        cfg = SocialConfig.from_astrbot(
+            {"input_state_interval_seconds": 2.0, "input_state_timeout_seconds": 90.0}
+        )
+        from social.input_state import InputStateNotifier as N
+        n = N(None, lambda: cfg, _QuietLog(), time_source=lambda: 0.0)
+        # 引擎 __init__ 里就是这样把它对齐面板值的
+        n.configure(cfg.input_state_interval_seconds, cfg.input_state_timeout_seconds)
+        self.assertEqual(n.interval, 2.0)
+        self.assertEqual(n.timeout, 90.0)
+
+    def test_engine_init_calls_configure(self):
+        src = Path(engine_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("self.input_state.configure(", src, "引擎构造时没把面板值传给上报器")
+
+
+class _FlowEngine:
+    """只拼 _verify_all_segments / _flow_reply_inner 验收所需的最小依赖。"""
+
+    _verify_all_segments = staticmethod(SocialEngine._verify_all_segments)
+
+    def __init__(self):
+        self._last_persona = {}
+
+
+class TestVerifyAllSegments(unittest.TestCase):
+    """群心流/破冰的验收要盖住**每一段**，不只 parts[0]。"""
+
+    def test_second_segment_gets_checked(self):
+        e = _FlowEngine()
+        segs = ["今天挺好的", "想表达此刻的孤独和饥饿感"]
+        bad, why = e._verify_all_segments(segs, recent=[], called="")
+        self.assertEqual(bad, segs[1], "后续段没被验收，动机泄漏会直接进群")
+        self.assertIn("动机", why)
+
+    def test_all_clean_returns_empty(self):
+        e = _FlowEngine()
+        bad, why = e._verify_all_segments(["今天天气不错呀，你那边呢", "你吃饭了没"], recent=[], called="")
+        self.assertEqual((bad, why), ("", ""))
+
+    def test_allow_short_only_for_group_flow(self):
+        e = _FlowEngine()
+        # 短应和默认被拦
+        bad, _ = e._verify_all_segments(["嗯"], recent=[], called="")
+        self.assertEqual(bad, "嗯")
+        # 群心流开了 allow_short 就放行
+        bad2, _ = e._verify_all_segments(["嗯"], recent=[], called="", allow_short=True)
+        self.assertEqual(bad2, "")
+
+
+class TestPreviewNoSideEffects(unittest.TestCase):
+    """预览是 dry run：不能改念头/兴趣/冷落，也不能动由头。"""
+
+    def test_preview_restores_user_subtree(self):
+        e = _PreviewEngine(ranked=_ranked(), reply="预览内容")
+        u = e.state.user("bot1", "u1")
+        u["urge"] = 1.234
+        u["interest"] = 0.5
+        anchors.add_anchor(u, anchors.KIND_MISS, "想起你了", now=e._time())
+        before = json.loads(json.dumps(e.state.bot("bot1").get("users", {})))
+
+        # 模拟真实 settle_minds 那个**就地写回**：它会把 urge/interest 改掉、
+        # 还可能推进冷落计数。预览必须把这些全部还原。
+        def mutating(bid, now, dt, root, bot_state, min_urge=0.0):
+            victim = e.state.user(bid, "u1")
+            victim["urge"] = 9.9
+            victim["interest"] = 0.99
+            victim["no_reply_streak"] = 7
+            return e._ranked
+
+        e.settle_minds = mutating
+        _run(e.preview_once("bot1"))
+        after = e.state.bot("bot1").get("users", {})
+        self.assertEqual(
+            after.get("u1", {}).get("urge"), before.get("u1", {}).get("urge"),
+            "预览改了念头（settle_minds 的就地副作用没被还原）",
+        )
+        self.assertEqual(
+            after.get("u1", {}).get("interest"), before.get("u1", {}).get("interest")
+        )
+        self.assertEqual(after.get("u1", {}).get("no_reply_streak"), 0)
+        self.assertEqual(
+            [dict(a) for a in anchors.load_anchors(after.get("u1", {}))],
+            [dict(a) for a in anchors.load_anchors(before.get("u1", {}))],
+        )
+
+    def test_preview_skips_hot_chat_user(self):
+        """刚聊过的人真实不会开口，预览也不该拿它当样例。"""
+        now = 1_700_000_000.0
+        ranked = [("u1", {"umo": "aiocqhttp:FriendMessage:u1", "last_seen": now - 5.0}, 3.0)]
+        e = _PreviewEngine(ranked=ranked, reply="预览内容")
+        out = _run(e.preview_once("bot1"))
+        self.assertNotIn("预览内容", out, "对刚聊过的人生成了内容")
+        self.assertEqual(e.generator.generate_calls, 0)
+
+
+class TestKnownBotIds(unittest.TestCase):
+    """只混群、从不私聊的兄弟 bot 也要能被认出来。"""
+
+    def test_note_and_read_known_bot_ids(self):
+        st = SocialState(os.path.join(tempfile.mkdtemp(), "s.json"))
+        st.note_bot_id("botB")
+        self.assertIn("botB", st.known_bot_ids())
+        st.note_bot_id("default")  # 占位名不记
+        self.assertNotIn("default", st.known_bot_ids())
+
+    def test_sibling_bots_includes_group_only_bot(self):
+        e = _SiblingEngine()
+        e.state.note_bot_id("botC")  # 只在群里见过、没私聊过 → 不在顶层 bots
+        self.assertIn("botC", e._sibling_bots("botA"))
+
+
+class TestTierOverrideListElement(unittest.TestCase):
+    """列表元素里手填的「a:high,b:low」也要能拆开。"""
+
+    def test_comma_inside_list_element(self):
+        cfg = SocialConfig.from_astrbot({"tier_override": ["u1:high,u2:low"]})
+        self.assertEqual(cfg.tier_override_for("u1"), "high")
+        self.assertEqual(cfg.tier_override_for("u2"), "low")
 
 
 if __name__ == "__main__":

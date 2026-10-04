@@ -156,6 +156,28 @@ class SocialState:
             .setdefault(uid, self._default_user())
         )
 
+    def known_bot_ids(self) -> set:
+        """本进程见过「自己也在发言」的 bot id 集合（多 bot 同进程部署时的兄弟）。
+
+        与顶层 `bots` 键不同：后者只在某 bot 有过私聊用户/被心跳结算时才建。
+        只混群、从不私聊的兄弟 bot 永远不在 `bots` 里——用这个独立名单才能把它认出来。
+        """
+        return {
+            str(x) for x in (self.data.get("_known_bot_ids") or []) if x and str(x) != "default"
+        }
+
+    def note_bot_id(self, other: str) -> None:
+        """记下一个「确认是 bot 自己」的 id（它以自己的身份发过消息）。"""
+        other = str(other or "")
+        if not other or other == "default":
+            return
+        ids = self.data.setdefault("_known_bot_ids", [])
+        if other not in ids:
+            ids.append(other)
+            if len(ids) > 64:
+                del ids[:-64]
+            self.mark_dirty()
+
     @staticmethod
     def _default_user() -> Dict[str, Any]:
         """返回默认用户状态结构。"""

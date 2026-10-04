@@ -11,6 +11,7 @@ v1.19.0：
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import random
@@ -31,6 +32,7 @@ from . import pacing
 from .clock import city_now
 from .config import SocialConfig
 from .core_bridge import CoreBridge
+from .input_state import InputStateNotifier
 from .sanitize import sanitize_incoming
 from .anchors import anchor_meta, anchor_sentence, prepare_round_anchors
 from .verify import (
@@ -286,6 +288,14 @@ class SocialEngine:
             os.path.join(os.path.dirname(state_path), SIGNALS_FILE_NAME), time_source=self._time
         )
         self.generator = MessageGenerator(context, self.cfg, time_source=self._time)
+        # 「正在输入」：主动开口前先向 QQ 报一声（仅 NapCat 私聊，纯装饰，出错不影响发消息）
+        self.input_state = InputStateNotifier(
+            context, lambda: self.cfg, logger, time_source=lambda: time.monotonic()
+        )
+        # 把面板上配的间隔/超时真正吃到：不然永远按构造时的默认 0.5/120 跑。
+        self.input_state.configure(
+            self.cfg.input_state_interval_seconds, self.cfg.input_state_timeout_seconds
+        )
         self._data_dir = data_dir
         self.running = False
         self._last_flush = 0.0
@@ -412,6 +422,10 @@ class SocialEngine:
         self._bg_tasks.clear()
         self._flow_inflight.clear()
         try:
+            await self.input_state.stop_all()
+        except Exception as exc:  # pragma: no cover - 纯装饰
+            logger.debug(f"[autonomous_social] 停输入状态失败: {exc}")
+        try:
             self.state.save()
             logger.info("[autonomous_social] 引擎已停止，状态已保存")
         except Exception as e:
@@ -463,6 +477,12 @@ class SocialEngine:
         bid = self._get_bot_id(event)
         if not bid:
             return
+        # 本账号真实处理到了一条消息 → 它是个真实 bot（不只是 default 占位）。
+        # 记下来：多 bot 同进程时，只混群的兄弟也能被 _sibling_bots 认出来。
+        try:
+            self.state.note_bot_id(bid)
+        except Exception:
+            pass
 
         # 获取用户 ID
         uid = self._get_sender_id(event)
@@ -877,22 +897,93 @@ class SocialEngine:
 
     @staticmethod
     def _mentions_bot(event: Any, bid: str) -> bool:
-        """这条群消息是不是 @ 了 bot。用作心流「有人接我插的话」的硬信号。
-
-        扫消息链里的 At 段（qq/target/user_id 字段 ≡ bot 自己的 id）。
-        """
+        """这条群消息是不是 @ 了 bot。用作心流「有人接我插的话」的硬信号。"""
         if not bid:
             return False
+        return str(bid) in SocialEngine._at_targets(event)
+
+    @staticmethod
+    def _at_targets(event: Any) -> List[str]:
+        """这条消息 @ 了哪些 id（去重、原样字符串）。私聊或没有 @ 时返回空列表。
+
+        多 bot 同群时这是唯一靠得住的「是不是在叫我」判据：
+        一条消息 @ 了谁，在消息链里写得明明白白，不依赖模型猜。
+        """
+        at_all_cls, at_cls = SocialEngine._at_component_classes()
+        out: List[str] = []
         try:
             chain = getattr(getattr(event, "message_obj", None), "message", None) or []
             for comp in chain:
-                for attr in ("qq", "target", "user_id"):
-                    val = getattr(comp, attr, None)
-                    if val is not None and str(val) == str(bid):
-                        return True
+                # 优先 isinstance（框架定义了类就用真类型，重命名/包装都不怕）；
+                # 拿不到框架类时退到类名比对，保证只读场景也能工作。
+                if at_all_cls is not None:
+                    is_at_all = isinstance(comp, at_all_cls)
+                    is_at = isinstance(comp, at_cls)
+                else:
+                    label = type(comp).__name__
+                    is_at_all = label == "AtAll"
+                    is_at = label == "At"
+                if is_at_all:
+                    # @全体成员也是「有目标」的消息：不当作没人点名的闲聊去接。
+                    if "all" not in out:
+                        out.append("all")
+                    continue
+                if not is_at:
+                    continue
+                val = getattr(comp, "qq", None)
+                if val is None:
+                    val = getattr(comp, "target", None)
+                if val is None:
+                    val = getattr(comp, "user_id", None)
+                if val is None:
+                    continue
+                text = str(val)
+                if text and text not in out:
+                    out.append(text)
         except Exception:
             pass
-        return False
+        return out
+
+    @staticmethod
+    def _at_component_classes():
+        """(AtAll, At) 两个框架类；导入失败时返回 (None, None) 退回类名比对。"""
+        try:
+            from astrbot.api.message_components import At, AtAll
+        except Exception:
+            try:
+                from astrbot.api.message_components import At  # type: ignore
+                AtAll = None  # type: ignore
+            except Exception:
+                return None, None
+        return AtAll, At
+
+    def _sibling_bots(self, bid: str) -> set:
+        """本进程见过的其它 bot id（多 bot 同进程部署时的「兄弟」）。
+
+        它们的消息在事件层看起来就是普通群成员，框架不会替我们区分。
+        两个来源取并集：
+
+        * 顶层 `bots` 键——有过私聊用户/被心跳结算的角色；
+        * `_known_bot_ids`——本插件实例以某个 bid 真实处理过的账号（含只混群的）。
+
+        只认确实见过的 id。各 bot 跑在不同进程/不同 state 文件时本函数恒为空——
+        跨进程的兄弟认不出，README 里写清了边界。
+        """
+        out = set()
+        try:
+            for other in (self.state.data.get("bots", {}) or {}):
+                other = str(other or "")
+                if other and other != "default" and other != str(bid):
+                    out.add(other)
+        except Exception:
+            pass
+        try:
+            for other in self.state.known_bot_ids():
+                if other and other != str(bid):
+                    out.add(other)
+        except Exception:
+            pass
+        return out
 
     # ─── 群聊心流（v1.11.0） ───────────────────
 
@@ -909,9 +1000,19 @@ class SocialEngine:
         gid = self._get_group_id(event)
         if not bid or not gid:
             return
+        # 本账号真实处理到了群消息 → 它是个真实 bot。记下来供 _sibling_bots 识别
+        # （只混群、从不私聊的兄弟也会出现在顶层 bots 之外，靠这个名单补上）。
+        try:
+            self.state.note_bot_id(bid)
+        except Exception:
+            pass
         uid = self._get_sender_id(event)
         # bot 自己的群发言不进参考库（不学自己）；主链路回复另走 note_spoken 开窗
         is_bot = bool(uid) and uid == bid
+        # 兄弟 bot（同一账本里见过的其它 bot）：也不是真人。它们的消息不进风格库、
+        # 不触发心流——不然多 bot 同群时，一个 bot 说话，另一个 bot 把它当群友接一句，
+        # 串台就是从这儿开始的。
+        is_sibling = bool(uid) and uid in self._sibling_bots(bid)
         umo = ""
         try:
             umo = str(getattr(event, "unified_msg_origin", "") or "")
@@ -931,19 +1032,28 @@ class SocialEngine:
         store_text = self.cfg.group_ref_lib_enabled and self.cfg.group_store_message_text
         now = self._time()
         g = self.state.record_group_message(
-            bid, gid, umo, group_name, sender_name, msg, is_bot, now,
-            store_text=store_text, sample_cap=self.cfg.group_ref_sample_size,
+            bid, gid, umo, group_name, sender_name, msg, is_bot or is_sibling, now,
+            store_text=store_text and not is_sibling, sample_cap=self.cfg.group_ref_sample_size,
         )
         # 有人 @ 了 bot 且心流窗口开着：算「接住了我刚插的话」，把连着插没人理的计数清零，
         # 允许继续接。不是 @ 的普通群聊不算接话（避免一有人说话就当受欢迎继续无脑插）。
         if (
             not is_bot
+            and not is_sibling
             and self._mentions_bot(event, bid)
             and float(g.get("flow_open_until", 0) or 0) > now
         ):
             self.state.note_flow_pickup(bid, gid)
-        # 心流：窗口开着、不是 bot 自己发的、预筛过了，才去试着接一句
-        if not self.cfg.group_flow_enabled or is_bot:
+        # 心流：窗口开着、不是 bot（自己和兄弟都算）发的、**没有任何 @**、预筛过了，
+        # 才去试着接一句。
+        #
+        # 「无艾特接话」的字面意思就是接没人点名的话：
+        # - 消息 @ 了别人（哪怕不是本 bot）→ 那是对着某个具体的人说的，不掺和；
+        # - 消息 @ 了本 bot → 主链路会正经回它，心流再插一句就是同一个人连说两遍；
+        # - 多 bot 同群时，@ 还常常是「另一台 bot 在跟它说话」的信号，接了就串台。
+        if not self.cfg.group_flow_enabled or is_bot or is_sibling:
+            return
+        if self._at_targets(event):
             return
         if float(g.get("flow_open_until", 0) or 0) <= now:
             return
@@ -983,6 +1093,23 @@ class SocialEngine:
             await self._flow_reply_inner(bid, gid, trigger_ts)
         finally:
             self._flow_inflight.discard((bid, gid))
+
+    @staticmethod
+    def _verify_all_segments(segments, *, recent, called, allow_short=False):
+        """逐段过验收，返回 (不过的那段正文, 原因)；全过返回 ("", "")。
+
+        `parts[0]` 只是模型输出的第一段；`plan_segments` 拆出来的后续段以前一律
+        免检直接补发，动机泄漏/括号截断/复读都可能从那里进群。验收要盖住每一条
+        真正发出去的段。
+        """
+        for text in segments:
+            body = str(text or "")
+            passed, reason = verify_message(
+                body, recent=recent, called=called, allow_short=allow_short
+            )
+            if not passed:
+                return body, reason
+        return "", ""
 
     async def _flow_reply_inner(self, bid: str, gid: str, trigger_ts: float) -> None:
         """在关注窗口内无 @ 接一句。生成前重校闸（状态可能变了），模型可选择不接。"""
@@ -1034,6 +1161,21 @@ class SocialEngine:
         if not parts:
             self.log(f"群 {gid} 心流：模型选择不接或生成为空")
             return
+        # ── 验收层（与私聊侧同一套五道检查）────────────────────
+        # 群心流以前没有任何验收：模型写什么就发什么，含动机泄漏、括号截断、
+        # 复读（同一晚 23 条一个调子）的毛病都可能直接进群。与私聊侧对齐：
+        # 判不过就不发（不重生成、不退回）——宁可不接，不可发一条废话。
+        # 先拆段再逐段验：只验 parts[0] 的话，后续补发的段等于免检。
+        # 近期发过的话用她在这个群自己说过的，防接话与自己的上一句重复。
+        try:
+            own_recent_texts = [
+                str(t).strip()
+                for t in (group_ctx.get("own_recent") or [])
+                if str(t).strip()
+            ]
+        except Exception:
+            own_recent_texts = []
+        called = str(self._last_persona.get(bid, "") or "")
         # 拆不拆、隔多久：跟这个 Bot 的分段回复设置。模型已经分过的段（---）也一并
         # 交给它定：主人没开分段就合并回一条，开了才按框架的拆法与间隔发。
         segments, waits = pacing.plan_segments(
@@ -1041,6 +1183,20 @@ class SocialEngine:
             allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
         )
         if not segments:
+            return
+        bad_text, flow_why = self._verify_all_segments(
+            segments, recent=own_recent_texts, called=called, allow_short=True,
+        )
+        if bad_text:
+            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
+            self._m["last_rejected"] = str(bad_text)[:200]
+            if throttle.allow(f"flow.rejected.{bid}", window=1800.0):
+                logger.info(
+                    f"[autonomous_social][{bid}] 群 {gid} 心流验收不过，未发送：{flow_why}｜"
+                    f"原文：{str(bad_text)[:120]!r}"
+                    + throttle.summary(f"flow.rejected.{bid}")
+                )
+            self.log(f"群 {gid} 心流验收不过（{flow_why}），不发")
             return
         ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
@@ -1179,12 +1335,33 @@ class SocialEngine:
             return False
         if not parts:
             return False
-        # 破冰也服从这个 Bot 的分段设置（模型分过的段一并交过去）
+        # ── 验收层（与私聊侧、心流同一套）──────────────────────
+        # 破冰以前也是裸发：模型写出动机泄漏、括号截断、复读（连着几天同一句）
+        # 都会直接进群。判不过就不发——宁可不破冰，不可抛一句废话头。
+        # 先拆段再逐段验，后续补发的段不再免检。
         segments, waits = pacing.plan_segments(
             parts, umo, self.context,
             allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
         )
         if not segments:
+            return False
+        try:
+            bad_text, ice_why = self._verify_all_segments(
+                segments,
+                recent=[str(t).strip() for t in (group_ctx.get("own_recent") or []) if str(t).strip()],
+                called=str(self._last_persona.get(bid, "") or ""),
+            )
+        except Exception:
+            bad_text, ice_why = "", ""
+        if bad_text:
+            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
+            self._m["last_rejected"] = str(bad_text)[:200]
+            if throttle.allow(f"icebreak.rejected.{bid}", window=1800.0):
+                logger.info(
+                    f"[autonomous_social][{bid}] 群 {gid} 破冰验收不过，未发送：{ice_why}｜"
+                    f"原文：{str(bad_text)[:120]!r}"
+                    + throttle.summary(f"icebreak.rejected.{bid}")
+                )
             return False
         ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
@@ -1833,6 +2010,13 @@ class SocialEngine:
         tier = anchors.relation_tier(
             u, affection=aff, base_affection=base, first_met=first_met, now=now
         )
+        # 手动覆盖：主人明确指定的档位优先于按涨幅/互动的推算。
+        try:
+            override = self.cfg.tier_override_for(uid)
+        except Exception:
+            override = ""
+        if override:
+            tier = override
         warmth = (aff - base) if (aff is not None and base is not None) else None
         return tier, aff, warmth
 
@@ -2694,6 +2878,37 @@ class SocialEngine:
     ) -> Tuple[bool, str]:
         """把念头变成一条消息。返回 (是否发出, 说明文本)。
 
+        只做一件事：把「正在输入」的收尾包住——开始生成时点亮，不管是从哪条路
+        退出（发出、模型否决、验收拦下、发送失败、抛异常）都停掉。
+        真正的逻辑在 `_speak_inner`。
+        """
+        umo = str(u.get("umo", "") or "")
+        try:
+            return await self._speak_inner(
+                bid, uid, u, urge, now,
+                allow_veto=allow_veto, preset=preset, require_about_peer=require_about_peer,
+            )
+        finally:
+            if umo:
+                try:
+                    await self.input_state.stop(umo)
+                except Exception as exc:  # pragma: no cover - 纯装饰
+                    logger.debug(f"[autonomous_social] 停输入状态失败: {exc}")
+
+    async def _speak_inner(
+        self,
+        bid: str,
+        uid: str,
+        u: Dict[str, Any],
+        urge: float,
+        now: float,
+        *,
+        allow_veto: bool = True,
+        preset: Optional[Tuple[str, Dict[str, Any]]] = None,
+        require_about_peer: bool = False,
+    ) -> Tuple[bool, str]:
+        """（实现）把念头变成一条消息。返回 (是否发出, 说明文本)。
+
         allow_veto=True 时模型可以回答「现在不该说」，这是自动循环的默认；手动触发
         传 False —— 主人明确要看效果，就别再替他否决了。
 
@@ -2892,6 +3107,12 @@ class SocialEngine:
             self._defer_cue_only(u, reason_meta)
 
         thread_anchor = self._last_said(u)
+        # 从现在起她开始写话了：报「正在输入」。放到这一行而不是函数开头——前面
+        # 全是本地的闸门与准备，没过闸门就返回的话不该点灯。
+        try:
+            await self.input_state.start(umo, uid)
+        except Exception as exc:  # pragma: no cover - 纯装饰
+            logger.debug(f"[autonomous_social] 启动输入状态失败: {exc}")
         parts: Optional[List[str]] = None
         veto_note = ""
         # 承诺只从 decide 的结构化输出里取（generate 路径没有那行 >），所以两条分支
@@ -3363,6 +3584,167 @@ class SocialEngine:
                 "急用可以先在面板里检查模型配置与 key。"
             )
         return True, ""
+
+    async def preview_once(self, bid: str, uid_filter: str = "") -> str:
+        """只生成、不发送：看一眼她此刻想对谁开口、打算说出一句什么。
+
+        全程不开「正在输入」、不消费由头、不记账、不动冷却——就是一次 dry run。
+        可选带一个人 ID「主动消息预览 12345」只看那个人。
+
+        `settle_minds` 会**就地**结算念头与冷落（写 urge/interest，settle_pending
+        还可能把「被冷落」提前定案），所以预览前把该角色的用户子树深拷一份，
+        不管从哪条路退出都原样还原。也不在这里 flush（本来就没有真改动要落盘）。
+        """
+        ok, why = await self._trigger_precheck(bid)
+        if not ok:
+            return why
+        now = self._time()
+        users = self.state.bot(bid).get("users", {})
+        if not users:
+            return "还没有可预览的用户（都没人私聊过 bot，且历史导入与播种名单都是空的）。"
+
+        # dry run：保存用户子树，结束后还原——预览不该改变任何人的念头/兴趣/冷落。
+        users_snapshot = copy.deepcopy(users)
+        try:
+            return await self._preview_run(bid, now, uid_filter)
+        finally:
+            self.state.bot(bid)["users"] = users_snapshot
+
+    async def _preview_run(self, bid: str, now: float, uid_filter: str) -> str:
+        """（预览实现，无副作用）拼上下文、调模型拿一句，不发送不改状态。"""
+        core_root = None
+        bot_state = None
+        try:
+            core_root = self.core.read_root()
+            if core_root:
+                bot_state = self.core.bot_self_state(bid, root=core_root)
+                self._remember_clock(bid, bot_state)
+                self._remember_night(bid, bot_state)
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 预览时读 Core 失败: {e}")
+
+        ranked = self.settle_minds(
+            bid, now, self._moment_of(bid, now), core_root, bot_state, min_urge=0.0
+        )
+        if not ranked:
+            return "没有可预览的用户（都没有会话来源，或都还在刚聊完的窗口里）。"
+        ordered = sorted(ranked, key=lambda x: x[2], reverse=True)
+        target = str(uid_filter or "").strip()
+        if target:
+            filtered = [row for row in ordered if str(row[0]) == target]
+            if not filtered:
+                return f"名单里没有 {target}，或 TA 还没有可用的会话来源。"
+            ordered = filtered
+
+        tried: List[str] = []
+        for uid, u, urge in ordered[:TRIGGER_CANDIDATE_LIMIT]:
+            if history_ingest.umo_kind(str(u.get("umo", "") or "")) == "group":
+                continue
+            # 与 trigger_once 同一道「正在热聊」过滤：刚聊过的人真实不会开口，
+            # 预览也不该拿它当样例。
+            seen_gap = now - float(u.get("last_seen", 0) or 0)
+            if seen_gap < HOT_CHAT_THRESHOLD:
+                tried.append(f"{uid}：刚聊过，现在不会开口")
+                continue
+            try:
+                text = await self._preview_one(bid, uid, u, urge, now, core_root)
+            except Exception as e:
+                tried.append(f"{uid} 出错：{e}")
+                continue
+            if text:
+                head = f"[预览] {uid}（念头 {urge:.2f}）——只生成、没有发送："
+                tail = f"\n\n（前面 {len(tried)} 位没生成出来，才轮到 TA）" if tried else ""
+                return head + "\n" + text + tail
+            tried.append(f"{uid}：这次没生成出内容")
+        return "候选都试过了，没生成出内容：" + "；".join(tried)
+
+    async def _preview_one(
+        self, bid: str, uid: str, u: Dict[str, Any], urge: float, now: float,
+        core_root: Optional[Dict],
+    ) -> str:
+        """（预览实现）拼出与真实发送同一份上下文与由头，只调模型拿文本，不发送。
+
+        u 传的是 settle_minds 返回的副本，但拼上下文要读最新那份，所以进锁后重新取。
+        """
+        async with self._user_lock(bid, uid):
+            u = self.state.user(bid, uid)
+            umo = str(u.get("umo", "") or "")
+            if not umo:
+                return ""
+            tier, aff, warmth = self._tier_of(bid, uid, u, core_root, now)
+            user_core = None
+            core_context = "没有可用的 Humanoid Core 状态。"
+            try:
+                if core_root:
+                    user_core = self.core.load_snapshot(bid, uid, root=core_root)
+                    if user_core:
+                        core_context = self.core.compact(user_core)
+            except Exception as e:
+                self.log(f"预览加载用户 {uid} Core 快照失败: {e}")
+            u_copy = dict(u)
+            affection = user_core.get("affection") if user_core else None
+            if affection is None:
+                try:
+                    msgs = int(u.get("message_count", 0) or 0)
+                except (TypeError, ValueError):
+                    msgs = 0
+                blended = (
+                    AFFECTION_INTEREST_WEIGHT * float(u.get("interest", 0.35) or 0.35)
+                    + AFFECTION_FAMILIAR_WEIGHT * desire.familiarity(msgs)
+                )
+                affection = round(blended * 100, 1)
+            u_copy["_affection"] = affection
+            u_copy["_tier"] = tier
+            u_copy["_tier_note"] = anchors.tier_note(tier, aff, warmth)
+            u_copy["_energy"] = user_core.get("energy") if user_core else None
+            u_copy["_social_energy"] = user_core.get("social_energy") if user_core else None
+            u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
+            if user_core:
+                u_copy["_nickname"] = str(user_core.get("nickname") or "")
+                u_copy["_said"] = list(user_core.get("said") or [])
+                u_copy["_mood_tag"] = str(user_core.get("mood_tag") or "")
+                u_copy["_attention"] = user_core.get("attention")
+            session_history = await self._load_session_history(umo)
+            u_copy["conversation"] = self._generation_conversation(u, session_history)
+            recent_pro = self.state.recent_proactive(bid, uid, now)
+            u_copy["_recent_proactive"] = [
+                str(e.get("text", "") or "").strip()
+                for e in recent_pro
+                if str(e.get("text", "") or "").strip()
+            ]
+            reason, reason_meta = generate_reason(
+                u_copy, now, self._moment_of(bid, now).hour
+            )
+            try:
+                _persona_name, persona_prompt = await self._persona(umo, bid)
+            except Exception as e:
+                self.log(f"预览解析人格失败: {e}")
+                persona_prompt = ""
+            mind = self._mind(bid, u, now, urge)
+            decision = None
+            if self.cfg.llm_gate:
+                try:
+                    decision = await self.generator.decide(
+                        umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
+                        at=now, clock_offset=self._clock_offset_for(bid),
+                    )
+                except Exception as e:
+                    self.log(f"预览判断该不该说时出错: {e}")
+                if decision is not None and not decision.send:
+                    return f"（她想了想，觉得现在不该开口：{decision.why_not}）"
+            if decision is not None and decision.parts:
+                return str(decision.parts[0])
+            try:
+                parts = await self.generator.generate(
+                    umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
+                    at=now, clock_offset=self._clock_offset_for(bid),
+                )
+            except Exception as e:
+                self.log(f"预览生成消息出错: {e}")
+                parts = None
+            if not parts:
+                return ""
+            return str(parts[0])
 
     async def trigger_once(self, bid: str) -> str:
         """手动触发一次主动联系：绕过念头是否攒满，直接挑最想说的人说一句。
@@ -4499,7 +4881,8 @@ class SocialEngine:
             f"- 记录 bot：{len(bots)}（{bot_list}）　候选用户：{users}\n"
             f"- 发送/回复：{reply_rate}　回复窗口：{self.cfg.reply_window_hours} 小时\n"
             f"- 连发：{'开' if self.cfg.allow_burst else '关'}（拆法跟 AstrBot 的分段回复设置）"
-            f"　括号动作/emoji：看她自己的说话习惯"
+            f"　括号动作/emoji：看她自己的说话习惯\n"
+            f"- 输入状态：{'开' if self.cfg.input_state_enabled else '关'}（仅 NapCat 私聊）"
         )
         sections.append("【各角色】\n" + self._per_bot_status_text())
         sections.append("【念头】\n" + self.urge_panel_text())

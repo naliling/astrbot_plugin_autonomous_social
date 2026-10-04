@@ -322,6 +322,31 @@
     "obvious_hint": true,
     "default": true
   },
+  "input_state_enabled": {
+    "type": "bool",
+    "description": "输入状态（正在输入）",
+    "hint": "她写主动消息的那几秒，QQ 会给对方显示她正在输入。仅 NapCat（aiocqhttp）私聊生效，其它平台自动跳过",
+    "obvious_hint": true,
+    "default": true
+  },
+  "input_state_interval_seconds": {
+    "type": "float",
+    "description": "输入状态上报间隔（秒）",
+    "hint": "每这么久向 QQ 报一次「正在输入」。QQ 的状态约 8~10 秒自己会消失，隔太久会闪",
+    "obvious_hint": true,
+    "default": 0.5,
+    "min": 0.1,
+    "max": 10.0
+  },
+  "input_state_timeout_seconds": {
+    "type": "float",
+    "description": "输入状态超时（秒）",
+    "hint": "万一生成或发送卡住，最多显示这么久就自己停，免得「正在输入」一直闪",
+    "obvious_hint": true,
+    "default": 120.0,
+    "min": 10.0,
+    "max": 600.0
+  },
   "greeting_enabled": {
     "type": "bool",
     "description": "早晚问候",
@@ -576,10 +601,24 @@
     "obvious_hint": true,
     "default": true
   },
+  "trigger_group_requires_at": {
+    "type": "bool",
+    "description": "群内触发须@本bot",
+    "hint": "多台 bot 同在一个群时：开启后，「触发社交」只在消息 @ 了本 bot 时才执行，哪台被 @ 就只触发哪台；关掉则群内发指令每台都会各自触发（多 bot 同群会串台，单台部署才建议关）。",
+    "obvious_hint": true,
+    "default": true
+  },
   "allowed_trigger_uids": {
     "type": "list",
     "description": "指令白名单",
     "hint": "除主人外允许谁使用指令（填user_id）。",
+    "obvious_hint": true,
+    "default": null
+  },
+  "tier_override": {
+    "type": "list",
+    "description": "关系档手动覆盖",
+    "hint": "强制指定某人的关系档：逐条填 uid:high、uid:mid 或 uid:low。写了的人不再按好感涨幅推算，最小间隔/由头池/念想门槛都按指定档走。",
     "obvious_hint": true,
     "default": null
   },
