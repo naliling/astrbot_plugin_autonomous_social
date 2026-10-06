@@ -273,7 +273,6 @@ class CoreBridge:
             "energy": selfs.get("energy"),
             "social_energy": selfs.get("social_energy"),
             "cycle": selfs.get("current_cycle_day"),
-            "process": selfs.get("current_process"),
             "schedule": selfs.get("daily_schedule"),
             "weather": selfs.get("_cached_weather_obj"),
             "contract_v": None,
@@ -334,7 +333,6 @@ class CoreBridge:
             proc["phase"] = view["activity"]["phase"]
             view["process"] = proc
         return view
-
     def load_snapshot(
         self,
         bot_id: str,
@@ -473,15 +471,13 @@ class CoreBridge:
         if cycle is not None and cycle != "":
             parts.append(f"生理周期: 第{cycle}天")
 
-        proc = s.get("process")
-        if isinstance(proc, dict) and proc:
-            name = proc.get("name", "")
-            phase = proc.get("phase", "")
-            if name:
-                desc = f"当前过程: {name}"
-                if phase:
-                    desc += f"（{phase}）"
-                parts.append(desc)
+        act = s.get("activity")
+        if isinstance(act, dict) and act.get("name"):
+            loc = str(act.get("location") or "").strip()
+            desc = f"此刻在: {act['name']}"
+            if loc:
+                desc += f"（{loc}）"
+            parts.append(desc)
 
         sched = s.get("schedule")
         if isinstance(sched, list) and sched:

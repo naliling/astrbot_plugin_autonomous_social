@@ -62,6 +62,7 @@ from social import (  # noqa: E402
     desire,
     anchors,
     history_ingest,
+    memory_bridge,
     sanitize,
     verify as verify_module,
     generator,
@@ -752,6 +753,42 @@ class TestIntimateDetection(unittest.TestCase):
             self.assertTrue(generator._looks_intimate(text), f"{text!r} 漏判了")
 
 
+class TestIntimacyChannelGate(unittest.TestCase):
+    """「想要了」通道：必须真的做过色色（ccb_done_count>0）且此刻欲望涨上来。
+
+    原来只对白名单里的人开放、且「有过亲密史 或 欲望涨上来」二者其一即可——
+    于是只要有过一次就会一直问。现在填 ID 不够、好感高也不够、有亲密史也不免检。
+    """
+
+    def _engine(self, done, libido, base_libido, affection=80.0):
+        return _IntimacyEngine({
+            ("bot1", "u1"): {
+                "affection": affection,
+                "mood": {"libido": libido, "base_libido": base_libido},
+                "ccb_done_count": done,
+            }
+        })
+
+    def _pick(self, engine):
+        return [uid for uid, _u in engine._intimacy_pick("bot1", engine._time(), {}, {"stub": True})]
+
+    def test_requires_actual_history(self):
+        e = self._engine(done=0, libido=45.0, base_libido=34.0)
+        self.assertEqual(self._pick(e), [], "没真做过色色，欲望再高也不该问")
+
+    def test_requires_current_desire(self):
+        e = self._engine(done=3, libido=34.0, base_libido=34.0)
+        self.assertEqual(self._pick(e), [], "有过亲密史也不免检，欲望没涨就不该问")
+
+    def test_picks_when_both_met(self):
+        e = self._engine(done=1, libido=45.0, base_libido=34.0)
+        self.assertEqual(self._pick(e), ["u1"])
+
+    def test_affection_gate_still_applies(self):
+        e = self._engine(done=1, libido=45.0, base_libido=34.0, affection=10.0)
+        self.assertEqual(self._pick(e), [])
+
+
 class TestModeNote(unittest.TestCase):
     """mode_note 在字段缺失时会渲染出「你自己上一句说的是：「」。」这种空引号。"""
 
@@ -928,6 +965,46 @@ class _TriggerGen:
 class _NullCore:
     def read_root(self):
         return None
+
+
+class _SnapCore:
+    def __init__(self, snapshots):
+        self._snapshots = snapshots
+
+    def load_snapshot(self, bid, uid, root=None):
+        return self._snapshots.get((bid, uid))
+
+
+class _IntimacyEngine:
+    """只保留 _intimacy_pick 用到的那几个依赖。"""
+
+    _intimacy_pick = SocialEngine._intimacy_pick
+
+    def __init__(self, snapshots):
+        import tempfile as _tf
+
+        self.cfg = SocialConfig.from_astrbot({})
+        self._tf_dir = _tf.mkdtemp()
+        self.state = SocialState(os.path.join(self._tf_dir, "state.json"))
+        self.core = _SnapCore(snapshots)
+        self.state.user("bot1", "u1")["umo"] = "aiocqhttp:FriendMessage:u1"
+
+    def _time(self):
+        return 1_700_000_000.0
+
+    def _moment_of(self, bid, now):
+        import datetime
+
+        return datetime.datetime(2023, 11, 15, 14, 0)
+
+    def _quiet_now(self, bid, hour):
+        return False
+
+    def gate_reason(self, bid, uid, u, now, body):
+        return ""
+
+    def log(self, _msg):
+        pass
 
 
 # ─── 日志节流：持续故障不能把日志刷爆 ──────────────────────────────
@@ -3247,6 +3324,8 @@ class _PreviewEngine:
     _generation_conversation = SocialEngine._generation_conversation
     _load_session_history = SocialEngine._load_session_history
     _mind = SocialEngine._mind
+    _memory_bridge = SocialEngine._memory_bridge
+    _fetch_memory_note = SocialEngine._fetch_memory_note
     _tier_of = SocialEngine._tier_of
     preview_once = SocialEngine.preview_once
     _preview_run = SocialEngine._preview_run
@@ -3575,14 +3654,6 @@ class TestGroupOpenerPrompts(unittest.TestCase):
         p, _ = self._gen()._compose_group("topic", {}, "人设", 40)
         self.assertIn("想开个新话头", p)
 
-    def test_welcome_names_the_new_member_when_known(self):
-        p, _ = self._gen()._compose_group("welcome", {"new_member": "小明"}, "人设", 40)
-        self.assertIn("小明", p)
-
-    def test_welcome_without_name_does_not_invent_one(self):
-        p, _ = self._gen()._compose_group("welcome", {}, "人设", 40)
-        self.assertIn("别编", p)
-
     def test_group_boundary_forbids_starting_intimate_topics(self):
         p, _ = self._gen()._compose_group(
             "flow", {"latest": {"name": "甲", "text": "在吗"}}, "人设", 40)
@@ -3598,6 +3669,73 @@ class TestGroupOpenerPrompts(unittest.TestCase):
         p, _ = self._gen(group_mention_member=False)._compose_group(
             "flow", {"members": ["小明"]}, "人设", 40)
         self.assertNotIn("小明", p)
+
+
+class TestMemoryBridge(unittest.TestCase):
+    """主动消息接 memory_companion：查宿主注册表、读写、没装降级。"""
+
+    def _meta(self, name, bridge=None, activated=True):
+        module = types.SimpleNamespace(
+            get_memory_companion_bridge=(lambda: bridge) if bridge is not None else None
+        )
+        return types.SimpleNamespace(
+            name=name, display_name=name, root_dir_name=name, module_path="",
+            activated=activated, module=module,
+        )
+
+    def _ctx(self, stars):
+        return types.SimpleNamespace(get_all_stars=lambda: list(stars))
+
+    def test_finds_bridge_via_registry(self):
+        bridge = object()
+        ctx = self._ctx([self._meta("astrbot_plugin_memory_companion", bridge)])
+        self.assertIs(memory_bridge.find_memory_bridge(ctx), bridge)
+
+    def test_none_when_no_registry_api(self):
+        self.assertIsNone(memory_bridge.find_memory_bridge(types.SimpleNamespace()))
+        self.assertIsNone(memory_bridge.find_memory_bridge(None))
+
+    def test_none_when_not_installed(self):
+        ctx = self._ctx([self._meta("astrbot_plugin_other", object())])
+        self.assertIsNone(memory_bridge.find_memory_bridge(ctx))
+
+    def test_none_when_inactive(self):
+        ctx = self._ctx([self._meta("astrbot_plugin_memory_companion", object(), activated=False)])
+        self.assertIsNone(memory_bridge.find_memory_bridge(ctx))
+
+    def test_fetch_returns_text(self):
+        class _B:
+            async def compose_context(self, **kw):
+                return "她记得 TA 上周提过猫吐了"
+
+        text = _run(memory_bridge.fetch_memory_text(_B(), "umo", "u1"))
+        self.assertIn("猫吐了", text)
+
+    def test_fetch_degrades_on_error(self):
+        class _B:
+            async def compose_context(self, **kw):
+                raise RuntimeError("boom")
+
+        self.assertEqual(_run(memory_bridge.fetch_memory_text(_B(), "umo", "u1")), "")
+
+    def test_write_passes_user_id_and_content(self):
+        seen = {}
+
+        class _B:
+            async def record_external_memory(self, **kw):
+                seen.update(kw)
+
+        _run(memory_bridge.write_proactive(_B(), "u1", "在吗", umo="umo", ts=123.0))
+        self.assertEqual(seen.get("user_id"), "u1")
+        self.assertIn("在吗", seen.get("content", ""))
+        self.assertEqual(seen.get("source_plugin"), "astrbot_plugin_autonomous_social")
+
+    def test_engine_switch_off_returns_none(self):
+        class _E:
+            cfg = SocialConfig.from_astrbot({"memory_bridge_enabled": False})
+            context = None
+
+        self.assertIsNone(SocialEngine._memory_bridge(_E()))
 
 
 if __name__ == "__main__":

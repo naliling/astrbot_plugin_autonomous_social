@@ -28,6 +28,7 @@ except ImportError:
 
 from . import __version__, anchors, anchors as anchor_mod, desire
 from . import history_ingest
+from . import memory_bridge
 from . import pacing
 from .clock import city_now
 from .config import SocialConfig
@@ -496,6 +497,49 @@ class SocialEngine:
         if self.cfg.debug:
             logger.info(f"[autonomous_social] {message}")
 
+    # ─── 记忆联动（astrbot_plugin_memory_companion） ───────
+
+    def _memory_bridge(self):
+        """拿 memory_companion 的桥接对象；开关关掉 / 没装都返回 None。
+
+        懒解析一次：插件加载顺序不保证，构造时对面可能还没就绪。
+        """
+        if not getattr(self.cfg, "memory_bridge_enabled", True):
+            return None
+        if not getattr(self, "_memory_bridge_resolved", False):
+            self._memory_bridge_resolved = True
+            try:
+                self._memory_bridge_obj = memory_bridge.find_memory_bridge(
+                    getattr(self, "context", None)
+                )
+            except Exception:
+                self._memory_bridge_obj = None
+        return getattr(self, "_memory_bridge_obj", None)
+
+    async def _fetch_memory_note(self, umo: str, uid: str) -> str:
+        """生成前拉这个人的长期记忆（拿不到返回空串，不影响发送）。"""
+        bridge = self._memory_bridge()
+        if bridge is None:
+            return ""
+        try:
+            return await memory_bridge.fetch_memory_text(bridge, umo, uid)
+        except Exception:
+            return ""
+
+    def _remember_proactive(self, umo: str, uid: str, text: str, ts: float) -> None:
+        """发出后把这条主动消息写回记忆库（后台任务，失败不影响主链路）。"""
+        bridge = self._memory_bridge()
+        if bridge is None:
+            return
+        try:
+            task = asyncio.create_task(
+                memory_bridge.write_proactive(bridge, uid, text, umo=umo, ts=ts)
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except Exception:
+            pass
+
     # ─── 消息观察 ───────────────────────────────────────
 
     async def observe(self, event: Any) -> None:
@@ -507,7 +551,7 @@ class SocialEngine:
         if not self.cfg.enabled:
             return
 
-        # K2：入群/退群这类 notice 不是聊天消息，不进观察账本（入群另走 welcome_member）。
+        # 入群/退群这类 notice 不是聊天消息，不进观察账本。
         raw_obj = getattr(getattr(event, "message_obj", None), "raw_message", None)
         if isinstance(raw_obj, dict) and str(raw_obj.get("notice_type") or ""):
             return
@@ -1436,107 +1480,6 @@ class SocialEngine:
             ):
                 out.append((gid, g))
         return out
-
-    async def welcome_member(self, event: Any) -> None:
-        """K2：新人入群，她顺口欢迎一句。
-
-        入群靠 OneBot 的 `group_increase` 通知（框架没有独立的成员增加事件，从
-        raw_message 里读）。只欢迎「别人」进群，不欢迎 bot 自己；同一个新人只欢迎一次。
-        """
-        if not self.cfg.enabled or not self.cfg.group_welcome_enabled:
-            return
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if not isinstance(raw, dict) or str(raw.get("notice_type") or "") != "group_increase":
-            return
-        bid = self._get_bot_id(event)
-        gid = self._get_group_id(event)
-        if not bid or not gid:
-            return
-        try:
-            self_id = str(event.get_self_id() or "").strip()
-        except Exception:
-            self_id = ""
-        new_uid = str(raw.get("user_id") or "").strip()
-        if not new_uid or new_uid == self_id:
-            return  # 是 bot 自己进群，不是新人
-        if self.send_breaker_left(bid) > 0:
-            return
-        now = self._time()
-        g = self.state.group(bid, gid)
-        umo = str(g.get("umo", "") or "")
-        if not umo:
-            try:
-                umo = str(getattr(event, "unified_msg_origin", "") or "")
-            except Exception:
-                umo = ""
-        if not umo:
-            return
-        welcomed = g.setdefault("welcomed", [])
-        if new_uid in welcomed:
-            return
-        # 新人名字：拿得到就用，拿不到就不提名字（比叫错名字好）。
-        name = ""
-        try:
-            name = str(event.get_sender_name() or "").strip()
-        except Exception:
-            name = ""
-        group_ctx = self._build_group_ctx(bid, gid, g)
-        group_ctx["now"] = now
-        group_ctx["clock_offset"] = self._clock_offset_for(bid)
-        group_ctx["new_member"] = name
-        try:
-            _pn, persona_prompt = await self._persona(umo, bid)
-        except Exception:
-            persona_prompt = ""
-        try:
-            parts = await self.generator.group_message(
-                umo, "welcome", group_ctx, persona_prompt,
-                at=now, clock_offset=self._clock_offset_for(bid),
-            )
-        except Exception as e:
-            self.log(f"群 {gid} 欢迎新人生成失败: {e}")
-            return
-        if not parts:
-            return
-        segments, waits = pacing.plan_segments(
-            parts, umo, self.context,
-            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
-        )
-        if not segments:
-            return
-        try:
-            bad_text, why = self._verify_all_segments(
-                segments,
-                recent=[str(t).strip() for t in (group_ctx.get("own_recent") or []) if str(t).strip()],
-                called=str(self._last_persona.get(bid, "") or ""),
-                allow_short=True,
-            )
-        except Exception:
-            bad_text, why = "", ""
-        if bad_text:
-            self.log(f"群 {gid} 欢迎新人验收不过（{why}），不发")
-            return
-        ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
-        if not ok_send:
-            if peer_unreachable:
-                self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
-            else:
-                self.log(f"群 {gid} 欢迎新人发送失败：{err}")
-            return
-        sent_ts = self._time()
-        welcomed.append(new_uid)
-        if len(welcomed) > 50:
-            del welcomed[: len(welcomed) - 50]
-        self.state.open_flow(bid, gid, sent_ts, self.cfg.flow_window_minutes * 60.0)
-        self.state.record_group_self_text(
-            bid, gid, segments[0], sent_ts,
-            sample_cap=self.cfg.group_ref_sample_size,
-            store_text=self.cfg.group_store_message_text,
-        )
-        self.state.save()
-        self.log(f"群 {gid} 欢迎新人→ {segments[0]}")
-        if len(segments) > 1:
-            self._schedule_group_burst(bid, gid, umo, segments[1:], waits, sent_ts)
 
     async def _icebreak(self, bid: str, gid: str, g: Dict[str, Any], now: float,
                         *, mode: str = "icebreak") -> bool:
@@ -2857,7 +2800,7 @@ class SocialEngine:
         promises: List[Tuple[str, str, Dict[str, Any], str]] = []
         # 念想：没有正事，就是想 TA 说一句。这一类绕过「刚聊过」阻断（见 _miss_pick）
         misses: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
-        # 「想要了」：只对白名单里、好感够、又想要的人主动问一句（见 _intimacy_pick）
+        # 「想要了」：只对真的做过色色、且此刻欲望涨上来的人主动问一句（见 _intimacy_pick）
         intimacies: List[Tuple[str, str, Dict[str, Any]]] = []
         # 按角色存住身体快照：后面要用它过闸门，拿循环残留的变量会把 A 的身体套到 B 头上
         bodies: Dict[str, Dict[str, Any]] = {}
@@ -3153,7 +3096,7 @@ class SocialEngine:
                 st_u["miss_day"] = self._miss_mark_today(st_u, self._moment_of(bid, self._time()).strftime("%Y-%m-%d"))
                 self.state.mark_dirty()
 
-        # 「想要了」：只对白名单里、好感够、又想要的人主动问一句（可不可以）。
+        # 「想要了」：只对真的做过色色、且此刻欲望涨上来的人主动问一句（可不可以）。
         for bid, uid, u in intimacies:
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 continue
@@ -3450,11 +3393,13 @@ class SocialEngine:
         # 承诺只从 decide 的结构化输出里取（generate 路径没有那行 >），所以两条分支
         # 都得有这个变量——原来只在 llm_gate 分支里定义，关掉闸门时下面读它会 NameError。
         decision = None
+        # 记忆联动：装了记忆插件就先把这个人的长期记忆拉出来，揉进这次生成。
+        memory_note = await self._fetch_memory_note(umo, uid)
         if allow_veto and self.cfg.llm_gate:
             try:
                 decision = await self.generator.decide(
                     umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                    at=now, clock_offset=self._clock_offset_for(bid),
+                    at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
                 )
             except Exception as e:
                 if throttle.allow(f"speak.decide.{bid}"):
@@ -3498,7 +3443,7 @@ class SocialEngine:
             try:
                 parts = await self.generator.generate(
                     umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                    at=now, clock_offset=self._clock_offset_for(bid),
+                    at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
                 )
             except Exception as e:
                 if throttle.allow(f"speak.generate.{bid}"):
@@ -3713,6 +3658,8 @@ class SocialEngine:
             expect_reply=category not in ("greet", "closer"),
             why=self._why_now(bid, u, category, reason, reason_meta, sent_ts),
         )
+        # 记忆联动：把这条主动消息写回记忆库（后台任务，失败不影响主链路）。
+        self._remember_proactive(umo, uid, segments[0], sent_ts)
         # 发成功了，之前那次失败就不再约束他
         u["send_fail_count"] = 0
         u["send_fail_until"] = 0.0
@@ -4070,17 +4017,6 @@ class SocialEngine:
         )
         return f"闸门都过了，只是念头还没攒够（现在 {urge:.2f}，要到 {desire.FIRE_THRESHOLD:.2f} 左右）"
 
-    def _intimacy_uids(self) -> set:
-        """「想要了」通道的白名单（归一化成 str 集合）。留空=通道不启用。"""
-        raw = getattr(self.cfg, "intimacy_uids", None)
-        if isinstance(raw, (list, tuple, set)):
-            items = raw
-        elif isinstance(raw, str):
-            items = raw.replace("，", ",").split(",")
-        else:
-            items = []
-        return {str(x).strip() for x in items if str(x or "").strip()}
-
     def _intimacy_pick(
         self,
         bid: str,
@@ -4088,16 +4024,13 @@ class SocialEngine:
         body: Optional[Dict[str, Any]],
         core_root: Optional[Dict[str, Any]],
     ) -> List[Tuple[str, Dict[str, Any]]]:
-        """「想要了」通道：只对**白名单里**的人，好感够高、又（有过亲密史 或 欲望涨上来）
-        时，主动问一句可不可以。白名单是防乱找人——好感高的人可多着呢。
+        """「想要了」通道：只对**真的做过色色**、且此刻**欲望涨上来**的人，主动问一句可不可以。
+
+        「做过色色」是硬门槛（ccb_done_count>0）——填 ID 不够，好感高也不够；
+        「欲望涨上来」是当下状态——有过亲密史也不免检，否则一旦有过就变成一直触发。
         """
-        allow = self._intimacy_uids()
-        if not allow:
-            return []
         out: List[Tuple[str, Dict[str, Any]]] = []
         for uid, u in self.state.bot(bid).get("users", {}).items():
-            if str(uid) not in allow:
-                continue
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
             if body and body.get("asleep"):
@@ -4137,8 +4070,10 @@ class SocialEngine:
                 done = float(snap.get("ccb_done_count") or 0.0)
             except (TypeError, ValueError):
                 done = 0.0
+            if done <= 0:
+                continue
             rise = float(getattr(self.cfg, "intimacy_libido_rise", 6.0) or 6.0)
-            if (lib - base_lib) < rise and done <= 0:
+            if (lib - base_lib) < rise:
                 continue
             try:
                 last = float(u.get("intimacy_asked_at", 0.0) or 0.0)
@@ -4213,12 +4148,13 @@ class SocialEngine:
                 self.log(f"预览解析人格失败: {e}")
                 persona_prompt = ""
             mind = self._mind(bid, u, now, urge)
+            memory_note = await self._fetch_memory_note(umo, uid)
             decision = None
             if self.cfg.llm_gate:
                 try:
                     decision = await self.generator.decide(
                         umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                        at=now, clock_offset=self._clock_offset_for(bid),
+                        at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
                     )
                 except Exception as e:
                     self.log(f"预览判断该不该说时出错: {e}")
@@ -4229,7 +4165,7 @@ class SocialEngine:
             try:
                 parts = await self.generator.generate(
                     umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                    at=now, clock_offset=self._clock_offset_for(bid),
+                    at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
                 )
             except Exception as e:
                 self.log(f"预览生成消息出错: {e}")

@@ -405,9 +405,12 @@ class SocialConfig:
     # 回复检测窗口
     reply_window_hours: int = REPLY_WINDOW_DEFAULT
 
-    # 「想要了」通道（v1.27.13）：只对**白名单里**的人主动问一句可不可以。
-    # 白名单是防乱找人——好感高的人可多着呢，不能谁好感高就去问谁。
-    intimacy_uids: Any = None
+    # 记忆联动：装了 astrbot_plugin_memory_companion 时，主动消息生成前拉这个人的
+    # 长期记忆揉进提示词，发出后把这条写回记忆库。没装就自动跳过（照常发，只是没记忆）。
+    memory_bridge_enabled: bool = True
+
+    # 「想要了」通道（v1.27.13）：只对**真的做过色色**、且此刻欲望涨上来的人主动问一句。
+    # 做过色色是硬门槛（填 ID 不够、好感高也不够）；欲望涨上来是当下状态（有过亲密史也不免检）。
     intimacy_affection_min: int = 70
     intimacy_libido_rise: float = 6.0
     intimacy_cooldown_hours: int = 48
@@ -480,9 +483,6 @@ class SocialConfig:
     group_topic_daily_cap: int = GROUP_TOPIC_DAILY_CAP_DEFAULT
     # G3：群内接话/起话头时，允许自然地点某个群友的名字。
     group_mention_member: bool = True
-    # K2：新人入群时，她顺口欢迎一句（靠 OneBot 的 group_increase 通知；
-    # 有些实现不上报，那种情况下这条自然不会触发）。
-    group_welcome_enabled: bool = True
     group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
@@ -709,7 +709,7 @@ class SocialConfig:
                 REPLY_WINDOW_MIN,
                 min(REPLY_WINDOW_MAX, int(g("reply_window_hours", _d("reply_window_hours",  REPLY_WINDOW_DEFAULT)))),
             ),
-            intimacy_uids=g("intimacy_uids", _d("intimacy_uids",  None)),
+            memory_bridge_enabled=bool(g("memory_bridge_enabled", _d("memory_bridge_enabled", True))),
             intimacy_affection_min=max(
                 0, min(100, int(g("intimacy_affection_min", _d("intimacy_affection_min",  70)))),
             ),
@@ -794,7 +794,6 @@ class SocialConfig:
                 min(GROUP_TOPIC_DAILY_CAP_MAX, int(g("group_topic_daily_cap", _d("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)))),
             ),
             group_mention_member=bool(g("group_mention_member", _d("group_mention_member", True))),
-            group_welcome_enabled=bool(g("group_welcome_enabled", _d("group_welcome_enabled", True))),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", _d("group_stale_days",  GROUP_STALE_DAYS_DEFAULT))))
             ),

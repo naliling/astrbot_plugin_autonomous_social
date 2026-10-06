@@ -140,9 +140,11 @@ def compose_tone(
 _SENTENCE_RULES: List[str] = [
     "别以「在吗」「最近怎么样」「好久不见」这种不带任何自身信息的话开头——说了等于没说",
     "别问「在干嘛」「在忙吗」「吃了吗」这类只要对方回一个「嗯」的问题",
-    # 括号是动作/内心，不是发言。模型常在结尾再补一句纯括号的内心，拆段后就变成
-    # 一条「内心独白」单独发出去（v1.27.10 修）。这里从生成侧也堵一道。
-    "只写**真正要说出口的话**：括号里只能放动作/内心，而且**不能整条都是括号**——发出去的必须有一句给人看的话",
+    # 发出去的那条得有一句给人看的话。模型常在结尾再补一句纯动作/内心的描写，
+    # 拆段后就变成一条单独发出去（v1.27.10 修）。这里从生成侧也堵一道。
+    # **不教格式**：原来写「括号里只能放动作/内心」，那等于给模型示范排版，
+    # 它会照着每条都写「（动作）台词」。只说不许整条都是描写，不说往哪放。
+    "只写**真正要说出口的话**——发出去的那条得有一句给人看的话，不能整条都是动作描写或内心独白",
 ]
 # 原来这里是四条：后两条（「别解释为什么现在发」「一句话里没她自己就重写」）与
 # 下面「几件事」里的条目重复，合并后去重。约束少两条，人设的戏份就多两分。
@@ -882,6 +884,7 @@ class MessageGenerator:
         mind: Optional[Dict[str, Any]] = None,
         at: Optional[float] = None,
         clock_offset: Optional[int] = None,
+        memory_note: str = "",
     ) -> Optional[List[str]]:
         """直接写一条要发的消息（手动触发用，不经过模型否决）。
 
@@ -890,7 +893,7 @@ class MessageGenerator:
         """
         prepared = await self._compose(
             umo, target, core_context, reason, reason_meta, persona_prompt, mind,
-            decide=False, at=at, clock_offset=clock_offset,
+            decide=False, at=at, clock_offset=clock_offset, memory_note=memory_note,
         )
         if prepared is None:
             return None
@@ -915,6 +918,7 @@ class MessageGenerator:
         mind: Optional[Dict[str, Any]] = None,
         at: Optional[float] = None,
         clock_offset: Optional[int] = None,
+        memory_note: str = "",
     ) -> Optional[Decision]:
         """让模型自己判断现在要不要说这句，要就说是什么。
 
@@ -927,7 +931,7 @@ class MessageGenerator:
         """
         prepared = await self._compose(
             umo, target, core_context, reason, reason_meta, persona_prompt, mind,
-            decide=True, at=at, clock_offset=clock_offset,
+            decide=True, at=at, clock_offset=clock_offset, memory_note=memory_note,
         )
         if prepared is None:
             return None
@@ -1033,27 +1037,6 @@ class MessageGenerator:
 
         shape: List[str] = []
         shape.append(emoji_note)
-
-        if mode == "welcome":
-            name = str(group_ctx.get("new_member", "") or "").strip()
-            body = ["群里刚来了一个新成员。"]
-            if name:
-                body.append(f"新来的这位叫「{name}」。")
-            body.append("你想顺口欢迎一句，像群里熟人那样，不用太热情。")
-            body.append("要求：")
-            body.append("- 短、口语，一句就够；别像客服或群公告；")
-            if name:
-                body.append(
-                    f"- 可以带上名字「{name}」，但别生硬地念、也别像点名报到；"
-                )
-            else:
-                body.append("- 不知道名字就别编一个，直接欢迎就行；")
-            body.append("- 别问一堆问题，也别让人有压力必须回。")
-            if shape:
-                body.append("- " + " ".join(shape))
-            body.append(f"长度不超过 {max_len} 字。直接写你要发到群里的那句话，不要写别的。")
-            blocks.append("\n".join(body))
-            return "\n\n".join(b for b in blocks if b), allow_emoji
 
         if mode in ("icebreak", "topic"):
             reason = str(group_ctx.get("reason", "") or "").strip()
@@ -1168,9 +1151,10 @@ class MessageGenerator:
             # F9（v1.27.8）：两步判断，都过了才接。
             "两步判断（都过了才接）：① 这个话题你插进去自不自然，接不上、或大家在对着某个具体的人说事，就别接；"
             "② 群里最新这几句里有没有人在跟你（这个 bot）说话，有人点名找你那是主链路要回的，别抢着接。判不准就答 NO。",
-            # 括号是「动作/内心」，不是发言；而且不许把刚说过的那句换个说法再说一遍。
-            "输出要求：只写**真正要说出口的话**。括号里只能放动作/内心，而且**不能整条都是括号**——"
-            "发出去的必须有一句给人看的话。也别把你刚说过的那句换个说法再说一遍。",
+            # 发出去的必须有一句给人看的话；也不许把刚说过的那句换个说法再说一遍。
+            # **不教格式**（同 _SENTENCE_RULES）：只说不许整条都是描写。
+            "输出要求：只写**真正要说出口的话**——发出去的必须有一句给人看的话，不能整条都是动作描写或内心独白。"
+            "也别把你刚说过的那句换个说法再说一遍。",
         ]
         if shape:
             instr.append("- " + " ".join(shape))
@@ -1204,6 +1188,7 @@ class MessageGenerator:
         decide: bool,
         at: Optional[float] = None,
         clock_offset: Optional[int] = None,
+        memory_note: str = "",
     ) -> Optional[tuple]:
         """拼出 prompt，返回 (provider, prompt, max_len, emoji)；provider 拿不到返回 None。"""
         provider = await self._get_provider(umo)
@@ -1400,6 +1385,11 @@ class MessageGenerator:
 
         # 你的背景状态（Core 数据；仅背景，别念数值，但可自然带一句近况制造生活感）
         core_block = f"【你的背景状态·仅背景，别在消息里念这些数值】\n{core_context}"
+        memory_block = (
+            "【你记得的关于 TA 的事·长期记忆，可以自然带一句，别当成清单念】\n"
+            f"{memory_note}"
+            if memory_note else ""
+        )
 
         mind_block = self._format_mind(mind)
 
@@ -1599,6 +1589,8 @@ class MessageGenerator:
                         "上面这些是她现在真的知道的事，**从里面挑一件说**；"
                         "别编素材里没有的经历，也别把「饿了、困了」当成唯一可说的事。",
                     ])
+                    if memory_block:
+                        parts.extend(["", memory_block])
 
             # 问候类的 mode_note 自带「现在几点、想做什么」的开头，再单独写一遍
             # msg_type_desc 就是同一句话说两遍，后面 style_hint 与 mode_note 的第二条

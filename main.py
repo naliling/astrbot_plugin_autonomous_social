@@ -104,57 +104,6 @@ try:
 except ImportError:
     get_astrbot_data_path = None
 
-# K2：新人入群欢迎靠精确匹配 notice（group_increase），用 custom_filter——拿不到
-# 这套 API 的旧版框架上就退化成不注册，不影响其它功能。
-try:
-    from astrbot.api.event.filter import CustomFilter, custom_filter  # type: ignore
-except Exception:
-    try:
-        from astrbot.api.event import filter as _filter_mod_join  # type: ignore
-        CustomFilter = getattr(_filter_mod_join, "CustomFilter", None)
-        custom_filter = getattr(_filter_mod_join, "custom_filter", None)
-    except Exception:
-        CustomFilter = None
-        custom_filter = None
-
-
-def _noop_decorator(func=None, **_kw):
-    if func is not None:
-        return func
-
-    def _dec(f):
-        return f
-
-    return _dec
-
-
-if CustomFilter is not None and custom_filter is not None:
-
-    class _GroupMemberJoinFilter(CustomFilter):
-        """只认「群里有新成员加入」的通知（不是 bot 自己进群）。
-
-        框架没有独立的成员增加事件，OneBot 适配器把 notice 原样转进来，判据得自己
-        从 raw_message 里读。用 custom_filter 精确匹配，平时不占 activated_handlers。
-        """
-
-        def filter(self, event, cfg) -> bool:
-            try:
-                raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-                if not isinstance(raw, dict):
-                    return False
-                if str(raw.get("notice_type") or "") != "group_increase":
-                    return False
-                getter = getattr(event, "get_self_id", None)
-                self_id = str(getter() or "").strip() if callable(getter) else ""
-                uid = str(raw.get("user_id") or "").strip()
-                return bool(uid) and uid != self_id
-            except Exception:
-                return False
-
-    _member_join_decorator = custom_filter(_GroupMemberJoinFilter)
-else:
-    _member_join_decorator = _noop_decorator
-
 from .social import __version__
 from .social.config import migrate_legacy_defaults
 from .social.engine import SocialEngine
@@ -280,16 +229,6 @@ class AutonomousSocial(Star):
             await self._engine.observe(event)
         except Exception as exc:
             logger.warning(f"[autonomous_social] 观察消息失败: {exc}")
-
-    @_member_join_decorator
-    async def on_group_member_join(self, event: AstrMessageEvent):
-        """K2：新人入群，让引擎决定要不要欢迎一句。"""
-        if self._engine is None:
-            return
-        try:
-            await self._engine.welcome_member(event)
-        except Exception as exc:
-            logger.warning(f"[autonomous_social] 欢迎新人失败: {exc}")
 
     @after_message_sent()
     async def observe_outgoing(self, event: AstrMessageEvent):

@@ -306,7 +306,6 @@ class SocialState:
             "topic_day": "",         # G1：最近主动起话头的日期
             "topic_count_day": 0,
             "topic_at": 0.0,
-            "welcomed": [],          # K2：已欢迎过的新成员 ID（去重，防重复欢迎）
             "samples": [],           # 参考库：近期群友发言 [{ts, name, text}]（去重、限长）
             "blocked_until": 0.0,    # 发送失败（被踢/会话失效）隔离
             "blocked_reason": "",

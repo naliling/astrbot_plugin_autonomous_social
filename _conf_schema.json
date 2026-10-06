@@ -454,13 +454,6 @@
     "obvious_hint": true,
     "default": true
   },
-  "group_welcome_enabled": {
-    "type": "bool",
-    "description": "新人入群欢迎",
-    "hint": "群里来了新成员时，她顺口欢迎一句。需要平台上报「成员增加」通知（OneBot 的 group_increase）；不上报的平台不会触发。推荐开启。",
-    "obvious_hint": true,
-    "default": true
-  },
   "group_ref_lib_enabled": {
     "type": "bool",
     "description": "群聊风格学习",
@@ -633,17 +626,17 @@
     "min": 1,
     "max": 48
   },
-  "intimacy_uids": {
-    "type": "list",
-    "description": "「想要了」通道白名单",
-    "hint": "只有名单里的人，才会被主动问「可不可以」。留空=这个通道不启用（防乱找人）。",
+  "memory_bridge_enabled": {
+    "type": "bool",
+    "description": "联动记忆插件",
+    "hint": "装了「我会牢牢记住你」（astrbot_plugin_memory_companion）时，主动消息会先读这个人的长期记忆、发完再写回；没装就自动跳过（照常发，只是没有记忆）。推荐开启。",
     "obvious_hint": true,
-    "default": []
+    "default": true
   },
   "intimacy_affection_min": {
     "type": "int",
     "description": "「想要了」通道的好感门槛",
-    "hint": "好感要到这里才会被主动问（默认 70）",
+    "hint": "好感要到这里、且真的做过色色（有过亲密史），才会被主动问（默认 70）",
     "default": 70,
     "min": 0,
     "max": 100
@@ -651,7 +644,7 @@
   "intimacy_libido_rise": {
     "type": "float",
     "description": "「想要了」通道的欲望门槛",
-    "hint": "亲近欲比基线高多少才算「想要了」（默认 6；已经有过亲密史的人不受此限）",
+    "hint": "亲近欲比基线高多少才算「想要了」（默认 6）。有过亲密史也不免检——不然一旦有过就会一直问。",
     "default": 6.0
   },
   "intimacy_cooldown_hours": {
