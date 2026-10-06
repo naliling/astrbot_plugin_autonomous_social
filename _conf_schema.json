@@ -209,7 +209,7 @@
     "description": "中等关系的人，两条主动消息的最小间隔（分钟）",
     "hint": "中等关系的人两条消息最少隔多久",
     "obvious_hint": true,
-    "default": 120,
+    "default": 60,
     "min": 10,
     "max": 720
   },
@@ -422,6 +422,45 @@
     "obvious_hint": true,
     "default": true
   },
+  "group_topic_enabled": {
+    "type": "bool",
+    "description": "群内主动起话头",
+    "hint": "不只在冷场时——她在群里静了一阵、又有现成话头（节日/天气/时令）时，可以主动起个话题，而不只是接话。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "group_topic_gap_hours": {
+    "type": "float",
+    "description": "群内起话头间隔（小时）",
+    "hint": "她在同一个群里静了这么久之后，才考虑主动起话头。推荐8小时。",
+    "obvious_hint": true,
+    "default": 8.0,
+    "min": 1.0,
+    "max": 72.0
+  },
+  "group_topic_daily_cap": {
+    "type": "int",
+    "description": "群内起话头每日上限",
+    "hint": "每群每天最多主动起几次话头。推荐1次。",
+    "obvious_hint": true,
+    "default": 1,
+    "min": 1,
+    "max": 5
+  },
+  "group_mention_member": {
+    "type": "bool",
+    "description": "群内可以点名群友",
+    "hint": "接话/起话头时，允许她像熟人那样自然地点一下某个群友的名字。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
+  "group_welcome_enabled": {
+    "type": "bool",
+    "description": "新人入群欢迎",
+    "hint": "群里来了新成员时，她顺口欢迎一句。需要平台上报「成员增加」通知（OneBot 的 group_increase）；不上报的平台不会触发。推荐开启。",
+    "obvious_hint": true,
+    "default": true
+  },
   "group_ref_lib_enabled": {
     "type": "bool",
     "description": "群聊风格学习",
@@ -593,6 +632,35 @@
     "default": 2,
     "min": 1,
     "max": 48
+  },
+  "intimacy_uids": {
+    "type": "list",
+    "description": "「想要了」通道白名单",
+    "hint": "只有名单里的人，才会被主动问「可不可以」。留空=这个通道不启用（防乱找人）。",
+    "obvious_hint": true,
+    "default": []
+  },
+  "intimacy_affection_min": {
+    "type": "int",
+    "description": "「想要了」通道的好感门槛",
+    "hint": "好感要到这里才会被主动问（默认 70）",
+    "default": 70,
+    "min": 0,
+    "max": 100
+  },
+  "intimacy_libido_rise": {
+    "type": "float",
+    "description": "「想要了」通道的欲望门槛",
+    "hint": "亲近欲比基线高多少才算「想要了」（默认 6；已经有过亲密史的人不受此限）",
+    "default": 6.0
+  },
+  "intimacy_cooldown_hours": {
+    "type": "int",
+    "description": "「想要了」的追问冷却（小时）",
+    "hint": "问过一次隔多久才会再问（默认 48）",
+    "default": 48,
+    "min": 1,
+    "max": 720
   },
   "owner_only_commands": {
     "type": "bool",

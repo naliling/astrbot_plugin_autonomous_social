@@ -168,3 +168,77 @@ def flow_meta() -> Dict[str, Any]:
 
 def icebreak_meta() -> Dict[str, Any]:
     return {"category": "icebreak", "intent": "icebreak", "mode": "icebreak", "msg_type": "group_icebreak"}
+
+
+def topic_meta() -> Dict[str, Any]:
+    return {"category": "topic", "intent": "topic", "mode": "topic", "msg_type": "group_topic"}
+
+
+def icebreak_topics(holiday: str, weather: str) -> str:
+    """K1：破冰/起话头可用的现成素材（节日 / 天气）。只给事实，不给台词。
+
+    破冰动机句早就删了（由模型自己产生），但模型手里没有「今天是什么日子」这类
+    客观事实，只能拿平庸话题凑。这里把节日/天气递进去当话头的种子，说什么仍由她定。
+    """
+    lines: List[str] = []
+    holiday = str(holiday or "").strip()
+    weather = str(weather or "").strip()
+    if holiday:
+        lines.append(f"今天是{holiday}")
+    if weather:
+        lines.append(f"外头{weather}")
+    return "\n".join(f"- {x}" for x in lines)
+
+
+def member_names(samples: List[Dict[str, Any]], limit: int = 6) -> List[str]:
+    """G3：近期在群里说过话的人名（去重、最新在前）。给「点名」用。"""
+    out: List[str] = []
+    for item in reversed(samples or []):
+        if not isinstance(item, dict) or item.get("self"):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name or name in out:
+            continue
+        out.append(name)
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+def group_topic_due(
+    group: Dict[str, Any],
+    now: float,
+    *,
+    gap_hours: float,
+    daily_cap: int,
+    stale_days: int,
+    today: str,
+    is_quiet: bool,
+    has_history_minimum: int = 5,
+) -> bool:
+    """G1：这个群现在该不该由她**主动起个话头**（不必等群彻底冷掉）。
+
+    比破冰宽松（不要求群安静很久），但仍旧保守：得有人聊过、她自己在群里静了够久、
+    今天没起够、群没凉透、不在安静时段。
+    """
+    if is_quiet:
+        return False
+    if float(group.get("blocked_until", 0) or 0) > now:
+        return False
+    if int(group.get("msg_count", 0) or 0) < has_history_minimum:
+        return False
+    last_seen = float(group.get("last_seen", 0) or 0)
+    if last_seen <= 0:
+        return False
+    if now - last_seen > max(1, stale_days) * 86400.0:
+        return False
+    gap = max(1.0, float(gap_hours)) * 3600.0
+    if now - float(group.get("last_bot_spoke", 0) or 0) < gap:
+        return False
+    # 刚破过冰就别又起话头——那是同一件事连着做两遍。
+    if now - float(group.get("icebreak_at", 0) or 0) < gap:
+        return False
+    if str(group.get("topic_day", "") or "") == today:
+        if int(group.get("topic_count_day", 0) or 0) >= max(1, daily_cap):
+            return False
+    return True

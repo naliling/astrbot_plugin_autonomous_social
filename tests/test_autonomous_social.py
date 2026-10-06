@@ -1515,11 +1515,12 @@ class TestTriggerPacing(unittest.TestCase):
         self.assertEqual(high, 0.0, "高档隔 40 分钟就该能开口了")
         self.assertGreater(mid, 0.0, "中档不该这么近")
         self.assertGreater(low, mid, "低档应该更远")
-        self.assertGreater(low, 12 * 3600.0, "低档应该隔一两天，试试就好")
+        # v1.27.8（F4）：低档 1440→720 分钟（12 小时），整体更频繁。
+        self.assertGreater(low, 10 * 3600.0, "低档应该明显更远")
 
     def test_gap_stretches_when_ignored(self):
-        a = {"last_sent": self.clock - 3 * 3600, "no_reply_streak": 0}
-        b = {"last_sent": self.clock - 3 * 3600, "no_reply_streak": 6}
+        a = {"last_sent": self.clock - 30 * 60, "no_reply_streak": 0}
+        b = {"last_sent": self.clock - 30 * 60, "no_reply_streak": 6}
         self.assertGreater(
             self.engine._gap_left(b, "mid", self.clock),
             self.engine._gap_left(a, "mid", self.clock),
@@ -2096,7 +2097,11 @@ class TestUrgeNotWipedByContact(unittest.TestCase):
         u.update({"umo": "x:private:u", "message_count": 300, "interest": 0.75,
                   "urge": 2.4, "no_reply_streak": 0})
         st.record_incoming("b", "u", "在吗", hour_override=12)
-        self.assertEqual(float(u.get("urge", 0.0) or 0.0), 0.0)
+        # v1.27.8（F3）：念头不再**完全**清零，改成软清零（保留三成）——
+        # 否则对方勤发消息就永远攒不起来，主动消息一次都不触发。
+        got = float(u.get("urge", 0.0) or 0.0)
+        self.assertLess(got, 2.4, "收到消息该把念头压下去")
+        self.assertGreater(got, 0.0, "但不该完全清零")
 
     def test_miss_channel_reaches_an_active_user(self):
         """每小时都回话的人，靠念想通道 7 天内也必须能收到——这才是真正的保证。"""
@@ -2326,7 +2331,7 @@ class TestNoFloodToActiveUsers(unittest.TestCase):
     def test_icebreak_prompt_carries_her_own_recent_lines(self):
         """破冰 prompt 要带上她自己最近在群里说过的话，否则会逐字重复。"""
         src_txt = Path(generator_mod.__file__).read_text(encoding="utf-8")
-        i = src_txt.index('if mode == "icebreak"')
+        i = src_txt.index('if mode in ("icebreak", "topic")')
         body = src_txt[i:src_txt.index("# mode == flow", i)]
         self.assertIn("own_recent", body, "破冰没带「自己说过什么」的防重复")
 
@@ -3445,6 +3450,154 @@ class TestTierOverrideListElement(unittest.TestCase):
         cfg = SocialConfig.from_astrbot({"tier_override": ["u1:high,u2:low"]})
         self.assertEqual(cfg.tier_override_for("u1"), "high")
         self.assertEqual(cfg.tier_override_for("u2"), "low")
+
+
+# ─── v1.27.8 回归：指令识别 / 冷静期与气没消闸门 ─────────────────────
+
+class TestCommandDetection(unittest.TestCase):
+    """F1：别的插件的指令（含被剪掉 `/` 的）不该被当成聊天记进观察账本。"""
+
+    @staticmethod
+    def _ev(chain_text=None, wake=True):
+        comps = [types.SimpleNamespace(text=chain_text)] if chain_text is not None else []
+        return types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message=comps),
+            is_at_or_wake_command=wake,
+        )
+
+    def test_chain_slash_is_command(self):
+        from social.engine import _looks_like_command
+        # 框架把 `/` 从 message_str 剪掉后，文本里没有 `/`，但原始消息链里还在
+        self.assertTrue(_looks_like_command(self._ev("/别的插件指令"), "别的插件指令", "别的插件指令"))
+
+    def test_registered_name_with_wake_is_command(self):
+        from social.engine import _looks_like_command
+        self.assertTrue(_looks_like_command(self._ev(), "触发社交", "触发社交"))
+
+    def test_registered_name_without_wake_is_not_command(self):
+        from social.engine import _looks_like_command
+        self.assertFalse(_looks_like_command(self._ev(wake=False), "触发社交", "触发社交"))
+
+    def test_normal_chat_is_not_command(self):
+        from social.engine import _looks_like_command
+        self.assertFalse(_looks_like_command(self._ev(), "今天天气不错", "今天天气不错"))
+
+
+class _CoolCore:
+    """只回一个用户快照的假 Core 桥。"""
+
+    def __init__(self, mood):
+        self._mood = mood
+
+    def load_snapshot(self, bid, uid):
+        return {"mood": self._mood}
+
+
+class TestCoreMoodGate(unittest.TestCase):
+    """D4/C5：Core 那边她冷静期 / 气没消时，不主动找这个人。"""
+
+    def _engine(self, mood):
+        class E:
+            gate_reason = SocialEngine.gate_reason
+
+            def __init__(self):
+                self.cfg = SocialConfig.from_astrbot({})
+                self.core = _CoolCore(mood)
+                self._city_offset = {}
+
+            def _moment_of(self, bid, now):
+                import datetime
+                return datetime.datetime(2023, 11, 15, 14, 0)
+
+            def _quiet_now(self, bid, hour):
+                return False
+        return E()
+
+    def test_cooling_blocks(self):
+        now = 1_700_000_000.0
+        eng = self._engine({"cool_no_proactive_until": now + 3600})
+        self.assertIn("气", eng.gate_reason("bot1", "u1", {}, now, None))
+
+    def test_high_aggression_blocks(self):
+        now = 1_700_000_000.0
+        eng = self._engine({"aggression": 45.0, "base_aggression": 28.0})
+        self.assertIn("气", eng.gate_reason("bot1", "u1", {}, now, None))
+
+    def test_calm_passes(self):
+        now = 1_700_000_000.0
+        eng = self._engine({"aggression": 30.0, "base_aggression": 28.0})
+        self.assertEqual(eng.gate_reason("bot1", "u1", {}, now, None), "")
+
+
+class TestSegmentVerification(unittest.TestCase):
+    """私聊主动：`parts[0]` 过了**不代表后续段也过**。
+
+    模型常在结尾再补一句纯括号的内心（「（记住了 宝宝16岁…）」），拆段后那一段会
+    单独发出去，看起来就是「内心独白被当成发言发了一条」，而且和上一条重复。
+    旧版只验 parts[0]，这一路完全免检（v1.27.10 修）。
+    """
+
+    def test_later_pure_parenthetical_segment_rejected(self):
+        bad, why = SocialEngine._verify_all_segments(
+            ["记住了，下次不会再忘了", "（记住了 宝宝16岁 以后绝对不会再忘了 原谅人家嘛）"],
+            recent=[], called="",
+        )
+        self.assertTrue(bad, "纯括号的后续段没被拦下")
+        self.assertIn("括号", why)
+
+    def test_all_speech_segments_pass(self):
+        bad, why = SocialEngine._verify_all_segments(
+            ["在忙吗", "刚忙完，想起你了"], recent=[], called="",
+        )
+        self.assertEqual(bad, "", f"正常两段被误拦：{why}")
+
+    def test_require_about_peer_reaches_every_segment(self):
+        bad, why = SocialEngine._verify_all_segments(
+            ["想你了，在干嘛", "今天天气不错"], recent=[], called="",
+            require_about_peer=True,
+        )
+        self.assertTrue(bad, "念想通道的第二段没有第二人称，该被拦")
+
+
+class TestGroupOpenerPrompts(unittest.TestCase):
+    """G1/G3/K1/K2：群聊几种开口模式的提示词要拼得出来，且带群聊边界。"""
+
+    def _gen(self, **conf):
+        return generator.MessageGenerator(_PlainCtx(), SocialConfig.from_astrbot(conf))
+
+    def test_icebreak_carries_topic_hint(self):
+        p, _ = self._gen()._compose_group(
+            "icebreak", {"topic_hint": "- 今天是中秋节"}, "人设", 40)
+        self.assertIn("中秋", p)
+        self.assertIn("群聊", p)
+
+    def test_topic_mode_is_framed_as_starting_a_topic(self):
+        p, _ = self._gen()._compose_group("topic", {}, "人设", 40)
+        self.assertIn("想开个新话头", p)
+
+    def test_welcome_names_the_new_member_when_known(self):
+        p, _ = self._gen()._compose_group("welcome", {"new_member": "小明"}, "人设", 40)
+        self.assertIn("小明", p)
+
+    def test_welcome_without_name_does_not_invent_one(self):
+        p, _ = self._gen()._compose_group("welcome", {}, "人设", 40)
+        self.assertIn("别编", p)
+
+    def test_group_boundary_forbids_starting_intimate_topics(self):
+        p, _ = self._gen()._compose_group(
+            "flow", {"latest": {"name": "甲", "text": "在吗"}}, "人设", 40)
+        self.assertIn("群聊", p)
+        self.assertIn("色情", p)
+
+    def test_member_names_shown_when_enabled(self):
+        p, _ = self._gen(group_mention_member=True)._compose_group(
+            "flow", {"members": ["小明", "小红"]}, "人设", 40)
+        self.assertIn("小明", p)
+
+    def test_member_names_hidden_when_disabled(self):
+        p, _ = self._gen(group_mention_member=False)._compose_group(
+            "flow", {"members": ["小明"]}, "人设", 40)
+        self.assertNotIn("小明", p)
 
 
 if __name__ == "__main__":

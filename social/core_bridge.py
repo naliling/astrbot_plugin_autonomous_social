@@ -283,6 +283,7 @@ class CoreBridge:
             "energy_text": "",
             "day": {},
             "persona": "",
+            "holiday": "",
         }
         contract = selfs.get("contract")
         if not isinstance(contract, dict) or int(contract.get("v") or 0) < 1:
@@ -324,6 +325,7 @@ class CoreBridge:
             "next": [str(x) for x in (day.get("next") or []) if str(x).strip()],
         }
         view["persona"] = str(contract.get("persona") or "")
+        view["holiday"] = str(contract.get("holiday") or "").strip()
         if contract.get("weather"):
             view["weather"] = {"env": contract.get("weather")}
         proc = view.get("process")
@@ -418,6 +420,11 @@ class CoreBridge:
             "first_met": first_met,
             "last_message": last_msg,
             "last_interaction": user.get("last_interaction"),
+            # 亲密历史（成人档在用户级写的几个数）：社交层靠它判断
+            # 「有没有和对方色色过 / 上一次多久前」，从而决定要不要主动问一句。
+            "ccb_done_count": user.get("ccb_done_count"),
+            "ccb_last_at": user.get("ccb_last_at"),
+            "ccb_satisfy": user.get("ccb_satisfy"),
             # 她该怎么称呼这个人（Core 从 TA 自报的昵称里认定，改口会跟着变）
             "nickname": str(user.get("nickname", "") or "").strip(),
             "nickname_src": str(user.get("nickname_src", "") or "").strip(),

@@ -140,6 +140,9 @@ def compose_tone(
 _SENTENCE_RULES: List[str] = [
     "别以「在吗」「最近怎么样」「好久不见」这种不带任何自身信息的话开头——说了等于没说",
     "别问「在干嘛」「在忙吗」「吃了吗」这类只要对方回一个「嗯」的问题",
+    # 括号是动作/内心，不是发言。模型常在结尾再补一句纯括号的内心，拆段后就变成
+    # 一条「内心独白」单独发出去（v1.27.10 修）。这里从生成侧也堵一道。
+    "只写**真正要说出口的话**：括号里只能放动作/内心，而且**不能整条都是括号**——发出去的必须有一句给人看的话",
 ]
 # 原来这里是四条：后两条（「别解释为什么现在发」「一句话里没她自己就重写」）与
 # 下面「几件事」里的条目重复，合并后去重。约束少两条，人设的戏份就多两分。
@@ -429,6 +432,12 @@ _MODE_NOTES = {
         "- 像路上碰见随口一句，一句话就够；\n"
         "- 可以带一句你正在干什么，但别借机展开一整段。"
     ),
+    "holiday": (
+        "今天是节日，你想顺口跟TA提一句。\n"
+        "- 别写成群发的贺卡、祝福模板，也别硬凑吉祥话；\n"
+        "- 像自己突然想起来那样，一句就够，可以带一点你今天过节的小打算；\n"
+        "- 别解释你为什么挑今天说这件事。"
+    ),
 }
 
 _MODE_ASK = {
@@ -679,6 +688,26 @@ _INTIMATE_PATTERNS: tuple = (
     # 「下面」日常里太多（下面还有、下面给你看），只留更具体的
     "大腿内侧", "敏感带", "下面都湿",
 )
+
+
+def _group_boundary(members: List[str], mention: bool) -> str:
+    """G1/G3：群聊边界 + 可点名的人。所有群聊模式共用。
+
+    群聊不是私聊：不论人设多开放，都不在群里主动挑起亲密/色情话题；有人这样起头就
+    自然岔开。这是主人明确要的底线，且是**生成提示词**里的一句边界，不是往人设里
+    塞规矩。
+    """
+    lines = [
+        "【这是群聊，不是私聊】不论她的人设多开放，都不在群里主动挑起亲密、暧昧、"
+        "色情的话题；要是有人在群里这样起头，就自然地岔开、回到正常聊天，别顺着往下走。"
+    ]
+    if mention and members:
+        lines.append(
+            "【群里的人】最近说过话的：" + "、".join(members) + "。"
+            "接话/起话头时如果自然，可以带上某一个人的名字（像熟人那样点一句），"
+            "但别每次都点、也别硬点。"
+        )
+    return "\n".join(lines)
 
 
 def _looks_intimate(*texts: str) -> bool:
@@ -979,6 +1008,10 @@ class MessageGenerator:
         blocks: List[str] = []
         if persona_prompt:
             blocks.append("【你是谁】\n" + persona_prompt.strip())
+        # G1/G3：群聊边界与可点名的人（所有群聊模式共用）
+        _members = [str(x).strip() for x in (group_ctx.get("members") or []) if str(x).strip()]
+        _mention = bool(getattr(self.cfg, "group_mention_member", True)) if self.cfg else True
+        blocks.append(_group_boundary(_members, _mention))
         style_ref = str(group_ctx.get("style_ref", "") or "").strip()
         if style_ref:
             # 私聊路径一直有这层边界标注，群聊路径却没有。群聊里的样本文本与实时发言
@@ -1001,15 +1034,48 @@ class MessageGenerator:
         shape: List[str] = []
         shape.append(emoji_note)
 
-        if mode == "icebreak":
+        if mode == "welcome":
+            name = str(group_ctx.get("new_member", "") or "").strip()
+            body = ["群里刚来了一个新成员。"]
+            if name:
+                body.append(f"新来的这位叫「{name}」。")
+            body.append("你想顺口欢迎一句，像群里熟人那样，不用太热情。")
+            body.append("要求：")
+            body.append("- 短、口语，一句就够；别像客服或群公告；")
+            if name:
+                body.append(
+                    f"- 可以带上名字「{name}」，但别生硬地念、也别像点名报到；"
+                )
+            else:
+                body.append("- 不知道名字就别编一个，直接欢迎就行；")
+            body.append("- 别问一堆问题，也别让人有压力必须回。")
+            if shape:
+                body.append("- " + " ".join(shape))
+            body.append(f"长度不超过 {max_len} 字。直接写你要发到群里的那句话，不要写别的。")
+            blocks.append("\n".join(body))
+            return "\n\n".join(b for b in blocks if b), allow_emoji
+
+        if mode in ("icebreak", "topic"):
             reason = str(group_ctx.get("reason", "") or "").strip()
-            head = "你在一个群聊里，群已经安静了一阵。"
+            if mode == "topic":
+                head = "你在一个群聊里。"
+                lead = "你自己想开个新话头，跟大家聊点什么。"
+            else:
+                head = "你在一个群聊里，群已经安静了一阵。"
+                lead = "你想在群里抛一个轻松的话头，让大家搭句话。"
             if reason:
                 head += reason
             body = [
                 head,
-                "你想在群里抛一个轻松的话头，让大家搭句话。",
+                lead,
             ]
+            # K1：把节日/天气这类现成话头递进去（没有就不给，不硬编）。
+            topic_hint = str(group_ctx.get("topic_hint", "") or "").strip()
+            if topic_hint:
+                body.append(
+                    "【可以拿来当话头的现成事】（有就用，没有就自己想一个；"
+                    "不用硬扯上它）：\n" + topic_hint
+                )
             # 你自己最近在群里说过的话（含前几次破冰）：不列出的话，她每次破冰会
             # 说同一句（一天最多两次、连着几天就是逐字重复）——心流接话早就有这层
             # 防重复，破冰这条一直漏了。
@@ -1092,8 +1158,19 @@ class MessageGenerator:
             "判断：这话你接得上、接了不尴、能让聊天更热闹就接；接不上、没意思、或会打断别人就别接。",
             "要求：",
             "- 像群里正常一员那样说话，短、口语，可以自然地玩梗/接梗，但别硬玩、别复读别人的话；",
-            "- 短、口语，别长篇大论；不要 @ 任何人，除非特别自然；",
+            # G3：开了「群内可以点名群友」时，别再用一句「不要 @ 任何人」把它堵死。
+            (
+                "- 短、口语，别长篇大论；一般不用 @ 谁，直接说话就行；要叫谁只在特别自然时才叫；"
+                if _mention else
+                "- 短、口语，别长篇大论；不要 @ 任何人，除非特别自然；"
+            ),
             "- 不要每条都接，宁可不接也别尬聊。",
+            # F9（v1.27.8）：两步判断，都过了才接。
+            "两步判断（都过了才接）：① 这个话题你插进去自不自然，接不上、或大家在对着某个具体的人说事，就别接；"
+            "② 群里最新这几句里有没有人在跟你（这个 bot）说话，有人点名找你那是主链路要回的，别抢着接。判不准就答 NO。",
+            # 括号是「动作/内心」，不是发言；而且不许把刚说过的那句换个说法再说一遍。
+            "输出要求：只写**真正要说出口的话**。括号里只能放动作/内心，而且**不能整条都是括号**——"
+            "发出去的必须有一句给人看的话。也别把你刚说过的那句换个说法再说一遍。",
         ]
         if shape:
             instr.append("- " + " ".join(shape))

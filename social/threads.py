@@ -24,7 +24,7 @@ import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .clock import city_epoch, city_now
-from .reasoning import is_leaving, is_thin, last_direction, sleep_signal
+from .reasoning import is_leaving, is_thin, last_direction, sleep_signal, busy_signal
 
 # ─── 1. 这一场话还没完 ──────────────────────────────
 
@@ -115,7 +115,9 @@ def thread_reason(
         # 她上一条主动发的话还悬着：这时候再补一句就是追着人要回复
         return "", ""
     last_msg = str(user.get("last_message", "") or "")
-    if is_leaving(last_msg) or sleep_signal(user, now):
+    # T1：对方最近在忙（不一定是最后一句）就别追问——真忙与敷衍要分开，
+    # 「在忙」之后回一个「嗯」不是敷衍，是在忙。
+    if is_leaving(last_msg) or sleep_signal(user, now) or busy_signal(user, now):
         return "", ""
     # 「说断了」不是「对方停了一下」。
     #
@@ -376,6 +378,27 @@ def live_loop(user: Dict[str, Any], now: float) -> Optional[str]:
     """到点且还没回访过、也没凉过头的那件事。分工同 live_cue。"""
     hits = live_loops(user, now, limit=1)
     return hits[0][1] if hits else None
+
+
+def loops_resolved_by(user: Dict[str, Any], msg: str) -> List[str]:
+    """T2：对方这条消息里带了某件未完事的**结果**——那件就不必再回访了。
+
+    「问到了就记住」：不是把结果存成记忆，只是别让一个已经结束的话题继续挂着——
+    对方明明已经说了「面试过了」，过几小时还去问「后来怎么样」。
+    返回被关掉的那些 about（供调用方落账/日志）。
+    """
+    body = str(msg or "").strip()
+    if not body or not any(w in body for w in _LOOP_CLOSED):
+        return []
+    out: List[str] = []
+    for item in loop_entries(user):
+        about = str(item.get("about", "")).strip()
+        if not about:
+            continue
+        # 待回访那件事的关键词还在对方这句里 → 这句说的是它的结果
+        if any(w in body for w in _LOOP_WORDS if w in about):
+            out.append(about)
+    return out
 
 
 def loop_meta(text: str) -> Dict[str, Any]:

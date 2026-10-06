@@ -54,6 +54,8 @@ KIND_THREAD = "thread"     # 话说到一半断了
 KIND_DERIVED = "derived"   # 从她自己的状态派生的一件具体的事
 KIND_MISS = "miss"         # 想念：好感够、又想了一阵子（不是有正事要说）
 KIND_GREET = "greet"       # 问候：没事干，随口说一句看看你回不回
+KIND_HOLIDAY = "holiday"   # 节日：今天是个节，顺口提一句
+KIND_WEATHER = "weather"   # 天气：外头变了样（下雨/降温），一句观察
 
 # ── 有效期：按性质分三类 ──────────────────────────────────────────
 #
@@ -79,6 +81,8 @@ _KIND_TTL = {
     KIND_LOOP: TTL_PEER_EVENT,
     KIND_PROMISE: TTL_PEER_EVENT,
     KIND_THREAD: TTL_DAY_PART,
+    KIND_HOLIDAY: TTL_DAY_PART,
+    KIND_WEATHER: TTL_SELF_EVENT,
 }
 
 KIND_RANK = {
@@ -86,8 +90,10 @@ KIND_RANK = {
     KIND_CUE: 1,
     KIND_LOOP: 2,
     KIND_THREAD: 3,
+    KIND_HOLIDAY: 3,
     KIND_MISS: 4,
     KIND_DERIVED: 5,
+    KIND_WEATHER: 6,
 }
 
 
@@ -121,7 +127,7 @@ TIER_MID = "mid"
 TIER_LOW = "low"
 
 # 各档的最小间隔（分钟）。高档很近，因为她常聊；低档隔一两天，试试就好。
-TIER_MIN_GAP_MINUTES = {TIER_HIGH: 30, TIER_MID: 120, TIER_LOW: 1440}
+TIER_MIN_GAP_MINUTES = {TIER_HIGH: 20, TIER_MID: 60, TIER_LOW: 720}
 # 各档同时挂几件事。高档可以挂多点（一天的机会本来就多）
 TIER_POOL_MAX = {TIER_HIGH: 12, TIER_MID: 8, TIER_LOW: 4}
 
@@ -454,6 +460,57 @@ def _derive_from_state(
     return out
 
 
+def _notable_weather(body: Dict[str, Any]) -> str:
+    """外头「变了样」才值得专门说一句：下雨下雪、大热大冷。
+
+    多云、晴、气温 20℃ 这种太平常，拿它当由头等于没话找话。
+    """
+    weather = (body or {}).get("weather")
+    if isinstance(weather, dict):
+        weather = weather.get("env") or weather.get("weather")
+    text = _s(weather)
+    if not text:
+        return ""
+    if any(w in text for w in ("雨", "雪", "雷", "雹", "雾", "霾")):
+        return f"外头{text}"
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*[℃°]", text)
+    if m:
+        try:
+            temp = float(m.group(1))
+        except ValueError:
+            temp = None
+        if temp is not None and (temp <= 5.0 or temp >= 33.0):
+            return f"外头{text}"
+    return ""
+
+
+def derive_extras(
+    u: Dict[str, Any], body: Dict[str, Any], now: float, taken: set
+) -> List[Tuple[str, str]]:
+    """A1/L2：再补两类由头——节日 与 天气。返回 [(kind, text)]。
+
+    节日来自 Core 契约（可预测的客观事实，不让模型现编）；天气只在「变了样」时才有
+    意义（见 `_notable_weather`）。
+    """
+    out: List[Tuple[str, str]] = []
+
+    def offer(kind: str, text: str) -> None:
+        text = _short(text, 16)
+        if not text or text in taken:
+            return
+        taken.add(text)
+        out.append((kind, text))
+
+    body = body if isinstance(body, dict) else {}
+    holiday = _s(body.get("holiday"))
+    if holiday:
+        offer(KIND_HOLIDAY, f"今天是{holiday}")
+    wx = _notable_weather(body)
+    if wx:
+        offer(KIND_WEATHER, wx)
+    return out
+
+
 def _is_idle(body: Dict[str, Any]) -> bool:
     """她此刻闲不闲。
 
@@ -567,6 +624,14 @@ def prepare_round_anchors(
             picked.append(item)
         if len(picked) >= limit:
             break
+    # A1/L2：再补节日/天气两类由头。只在正常主动那条路给——「念想」通道说的必须是
+    # 关于 TA 的，插一句「今天是中秋」就跑题了。
+    if not relational:
+        for extra_kind, text in derive_extras(u, body, now, used):
+            item = add_anchor(u, extra_kind, text, now=now)
+            if item is not None:
+                item.setdefault("tries", 0)
+                picked.append(item)
     return picked
 
 
@@ -728,6 +793,8 @@ _REASON_BY_KIND = {
     KIND_MISS: "你最近一直在想TA",
     KIND_GREET: "你们有一阵子没说话了",
     KIND_DERIVED: "你自己这边刚发生的事",
+    KIND_HOLIDAY: "今天是个节日",
+    KIND_WEATHER: "外头的天气变了样",
 }
 
 
@@ -759,6 +826,7 @@ def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
         KIND_LOOP: "loop",
         KIND_THREAD: "presence",
         KIND_MISS: "miss",
+        KIND_HOLIDAY: "holiday",
     }.get(kind, "share")
     return {
         "category": "anchor",

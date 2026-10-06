@@ -303,6 +303,10 @@ class SocialState:
             "icebreak_day": "",      # 最近破冰的日期（按角色时钟）
             "icebreak_count_day": 0,
             "icebreak_at": 0.0,
+            "topic_day": "",         # G1：最近主动起话头的日期
+            "topic_count_day": 0,
+            "topic_at": 0.0,
+            "welcomed": [],          # K2：已欢迎过的新成员 ID（去重，防重复欢迎）
             "samples": [],           # 参考库：近期群友发言 [{ts, name, text}]（去重、限长）
             "blocked_until": 0.0,    # 发送失败（被踢/会话失效）隔离
             "blocked_reason": "",
@@ -502,6 +506,17 @@ class SocialState:
             g["icebreak_day"] = day
             g["icebreak_count_day"] = 1
         g["icebreak_at"] = now
+        self.mark_dirty()
+
+    def note_group_topic(self, bid: str, gid: str, now: float, day: str) -> None:
+        """G1：记一次「主动起话头」：同一天计数 +1，跨天归零。"""
+        g = self.group(bid, gid)
+        if str(g.get("topic_day", "") or "") == day:
+            g["topic_count_day"] = int(g.get("topic_count_day", 0) or 0) + 1
+        else:
+            g["topic_day"] = day
+            g["topic_count_day"] = 1
+        g["topic_at"] = now
         self.mark_dirty()
 
     def is_group_blocked(self, bid: str, gid: str, now: float) -> bool:
@@ -1157,8 +1172,11 @@ class SocialState:
         u["last_message"] = text[:MESSAGE_TRUNCATE_LENGTH] if store_text else ""
         if name:
             u["name"] = name
-        # 刚说过话，此刻没有「再主动找 TA」的念头
-        u["urge"] = 0.0
+        # 刚说过话：念头**软清零**（v1.27.8，F3）。
+        # 原来是直接归零：对方每发一条消息念头就清零，而念头要攒四五个小时才够门槛
+        # ——于是「对方每小时发一句」的人永远攒不起来，主动消息一次都不触发。
+        # 现在保留三成，让人勤发消息也能被主动找。
+        u["urge"] = float(u.get("urge", 0.0) or 0.0) * 0.3
         u["urge_at"] = ts
 
         self.mark_dirty()

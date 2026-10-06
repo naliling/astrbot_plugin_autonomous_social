@@ -365,6 +365,44 @@ def is_leaving(text: str) -> bool:
     return any(word in body for word in _LEAVING_WORDS)
 
 
+# 对方最近说过自己在忙。跟 `_LEAVING_WORDS` 的区别：那个只认**最后一句**是离开语；
+# 而真忙的人不一定每句都提，往往先说了「在忙」、后面只回一个「嗯」——只判最后一句
+# 就会把这个「嗯」当成敷衍，转头去追问，变成打扰。窗口内任意一条说了忙，就不追。
+_BUSY_WORDS = (
+    "忙", "开会", "加班", "赶工", "赶项目", "赶方案", "赶材料", "出差",
+    "考试", "复习", "答辩", "面试", "deadline", "ddl", "写材料", "做方案",
+    "带娃", "看孩子", "接孩子", "陪产", "值班", "夜班",
+)
+# 忙这件事的保鲜期：三小时内说过就算「还在忙」，过了就不再压着追问。
+BUSY_SUPPRESS_SECONDS = 3 * 3600.0
+
+
+def busy_signal(user: Dict[str, Any], now: float) -> bool:
+    """对方最近说过自己在忙（不要求是最后一句）：这时候别追着问。
+
+    只看**对方**（dir != 'out'）说的话；她自己说的「忙」不算。
+    """
+    conv = user.get("conversation") or []
+    try:
+        recent = [m for m in conv if str(m.get("text", ""))][-4:]
+    except TypeError:
+        return False
+    for m in reversed(recent):
+        if str(m.get("dir", "")) == "out":
+            continue
+        try:
+            ts = float(m.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if now - ts > BUSY_SUPPRESS_SECONDS:
+            return False
+        text = str(m.get("text", ""))
+        # 「不忙」「没那么忙」是否定：不能当在忙。
+        if any(w in text for w in _BUSY_WORDS) and "不忙" not in text and "没那么忙" not in text:
+            return True
+    return False
+
+
 def last_direction(user: Dict[str, Any]) -> str:
     """对话历史里最后一句是谁说的：'in' / 'out' / ''。"""
     for item in reversed(user.get("conversation") or []):

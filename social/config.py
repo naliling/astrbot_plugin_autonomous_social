@@ -59,7 +59,7 @@ MISS_AFFECTION_MIN_DEFAULT = 42
 # 「就是想你了」几乎从来没发生过；两句日常聊天里的黏糊话该是正常频率。
 MISS_DAILY_CAP_DEFAULT = 2
 # 两条主动消息的最小间隔（分钟）默认值与范围；
-MIN_GAP_MINUTES_DEFAULT = 120
+MIN_GAP_MINUTES_DEFAULT = 60
 MIN_GAP_MAX = 720
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
@@ -214,6 +214,15 @@ GROUP_IDLE_HOURS_DEFAULT = 6.0
 ICEBREAK_DAILY_CAP_MIN = 1
 ICEBREAK_DAILY_CAP_MAX = 10
 ICEBREAK_DAILY_CAP_DEFAULT = 2
+
+# G1：群内主动起话头——不只在冷场时才开口。她在群里多久没说话之后可以起一个新话头，
+# 以及每群每天最多几次。比破冰宽松（不用等群彻底冷掉），但仍旧保守。
+GROUP_TOPIC_GAP_HOURS_MIN = 1.0
+GROUP_TOPIC_GAP_HOURS_MAX = 72.0
+GROUP_TOPIC_GAP_HOURS_DEFAULT = 8.0
+GROUP_TOPIC_DAILY_CAP_MIN = 1
+GROUP_TOPIC_DAILY_CAP_MAX = 5
+GROUP_TOPIC_DAILY_CAP_DEFAULT = 1
 
 # 超过这么多天没在某个群见到任何消息，就当已经不在这个群了（被踢/退群/群解散）：
 # 不再对它破冰，并在清理时丢掉它的样本。心流本身只由实时群消息驱动，被踢自然就停。
@@ -396,6 +405,13 @@ class SocialConfig:
     # 回复检测窗口
     reply_window_hours: int = REPLY_WINDOW_DEFAULT
 
+    # 「想要了」通道（v1.27.13）：只对**白名单里**的人主动问一句可不可以。
+    # 白名单是防乱找人——好感高的人可多着呢，不能谁好感高就去问谁。
+    intimacy_uids: Any = None
+    intimacy_affection_min: int = 70
+    intimacy_libido_rise: float = 6.0
+    intimacy_cooldown_hours: int = 48
+
     # 手动触发白名单：管理面板里逐条添加的列表；留空则回退到 AstrBot 管理员（全局配置 admins_id）
     allowed_trigger_uids: Any = None
 
@@ -458,6 +474,15 @@ class SocialConfig:
     flow_ignored_exit: int = FLOW_IGNORED_EXIT_DEFAULT
     group_idle_hours: float = GROUP_IDLE_HOURS_DEFAULT
     icebreak_daily_cap: int = ICEBREAK_DAILY_CAP_DEFAULT
+    # G1：群内主动起话头（不只在冷场时）。她在群里静了这么久之后可以起一个新话头。
+    group_topic_enabled: bool = True
+    group_topic_gap_hours: float = GROUP_TOPIC_GAP_HOURS_DEFAULT
+    group_topic_daily_cap: int = GROUP_TOPIC_DAILY_CAP_DEFAULT
+    # G3：群内接话/起话头时，允许自然地点某个群友的名字。
+    group_mention_member: bool = True
+    # K2：新人入群时，她顺口欢迎一句（靠 OneBot 的 group_increase 通知；
+    # 有些实现不上报，那种情况下这条自然不会触发）。
+    group_welcome_enabled: bool = True
     group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
@@ -684,6 +709,16 @@ class SocialConfig:
                 REPLY_WINDOW_MIN,
                 min(REPLY_WINDOW_MAX, int(g("reply_window_hours", _d("reply_window_hours",  REPLY_WINDOW_DEFAULT)))),
             ),
+            intimacy_uids=g("intimacy_uids", _d("intimacy_uids",  None)),
+            intimacy_affection_min=max(
+                0, min(100, int(g("intimacy_affection_min", _d("intimacy_affection_min",  70)))),
+            ),
+            intimacy_libido_rise=max(
+                0.0, min(50.0, float(g("intimacy_libido_rise", _d("intimacy_libido_rise",  6.0)))),
+            ),
+            intimacy_cooldown_hours=max(
+                1, min(720, int(g("intimacy_cooldown_hours", _d("intimacy_cooldown_hours",  48)))),
+            ),
             allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
             tier_override=g("tier_override", _d("tier_override",  None)),
             history_ingest=bool(g("history_ingest", _d("history_ingest",  True))),
@@ -749,6 +784,17 @@ class SocialConfig:
                 ICEBREAK_DAILY_CAP_MIN,
                 min(ICEBREAK_DAILY_CAP_MAX, int(g("icebreak_daily_cap", _d("icebreak_daily_cap",  ICEBREAK_DAILY_CAP_DEFAULT)))),
             ),
+            group_topic_enabled=bool(g("group_topic_enabled", _d("group_topic_enabled", True))),
+            group_topic_gap_hours=max(
+                GROUP_TOPIC_GAP_HOURS_MIN,
+                min(GROUP_TOPIC_GAP_HOURS_MAX, float(g("group_topic_gap_hours", _d("group_topic_gap_hours", GROUP_TOPIC_GAP_HOURS_DEFAULT)))),
+            ),
+            group_topic_daily_cap=max(
+                GROUP_TOPIC_DAILY_CAP_MIN,
+                min(GROUP_TOPIC_DAILY_CAP_MAX, int(g("group_topic_daily_cap", _d("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)))),
+            ),
+            group_mention_member=bool(g("group_mention_member", _d("group_mention_member", True))),
+            group_welcome_enabled=bool(g("group_welcome_enabled", _d("group_welcome_enabled", True))),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", _d("group_stale_days",  GROUP_STALE_DAYS_DEFAULT))))
             ),

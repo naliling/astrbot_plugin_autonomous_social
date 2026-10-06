@@ -12,7 +12,7 @@ desc: |
   群里也不尬聊：只接没人点名的话，接之前跟私聊一样过一道验收。
 
   零额外依赖，开箱即用。
-version: "1.27.7"
+version: "1.27.15"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.0.0"
