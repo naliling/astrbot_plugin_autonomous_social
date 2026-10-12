@@ -1,5 +1,50 @@
 # 更新日志
 
+## v1.27.17 — 由头发出去才算数；「想起你之前说的X」接通；与 Core 2.27.17 同步
+
+本版依据一份外部审查（GPT）的意见逐条核实后修改。审查点名的是「状态生命周期」这一类风险，
+逐行核实后**确认了两处真 bug**（另有一处次要缺陷）；其余属设计选择，保留。
+
+- **修由头「已消费」记录丢失（高）**：`prune_anchors` 原来对**没用过**的由头也套
+  「用满冷却期」的判据（`used_at=0` → `0 + 45天 > now` 恒为假），于是每调一次
+  `prune_anchors` 就把本轮刚派生的候选抹掉。而 `prune_anchors` 在 `add_anchor` /
+  `live_anchors` / `prepare_round_anchors` 里都会被调——一轮里派生两条以上时，
+  只有**最后一条**留在池子里，而引擎取的是 `picks[:1]`（**第一条**）。后果：
+  发出去后 `consume` 找不到它，`used_at` 永远写不上，下一轮同一件事又被重新派生；
+  `mark_failed` 也失效，`ANCHOR_MAX_TRIES` 形同虚设。
+  （`add_anchor` 自己的注释早就写着这个后果：「实测 5 天 135 次调用 0 条送达」。）
+  现在：未用的候选**留到自己的 `expire_at`**（派生类 2h、时段类 3h、对方那边 24h），
+  用过的留到历史窗口；过期自然淘汰，不堵死派生，`consume`/`mark_failed` 也找得到对象。
+  仿真对比：正常场景送达不变（8 条），emoji 场景的**白转 LLM 请求从 92 降到 75**。
+- **接通「想起你之前说的X」这条由头来源**：`anchors._said_recent` 读的是用户状态里的
+  `[{"said": …, "ts": …}]`，而 Core 契约给的是 `user.said = [{"said": 原话, "at": epoch}]`
+  （短摘录、最新在前）——两边一直没接上，插件又从不写 `u["said"]`（Core 的 said 只进
+  生成侧的 `u_copy["_said"]`），于是这条由头从来没产出过。现在在每轮结算（`settle_minds`）
+  已加载用户 Core 快照处，把 `said` 按 `_said_recent` 认的形状落进 `u["said"]`
+  （时间键 `at` → `ts`，见 `SocialEngine._sync_peer_said`）；没装 Core 时照旧不触发。
+- **修 `thread_reason` 的隐患**：`floor` 算了却没用，真正的比较直接用参数
+  `presence_floor_seconds`——调用方不传（默认 `None`）时会抛 `TypeError`。
+  改用 `floor`（两个调用点都传 `presence`，结果不变）。
+- 测试：原「未用的由头该被 prune 掉」「池子不攒东西」两条用例编码的是上面那个 bug，
+  改为钉住正确行为（consume 后进 `_remembered`、不再重复派生；未用由头留到有效期）。
+  新增「Core 的 `said` 落进 `u["said"]` 并派生出由头」等用例。
+
+**核实为「设计选择 / 非 bug」的（保留）**：
+
+- **`ANCHOR_COOLDOWN`(7天) / `ANCHOR_HISTORY`(45天) 实际被 TTL(≤24h) 封顶**：
+  `consume` 不刷新 `expire_at`，用过的由头最多活 24h。这是「由头带有效期而不是冷却」
+  的既定语义（见 `_KIND_TTL` 注释），且派生类由头来自当下状态、次日状态已变，
+  不会真的重复。保留。
+- **`pending_proactive_context` / cue / loop 的清理**：只在真正注入/命中对应类别时消费，
+  不会因「临时条件不满足」误清；跨用户/跨角色隔离经核实无串号。保留。
+- **记忆写回**：`_remember_proactive` 只在发送成功路径调用（失败分支提前 return），
+  不会把未发出的内容写回记忆。保留。
+
+**发现但本轮未改（附建议）**：
+
+- `u["retry_at"]`（engine 写、无人读）与 `note_promise` 里的 `mark_dirty_hint`
+  是无害残留，不影响行为。
+
 ## v1.27.16 — 删掉入群欢迎；「想要了」改门槛；主动消息接记忆插件
 
 - **删掉新人入群欢迎（K2）**。它靠 OneBot 的 `group_increase` notice 触发，实际用起来

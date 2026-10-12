@@ -2490,6 +2490,35 @@ class TestAnchorTtl(unittest.TestCase):
         self.assertIn(anchors_mod.KIND_GREET, anchors_mod._KIND_TTL)
 
 
+class TestPeerSaidFeedsTheAnchor(unittest.TestCase):
+    """Core 契约的 `user.said` 要落成由头派生认的形状，否则「想起你之前说的X」永不触发。
+
+    两边曾经一直没接上：Core 给的是 `[{"said": 原话, "at": epoch}]`，而
+    `anchors._said_recent` 读的是用户状态里的 `[{"said": …, "ts": …}]`，
+    插件又从不写 `u["said"]`——于是这条由头来源从来没产出过。
+    """
+
+    def test_core_said_syncs_and_becomes_anchor(self):
+        now = 1_700_000_000.0
+        u: dict = {}
+        SocialEngine._sync_peer_said(u, [{"said": "想去那家店看看", "at": now - 3 * 86400}])
+        self.assertEqual(u["said"], [{"said": "想去那家店看看", "ts": now - 3 * 86400}])
+        got = anchors_mod._derive_from_state({"day": {}, "weather": ""}, u, now, set())
+        self.assertTrue(any("想去那家店看看" in x for x in got), got)
+
+    def test_malformed_said_is_safe(self):
+        u: dict = {}
+        SocialEngine._sync_peer_said(u, [None, "x", {"said": ""}, {"said": "ok", "at": "bad"}])
+        self.assertEqual(u["said"], [{"said": "ok", "ts": 0.0}])
+        SocialEngine._sync_peer_said(u, "not-a-list")
+        self.assertEqual(u["said"], [{"said": "ok", "ts": 0.0}], "非列表不该动现有值")
+
+    def test_absent_said_does_not_break(self):
+        u: dict = {}
+        SocialEngine._sync_peer_said(u, None)
+        self.assertNotIn("said", u)
+
+
 class TestNagInsteadOfCalendar(unittest.TestCase):
     """没有新事发生时，真人会随口说一句——安静本身就是理由。"""
 

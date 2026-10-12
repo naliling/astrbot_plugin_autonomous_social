@@ -1,18 +1,16 @@
-"""由头池是**一次性队列**，不是待办清单。
+"""由头池：未用的候选留到有效期，用过的留作「已消费记录」。
 
-我一度以为「未用的由头被 prune 掉了」是 bug——`prune_anchors` 对 `used_at=0` 的
-判定 `0 + 45天 > now` 恒为假，所以每加一条新由头，上一条就被丢掉，池子上限实际是 1，
-而不是 `add_anchor` 注释里写的 5、更不是 v1.23 声明的「高档 12」。
+**曾经把「未用的由头」也当过期**（`prune_anchors` 对 `used_at=0` 套「用满冷却期」的
+判据，`0 + 45天 > now` 恒为假），理由写在旧 docstring 里：「池子不攒东西，多样性
+全靠每轮重新派生」。
 
-改完（未用的按寿命留着、上限放到 12）之后，7 天回归仿真里「正常」场景的送达
-**从 127 条掉到 19 条**。原因和想的不一样：
+这条理由站不住：`add_anchor` 自己的注释就写着，只留未用的会把消费记录抹掉，
+于是同一句由头每轮被重新派生一次——**实测 5 天 135 次调用 0 条送达**。
+更直接的坏处是：一轮里派生两条以上时，只有最后一条留在池子里，而引擎取的是
+`picks[:1]`（第一条）——发出去后 `consume` 找不到它，`used_at` 永远写不上。
 
-    上限 1  → 每条用完就让位，下一轮从当下状态重新派生，6 轮拿到 18 条候选
-    上限 12 → 池子里**用过的**还在，`add_anchor` 又不会重加同样的事，
-               候选逐轮变少（3→2→1），派生被饿死
-
-**所以上限 1 才是对的机制**，`prune_anchors` 没写错，是注释在误导人。
-这一版把注释改对，把「由头池 12/8/4」的说法从 CHANGELOG / README 里去掉。
+现在：未用的候选留到自己的 `expire_at`（派生类 2h、时段类 3h、对方那边 24h），
+用过的留到历史窗口。过期自然淘汰，不堵死派生；`consume`/`mark_failed` 也找得到对象。
 """
 import logging
 import os
@@ -52,18 +50,31 @@ class PoolIsOneShotQueue(unittest.TestCase):
 
         这是整个机制的关键：留着用过的不放，派生就被饿死（实测 127 条 → 19 条）。
         """
+    def test_consumed_anchor_makes_way_for_fresh_ones(self):
+        """发出去的由头进 `_remembered`、不再重复；状态变了仍能派生出新的。
+
+        这是模块自己的契约（见 `_anchor_pick`：「同一件事一辈子只出现一次」）。
+        曾经坏在 `prune_anchors` 把未用的候选也当过期丢掉：一轮里派生两条以上时，
+        只有最后一条留在池子里，而引擎取的却是 `picks[:1]`（第一条）——`consume`
+        找不到它，`used_at` 永远写不上，于是同一件事每轮重新派生、模型一直白转。
+        """
+        from social.anchors import consume, _remembered
         u, now = {}, time.time()
-        total = 0
-        for _ in range(6):
-            picks = prepare_round_anchors(u, dict(BODY), now, limit=12, tier="high")
-            total += len(picks)
-            for p in picks[:1]:
-                p["used_at"] = now
-            now += 600
-        self.assertGreaterEqual(
-            total, 12,
-            f"6 轮只派出 {total} 条候选 —— 池子在堵死派生（上限太大时就是这个现象）",
-        )
+        picks = prepare_round_anchors(u, dict(BODY), now, limit=12, tier="high")
+        self.assertGreaterEqual(len(picks), 2, "这个 body 至少该派生出两条候选")
+        first = picks[0]["about"]
+        consume(u, first, now)
+        self.assertIn(first, _remembered(u, now),
+                      "consume 之后必须进 _remembered，否则下一轮重复派生同一句")
+        # 状态没变：同一条不该再出现
+        again = prepare_round_anchors(u, dict(BODY), now + 600, limit=12, tier="high")
+        self.assertNotIn(first, [p["about"] for p in again])
+        # 状态变了：能派生出新的由头
+        changed = {"day": {"doing": "去超市"}, "ongoing": ["准备明天的演示"]}
+        fresh = prepare_round_anchors(u, changed, now + 700, limit=12, tier="high")
+        abouts = [p["about"] for p in fresh]
+        self.assertTrue(any("超市" in a for a in abouts) or any("演示" in a for a in abouts),
+                        f"状态变了却派生不出新由头：{abouts}")
 
     def test_pool_never_exceeds_the_storage_cap(self):
         now = time.time()
@@ -162,25 +173,22 @@ class AnchorLevelCrossUserGuard(unittest.TestCase):
         st.user("bot1", "a")["proactive_log"][0]["ts"] = time.time() - 10 * 3600
         self.assertEqual(st.anchor_recent_users("bot1", time.time(), hours=2.0), {})
 
-    def test_unused_anchors_do_not_survive_prune(self):
-        """**这不是 bug，是承重的设计**——但值得钉住，因为很容易被当 bug 再「修」一次。
+    def test_unused_anchors_survive_prune_until_expiry(self):
+        """未用的由头留到自己的有效期，过期才淘汰。
 
-        `prune_anchors` 对没用过的由头也套了「用满冷却期」的判据
-        （`used_at=0` → `0 + 45天 > now` 恒为假），所以 `add_anchor` 刚挂上的由头，
-        下一次 `live_anchors` 就已经看不到了。
-
-        也就是说：**池子不攒东西，多样性全靠每轮重新派生。**
-        这正是 7 天能跑 127 条的原因——池子改成「攒着」之后（上限 12），
-        派生被池子里用过的堵死，送达从 127 掉到 19。
+        原来把「没用过的」也当过期，每调一次 prune 就抹掉本轮刚派生的候选——
+        这是 `consume` 失效、同一件事反复派生的根因
+        （见 test_consumed_anchor_makes_way_for_fresh_ones）。
         """
-        from social.anchors import add_anchor, load_anchors, prune_anchors
+        from social.anchors import add_anchor, load_anchors, prune_anchors, TTL_SELF_EVENT
         now = time.time()
         u = {}
         add_anchor(u, KIND_DERIVED, "刚忙完个案笔记", now=now)
         self.assertEqual(len(load_anchors(u)), 1, "刚挂上时是在的")
-        prune_anchors(u, now)
-        self.assertEqual(len(load_anchors(u)), 0,
-                         "没被 prune 掉的话派生会被堵死（实测送达 127 → 19）")
+        prune_anchors(u, now + TTL_SELF_EVENT - 60)
+        self.assertEqual(len(load_anchors(u)), 1, "有效期之内不该被 prune 掉")
+        prune_anchors(u, now + TTL_SELF_EVENT + 60)
+        self.assertEqual(len(load_anchors(u)), 0, "过了有效期该淘汰")
 
     def test_drop_marks_used_so_it_stops_being_re_derived(self):
         """撞车后这件事该被避开——靠的是标成「已用」进 `_remembered`。"""

@@ -232,22 +232,28 @@ def load_anchors(u: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def prune_anchors(u: Dict[str, Any], now: float) -> None:
-    """丢掉彻底过期的（用够久的、或寿到了的）。
+    """丢掉彻底过期的：用过的过了历史窗口，或任何一条过了自己的有效期。
 
-    判据是「用满冷却期」，**没用过的（used_at=0）也算过期**——这不是 bug，
-    是由头作为**一次性队列**的机制：一条由头只发一次，发完就该让位，
-    下一轮重新从当下状态派生新的。留着它们反而会堵死派生：
+    这里**不再把未用过的当过期**。原来的判据 `used_at + ANCHOR_HISTORY > now`
+    对未用过的（`used_at=0`）恒为假，于是每调一次 `prune_anchors` 就把本轮刚派生的
+    候选抹掉——而 `prune_anchors` 在 `add_anchor` / `live_anchors` / `prepare_round_anchors`
+    里都会被调。后果是：一轮里派生了两条以上时，只有最后一条留在池子里，
+    而引擎取的是 `picks[:1]`（第一条）——发出去后 `consume` 找不到它，`used_at` 永远
+    写不上，下一轮同一件事又被重新派生；`mark_failed` 也失效，试次上限形同虚设。
 
-        上限 1  → 每轮都重新派生，6 轮拿到 18 条候选
-        上限 12 → 池子里用过的还在，`add_anchor` 又不会重加同样的事，
-                  候选逐轮变少（3→2→1），派生被饿死
-
-    曾经试过把「没用过的」按寿命（expire_at）留着，发送量从 7 天 127 条掉到 19 条。
+    现在：未用的由头**留到自己的 expire_at**（派生类 2h、时段类 3h、对方那边 24h）；
+    用过的留到历史窗口（避重/冷却靠它）或有效期先到为止。过期的自然淘汰，
+    既不堵死派生（过期即让位），也不会让「刚派生的候选还没发就没了」。
     """
-    kept = [
-        a for a in load_anchors(u)
-        if (_f(a.get("used_at")) + ANCHOR_HISTORY > now) and (_f(a.get("expire_at")) or now + ANCHOR_TTL) > now
-    ]
+    kept = []
+    for a in load_anchors(u):
+        used = _f(a.get("used_at"))
+        exp = _f(a.get("expire_at"))
+        if used and used + ANCHOR_HISTORY <= now:
+            continue
+        if exp and exp <= now:
+            continue
+        kept.append(a)
     if len(kept) != len(load_anchors(u)) or kept != u.get("anchors"):
         u["anchors"] = kept
 

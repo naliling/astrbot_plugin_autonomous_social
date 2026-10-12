@@ -159,7 +159,7 @@ def thread_reason(
     # 照样每两小时（最小间隔一过）就收到一句「在吗」——7 天 30 次。
     # 对方还在说话，就不是人没了。
     peer_silence = now - seen
-    if peer_silence >= presence_floor_seconds and peer_silence < max_seconds:
+    if peer_silence >= floor and peer_silence < max_seconds:
         return "presence", ""
     return "", ""
 

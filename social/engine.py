@@ -1622,6 +1622,33 @@ class SocialEngine:
 
     # ─── 念头结算与选人 ───────────────────────────────
 
+    @staticmethod
+    def _sync_peer_said(u: Dict[str, Any], said: Any) -> None:
+        """把 Core 记的「TA 说过的一句原话」同步进用户状态，供由头派生用。
+
+        Core 契约里 `user.said` 是 `[{"said": 原话, "at": epoch}]`（短摘录、最新在前），
+        正是「想起你之前说的X」这条由头要的素材；而 `anchors._said_recent` 读的是
+        本插件用户状态里的 `[{"said": …, "ts": …}]`。两边一直没接上：插件从不写
+        `u["said"]`（Core 的 said 只进生成侧的 `u_copy["_said"]`），于是这条由头来源
+        从来没产出过。这里按 `_said_recent` 认的形状落一份，时间键从 `at` 映射到 `ts`。
+        """
+        if not isinstance(said, list):
+            return
+        fresh: List[Dict[str, Any]] = []
+        for item in said:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("said") or "").strip()
+            if not text:
+                continue
+            try:
+                ts = float(item.get("at") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            fresh.append({"said": text, "ts": ts})
+        if fresh != u.get("said"):
+            u["said"] = fresh
+
     def settle_minds(
         self,
         bid: str,
@@ -1678,6 +1705,7 @@ class SocialEngine:
                     snap = self.core.load_snapshot(bid, uid, root=core_root)
                     if snap:
                         affection = snap.get("affection")
+                        self._sync_peer_said(u, snap.get("said"))
                 except Exception as e:
                     self.log(f"加载用户 {uid} Core 快照失败: {e}")
 
