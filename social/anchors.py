@@ -36,10 +36,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # 一个人身上同时挂着几条「还没用过的事」
 ANCHOR_MAX = 5
-# 用过之后多久可以再用同一件事（秒）
+# 用过之后多久可以再用同一件事（秒）。它同时也是「已用记录」的寿命：冷却期内这条记录
+# 既是避重依据、也不再是候选；冷却一过就淘汰，同一件事可以重新派生。
+#
+# 原来还有一个更长的 ANCHOR_HISTORY(45 天)，但它被有效期(≤24h)封着、从来活不到那天
+# ——一个写了却永不生效的窗口比没有更误导人，收掉。
 ANCHOR_COOLDOWN = 7 * 86400.0
-# 用过的记录留多久才彻底忘掉（比冷却长：留着是为了别再派生出一模一样的一句）
-ANCHOR_HISTORY = 45 * 86400.0
 # 派生出来的由头最多留多久（过期的意义不大）
 ANCHOR_TTL = 14 * 86400.0
 # 一条由头最多试几次。**发出才算消费**；模型写砸了（被验收层拦下）只记一次失败，
@@ -232,7 +234,7 @@ def load_anchors(u: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def prune_anchors(u: Dict[str, Any], now: float) -> None:
-    """丢掉彻底过期的：用过的过了历史窗口，或任何一条过了自己的有效期。
+    """丢掉彻底过期的：用过的过了冷却，或任何一条过了自己的有效期。
 
     这里**不再把未用过的当过期**。原来的判据 `used_at + ANCHOR_HISTORY > now`
     对未用过的（`used_at=0`）恒为假，于是每调一次 `prune_anchors` 就把本轮刚派生的
@@ -242,14 +244,14 @@ def prune_anchors(u: Dict[str, Any], now: float) -> None:
     写不上，下一轮同一件事又被重新派生；`mark_failed` 也失效，试次上限形同虚设。
 
     现在：未用的由头**留到自己的 expire_at**（派生类 2h、时段类 3h、对方那边 24h）；
-    用过的留到历史窗口（避重/冷却靠它）或有效期先到为止。过期的自然淘汰，
-    既不堵死派生（过期即让位），也不会让「刚派生的候选还没发就没了」。
+    用过的留到冷却（避重靠它）——`consume` 会把它的 expire_at 推到冷却末，所以它不会
+    像以前那样被那条短有效期提前抹掉，7 天冷却才真的成立。
     """
     kept = []
     for a in load_anchors(u):
         used = _f(a.get("used_at"))
         exp = _f(a.get("expire_at"))
-        if used and used + ANCHOR_HISTORY <= now:
+        if used and used + ANCHOR_COOLDOWN <= now:
             continue
         if exp and exp <= now:
             continue
@@ -263,7 +265,7 @@ def _remembered(u: Dict[str, Any], now: float) -> set:
     out = set()
     for a in load_anchors(u):
         used = _f(a.get("used_at"))
-        if used and now - used < ANCHOR_HISTORY:
+        if used and now - used < ANCHOR_COOLDOWN:
             out.add(_s(a.get("about")))
     return out
 
@@ -350,12 +352,17 @@ def live_anchors(
 
 
 def consume(u: Dict[str, Any], about: str, now: float) -> None:
-    """标记某条由头已用过。"""
+    """标记某条由头已用过。
+
+    同时把它的 expire_at 推到冷却末：这条记录从此是「避重依据」而不再是候选，寿命该跟着
+    冷却走，而不是被当初那条短有效期（派生类 2h）提前抹掉——不然 7 天冷却形同虚设。
+    """
     for a in load_anchors(u):
         if _s(a.get("about")) == _s(about):
             a["used_at"] = now
             a["tries"] = 0
             a["use_count"] = int(_f(a.get("use_count"))) + 1
+            a["expire_at"] = now + ANCHOR_COOLDOWN
 
 
 # ── 派生 ──────────────────────────────────────────────────────

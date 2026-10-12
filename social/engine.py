@@ -205,8 +205,6 @@ TRIGGER_CANDIDATE_LIMIT = 3
 
 # 发送失败隔离这个人多久不再试
 SEND_BLOCK_HOURS = 24
-# 模型否决后的轻退避：推多久再试。由头不消耗，所以这只是「别每轮都问同一句」。
-VETO_BACKOFF_SECONDS = 1800.0
 # 低档连着几次发不出去就停发（真人不会一直追一个不回话的人）
 GIVEEUP_TRIES = 2
 # 只有平台明确说「这个目标发不了」才隔离该用户。平台级的失败（不支持主动消息、
@@ -3456,13 +3454,9 @@ class SocialEngine:
                 # 这句话」，再给机会也只是浪费。两者必须分开算。
                 desire.after_skip(u, now)
                 u["last_skip_reason"] = decision.why_not
-                # 轻退避：把「多久之后可以再试」往后挪一点，但**不动寿命**。
-                # 以前是走 defer_cue 去推 retry_at，而那条只处理有由头的路径；纯念头
-                # 否决时反而什么都没记，于是同一条由头每轮心跳重试一次——仿真里 7 天
-                # 626 次调用就是这么来的。
-                u["retry_at"] = max(
-                    float(u.get("retry_at", 0) or 0), now + VETO_BACKOFF_SECONDS
-                )
+                # 轻退避：`desire.after_skip` 已经把「多久之后可以再试」落在
+                # last_skip_at / last_skip_reason 上（由头不消耗，只是别每轮都问同一句）。
+                # 这里不再另写一个没人读的 retry_at——那是 defer_cue 时代的残留。
                 self.state.mark_dirty()
                 self.state.save()
                 return False, f"想过，但觉得现在不该说：{decision.why_not}"

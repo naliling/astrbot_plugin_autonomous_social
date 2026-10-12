@@ -2630,11 +2630,15 @@ class TestVetoDoesNotBurnTheAnchor(unittest.TestCase):
                          "否决不该消耗由头——那是「这个人此刻不该被找」，不是「这件事她驾驭不了」")
 
     def test_veto_still_backs_off(self):
-        """但也不能完全当无事发生，否则同一条由头每轮心跳重试一次。"""
+        """但也不能完全当无事发生，否则同一条由头每轮心跳重试一次。
+
+        退避落在 `desire.after_skip` 的 `last_skip_at` 上（`gate_reason` 按
+        `skip_cooldown_minutes` 读它）；不再另写一个没人读的 retry_at。
+        """
         src_txt = self._engine()
         i = src_txt.index("if not decision.send:")
         j = src_txt.index("parts = decision.parts", i)
-        self.assertIn("VETO_BACKOFF_SECONDS", src_txt[i:j], "否决没有退避")
+        self.assertIn("after_skip", src_txt[i:j], "否决没有退避")
 
     def test_verify_rejection_still_burns_the_anchor(self):
         src_txt = self._engine()

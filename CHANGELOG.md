@@ -1,5 +1,17 @@
 # 更新日志
 
+## v1.27.18 — 由头 7 天冷却真正生效；清掉两处死写；与 Core 2.27.18 同步
+
+- **修「用过的由头」寿命被有效期封顶**：`consume` 不刷新 `expire_at`，于是用过的由头
+  最多活 24h（它自己的 TTL），`ANCHOR_COOLDOWN`(7 天) 与 `ANCHOR_HISTORY`(45 天) 形同虚设
+  ——同一件事过一天就能重新派生。现在 `consume` 把 `expire_at` 推到冷却末，7 天冷却真的成立；
+  45 天那个写了却永不生效的窗口一并收掉。
+  仿真对比：正常场景送达不变（8 条），emoji 场景白转 LLM 请求 75→70。
+- **清死写**：`u["retry_at"]`（否决退避，写没人读——真正生效的是 `desire.after_skip` 的
+  `last_skip_at`，`gate_reason` 按 `skip_cooldown_minutes` 读它）与 `note_promise` 里的
+  `mark_dirty_hint`（静态方法里标脏无效，实际由随后的 `record_outgoing` 落盘）。
+- 测试：`test_veto_still_backs_off` 改为断言真实机制（`after_skip`）而不是那个被删掉的常量。
+
 ## v1.27.17 — 由头发出去才算数；「想起你之前说的X」接通；与 Core 2.27.17 同步
 
 本版依据一份外部审查（GPT）的意见逐条核实后修改。审查点名的是「状态生命周期」这一类风险，

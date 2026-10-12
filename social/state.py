@@ -1281,7 +1281,6 @@ class SocialState:
         })
         items.sort(key=lambda i: _num(i.get("at")), reverse=True)
         u["promises"] = items[:PROMISE_SLOTS_MAX]
-        u["mark_dirty_hint"] = True
 
     def record_spoken(
         self,
