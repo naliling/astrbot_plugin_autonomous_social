@@ -4376,15 +4376,13 @@ class SocialEngine:
             except Exception as e:
                 last_err = str(e)
             if attempt < SEND_RETRY_COUNT:
-                if throttle.allow(f"send.retry.{bid or '-'}"):
-                    logger.warning(
-                        f"[autonomous_social] 发送失败（第{attempt + 1}次），稍后重试: {last_err}"
-                        + throttle.summary(f"send.retry.{bid or '-'}")
-                    )
+                # 中间的重试不再单独打日志：一次发送失败只留最后那一条，
+                # 免得一次失败就刷好几行（手机端一行警告就占满屏）。
                 await asyncio.sleep(SEND_RETRY_DELAY)
             elif throttle.allow(f"send.failed.{bid or '-'}"):
+                _retried = f"（已重试{SEND_RETRY_COUNT}次）" if SEND_RETRY_COUNT else ""
                 logger.warning(
-                    f"[autonomous_social] 发送失败（已重试{SEND_RETRY_COUNT}次）: {last_err}"
+                    f"[autonomous_social] 发送失败{_retried}: {last_err}"
                     + throttle.summary(f"send.failed.{bid or '-'}")
                 )
         self._note_send_failure(bid, last_err, peer_unreachable)
