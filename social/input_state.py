@@ -145,7 +145,13 @@ class InputStateNotifier:
         except Exception as exc:  # pragma: no cover - 纯装饰
             self._log.debug(f"[autonomous_social] 输入状态上报失败: {exc}")
         finally:
-            self._tasks.pop(umo, None)
+            # 只清掉**还是自己**的那条记录：stop() 与 start() 可能交织，
+            # 不加这个判断的话旧任务的收尾会把刚起的新任务记录删掉，
+            # 新任务就再也没人能停（只能等 timeout，期间一直显示「正在输入」）。
+            current = asyncio.current_task()
+            entry = self._tasks.get(umo)
+            if entry is not None and entry[0] is current:
+                self._tasks.pop(umo, None)
 
     async def _report(self, api: Any, user_id: str) -> None:
         try:
