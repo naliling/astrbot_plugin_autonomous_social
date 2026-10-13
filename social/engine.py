@@ -35,7 +35,7 @@ from .config import SocialConfig
 from .core_bridge import CoreBridge
 from .input_state import InputStateNotifier
 from .sanitize import sanitize_incoming
-from .anchors import anchor_meta, anchor_sentence, prepare_round_anchors
+from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_anchors
 from .verify import (
     _bigrams,
     _check_cross_user,
@@ -3528,7 +3528,7 @@ class SocialEngine:
                         f"[{bid}]「{_about[:16]}」刚发给过别人了，换一个"
                     )
                     # 换个由头再试一次，而不是直接放弃这一轮
-                    self.state.drop_anchor(u, _about)
+                    drop_anchor(u, _about, self._time())
         if ok and self.cfg.cross_user_repeat_hours > 0:
             others = self.state.recent_proactive_others(
                 bid, uid, self._time(), hours=self.cfg.cross_user_repeat_hours

@@ -1,5 +1,14 @@
 # 更新日志
 
+## v1.27.19 — 修 drop_anchor 调用漏改（跨用户撞车分支崩溃）
+
+- **修 `engine.py` 里 `drop_anchor` 调用漏改**：由头相关函数早已抽到 `anchors.py` 变成
+  模块级函数（`add_anchor` / `load_anchors` / `drop_anchor` 都要显式传 `u`，`drop_anchor`
+  还要 `now`），但 `_speak_inner` 里「同一件事刚发给过别人了，换一个」这条分支仍按旧写法
+  `self.state.drop_anchor(u, _about)` 调——`SocialState` 上没有这个方法，参数也少一个 `now`。
+  走到这条分支就抛 `AttributeError`，把整个后台循环带崩、主动发言暂停 15 分钟，循环往复。
+  改为模块级 `drop_anchor(u, _about, self._time())` 并在文件顶部 import。
+
 ## v1.27.18 — 由头 7 天冷却真正生效；清掉两处死写；与 Core 2.27.18 同步
 
 - **修「用过的由头」寿命被有效期封顶**：`consume` 不刷新 `expire_at`，于是用过的由头

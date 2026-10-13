@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-__version__ = "1.27.18"
+__version__ = "1.27.19"
 
 LOG_PREFIX = "[autonomous_social]"
