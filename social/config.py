@@ -450,6 +450,9 @@ class SocialConfig:
 
     # 每轮心跳每个角色最多主动发几条（对不同用户；同一用户仍走自己的冷却）
     max_sends_per_round: int = MAX_SENDS_PER_ROUND_DEFAULT
+    # 批量调度：一轮里对多个人「逐人生成、并发发送」的上限（1 = 退回旧的串行）。
+    # 只影响同一轮内多个人之间的并行度，不改任何人的冷却/配额与内容。
+    batch_send_concurrency: int = 3
 
     # 早晚问候（时间性触发）：不靠念头攒，窗口到了、今天还没问候过就说一句
     greeting_enabled: bool = GREETING_ENABLED_DEFAULT
@@ -734,6 +737,7 @@ class SocialConfig:
                 MAX_SENDS_PER_ROUND_MIN,
                 min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", _d("max_sends_per_round",  MAX_SENDS_PER_ROUND_DEFAULT)))),
             ),
+            batch_send_concurrency=max(1, min(10, int(g("batch_send_concurrency", _d("batch_send_concurrency", 3))))),
             greeting_enabled=bool(g("greeting_enabled", _d("greeting_enabled",  GREETING_ENABLED_DEFAULT))),
             greeting_morning_start=max(
                 HOUR_MIN, min(HOUR_MAX, int(g("greeting_morning_start", _d("greeting_morning_start",  GREETING_MORNING_START_DEFAULT))))

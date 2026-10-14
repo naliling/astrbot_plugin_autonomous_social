@@ -2943,7 +2943,10 @@ class SocialEngine:
         # 同一个人一轮里只服务一次：既到问候窗口、念头又攒满时，说一句早安就够
         served: Set[Tuple[str, str]] = set()
 
-        async def speak(
+        # 逐人生成、批量调度：下面各通道只**收集**候选成 job（收集阶段不 await 发送），
+        # 全部攒齐后再统一交给 speak() 并发处理。job 带齐发送所需的一切，外加可选的
+        # 「发送成功后的 post 动作」（念想写 miss_day、想要了写 intimacy_asked_at）。
+        def job_of(
             bid: str,
             uid: str,
             u: Dict[str, Any],
@@ -2951,9 +2954,35 @@ class SocialEngine:
             preset: Optional[Tuple[str, Dict[str, Any]]],
             note: str,
             require_about_peer: bool = False,
-        ) -> bool:
-            """发一条、记账、记账后稍隔几秒。发不出（被否决/失败）不耗配额。"""
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+            post: Optional[Any] = None,
+        ) -> Dict[str, Any]:
+            return {
+                "bid": bid,
+                "uid": uid,
+                "u": u,
+                "urge": urge,
+                "preset": preset,
+                "note": note,
+                "require_about_peer": require_about_peer,
+                "post": post,
+            }
+
+        jobs: List[Dict[str, Any]] = []
+
+        async def speak(job: Dict[str, Any]) -> bool:
+            """发一条、记账、记账后稍隔几秒。发不出（被否决/失败）不耗配额。
+
+            「检查 + 占用」在拿到 per-(bot,uid) 锁之后、下一个 await 之前一次做完：
+            `served.add` 占住这个人，`budget[bid] -= 1` 占住这个角色的名额（失败再还
+            回去）。两件事都必须在锁内、中间不夹 await——同一角色下不同人的 job 并发
+            时各自的锁互不阻塞，若把占用留到 `await self._speak` 之后再做，它们会一起
+            读到同一个 budget 值，把 max_sends_per_round 冲破。
+            """
+            bid = job["bid"]
+            uid = job["uid"]
+            preset = job["preset"]
+            note = job["note"]
+            if budget.get(bid, 0) <= 0:
                 return False
             # 锁在这一层，而不是每个调用点：`_speak` 里有 LLM 调用（秒级），这段时间里
             # `observe` 可以从另一个协程插进来改**同一个** user dict（收到新消息会清
@@ -2961,6 +2990,11 @@ class SocialEngine:
             # urge 少加一点、last_seen 被覆盖、conversation 顺序错乱。
             # 锁是 per-(bot,uid) 的，所以发 A 的时候不会把发 B 一起堵住。
             async with self._user_lock(bid, uid):
+                if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+                    return False
+                # 检查与占用之间不能有 await，否则并发进来的同角色 job 会挤进这个窗口。
+                served.add((bid, uid))
+                budget[bid] -= 1
                 # 拿到锁之后重新取一次 u：等锁期间 observe 可能已经改过它，
                 # 继续用等锁前那个引用就是在写一份过期的快照。
                 u = self.state.user(bid, uid)
@@ -2974,9 +3008,13 @@ class SocialEngine:
                     preset_meta.setdefault("_message_count", u.get("message_count", 0))
                     preset_meta.setdefault("_avg_reply_seconds", u.get("avg_reply_seconds", 0.0))
                 sent, result = await self._speak(
-                    bid, uid, u, urge, now, preset=preset,
-                    require_about_peer=require_about_peer,
+                    bid, uid, u, job["urge"], now, preset=preset,
+                    require_about_peer=job["require_about_peer"],
                 )
+                if not sent:
+                    # 没发成：把占的位和名额都还回去，让后面的候选还有机会。
+                    served.discard((bid, uid))
+                    budget[bid] += 1
             self.log(f"{note}{uid} → {result}")
             if not sent:
                 # 模型自己否决的另记在 veto_total；这里记的是「这一条最终没发出去」。
@@ -2984,9 +3022,10 @@ class SocialEngine:
                 self._count_block(result)
                 self._note_decision(uid, f"没发：{result}")
                 return False
-            budget[bid] -= 1
-            served.add((bid, uid))
             self._note_decision(uid, f"发了：{note}")
+            post = job.get("post")
+            if post is not None:
+                post()
             if budget.get(bid, 0) > 0:
                 # 这一轮还会找下一个人：稍微隔开几秒，别一口气把所有话说完
                 await asyncio.sleep(random.uniform(2.0, 5.0))
@@ -3031,10 +3070,9 @@ class SocialEngine:
             # 「楼下便利店的关东煮今天有蟹棒诶」**正是真人会发的话**——真人分享自己
             # 看到的东西时不会句句带「你」。按「必须出现第二人称」去卡这一类，
             # 实测一天 155 个候选里 84 个被拦掉，量直接归零。
-            if await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0, (anchor_sentence(a), meta), f"问候（{label}） "
-            ):
-                served.add((bid, uid))
+            ))
 
         for bid, uid, u, kind, reason, gap in sorted(threads, key=lambda item: item[5]):
             if budget.get(bid, 0) <= 0:
@@ -3044,16 +3082,16 @@ class SocialEngine:
                 about=str(u.get("last_message", "") or ""),
                 asked=str(u.get("last_spoken_text", "") or ""),
             )
-            await speak(bid, uid, u, 0.0, (reason, meta), f"{kind}（沉默 {gap / 60:.0f} 分钟）")
+            jobs.append(job_of(bid, uid, u, 0.0, (reason, meta), f"{kind}（沉默 {gap / 60:.0f} 分钟）"))
 
         for bid, uid, u, about, overdue in sorted(loops, key=lambda item: -item[4]):
             if budget.get(bid, 0) <= 0:
                 continue
-            await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0,
                 (loop_reason(about), loop_meta(about)),
                 f"回访「{about}」（到期 {overdue / 60:.0f} 分钟后）",
-            )
+            ))
 
         # 轮转：先按「最久没联系的优先」，念头只做同分次序。
         #
@@ -3090,50 +3128,57 @@ class SocialEngine:
                 self._count_block(why)
                 self.log(f"有由头但没说（{uid}）：{why}")
                 continue
-            await speak(
+            jobs.append(job_of(
                 bid, uid, u, urge,
                 (anchor_sentence(a), anchor_meta(a)),
                 f"因为{a.get('about')} urge={urge:.2f} ",
-            )
+            ))
 
         # 兑现承诺排在「另起话题」之后：她是自己答应过这件事的，理由比随口找个话题足。
         for bid, uid, u, about in promises:
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 continue
-            await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0, (f"该兑现「{about}」了", promise_meta(about)),
                 f"兑现承诺「{about}」 ",
-            )
+            ))
 
         # 念想型：没有正事可说时不占「有正事」的优先级，但也别排到最后——
         # 它本来就是「闲下来想起一个人」的状态。
+        def _miss_post(_bid: str, _uid: str) -> None:
+            # 记上今天已发几条。上限不再是一天一条（那让「没有正事就是想找你」
+            # 变成稀有事件，用户反馈里「每次发言都有事」的一半原因就在这）。
+            st_u = self.state.user(_bid, _uid)
+            st_u["miss_day"] = self._miss_mark_today(
+                st_u, self._moment_of(_bid, self._time()).strftime("%Y-%m-%d")
+            )
+            self.state.mark_dirty()
+
         for bid, uid, u, a in misses:
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 continue
-            if await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0,
                 (anchor_sentence(a), anchor_meta(a)),
                 f"念想「{a.get('about')}」 ",
                 require_about_peer=True,
-            ):
-                # 记上今天已发几条。上限不再是一天一条（那让「没有正事就是想找你」
-                # 变成稀有事件，用户反馈里「每次发言都有事」的一半原因就在这）。
-                st_u = self.state.user(bid, uid)
-                st_u["miss_day"] = self._miss_mark_today(st_u, self._moment_of(bid, self._time()).strftime("%Y-%m-%d"))
-                self.state.mark_dirty()
+                post=lambda _b=bid, _u=uid: _miss_post(_b, _u),
+            ))
 
         # 「想要了」：只对真的做过色色、且此刻欲望涨上来的人主动问一句（可不可以）。
+        def _intimacy_post(_bid: str, _uid: str) -> None:
+            self.state.user(_bid, _uid)["intimacy_asked_at"] = now
+            self.state.mark_dirty()
+
         for bid, uid, u in intimacies:
             if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                 continue
-            if await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0,
                 (_intimacy_reason(), _intimacy_meta()),
                 "想要了（主动问一句可不可以）",
-            ):
-                st_u = self.state.user(bid, uid)
-                st_u["intimacy_asked_at"] = now
-                self.state.mark_dirty()
+                post=lambda _b=bid, _u=uid: _intimacy_post(_b, _u),
+            ))
 
         for bid, uid, u, reason in closers:
             if budget.get(bid, 0) <= 0:
@@ -3141,7 +3186,7 @@ class SocialEngine:
             hung = (now - float(u.get("last_sent", 0) or 0)) / 3600.0
             # 已读续接：对方回过（那句回话走的是正常聊天链路，不是插件发的）之后又
             # 没声了，这时候补的一句该**接着那几句说**。没有素材时退回老做法。
-            await speak(
+            jobs.append(job_of(
                 bid, uid, u, 0.0,
                 (
                     reason,
@@ -3151,7 +3196,25 @@ class SocialEngine:
                     ),
                 ),
                 f"收场（那句悬了 {hung:.1f} 小时）",
-            )
+            ))
+
+        # 有界并发：收集完成后统一调度。`batch_send_concurrency == 1` 时逐条 await，
+        # 与改造前的串行行为一致（连发送之间那几秒间隔也一样）。
+        limit = max(1, int(self.cfg.batch_send_concurrency))
+        if limit == 1:
+            for job in jobs:
+                await speak(job)
+        else:
+            sem = asyncio.Semaphore(limit)
+
+            async def _dispatch(job: Dict[str, Any]) -> None:
+                async with sem:
+                    try:
+                        await speak(job)
+                    except Exception as exc:  # 单个候选炸了不该带走这一轮其它人的发送
+                        self.log(f"发送任务异常（{job['uid']}）：{exc}")
+
+            await asyncio.gather(*(_dispatch(job) for job in jobs))
 
         # 运行指标刷盘：容器侧不用开日志就能从 state.json 的 _runtime 段判断
         # 「她到底跑起来没、卡在哪一步」。只存数字与短标签。

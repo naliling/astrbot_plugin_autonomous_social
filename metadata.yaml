@@ -15,7 +15,7 @@ desc: |
   惦记的事、上次没说完的，她记得住。没装也不影响：主动消息照常发，只是没有这份记忆。
 
   零额外依赖，开箱即用。
-version: "1.27.21"
+version: "1.27.22"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.0.0"

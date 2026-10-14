@@ -240,6 +240,14 @@
     "min": 1,
     "max": 10
   },
+  "batch_send_concurrency": {
+    "type": "int",
+    "description": "【进阶】批量发送并发数",
+    "hint": "一轮里对多个人「逐人生成、并发发送」的上限（1 = 退回串行）。只影响同一轮多个人之间的并行度，不改任何人的冷却/配额与内容。",
+    "default": 3,
+    "min": 1,
+    "max": 10
+  },
   "cross_user_repeat_ratio": {
     "type": "float",
     "description": "跨用户撞车的相似度上限",
