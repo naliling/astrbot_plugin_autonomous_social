@@ -2401,6 +2401,24 @@ class SocialEngine:
             return "上一条主动发的还没回"
         return ""
 
+    @staticmethod
+    def _core_last_interaction(
+        core_root: Optional[Dict[str, Any]], bid: str, uid: str
+    ) -> Optional[float]:
+        """Core 记的「这个人上次说话」的时刻（每条消息都记）。拿不到返回 None。
+
+        社交层自己的 last_seen 只在它观察到消息时才更新，实测会落后 Core 几小时到
+        几天；由头/问候里的「沉默多久」要用 Core 这个更准的。
+        """
+        try:
+            user = (
+                ((core_root or {}).get("roles", {}) or {}).get(str(bid), {}) or {}
+            ).get("users", {}) or {}
+            ts = float((user.get(str(uid), {}) or {}).get("last_interaction") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return ts if ts > 0 else None
+
     def _anchor_pick(
         self,
         u: Dict[str, Any],
@@ -2411,6 +2429,7 @@ class SocialEngine:
         tier: str = "",
         affection: Optional[float] = None,
         warmth: Optional[float] = None,
+        last_talk: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """这个人本轮可以用的由头。
 
@@ -2422,7 +2441,7 @@ class SocialEngine:
         try:
             picks = prepare_round_anchors(
                 u, body or {}, now, limit=limit,
-                tier=tier, affection=affection, warmth=warmth,
+                tier=tier, affection=affection, warmth=warmth, last_talk=last_talk,
             )
         except Exception as exc:
             self.log(f"准备由头失败（{u.get('umo','')}）: {exc}")
@@ -2860,7 +2879,10 @@ class SocialEngine:
                 # 只留下**手上真有由头**的。念头够不够由 settle_minds 管，
                 # 但没有由头的人不进队——这就是「没什么可说的就别说话」。
                 for uid, u, urge in ready:
-                    picks = self._anchor_pick(u, bodies.get(bid), now)
+                    picks = self._anchor_pick(
+                        u, bodies.get(bid), now,
+                        last_talk=self._core_last_interaction(core_root, bid, uid),
+                    )
                     if not picks:
                         self.log(f"{uid} 念头到了但没由头，不找话说")
                         continue
@@ -3050,7 +3072,8 @@ class SocialEngine:
                 continue
             tier, aff, warmth = self._tier_of(bid, uid, u, core_root, now)
             picks = self._anchor_pick(
-                u, bodies.get(bid), now, limit=1, tier=tier, affection=aff, warmth=warmth
+                u, bodies.get(bid), now, limit=1, tier=tier, affection=aff, warmth=warmth,
+                last_talk=self._core_last_interaction(core_root, bid, uid),
             )
             if not picks:
                 continue
@@ -3415,6 +3438,9 @@ class SocialEngine:
         u_copy["_tier_note"] = anchors.tier_note(_tier, _aff, _warmth)
         u_copy["_energy"] = user_core.get("energy") if user_core else None
         u_copy["_social_energy"] = user_core.get("social_energy") if user_core else None
+        # Core 记的「这个人上次说话」时刻。主动消息里的「距离上次说话」用它，
+        # 不用社交层自己的 last_seen（那个只在它观察到消息时才更新，会落后几小时到几天）。
+        u_copy["_last_interaction"] = user_core.get("last_interaction") if user_core else None
         # 接了 Core v2.14 的契约时这里有完整的身体：困不困、饿不饿、想说话的程度，
         # 以及她此刻正手上的事。拿不到契约时为空，生成器会退回旧的两个标量。
         u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
@@ -4210,6 +4236,7 @@ class SocialEngine:
             u_copy["_tier_note"] = anchors.tier_note(tier, aff, warmth)
             u_copy["_energy"] = user_core.get("energy") if user_core else None
             u_copy["_social_energy"] = user_core.get("social_energy") if user_core else None
+            u_copy["_last_interaction"] = user_core.get("last_interaction") if user_core else None
             u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
             if user_core:
                 u_copy["_nickname"] = str(user_core.get("nickname") or "")

@@ -113,6 +113,20 @@ def _s(x: Any) -> str:
         return ""
 
 
+def _talk_ts(u: Dict[str, Any], last_talk: Optional[float] = None) -> float:
+    """「上次跟 TA 说话」的时刻。
+
+    以 Core 的 `last_interaction`（每条消息都记）为准，没有才退回社交层自己的
+    `last_seen`——后者只在社交层自己观察到消息时才更新，实测会落后 Core 几小时到
+    几天，于是把「TA 刚说过话」误报成「好久没理你了」。
+    """
+    try:
+        ts = float(last_talk)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return ts if ts > 0 else _f(u.get("last_seen"))
+
+
 # ── 关系热度分档 ──────────────────────────────────────────────────
 #
 # **为什么不按好感度绝对值分档。**
@@ -373,7 +387,8 @@ def _short(text: Any, n: int = 14) -> str:
 
 
 def _derive_from_state(
-    body: Dict[str, Any], u: Dict[str, Any], now: float, taken: set
+    body: Dict[str, Any], u: Dict[str, Any], now: float, taken: set,
+    *, last_talk: Optional[float] = None,
 ) -> List[str]:
     """从她自己的真实状态里，派生出「一件具体的事」。
 
@@ -461,7 +476,7 @@ def _derive_from_state(
     if _is_idle(body):
         offer("今天挺空的")
 
-    seen = _f(u.get("last_seen"))
+    seen = _talk_ts(u, last_talk)
     if seen and now > seen:
         hours = (now - seen) / 3600.0
         if hours >= 24 * 7:
@@ -592,6 +607,7 @@ def prepare_round_anchors(
     relational: bool = False,
     tier: str = "",
     warmth: Optional[float] = None,
+    last_talk: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """本轮这个人可以用的由头：存量池 + 当场派生。
 
@@ -615,16 +631,16 @@ def prepare_round_anchors(
         used.add(_s(a.get("about")))
 
     if relational:
-        candidates = derive_relations(u, affection, now, used)
+        candidates = derive_relations(u, affection, now, used, last_talk=last_talk)
         kind = KIND_MISS
         # 手上真没有新事发生 —— 真人这时候会随口说一句，不至于硬找个话题。
         # 「你有多久没理我了」本身就是理由。
         if not candidates:
-            gap_candidates = derive_nag(u, now, used, tier=tier)
+            gap_candidates = derive_nag(u, now, used, tier=tier, last_talk=last_talk)
             if gap_candidates:
                 return [c for c in gap_candidates]
     else:
-        candidates = _derive_from_state(body, u, now, used)
+        candidates = _derive_from_state(body, u, now, used, last_talk=last_talk)
         kind = KIND_DERIVED
 
     for text in candidates:
@@ -713,6 +729,7 @@ def derive_relations(
     taken: set,
     *,
     care_hours: float = 24.0,
+    last_talk: Optional[float] = None,
 ) -> List[str]:
     """派生出「关于 TA / 关于你们」的由头。"""
     out: List[str] = []
@@ -730,7 +747,7 @@ def derive_relations(
 
     # 牵挂：对方最近说过自己不好
     try:
-        since = now - _f(u.get("last_seen"))
+        since = now - _talk_ts(u, last_talk)
     except (TypeError, ValueError):
         since = 0.0
     if theirs and 0 < since <= care_hours * 3600.0:
@@ -775,9 +792,10 @@ _NAG_BY_GAP = (
 )
 
 
-def derive_nag(u: Dict[str, Any], now: float, taken: set, *, tier: str = "") -> List[str]:
+def derive_nag(u: Dict[str, Any], now: float, taken: set, *, tier: str = "",
+               last_talk: Optional[float] = None) -> List[str]:
     """安静了一阵子 → 随口问一句。分档只是为了换措辞。"""
-    seen = _f(u.get("last_seen"))
+    seen = _talk_ts(u, last_talk)
     if seen <= 0:
         return []
     gap = max(0.0, now - seen)

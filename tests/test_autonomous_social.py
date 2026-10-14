@@ -1183,6 +1183,36 @@ class TestNoScriptedContent(unittest.TestCase):
         self.assertEqual(block.count("改方案"), 1, "同一件事被列了两遍")
         self.assertIn("别编这里没有的事", block)
 
+    def test_material_block_prefers_core_last_interaction(self):
+        """「距离上次说话」以 Core 的 last_interaction 为准，不用社交层自己（偏旧）的 last_seen。"""
+        gen = self._generator()
+        import datetime
+
+        now = datetime.datetime(2026, 3, 4, 15, 30)
+        ref = 1_700_000_000.0
+        block = gen._material_block(
+            {
+                # 社交层账本偏旧（以为 3 天没说话）；Core 记的是 1 小时前
+                "last_seen": ref - 3 * 86400,
+                "_last_interaction": ref - 3600,
+            },
+            {},
+            now, ref,
+        )
+        self.assertIn("1.0 小时", block)
+        self.assertNotIn("3 天没跟你说话", block)
+
+    def test_material_block_falls_back_without_core(self):
+        gen = self._generator()
+        import datetime
+
+        now = datetime.datetime(2026, 3, 4, 15, 30)
+        ref = 1_700_000_000.0
+        block = gen._material_block(
+            {"last_seen": ref - 3 * 86400}, {}, now, ref,
+        )
+        self.assertIn("3 天没跟你说话", block, "没接 Core 时该退回自己的 last_seen")
+
     def test_style_profile_only_outputs_features(self):
         from social.style_profile import build_style_profile
 
@@ -2537,6 +2567,15 @@ class TestNagInsteadOfCalendar(unittest.TestCase):
         anchors_mod.derive_nag(u, 1_000_000.0 + 8 * 3600.0, set())
         again = anchors_mod.derive_nag(u, 1_000_000.0 + 8 * 3600.0 + 300.0, set())
         self.assertEqual(again, [], "同一句问候一辈子只说一次")
+
+    def test_nag_prefers_core_last_interaction(self):
+        """由头的「沉默」也用 Core 的 last_interaction：Core 说 1 分钟前刚说过，就不该发问候。"""
+        now = 1_000_000.0 + 8 * 3600.0
+        u = {"last_seen": 1_000_000.0, "conversation": []}
+        # 社交层以为隔了 8 小时（会发问候），Core 说 1 分钟前刚说过 → 不发
+        self.assertEqual(
+            anchors_mod.derive_nag(u, now, set(), last_talk=now - 60.0), []
+        )
 
 
 class TestQuiesce(unittest.TestCase):

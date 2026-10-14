@@ -2197,9 +2197,15 @@ class MessageGenerator:
         except Exception:
             pass
 
+        # 「距离上次说话」以 Core 的 last_interaction 为准（engine 从 Core 快照取进
+        # `_last_interaction`）：Core 每条消息都记，而社交层自己的 last_seen 只在它观察到
+        # 消息时才更新，实测会落后 Core 几小时到几天，把「TA 刚说过话」误报成「好久没理你了」。
+        # Core 没装 / 没这个字段时才退回自己的。
         seen = 0.0
         try:
-            seen = float(target.get("last_seen", 0) or 0)
+            seen = float(target.get("_last_interaction") or 0) or float(
+                target.get("last_seen", 0) or 0
+            )
         except (TypeError, ValueError):
             seen = 0.0
         if seen > 0 and ref > seen:
