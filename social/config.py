@@ -43,8 +43,6 @@ URGE_REFILL_DEFAULT = 4
 # 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
 CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
 CROSS_USER_REPEAT_HOURS_DEFAULT = 2.0
-# 提示里带上「可以拆成几段」的概率——已废弃：拆不拆跟框架分段设置走。
-BURST_PROBABILITY_DEFAULT = 0.62
 HOURLY_SENDS_CAP_DEFAULT = 12
 HOURLY_SENDS_CAP_MAX = 200
 GREETING_MIDDAY_START_DEFAULT = 12
@@ -65,7 +63,10 @@ MIN_GAP_MAX = 720
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
 # 心跳间隔（分钟）。它决定所有分钟级配置的实际精度
 HEARTBEAT_MIN_MINUTES_MIN = 1
+# 心跳下限的上限（与 schema 的 heartbeat_min_minutes.max=60 对齐）
 HEARTBEAT_MINUTES_MAX = 60
+# 心跳上限的上限（与 schema 的 heartbeat_max_minutes.max=120 对齐）
+HEARTBEAT_MAX_MINUTES_MAX = 120
 HEARTBEAT_MIN_DEFAULT = 8
 HEARTBEAT_MAX_DEFAULT = 15
 
@@ -163,14 +164,14 @@ MAX_SENDS_PER_ROUND_MIN = 1
 MAX_SENDS_PER_ROUND_MAX = 10
 MAX_SENDS_PER_ROUND_DEFAULT = 3
 
-# 连发拆段上限：跟框架分段设置走，只留一个硬护栏防刷屏。
-MAX_BURST_PARTS_MIN = 1
-MAX_BURST_PARTS_MAX = 4
-MAX_BURST_PARTS_DEFAULT = 4
-
 # ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
 # 下面这些管群聊侧。默认在 bot 所在的所有群生效（不需要白名单）。
+#
+# `private_only` **只管「要不要在群里主动说话」这一件事**：群会话会不会被当成
+# 「人」导入是另一码事（历史导入只收私聊会话、seed 名单只收私聊类型），
+# 与这一项无关。以前两者共用这一个开关，于是把它关掉时群会话会被建成用户条目，
+# 而条目的 umo 是群地址 —— 发送路径照着它发，一句私聊口吻的主动消息就进了群。
 
 # 心流：bot 在群里说过话后，开一个「关注窗口」，窗口内群消息若值得接就无需被@接一句。
 # 保守档——只有 bot 自己刚发过言才会开窗，不主动盯着整个群。
@@ -819,7 +820,7 @@ class SocialConfig:
             heartbeat_max_minutes=max(
                 HEARTBEAT_MIN_MINUTES_MIN,
                 min(
-                    HEARTBEAT_MINUTES_MAX,
+                    HEARTBEAT_MAX_MINUTES_MAX,
                     int(g("heartbeat_max_minutes", _d("heartbeat_max_minutes",  HEARTBEAT_MAX_DEFAULT))),
                 ),
             ),

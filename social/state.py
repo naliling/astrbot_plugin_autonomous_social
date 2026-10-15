@@ -50,6 +50,19 @@ def _safe_ts(value: Any, default: float = 0.0) -> float:
 
 # ─── 常量定义 ───────────────────────────────────────
 
+# umo 的 message_type 段里，哪些表示「这是一个群/频道会话」。
+# 必须与 `history_ingest._GROUP_TYPES` 保持同一套写法：`guildmessage` 曾经只在前者里，
+# 于是 QQ 频道的幽灵永远清不掉（前者拿它判「是群、别导入」，后者拿它判「是不是幽灵」）。
+_GROUP_UMO_TYPES = frozenset(
+    {"group", "g", "groupmessage", "guild", "guildmessage"}
+)
+
+# 多久没在这个群插过话，就把「连着插没人理」的账一笔勾销。
+#
+# 这个计数说的是**同一波活跃里**连插了几句没人接。隔了几个小时还记着，它就变成了
+# 「这个群永久不许她开口」—— 见 `forgive_stale_flow_ignored`。
+FLOW_IGNORED_RESET_SECONDS = 3 * 3600.0
+
 STATE_VERSION = 2
 DEFAULT_BOT_KEY = "default"
 
@@ -150,11 +163,15 @@ class SocialState:
 
     def user(self, bid: str, uid: str) -> Dict[str, Any]:
         """获取或创建用户状态。"""
-        return (
+        u = (
             self.bot(bid)
             .setdefault("users", {})
             .setdefault(uid, self._default_user())
         )
+        # 读路径（_min_gap_left / _note_giveup / 日志）要拿得到这个用户的 uid：
+        # 记录里存一份，省得每处调用都显式传 uid。每次取都归一化重写一遍。
+        u["__uid"] = str(uid)
+        return u
 
     def known_bot_ids(self) -> set:
         """本进程见过「自己也在发言」的 bot id 集合（多 bot 同进程部署时的兄弟）。
@@ -184,6 +201,7 @@ class SocialState:
         return {
             "name": "",
             "umo": "",
+            "__uid": "",
             "message_count": 0,
             "last_seen": 0.0,
             "last_message": "",
@@ -323,10 +341,17 @@ class SocialState:
         now: float,
         store_text: bool = True,
         sample_cap: int = 30,
+        is_self: bool = False,
     ) -> Dict[str, Any]:
         """记下一条群消息：刷新 last_seen/umo，并（需要时）把群友发言存进参考库。
 
         is_bot=True 时不进参考库（不学自己），但会刷 last_seen。参考库只存真人发言。
+
+        `is_self` 与 `is_bot` 要分开：多 bot 同群时，兄弟 bot 的发言**也是 bot**，
+        但它不是「我自己」。`last_human_at` 的语义是「最近一次**别人**开口」，
+        所以只有 `is_self=True` 才不更新它 —— 原来按 `is_bot` 判，于是兄弟 bot
+        说话时这个时间戳不动，连发补发任务以为群里没人接话、继续补旧句，
+        看起来就是两台 bot 在互相抢话。
         """
         g = self.group(bid, gid)
         if umo and g.get("umo") != umo:
@@ -337,8 +362,8 @@ class SocialState:
             g["name"] = str(name)[:60]
         g["last_seen"] = now
         g["msg_count"] = int(g.get("msg_count", 0) or 0) + 1
-        if not is_bot:
-            # 群友（非 bot）最近一次发言的时刻。连发补发任务用它判断
+        if not is_self:
+            # **别人**（真人或兄弟 bot）最近一次发言的时刻。连发补发任务用它判断
             # 「我话还没发完，群里已经有人接着说上了」——那种情况下继续补旧句
             # 就是自说自话。
             g["last_human_at"] = now
@@ -472,6 +497,23 @@ class SocialState:
         if int(g.get("flow_ignored", 0) or 0):
             g["flow_ignored"] = 0
             self.mark_dirty()
+
+    def forgive_stale_flow_ignored(self, bid: str, gid: str, now: float) -> None:
+        """距上一次心流插话够久 → 上一波已经结束，把「连着插没人理」的计数清零。
+
+        原来这个计数只有两处会清零：新开关注窗口（`open_flow` 里 `not was_open` 那一支）
+        与被 @（`note_flow_pickup`）。而它一旦到过退出阈值，她就不再插话
+        → 永远不会新开窗 → 计数**永远停在阈值上**：这个群从此不许她开口，
+        除非有人恰好 @ 她一次。加一道按时间的作废，让新的一波能重新开始数。
+        """
+        g = self.group(bid, gid)
+        if int(g.get("flow_ignored", 0) or 0) <= 0:
+            return
+        last = _num(g.get("flow_last_reply_at"))
+        if last <= 0 or (now - last) < FLOW_IGNORED_RESET_SECONDS:
+            return
+        g["flow_ignored"] = 0
+        self.mark_dirty()
 
     def record_group_self_text(
         self,
@@ -662,6 +704,15 @@ class SocialState:
                     if item not in a:
                         a.append(item)
                 target[f] = a
+        # conversation / proactive_log 合并后要按时间重排：`threads` / `recent_exchange`
+        # 靠 `reversed(conversation)` 取「最近一句」，不重排会取到更早的那条。
+        for f in ("conversation", "proactive_log"):
+            rows = target.get(f)
+            if isinstance(rows, list) and rows:
+                target[f] = sorted(
+                    (i for i in rows if isinstance(i, dict)),
+                    key=lambda i: _safe_ts(i.get("ts")),
+                )
         # 冷落计数取小的：合并的是同一个人，保留较宽松的那个判断更合理
         try:
             target["no_reply_streak"] = min(int(target.get("no_reply_streak", 0) or 0),
@@ -764,21 +815,24 @@ class SocialState:
                 # 放行，群会话被当「人」导入、拿群 umo 去发主动消息。群消息在观察链路
                 # 里从不建 per-user 记录，所以 users 里 umo 是群会话的一定是幽灵。
                 #
-                # 只跑一次：这个标记以前只写不读，于是每次启动都全量扫一遍并删人。
-                # 主人自己填的 seed_users 里写了 qq:group:12345 这类条目时，那些用户
-                # 每次启动被删、30 分钟后又被播种加回来，念头从头攒，周而复始。
-                if not self.data.get("_ghosts_cleaned"):
-                    users = bot.get("users")
-                    if isinstance(users, dict):
-                        for uid, u in list(users.items()):
-                            if not isinstance(u, dict):
+                # **改成每次启动都跑**：两个入口现在已经不会再产出群 umo 用户了
+                # （群会话导入无条件跳过、seed 名单拒绝群类型），所以留在 users 里的
+                # 群 umo 一定是幽灵。原来只跑一次，而那个标记在更早的版本里「只写不读」
+                # —— 升级上来时它已经是 true，于是这次清扫根本不执行，幽灵永远清不掉，
+                # 而幽灵带着群 umo，发送路径会照着它把消息发进群。
+                # 只有 seed 来的条目需要豁免：老配置里可能真写了 qq:group:12345。
+                users = bot.get("users")
+                if isinstance(users, dict):
+                    for uid, u in list(users.items()):
+                        if not isinstance(u, dict):
+                            continue
+                        segs = str(u.get("umo", "") or "").lower().split(":")
+                        mtype = segs[1] if len(segs) >= 3 else ""
+                        if mtype in _GROUP_UMO_TYPES:
+                            if str(u.get("source") or "") == "seed":
                                 continue
-                            segs = str(u.get("umo", "") or "").lower().split(":")
-                            mtype = segs[1] if len(segs) >= 3 else ""
-                            if mtype in ("group", "g", "groupmessage", "guild"):
-                                users.pop(uid)
-                                self._dirty = True
-            self.data["_ghosts_cleaned"] = True
+                            users.pop(uid)
+                            self._dirty = True
             self._dirty = True
         except Exception as exc:
             # 这里以前是 `except Exception: pass`：一条坏记录会废掉整条迁移链
@@ -851,7 +905,7 @@ class SocialState:
             结算后的状态：waiting / ignored，已结算过的返回当前值
         """
         u = self.user(bid, uid)
-        pending = float(u.get("pending_since", 0) or 0)
+        pending = _num(u.get("pending_since", 0))
         if pending <= 0 or u.get("pending_result") != "waiting":
             return str(u.get("pending_result", "") or "")
         if now - pending <= window_seconds:
@@ -902,6 +956,7 @@ class SocialState:
                     or u.get("last_message")
                     or u.get("cue")
                     or any(u.get("active_hours") or ())
+                    or u.get("loops") or u.get("promises") or u.get("said") or u.get("anchors")
                 )
                 if not has_heavy:
                     continue
@@ -913,6 +968,12 @@ class SocialState:
                     continue
                 for key in RETENTION_HEAVY_LIST_FIELDS:
                     u[key] = []
+                # 后加的「按用户挂在盘上的结构」也要一起清，否则长期不活跃的用户会
+                # 一直占着 loops/promises/said/anchors（旧实现只清 cue/loop 平铺字段）。
+                u["loops"] = []
+                u["promises"] = []
+                u["said"] = []
+                u["anchors"] = []
                 for key in RETENTION_HEAVY_TEXT_FIELDS:
                     u[key] = ""
                 u["active_hours"] = [0.0] * RETENTION_RHYTHM_HOURS
@@ -1116,7 +1177,7 @@ class SocialState:
         # 上一次主动联系有没有被接住。这里的窗口比回复率统计宽：晚上发的话对方早上回，
         # 算不算「回了我的主动消息」可以商量，但因此判定 TA 不想理我就太武断了。
         pending_window = pending_window_seconds or reply_window_seconds
-        pending = float(u.get("pending_since", 0) or 0)
+        pending = _num(u.get("pending_since", 0))
         if pending > 0 and u.get("pending_result") == "waiting":
             if ts - pending <= pending_window:
                 desire.after_reply(u, ts)
@@ -1130,7 +1191,7 @@ class SocialState:
             desire.forgive_late(u, ts)
 
         # 回复检测：只有在回复窗口内才算
-        last_pro = float(u.get("last_proactive_sent", 0))
+        last_pro = _num(u.get("last_proactive_sent", 0))
         if last_pro > 0 and not u.get("last_proactive_replied", True):
             if ts - last_pro <= reply_window_seconds:
                 u["last_proactive_replied"] = True
@@ -1138,7 +1199,7 @@ class SocialState:
                 # 滚动平均回复时间
                 reply_time = ts - last_pro
                 samples = int(u.get("reply_samples", 0))
-                old_avg = float(u.get("avg_reply_seconds", 0))
+                old_avg = _num(u.get("avg_reply_seconds", 0))
                 if samples == 0:
                     u["avg_reply_seconds"] = reply_time
                 else:
@@ -1175,7 +1236,7 @@ class SocialState:
         # 原来是直接归零：对方每发一条消息念头就清零，而念头要攒四五个小时才够门槛
         # ——于是「对方每小时发一句」的人永远攒不起来，主动消息一次都不触发。
         # 现在保留三成，让人勤发消息也能被主动找。
-        u["urge"] = float(u.get("urge", 0.0) or 0.0) * 0.3
+        u["urge"] = _num(u.get("urge", 0.0)) * 0.3
         u["urge_at"] = ts
 
         self.mark_dirty()
@@ -1197,15 +1258,18 @@ class SocialState:
         except (TypeError, ValueError):
             return
         try:
-            hours[hour] = float(hours[hour] or 0) + 1.0
+            hours[hour] = _num(hours[hour]) + 1.0
         except (TypeError, ValueError):
             hours[hour] = 1.0
-        total = sum(float(x or 0) for x in hours)
+        # 直方图元素也可能是脏数据（手改/损坏）：`sum(float(x) ...)` 会抛 ValueError，
+        # 而那会一路冒到心跳的宽 except 里 —— 这一条消息的 conversation /
+        # message_count / last_seen / 念头结算**全部丢失**，且 mark_dirty 不执行。
+        total = sum(_num(x) for x in hours)
         if total > RHYTHM_DECAY_TOTAL:
             # 折半而不是清零：保留大致轮廓，但让最近的样本占主导
-            hours = [float(x or 0) * 0.5 for x in hours]
+            hours = [_num(x) * 0.5 for x in hours]
             total *= 0.5
-        u["active_hours"] = [round(x, 3) for x in hours]
+        u["active_hours"] = [round(_num(x), 3) for x in hours]
         u["rhythm_samples"] = round(total, 2)
 
     @staticmethod
@@ -1219,7 +1283,7 @@ class SocialState:
             due = 0.0
         if due <= 0:
             return
-        old_due = float(u.get("cue_due", 0) or 0)
+        old_due = _num(u.get("cue_due", 0))
         if old_due > ts and due < old_due:
             # 已经有一个更晚到点的约定在等，不被更早的顶掉
             return
@@ -1324,7 +1388,7 @@ class SocialState:
         if not loop:
             return
         try:
-            due = float(loop_due or 0)
+            due = _num(loop_due)
         except (TypeError, ValueError):
             due = 0.0
         if due <= 0:
@@ -1344,11 +1408,11 @@ class SocialState:
             "retry_at": 0.0,
             "tries": 0,
         })
-        # 满了就把最凉的那件挤掉——还在等的按到期排，凉透的先走
-        items.sort(key=lambda i: _num(i.get("due")), reverse=True)
+        # 满了先挤掉**到期最晚**的，留下最紧要的几件（live_loops 取的就是最早到期的）。
+        items.sort(key=lambda i: _num(i.get("due")))
         u["loops"] = items[:LOOP_SLOTS_MAX]
-        # 平铺字段继续写最新那件：老代码与盘上的旧结构都还能认
-        newest = u["loops"][0]
+        # 平铺字段写「最新那件」（按录入时间）：老代码与盘上的旧结构都还能认
+        newest = max(u["loops"], key=lambda i: _num(i.get("at")))
         u["loop"] = str(newest.get("about", ""))
         u["loop_due"] = _num(newest.get("due"))
         u["loop_at"] = _num(newest.get("at")) or ts
@@ -1366,6 +1430,7 @@ class SocialState:
         count_proactive: bool = True,
         expect_reply: bool = True,
         why: str = "",
+        store_text: bool = True,
     ) -> Dict[str, Any]:
         """记录 AI 发出的主动消息。
 
@@ -1380,16 +1445,24 @@ class SocialState:
             expect_reply: 这句话是不是在等对方回。早安/晚安/收场传 False：
                 它们本来就不要求回复，进了「等回话」计时器就会把「没回早安」
                 记成「被冷落」
+            store_text: 是否持久化消息正文（`store_message_text`）。关掉后只留统计
+                与短标签，正文不落盘。
+
+                这条路径原来**完全不受开关约束**：`record_incoming` 与
+                `record_spoken` 都看这个开关，群聊侧还专门修过一次「只关了一半」，
+                唯独主动消息这里没有这个参数 —— 私聊里她的每句主动消息照样写进
+                `conversation` 与 `proactive_log`，面板上那个「更隐私」的承诺是空的。
 
         Returns:
             用户状态 dict
         """
         u = self.user(bid, uid)
         ts = self._now()
+        body = str(text or "")[:CONVERSATION_TRUNCATE_LENGTH] if store_text else ""
 
         # 对话历史
         conv = u.setdefault("conversation", [])
-        conv.append({"text": text[:CONVERSATION_TRUNCATE_LENGTH], "ts": ts, "dir": "out"})
+        conv.append({"text": body, "ts": ts, "dir": "out"})
         del conv[:-MAX_CONVERSATION_HISTORY]
 
         # 主动消息 7 天日志：只记自己主动发的（含连发的后续条），按（bid,uid）隔离。
@@ -1397,7 +1470,7 @@ class SocialState:
         log = u.setdefault("proactive_log", [])
         log.append({
             "ts": ts,
-            "text": str(text or "")[:CONVERSATION_TRUNCATE_LENGTH],
+            "text": body,
             "cat": str(msg_type or ""),
             # 她**为什么**这时候发这条。以前日志里只有正文，主人看到的是一句没头没尾
             # 的话，既没法理解也没法排障——「她为什么这时候想起我」是最该被看见的一件事。

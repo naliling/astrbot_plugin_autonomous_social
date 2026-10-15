@@ -60,7 +60,7 @@ _INTENT_CLAUSE = re.compile(
 # 「顺便…不指望回」这种搭配，以及「想找个借口」这种自述动机。
 _INTENT_TAIL = re.compile(
     r"(?:顺便[^，。！？]{0,12}不指望回|不指望(?:你|TA)?回|不用回我|不需要回复|不用回复"
-    r"|而已|不解释|不细说|想找(?:个|点)借口|找个借口|想找点乐子|说给自己听|写给自己)"
+    r"|不解释|不细说|想找(?:个|点)借口|找个借口|想找点乐子|说给自己听|写给自己)"
 )
 # 整条以「抱怨/吐槽/撒娇/调侃」这类**描述性**动词开头，且没有第二人称对象
 _NO_TARGET = re.compile(r"^\s*(?:表达|分享|抱怨|吐槽|撒娇|调侃|陈述|描述|说明|传达)")
@@ -288,8 +288,8 @@ _TITLE_NOT_HEAD = (
     "嗯", "哎", "诶", "啊", "哦", "噢", "唔", "嘿", "哈", "呵",
     "对", "那", "这", "好", "行", "是", "不", "没", "别", "先", "再",
     "说", "想", "看", "听", "算", "来", "去", "走", "在", "从", "把", "被", "给",
-    "总", "反", "其", "如", "如", "其", "毕", "竟", "果", "然", "于", "至",
-    "话", "接", "顺", "接", "另", "换", "改", "问", "答", "讲", "聊",
+    "总", "反", "其", "如", "毕", "竟", "果", "然", "于", "至",
+    "话", "接", "顺", "另", "换", "改", "问", "答", "讲", "聊",
 )
 
 
@@ -326,8 +326,9 @@ def strip_title_line(text: str) -> str:
     return rest if rest else raw
 
 
-def is_title_like(text: str) -> bool:
-    first = str(text or "").split("\n")[0].strip()
+def _title_shaped(line: str) -> bool:
+    """这一行**像不像**小标题——只看形状，不看整条够不够长。"""
+    first = str(line or "").strip()
     if not first or len(first) > _TITLE_MAX or _TITLE_NO_PEER.search(first):
         return False
     if first.startswith(("（", "(", "［", "[")):
@@ -336,7 +337,26 @@ def is_title_like(text: str) -> bool:
         return False
     if first.startswith(_TITLE_NOT_HEAD):
         return False
-    return len(str(text or "").strip()) >= _MIN_AFTER
+    return True
+
+
+def is_title_like(text: str) -> bool:
+    """整条是不是「只有一行标题、没有正文」。
+
+    判据必须落在**有没有第二行正文**上。原来末行量的是整条长度
+    （`len(str(text or "").strip()) >= _MIN_AFTER`），于是「刚忙完\\n好累啊」这种两行
+    短消息会被判成标题 —— 而 `strip_title_line` 在这种情况**故意不剥**（见它 321 行的
+    注释：首行后面那句太短，说明那不是标题，是被换行切开的一个词组）。结果这条消息
+    既没被剥、又被判成「只有标题」，**整条不发**。
+    """
+    lines = [ln.strip() for ln in str(text or "").split("\n")]
+    if any(ln for ln in lines[1:]):
+        return False                      # 有第二行正文，就不是「只有标题」
+    first = lines[0] if lines else ""
+    # 单行也要够长才算标题：一两个字的「早」「嗯」是极简回话，不是小标题。
+    if len(first) < _MIN_AFTER:
+        return False
+    return _title_shaped(first)
 
 
 # 协议残留：模型把 SEND/NO 协议的话漏进了正文。

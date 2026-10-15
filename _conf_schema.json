@@ -260,10 +260,10 @@
   "cross_user_repeat_hours": {
     "type": "float",
     "description": "跨用户撞车回看多久（小时）",
-    "hint": "往前比多少小时的记录",
+    "hint": "往前比多少小时的记录；0 = 关掉这道检查",
     "obvious_hint": true,
     "default": 2.0,
-    "min": 0.5,
+    "min": 0,
     "max": 48.0
   },
   "cross_user_calibrate": {
@@ -303,7 +303,7 @@
   "private_only": {
     "type": "bool",
     "description": "只主动私聊",
-    "hint": "开启后只主动私聊，不在群里主动说话。推荐开启（群聊分寸更难把握）。",
+    "hint": "开启后只主动私聊，不在群里主动说话。推荐开启（群聊分寸更难把握）。群会话不会被当成「人」导入，那与这一项无关。",
     "obvious_hint": true,
     "default": true
   },

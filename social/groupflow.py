@@ -58,7 +58,6 @@ def flow_should_consider(
     ignored_exit: int,
     is_quiet: bool = False,
     asleep: bool = False,
-    hold_seconds: float = 0.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -66,7 +65,7 @@ def flow_should_consider(
     - 安静时段 / 她正在睡觉——私聊侧五道闸都查了这两项，只有群心流漏了，而它又是
       事件驱动的（群消息一到就走，不经过心跳），于是深夜群里有人说话她照样插一句；
     - 关注窗口没开（bot 最近没在这个群说过话）——保守档的核心；
-    - 自己刚在主链路说完话后的冷却期（hold_seconds）——不然「被 @ 回一句」后马上又接，
+    - 自己刚在主链路说完话后的冷却期（`flow_hold_until`）——不然「被 @ 回一句」后马上又接，
       观感是同一个她在连续刷屏；
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
@@ -159,19 +158,6 @@ def build_style_reference(texts: List[str]) -> str:
 def icebreak_reason() -> str:
     """破冰动机句。现在恒为空——动机由模型自己产生。"""
     return ""
-
-
-def flow_meta() -> Dict[str, Any]:
-    """心流接话的 preset 元数据（供日志/生成侧标识用）。"""
-    return {"category": "flow", "intent": "flow", "mode": "flow", "msg_type": "group_flow"}
-
-
-def icebreak_meta() -> Dict[str, Any]:
-    return {"category": "icebreak", "intent": "icebreak", "mode": "icebreak", "msg_type": "group_icebreak"}
-
-
-def topic_meta() -> Dict[str, Any]:
-    return {"category": "topic", "intent": "topic", "mode": "topic", "msg_type": "group_topic"}
 
 
 def icebreak_topics(holiday: str, weather: str) -> str:

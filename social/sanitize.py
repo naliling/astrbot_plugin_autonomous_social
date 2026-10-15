@@ -49,8 +49,10 @@ _GENERIC_BRACKET_BLOCK = re.compile(r"[\u3014\u3015\u3010\u3011]([^\u3014\u3015\
 
 # 兜底：这些只可能出现在框架注入的文本里，正文里出现就是被污染了。
 # 逐个记特征也是地鼠，但这条**很便宜**——只在清洗之后扫一遍正文，命中就截断。
+# 只列**足够特异**的特征：像「uid=」「今天是20」这种真人也会写的子串不列，
+# 否则用户一句「今天是2026年…」就会被从那里截断、甚至整条丢掉。
 _FRAME_MARKERS = (
-    "uid=webchat", "uid=", "今天是20", "〔她的身体与生活",
+    "uid=webchat", "〔她的身体与生活",
     "你现在在想要不要", "这是一个[插件", "retrieval_intent",
 )
 
@@ -119,16 +121,6 @@ def looks_like_framework_only(text: Any) -> bool:
     """
     original = text if isinstance(text, str) else ""
     return bool(original.strip()) and not sanitize_incoming(original)
-
-
-def sanitize_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """历史导入的一行。顺带丢掉「只有框架内容」的行。"""
-    text = sanitize_incoming(row.get("text"))
-    if not text:
-        return {}
-    out = dict(row)
-    out["text"] = text
-    return out
 
 
 def sanitize_user_record(u: Dict[str, Any]) -> bool:

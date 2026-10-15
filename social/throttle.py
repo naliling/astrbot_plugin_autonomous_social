@@ -26,7 +26,9 @@ class LogThrottle:
         now = time.monotonic()
         last, pending = self._last.get(key, (0.0, 0))
         if now - last >= window:
-            self._last[key] = (now, 0)
+            # 推进窗口但**保留** pending：调用方紧接着用 summary() 读它。
+            # 这里清零的话「另有 N 次已省略」永远是 0（旧实现就是这个毛病）。
+            self._last[key] = (now, pending)
             return True
         self._last[key] = (last, pending + 1)
         return False
@@ -36,19 +38,18 @@ class LogThrottle:
         return self._last.get(key, (0.0, 0))[1]
 
     def summary(self, key: str) -> str:
-        """拼一句「期间另有 N 次同类已省略」，没有就返回空串。"""
-        n = self.pending(key)
-        return f"（期间另有 {n} 次同类，已省略）" if n else ""
+        """拼一句「期间另有 N 次同类已省略」，没有就返回空串。读后清零。"""
+        n = self._last.get(key, (0.0, 0))[1]
+        if not n:
+            return ""
+        self._last[key] = (self._last[key][0], 0)
+        return f"（期间另有 {n} 次同类，已省略）"
 
     def reset(self, key: Optional[str] = None) -> None:
         if key is None:
             self._last.clear()
         else:
             self._last.pop(key, None)
-
-    def stats(self) -> Dict[str, int]:
-        """当前仍在节流窗口内、且已经积累了省略次数的条目。"""
-        return {k: v[1] for k, v in self._last.items() if v[1] > 0}
 
 
 # 引擎与生成器共用一个实例：它们报的本来就是同一类问题，分开节流等于没节流

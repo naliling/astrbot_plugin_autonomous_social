@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from .sanitize import sanitize_incoming
 from .state import CONVERSATION_TRUNCATE_LENGTH, SocialState
 
+from astrbot.api import logger
+
 # AstrBot 数据目录下的会话数据库文件名：v4 起是 data_v4.db，更早期 4.x 是 data_v3.db
 _DB_FILENAMES = ("data_v4.db", "data_v3.db")
 
@@ -166,6 +168,9 @@ def recent_turns(content: Any, limit: int = 8) -> List[Dict[str, Any]]:
         text = sanitize_incoming(_message_text(item))
         if not text:
             continue
+        # 会话库里只有会话级的 updated_at，没有逐条消息的时间；导入的 turn 一律 ts=0.0。
+        # 于是按时间过滤的逻辑（threads 的 last_in_text/recent_in_count/nearby、anchors 的
+        # relation_tier）对这批历史不生效。
         out.append({
             "dir": "out" if role == "assistant" else "in",
             "text": text[:CONVERSATION_TRUNCATE_LENGTH],
@@ -344,7 +349,16 @@ def collect_from_history(
     for conv in iter_conversations(db_path, private_only=private_only):
         umo = conv["umo"]
         kind = umo_kind(umo)
-        if private_only and kind == "group":
+        # 只把**私聊**会话当「人」导入，**与 private_only 无关**。
+        #
+        # `private_only` 的名字、schema 提示与 config.py 的注释都只说一件事：
+        # 「要不要在群里主动说话」。而「把谁当成一个人」是另一回事 —— 原来两者
+        # 共用这一个开关，于是主人为了开群功能把它关掉时，群会话会被建成用户条目，
+        # 而条目的 `umo` 是**群地址**，发送路径照着它发：一句私聊口吻的主动消息
+        # 就直接进了群。群聊侧本来就有自己的容器（`bots[bid]["groups"]`）。
+        #
+        # 认不出的类型同样不导：宁可少导一个人，也不要把一个群当成一个人。
+        if kind != "private":
             continue
         uid = _uid_of(umo)
         if not uid or uid in existing:
@@ -365,7 +379,10 @@ def collect_from_history(
                 # 同上：库里存的是拼装后的消息，入库前先洗掉框架注入块
                 last = sanitize_incoming(last_user_text(content))
                 if last:
-                    row["last_message"] = last[-200:]
+                    # 头部而不是尾部：生成侧引用对方最后一句时取的是**前**若干字
+                    # （`TA最后说的是：「{last[:60]}」`），存尾部会让长消息的开头断掉。
+                    # 与 state.record_incoming 同一口径。
+                    row["last_message"] = last[:200]
                 row["conversation"] = recent_turns(content)
         rows.append(row)
     return rows
@@ -462,6 +479,11 @@ def normalize_seed_entries(raw: Any, default_platform: str) -> List[Tuple[str, s
     - ``12345``：用户 ID，平台取默认（seed_platform）
     - ``aiocqhttp:12345``：带平台的用户 ID
     - ``aiocqhttp:private:12345``：完整 umo，照用
+
+    **只收私聊类型**：名单里的人是要被当成「一个人」攒念头、发私聊口吻消息的，
+    而 `users` 里放一个群 umo，发送路径就会照着它把消息发进群。写了群/频道类型时
+    丢掉并告警 —— 原来会静默建成一个「群用户」，然后在每次启动时被幽灵清扫删掉、
+    30 分钟后又播种回来，念头从头攒，周而复始。
     """
     items: Any = raw
     if isinstance(raw, str):
@@ -489,9 +511,15 @@ def normalize_seed_entries(raw: Any, default_platform: str) -> List[Tuple[str, s
             msg_type.strip().lower() if len(parts) >= 3 else "private",
             uid.strip(),
         )
-        if not uid or uid in seen:
+        if not uid or (platform, uid) in seen:
             continue
-        seen.add(uid)
+        if msg_type not in _PRIVATE_TYPES:
+            logger.warning(
+                f"[autonomous_social] seed_users 里的 {s!r} 不是私聊会话（类型 {msg_type!r}），"
+                "已忽略：群/频道不能当「一个人」来主动私聊，群聊侧请用 group_* 开关"
+            )
+            continue
+        seen.add((platform, uid))
         out.append((platform, uid, msg_type))
     return out
 

@@ -350,8 +350,6 @@ class AutonomousSocial(Star):
         except Exception as e:
             yield event.plain_result(f"自检失败: {e}")
             return
-        import time as _time_mod
-        now = _time_mod.time()
         settled = m.get("last_settled") or 0
         yield event.plain_result(
             "自检完成（没有发送任何消息，也没有调用模型）：\n"

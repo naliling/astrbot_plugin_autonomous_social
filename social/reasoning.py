@@ -18,6 +18,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from .clock import city_epoch, city_now
 
 
+def _num(value: Any) -> float:
+    """容错取时间戳/计数。
+
+    state.json 里的脏数据（字符串、None）不该让整条观察链路抛异常 —— 那会一路冒到
+    心跳的崩溃退避里，插件降级成 30 分钟一轮，而且坏值不修就**每轮都在同一个点崩**。
+    """
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
@@ -42,23 +54,6 @@ _SLOT_NAMES_CN: Dict[str, str] = {
     "evening": "傍晚",
     "late_night": "深夜",
     "deep_night": "凌晨",
-}
-
-# ─── 时段理由 ───────────────────────────────────────
-
-# 以前这里是 7 个时段 × 8 条共 56 句「你现在可能在想什么」——
-# “楼下卖早餐的香味飘上来了”“咖啡喝到第二杯了，还是有点困”“食堂今天居然有我爱吃的菜”。
-# 它被当作动机塞进 prompt，模型就顺着往下编，于是她讲的是根本没发生过的事：
-# 掷一次骰子决定她今天吃了什么、心情如何。这不是拟人，是替她编记忆。
-# 动机现在由模型自己在 decide 阶段产生（见 generator 的输出格式），这里只保留时段本身。
-TIME_SLOT_LABELS = {
-    "early_morning": "清晨",
-    "morning": "上午",
-    "lunch": "午休",
-    "afternoon": "下午",
-    "evening": "傍晚",
-    "late_night": "夜里",
-    "deep_night": "深夜",
 }
 
 
@@ -167,13 +162,19 @@ _CUE_ANCHORS = (
     (r"后天", 2, 10, 0),
     (r"明天|明儿", 1, 10, 0),
     (r"今晚|今晚上|今天晚上", 0, 20, 30),
-    (r"下周|下个星期|下星期", 7, 10, 0),
-    (r"周末|星期天|星期日", -1, 12, 0),      # -1 表示下一个周六
+    (r"下周(?!\s*[一二三四五六日天])|下个星期(?!\s*[一二三四五六日天])|下星期(?!\s*[一二三四五六日天])", 7, 10, 0),
+    (r"周末", -1, 12, 0),                    # -1 表示下一个周六
+    # 「星期天/星期日」不列在这里：它们由下面的 _CUE_WEEKDAY 算成周日。
+    # 一并匹配的话，同一位置两个候选会取先加入的这个，把周日错算成周六。
     (r"待会|等会|等一下|一会儿|晚点|回头", 0, 0, 0),  # 相对锚点
 )
 
+# 「下周X / 下个星期X / 下星期X」：下一个该星期几，再往后一周。
+# 必须单独算：不然「下周三」会被 _CUE_ANCHORS 的「下周」抢走，
+# 算成「今天 +7 天的 10:00」——星期几整个丢了（周一提的「下周三」会变成下周一）。
+_CUE_NEXT_WEEK_WEEKDAY = re.compile(r"(?:下周|下个星期|下星期)([一二三四五六日天])")
 # 「周X/星期X」单独算：要推到下一个那个星期几
-_CUE_WEEKDAY = re.compile(r"(?:下周|星期|周)([一二三四五六日天])")
+_CUE_WEEKDAY = re.compile(r"(?:星期|周)([一二三四五六日天])")
 _WEEKDAY_CN = "一二三四五六日"
 
 # 同一句里出现这些说法时，锚点只是客套，不值得跟进
@@ -257,6 +258,13 @@ def extract_cue(
         candidates.append((match.start(), pattern,
                            _anchor_due(now, pattern, days, hour, minute, clock_offset_minutes)))
 
+    nw = _CUE_NEXT_WEEK_WEEKDAY.search(msg)
+    if nw:
+        idx = _WEEKDAY_CN.find(nw.group(1))
+        weekday = 6 if idx < 0 else idx
+        candidates.append((nw.start(), "weekday",
+                           _next_weekday(now, weekday, offset=clock_offset_minutes) + 7 * 86400.0))
+
     wd = _CUE_WEEKDAY.search(msg)
     if wd:
         ch = wd.group(1)
@@ -326,21 +334,20 @@ def sleep_signal(user: Dict[str, Any], now: float) -> bool:
     跳掉了，导致对方明明道了晚安却判不出来；也没按 dir 过滤，bot 自己的「晚安」也会被扫到。
     """
     conv = user.get("conversation") or []
-    try:
-        recent = [m for m in conv if str(m.get("text", ""))][-4:]
-    except TypeError:
-        return False
+    # 元素可能不是 dict（脏数据），那时 `m.get` 抛的是 AttributeError，
+    # 而原来只接了 TypeError —— 异常于是逃出观察链路。
+    recent = [m for m in conv if isinstance(m, dict) and str(m.get("text", ""))][-4:]
     for m in reversed(recent):
         # 只看对方说的；她自己说的（dir=='out'）跳过
         if str(m.get("dir", "")) == "out":
             continue
-        if now - float(m.get("ts", 0) or 0) > SLEEP_SUPPRESS_SECONDS:
+        if now - _num(m.get("ts", 0)) > SLEEP_SUPPRESS_SECONDS:
             return False
         if any(w in str(m.get("text", "")) for w in _SLEEP_WORDS):
             return True
     msg = str(user.get("last_message", "") or "")
     if msg and any(w in msg for w in _SLEEP_WORDS):
-        return now - float(user.get("last_seen", 0) or 0) <= SLEEP_SUPPRESS_SECONDS
+        return now - _num(user.get("last_seen", 0)) <= SLEEP_SUPPRESS_SECONDS
     return False
 
 # ─── 离开语 ────────────────────────────────
@@ -368,8 +375,11 @@ def is_leaving(text: str) -> bool:
 # 对方最近说过自己在忙。跟 `_LEAVING_WORDS` 的区别：那个只认**最后一句**是离开语；
 # 而真忙的人不一定每句都提，往往先说了「在忙」、后面只回一个「嗯」——只判最后一句
 # 就会把这个「嗯」当成敷衍，转头去追问，变成打扰。窗口内任意一条说了忙，就不追。
+# 不列单字「忙」：它会把「帮忙」「帮个忙」都算成在忙；问句（「你在忙吗」）另在
+# busy_signal 里排除。
 _BUSY_WORDS = (
-    "忙", "开会", "加班", "赶工", "赶项目", "赶方案", "赶材料", "出差",
+    "在忙", "忙着", "好忙", "很忙", "忙死", "忙得", "忙活", "忙不完",
+    "开会", "加班", "赶工", "赶项目", "赶方案", "赶材料", "出差",
     "考试", "复习", "答辩", "面试", "deadline", "ddl", "写材料", "做方案",
     "带娃", "看孩子", "接孩子", "陪产", "值班", "夜班",
 )
@@ -383,20 +393,18 @@ def busy_signal(user: Dict[str, Any], now: float) -> bool:
     只看**对方**（dir != 'out'）说的话；她自己说的「忙」不算。
     """
     conv = user.get("conversation") or []
-    try:
-        recent = [m for m in conv if str(m.get("text", ""))][-4:]
-    except TypeError:
-        return False
+    # 元素可能不是 dict（脏数据）：`m.get` 抛的是 AttributeError，接不住。
+    recent = [m for m in conv if isinstance(m, dict) and str(m.get("text", ""))][-4:]
     for m in reversed(recent):
         if str(m.get("dir", "")) == "out":
             continue
-        try:
-            ts = float(m.get("ts", 0) or 0)
-        except (TypeError, ValueError):
-            continue
+        ts = _num(m.get("ts", 0))
         if now - ts > BUSY_SUPPRESS_SECONDS:
             return False
         text = str(m.get("text", ""))
+        # 问句是在问「你是不是在忙」，不是自己在忙。
+        if _ASKING.search(text):
+            continue
         # 「不忙」「没那么忙」是否定：不能当在忙。
         if any(w in text for w in _BUSY_WORDS) and "不忙" not in text and "没那么忙" not in text:
             return True
@@ -436,27 +444,6 @@ LONG_ABSENCE_THRESHOLD = 172800
 # 长时间未联系的动机池：之前两条分支各自只有一句话，同一个用户反复命中会生成雷同的消息
 
 
-
-# ─── 一句话里有没有「没问完的问题」 ───────────────────
-
-_QUESTION_TAIL = re.compile(r"[?？]\s*$|[吗呢吧呗]\s*[!！。~～…]*\s*$")
-_QUESTION_WORDS = (
-    "怎么", "怎样", "为什么", "为啥", "什么", "啥", "哪里", "哪儿", "哪个", "几点",
-    "多少", "是不是", "有没有", "行不行", "可不可以", "要不要", "会不会", "能不能",
-    "谁", "几点", "咋", "怎样", "如何", "呢吗",
-)
-
-
-def is_question(text: str) -> bool:
-    """这句话像是在问事。她上一句是不是问句，决定了对方没接时该不该追问。"""
-    body = str(text or "").strip()
-    if not body:
-        return False
-    if _QUESTION_TAIL.search(body):
-        return True
-    return any(word in body for word in _QUESTION_WORDS)
-
-
 # 对方接话接得太短，基本等于没答：「嗯」「还行」「就那样」。
 _THIN_MAX_CHARS = 8
 # 「敷衍」词分成两类，判法不同：
@@ -477,8 +464,17 @@ _THIN_PHRASES = (
 )
 
 
-# 问句：结尾带问号或疑问语气词。短问句是在求回应，不是敷衍。
-_ASKING = re.compile(r"[?？吗呢么吧?]|吗$|呢$")
+# 问句：**带问号**，或**以「吗」结尾**。
+#
+# 原来写成 `[?？吗呢么吧?]|吗$|呢$` —— 那个字符类在**任意位置**匹配，于是
+# 「我忙着呢」「开会呢」「买了吧」全被判成问句。
+#
+# 就算改成只匹配结尾，「呢 / 吧」也不能留：它们在句尾本身就歧义 ——
+# 「我忙着呢」是陈述（进行体），「走吧」是建议，都不是问句。只有「吗」是稳定的
+# 疑问语气词。这个判据唯一的用途是 `busy_signal`：问句是在问「你是不是在忙」，
+# 不是自己在忙，所以要跳过。判错的后果是**该拦的不拦**（对方明明说了在忙，
+# 她还去追问）—— 所以宁可漏判问句，也不要把陈述判成问句。
+_ASKING = re.compile(r"[?？]|[吗]$")
 
 
 def is_thin(text: str) -> bool:
@@ -492,6 +488,13 @@ def is_thin(text: str) -> bool:
     # 之后她就收到一句「我想把那件事问清楚」——而「那件事」就是一个问号。
     if cleaned and not any("\u4e00" <= ch <= "\u9fff" or ch.isalnum() for ch in cleaned):
         return False
+    # 显式列出的「敷衍词」优先于下面的问句判据：「还行吧」「算了吧」「没什么事」
+    # 里带「吧/么」会被 _ASKING 当成疑问语气词拦下，必须先判它们。
+    if len(cleaned) <= _THIN_MAX_CHARS:
+        if cleaned in _THIN_EXACT:
+            return True
+        if any(p in cleaned for p in _THIN_PHRASES):
+            return True
     # 短**问句**不是敷衍，是对方在等一个回答。
     #
     # 以前「两个字就是敷衍」，于是「在吗」被判成打发了人，她转头去追问
@@ -499,11 +502,6 @@ def is_thin(text: str) -> bool:
     # 用户，7 天被她追问了 44 次。
     if _ASKING.search(cleaned):
         return False
-    if len(cleaned) <= _THIN_MAX_CHARS:
-        if cleaned in _THIN_EXACT:
-            return True
-        if any(p in cleaned for p in _THIN_PHRASES):
-            return True
     return len(cleaned) <= 2
 
 
@@ -513,30 +511,6 @@ def is_thin(text: str) -> bool:
 # 默认窗口（小时，按她所在城市的钟走）：早安 7-11，晚安 21-24。
 GREETING_MORNING_WINDOW = (7, 11)
 GREETING_NIGHT_WINDOW = (21, 24)
-
-_GREET_REASON_MORNING: List[str] = [
-    "早上刚醒，脑子还糊着，顺手跟TA说句早安。",
-    "洗漱完摸到手机，想跟TA道个早安。",
-    "醒了一会儿了，今天也想跟TA说句早安。",
-    "外面天刚亮，起来第一件事想跟TA道声早。",
-    "闹钟响过了还没完全醒，想跟TA说个早安。",
-]
-
-_GREET_REASON_MIDDAY: List[str] = [
-    "刚忙完一段，抬头看到消息列表里有TA，顺手说一句。",
-    "吃饭的时候想起TA了。",
-    "下午了，手头这摊事刚告一段落，想跟TA说句话。",
-    "刚泡上咖啡，想起来还有个人可以随口说两句。",
-    "今天还没顾上说话，这会儿想起来补一句。",
-]
-
-_GREET_REASON_NIGHT: List[str] = [
-    "今天到最后了，想跟TA道一句晚安。",
-    "准备睡了，睡前想跟TA说声晚安。",
-    "今天聊得挺舒服，睡前道个晚安。",
-    "夜深了，躺下了想跟TA说句晚安再睡。",
-    "眼睛已经睁不开了，想先跟TA道个晚安。",
-]
 
 
 def greeting_window_kind(
@@ -578,15 +552,6 @@ def greeting_due(user: Dict[str, Any], day: str, kind: str) -> bool:
         if kind == "midday":
             return False
     return True
-
-
-def greet_reason(kind: str) -> str:
-    """问候的动机（从池子里随机挑一句，喂给生成侧）。"""
-    pool = {
-        "night": _GREET_REASON_NIGHT,
-        "midday": _GREET_REASON_MIDDAY,
-    }.get(kind, _GREET_REASON_MORNING)
-    return random.choice(pool)
 
 
 def greet_meta(kind: str) -> Dict[str, Any]:
@@ -664,22 +629,6 @@ def relationship_tier(affection: Optional[float]) -> Tuple[str, str]:
         if affection < threshold:
             return name, desc
     return "intimate", "关系非常亲近，可以完全放松地表达想念和在意，语气可以亲密自然。"
-
-
-# 关系档位序数：用于按熟络程度过滤消息示例（unknown 视作一般熟）
-_TIER_RANK: Dict[str, int] = {
-    "acquaintance": 0,
-    "casual": 1,
-    "friendly": 2,
-    "close": 3,
-    "intimate": 4,
-}
-
-
-def tier_rank(affection: Optional[float]) -> int:
-    """好感度 → 关系档位序数（0-4，未知按 1）。"""
-    key, _ = relationship_tier(affection)
-    return _TIER_RANK.get(key, 1)
 
 
 def energy_descriptor(energy: Optional[float]) -> str:

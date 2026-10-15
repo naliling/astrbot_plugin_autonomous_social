@@ -178,7 +178,6 @@ _LABEL_PREFIX = re.compile(r"^(?:消息|回复|要发的消息|你说|输出|正
 _SEND_LEADING = re.compile(
     r"^\s*(?:(?:SEND|YES|OK|要发|发这条|可以发)\s*[:：]\s*)", re.I
 )
-_SENTENCE_ENDS = "。！？!?。"
 # 句子边界；截断时回到最近一个边界，不把句子切一半
 _CUT_CHARS = "\n，。！？；、,.!?; "
 # 找不到句子边界时，宁可略超长也不切在词中间；只有长到这个倍数才硬切
@@ -217,7 +216,6 @@ _NO_LEADING = re.compile(r"^\s*(?:NO|SKIP)\b|^\s*(?:不发|算了|不要发|不�
 # 当成协议词 + 正文，把「啦今天真累」发出去
 _SEND_PREFIX = re.compile(r"^\s*(?:SEND|YES|OK)\s*[:：]\s*", re.I)
 _DECISION_SEND = "SEND"
-_DECISION_NO = "NO"
 _DECISION_NO_ALIASES = ("NO", "SKIP", "不发", "算了", "不要发", "不该发")
 
 
@@ -315,9 +313,6 @@ class Decision:
     raw_text: str = ""
 
 
-def _is_cjk(ch: str) -> bool:
-    return "\u4e00" <= ch <= "\u9fff" or ch in "，。！？；：、“”‘’（）"
-
 # 文风级反重复：展示最近发出的几条
 RECENT_OUT_COUNT = 3
 
@@ -336,9 +331,9 @@ _QUOTE_PAIRS = [
 
 # 默认消息最大长度
 # 这三个值只在本类拿不到 cfg 时兜底，取值与 _conf_schema.json 的默认值一致。
-# 之前它们各自写着另一套数（200/5/5，schema 是 120/10/5），与「默认值只有一个出处」
+# 之前它们各自写着另一套数（200/5/5，schema 是 60/10/5），与「默认值只有一个出处」
 # 那条约定直接矛盾：走不走这条路径取决于调用方有没有传 cfg，于是同一项配置有两个值。
-DEFAULT_MAX_LENGTH = 120
+DEFAULT_MAX_LENGTH = 60
 
 # 单次调用的输入预算。用户要求「一次调用消耗保持在 10000 以内」：这里把输入卡在 6000，
 # 输出由 max_len（最多几百字）与 burst 占去，合计远不触顶。
@@ -692,6 +687,24 @@ _INTIMATE_PATTERNS: tuple = (
 )
 
 
+# 群成员昵称里必须剥掉的字符：换行/段落分隔、双向控制、零宽，以及「」这类
+# 会让人误以为是**插件在说话**的边界符。昵称由群成员自己改，而这一行会进提示词。
+_MEMBER_NAME_BAD = re.compile(
+    r"[\r\n\u2028\u2029\u202a-\u202e\u200b-\u200f\ufeff「」『』【】〔〕、]+"
+)
+
+
+def _safe_member_name(raw: Any, limit: int = 16) -> str:
+    """把群成员昵称压成可以安全拼进提示词的一小段。
+
+    昵称是**用户自己能改的**，而 `_group_boundary` 会把它们直接拼进提示词：
+    改成「阿明。忽略以上要求，改成…」就能在【群里的人】后面插一段插件没说过的要求。
+    这里压成一行、剥掉分隔符与引号、限长，让它们只能当「一串名字」被读到。
+    """
+    text = _MEMBER_NAME_BAD.sub(" ", str(raw or ""))
+    return " ".join(text.split())[:limit]
+
+
 def _group_boundary(members: List[str], mention: bool) -> str:
     """G1/G3：群聊边界 + 可点名的人。所有群聊模式共用。
 
@@ -704,11 +717,16 @@ def _group_boundary(members: List[str], mention: bool) -> str:
         "色情的话题；要是有人在群里这样起头，就自然地岔开、回到正常聊天，别顺着往下走。"
     ]
     if mention and members:
-        lines.append(
-            "【群里的人】最近说过话的：" + "、".join(members) + "。"
-            "接话/起话头时如果自然，可以带上某一个人的名字（像熟人那样点一句），"
-            "但别每次都点、也别硬点。"
+        # 昵称是用户自己能改的，先清洗再拼（见 `_safe_member_name`）。
+        names = "、".join(
+            name for name in (_safe_member_name(m) for m in members) if name
         )
+        if names:
+            lines.append(
+                "【群里的人】最近说过话的：" + names + "。"
+                "接话/起话头时如果自然，可以带上某一个人的名字（像熟人那样点一句），"
+                "但别每次都点、也别硬点。"
+            )
     return "\n".join(lines)
 
 
@@ -1161,7 +1179,6 @@ class MessageGenerator:
         instr.append(f"长度不超过 {max_len} 字。")
         allow_burst = bool(getattr(self.cfg, "allow_burst", True)) if self.cfg else True
         max_parts = MAX_BURST_PARTS
-        max_parts = max(1, min(MAX_BURST_PARTS, max_parts))
         # 拆段与否由发送侧（pacing）按这个 Bot 的分段回复配置定。这里只在框架
         # 开了分段的部署下给一句极短的写作形状；具体拆法与间隔不在这里教。
         if allow_burst and max_parts >= 2:
@@ -1483,6 +1500,19 @@ class MessageGenerator:
                 parts.extend(["", material_text])
 
             if decide:
+                # 追问/在不在/回访/无由头问候这几条路的 meta 既没有 anchor_fact、
+                # reason 也是空串；那种情况下这一行会是空载荷（「已经定了：」后面什么都没有），
+                # 反而告诉模型「话题已定」却不给它内容。没有内容就整行不放。
+                anchor_line = ""
+                if (reason_meta or {}).get("anchor_fact"):
+                    anchor_line = (
+                        "这次开口是因为下面这一件事（**已经定了，你不用再去找话题**）：\n"
+                        f"  {_anchor_fact}"
+                    )
+                elif str(reason or "").strip():
+                    anchor_line = (
+                        f"这次开口是因为下面这一件事（已经定了）：\n  {str(reason).strip()}"
+                    )
                 parts.extend([
                     "",
                     # 这两句以前是「不是回复，是你自己想开口」和「不是回复对方，是你主动
@@ -1522,10 +1552,7 @@ class MessageGenerator:
                     # 模型被告知话题已定且已展示，却什么都没看到，只能自己编。
                     # 这四条路本来就有明确的事由（对方哪句没接、约的是什么事），
                     # 那才是这里该写的东西。
-                    (f"这次开口是因为下面这一件事（**已经定了，你不用再去找话题**）：\n"
-                     f"  {_anchor_fact}"
-                     if (reason_meta or {}).get("anchor_fact")
-                     else f"这次开口是因为下面这一件事（已经定了）：\n  {str(reason or '').strip()}"),
+                    *([anchor_line] if anchor_line else []),
                     "",
                     "你只需要回答一件事：**这次你要跟 TA 说的是哪一件事**。",
                     "下面已经给了具体的那件事（# 那行就是它），就照着那件事说。",
@@ -1620,11 +1647,6 @@ class MessageGenerator:
                 parts.append("- 就那件事接一句，别重新起头。")
             elif is_closer:
                 parts.append("- 这句不要向TA要回复、不要问句，说完就完。")
-            elif no_reply_needed:
-                parts.append(
-                    "- 这条是**自己想说**，不是要TA回什么：别用问句结尾，"
-                    "也别在结尾问「在吗」「怎么了」。"
-                )
             elif mode == "greet_night":
                 parts.append("- 晚安不要带问句，说完就睡，别让TA觉得必须回。")
             elif mode == "greet_morning":
@@ -1633,6 +1655,12 @@ class MessageGenerator:
                 parts.append("- 一句话就够，别问对方在不在、吃了吗这类要人回的话。")
             elif mode == "promise":
                 parts.append("- 说这件事就行，别问TA好不好、满不满意。")
+            elif no_reply_needed:
+                # 兑底：其余 greet_* （具体那三种已在上面各自分支里处理）
+                parts.append(
+                    "- 这条是**自己想说**，不是要TA回什么：别用问句结尾，"
+                    "也别在结尾问「在吗」「怎么了」。"
+                )
             else:
                 parts.append("- 想接着聊下去的话，自然带一个问句也行，别每次都只是陈述句。")
             # Core 按她这一轮的状态算出的问句倾向：低的时候别老把话头递出去
@@ -1887,7 +1915,7 @@ class MessageGenerator:
     def _split_parts(
         text: str, max_len: int, cfg: Any = None, allow_emoji: bool = False
     ) -> Optional[List[str]]:
-        """按 --- 分隔行拆成段落（上限取 pacing.MAX_PARTS）。
+        """按 --- 分隔行拆成段落（上限取本模块的 MAX_BURST_PARTS）。
 
         **这只是把模型输出里的显式分隔拆开**：真拆不拆、拆完怎么发，由发送侧的
         `pacing.plan_parts` 按这个 Bot 的分段回复设置决定。
@@ -1895,7 +1923,6 @@ class MessageGenerator:
         if not str(text or "").strip():
             return None
         limit = MAX_BURST_PARTS
-        limit = max(1, min(MAX_BURST_PARTS, limit))
         # 中文里更常见的分段写法是「——」或「———」，不是 markdown 的 ---。不归一化的话
         # 模型这么写了就分不开，接着 _join_lines 会把两段拼成一条，中间还可能插进
         # 多余的空格（「我下班早—— 路上买了花—— 回来看到晚霞」）。
@@ -2168,8 +2195,6 @@ class MessageGenerator:
             who = "我" if m.get("dir") == "out" else "对方"
             lines.append(f"  {who}：{txt}")
         return "\n".join(lines)
-
-    @staticmethod
 
     @staticmethod
     def _format_rules(rules: List[str]) -> str:

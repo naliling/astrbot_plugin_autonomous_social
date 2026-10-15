@@ -58,6 +58,27 @@ class SignalsWriter:
         self._last_error: str = ""
         # 角色数：>1 时不写会串台的顶层字段
         self._roles = 1
+        # 我们自己的保鲜期（秒），写进文件让 Core 按它判断过期。
+        # 0 = 还没声明，Core 用它自己的默认值。
+        self._ttl_seconds = 0.0
+
+    def set_ttl_seconds(self, seconds: float) -> None:
+        """声明「这份信号多久之内算新鲜」，由**写方**决定。
+
+        Core 那边的过期阈值原来是写死的 900 秒，而这里的心跳间隔是**可配的**
+        （`heartbeat_max_minutes`：默认 15 分钟、最大 120 分钟）。`beat()` 每轮都重写
+        mtime 来对抗这件事，但只要心跳间隔超过 15 分钟，Core 就会在两次心跳之间
+        把整份信号判成过期、当成没有——被冷落计数读成 0，刚主动开过口也当没发生。
+        所以把真实保鲜期写进文件（`ttl_seconds`），让对面按我们的节奏算。
+        """
+        try:
+            value = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return
+        if value == self._ttl_seconds:
+            return
+        self._ttl_seconds = value
+        self._dirty = True
 
     def _slot(self, bid: str) -> dict[str, Any]:
         by_bid = self._payload.setdefault("by_bid", {})
@@ -139,10 +160,13 @@ class SignalsWriter:
     def beat(self) -> bool:
         """每个周期无条件重写一遍：内容没变也要刷新 mtime。
 
-        这个文件的全部价值就在于 Core 那边按 mtime 判断「社交层还活着吗」，而 Core
-        的过期阈值是 900 秒。内容没变就不写的话，mtime 会被心跳间隔（默认 8~15 分钟）
-        拖过那个阈值，Core 读到 stale 就把一切当没有——被冷落计数被读成 0，
-        刚主动开过口也当没发生过。这一个几百字节的小文件，每轮心跳重写一次不算什么。
+        这个文件的全部价值就在于 Core 那边按 mtime 判断「社交层还活着吗」。内容没变
+        就不写的话，mtime 会被心跳间隔拖过 Core 的过期阈值，Core 读到 stale 就把一切
+        当没有——被冷落计数被读成 0，刚主动开过口也当没发生过。
+
+        心跳间隔是可配的（最大 120 分钟），所以除了每轮重写 mtime，`flush` 还会把
+        我们真实的保鲜期写进 `ttl_seconds`，让 Core 按我们的节奏判过期（见
+        `set_ttl_seconds`）。这一个几百字节的小文件，每轮心跳重写一次不算什么。
         """
         return self.flush(force=True)
 
@@ -157,6 +181,9 @@ class SignalsWriter:
             return False
         payload = dict(self._payload)
         payload["updated_at"] = round(now, 1)
+        if self._ttl_seconds > 0:
+            # 让 Core 按我们真实的保鲜期算过期，而不是它写死的 900 秒。
+            payload["ttl_seconds"] = round(self._ttl_seconds, 1)
         directory = os.path.dirname(self.path)
         try:
             os.makedirs(directory, exist_ok=True)

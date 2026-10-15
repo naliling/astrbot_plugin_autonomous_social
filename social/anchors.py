@@ -608,6 +608,7 @@ def prepare_round_anchors(
     tier: str = "",
     warmth: Optional[float] = None,
     last_talk: Optional[float] = None,
+    missing_floor: float = 60.0,
 ) -> List[Dict[str, Any]]:
     """本轮这个人可以用的由头：存量池 + 当场派生。
 
@@ -631,7 +632,9 @@ def prepare_round_anchors(
         used.add(_s(a.get("about")))
 
     if relational:
-        candidates = derive_relations(u, affection, now, used, last_talk=last_talk)
+        candidates = derive_relations(
+            u, affection, now, used, last_talk=last_talk, missing_floor=missing_floor
+        )
         kind = KIND_MISS
         # 手上真没有新事发生 —— 真人这时候会随口说一句，不至于硬找个话题。
         # 「你有多久没理我了」本身就是理由。
@@ -730,6 +733,7 @@ def derive_relations(
     *,
     care_hours: float = 24.0,
     last_talk: Optional[float] = None,
+    missing_floor: float = 60.0,
 ) -> List[str]:
     """派生出「关于 TA / 关于你们」的由头。"""
     out: List[str] = []
@@ -775,8 +779,15 @@ def derive_relations(
         aff = float(affection) if affection is not None else 0.0
     except (TypeError, ValueError):
         aff = 0.0
-    if aff >= 60.0 and since >= 5 * 3600.0:
+    if aff >= float(missing_floor) and since >= 5 * 3600.0:
         offer("有点想你了")
+    # 搭话：没什么事，就是想找 TA 说句话。关系不算生、也安静了一会儿，就开个口。
+    # 这是「她会主动打开话头」的那一类——**不需要对方先说过什么**。
+    if aff >= float(missing_floor) and since >= 2 * 3600.0:
+        for text in _CASUAL_OPENERS:
+            if text not in taken:
+                offer(text)
+                break
     return out
 
 
@@ -789,6 +800,14 @@ _NAG_BY_GAP = (
     (6 * 3600.0, "你好久没理我了"),
     (3 * 3600.0, "好半天没动静了，你还在吗"),
     (90 * 60.0, "刚才怎么没声了"),
+)
+
+# 「没事也想搭一句话」的开场白。与 `_NAG_BY_GAP` 的区别：那些是抱怨（你不理我），
+# 这些是**中性搭话**（在干嘛呢）。用过的会进由头冷却，不会天天同一句。
+_CASUAL_OPENERS = (
+    "在干嘛呢",
+    "闲着没事，跟你说句话",
+    "突然想找你聊两句",
 )
 
 
@@ -878,8 +897,3 @@ def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
         # 给提示词的那句「给定事实」
         "anchor_fact": anchor_sentence(a),
     }
-
-
-def anchor_topic(a: Dict[str, Any]) -> str:
-    """给模型的「#」行用：就是那件事本身，几个字。"""
-    return _s(a.get("about")) or "这件事"

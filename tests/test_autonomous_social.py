@@ -102,7 +102,7 @@ class TestFireGateDeadlock(unittest.TestCase):
                     desire.FIRE_THRESHOLD + desire.FIRE_GATE_SPAN * (i / 399.0), 3
                 )
                 u = {"no_reply_streak": streak, "fire_gate": gate, "urge": 99.0}
-                cap = desire.urge_cap(u, has_live_cue=False)
+                cap = desire.URGE_CEILING
                 urge = min(u["urge"], cap)          # engine 里的 cap 夹紧
                 threshold = desire.effective_gate(u, cap)
                 self.assertGreaterEqual(
@@ -113,9 +113,18 @@ class TestFireGateDeadlock(unittest.TestCase):
     def test_randomness_preserved_when_cap_is_high(self):
         """天花板高于门槛上界时，随机抖动仍然调节「等多久」，不能被压平成常量。"""
         u = {"no_reply_streak": 0, "fire_gate": desire.FIRE_THRESHOLD + 0.5}
-        cap = desire.urge_cap(u, has_live_cue=False)
+        cap = desire.URGE_CEILING
         self.assertAlmostEqual(
             desire.effective_gate(u, cap), desire.FIRE_THRESHOLD + 0.5, places=3
+        )
+
+    def test_being_ignored_raises_the_bar(self):
+        """越被冷落越克制：门槛随 streak 抬高（旧实现被 clamp 反转成越低越容易发）。"""
+        u0 = {"no_reply_streak": 0, "fire_gate": desire.FIRE_THRESHOLD}
+        u4 = {"no_reply_streak": 4, "fire_gate": desire.FIRE_THRESHOLD}
+        self.assertGreater(
+            desire.effective_gate(u4, desire.URGE_CEILING),
+            desire.effective_gate(u0, desire.URGE_CEILING),
         )
 
     def test_streak_decays_from_last_active_contact_not_last_chat(self):
@@ -1476,7 +1485,14 @@ class TestCueConsumedOnlyByCueMessages(unittest.TestCase):
     def test_engine_clears_cue_only_for_cue_category(self):
         src = PLUGIN_ROOT / "social" / "engine.py"
         text = src.read_text(encoding="utf-8")
-        self.assertIn('elif category == "cue"', text)
+        compact = " ".join(text.split())
+        # 只有「因为想起这件事才开口」才消费 cue：category=="cue"，或它的由头就是那条
+        # 时间锚点（KIND_CUE）。问候/收场不会命中。
+        self.assertIn(
+            'elif (category == "cue" or '
+            'str((_a or {}).get("kind") or "") == anchors.KIND_CUE):',
+            compact,
+        )
         self.assertNotIn(
             'if u.get("cue_due") and float(u["cue_due"]) <= ts:',
             text,

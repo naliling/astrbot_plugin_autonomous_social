@@ -40,6 +40,13 @@ from typing import Any, List, Optional, Sequence, Tuple
 # 4 比原来的 3 多一格，因为框架用户自己可能把阈值调得很宽。
 MAX_PARTS = 4
 
+
+def _cap_parts(segments: List[str], limit: int = MAX_PARTS) -> List[str]:
+    """超过上限时把多出来的并进最后一段，而不是丢掉——丢内容比刷屏更糟。"""
+    if len(segments) <= limit:
+        return segments
+    return segments[: limit - 1] + ["".join(segments[limit - 1:])]
+
 # 读不到配置时的默认值：与框架 `default.py` 的 segmented_reply 出厂值一致。
 _DEFAULT_REGEX = r".*?[。？！~…]+|.+$"
 _DEFAULT_SPLIT_WORDS = ["。", "？", "！", "~", "…"]
@@ -184,10 +191,10 @@ def plan_parts(
     cfg = read_segmented_reply(context, umo)
     if not bool(cfg.get("enable", False)):
         return [body], []
-    segments = split_segments(body, cfg)
-    segments = [s for s in segments if s.strip()][:MAX_PARTS]
+    segments = [s for s in split_segments(body, cfg) if s.strip()]
     if len(segments) <= 1:
         return [body], []
+    segments = _cap_parts(segments)
     waits = [part_interval(seg, cfg) for seg in segments[1:]]
     return segments, waits
 
@@ -219,6 +226,6 @@ def plan_segments(
     cfg = read_segmented_reply(context, umo)
     if not bool(cfg.get("enable", False)):
         return ["\n".join(segs)], []
-    segs = segs[:MAX_PARTS]
+    segs = _cap_parts(segs)
     waits = [part_interval(seg, cfg) for seg in segs[1:]]
     return segs, waits

@@ -58,15 +58,13 @@ RHYTHM_UNKNOWN = 1.10
 # 直方图平滑权重：「晚上九点常在线」意味着八点十点也大概率醒着
 RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 
-# 连续被冷落的念头天花板：越攒不出去，越说明对方不打算接
-# v25优化：收紧天花板，被冷落后更克制
-STREAK_CAP: Dict[int, float] = {0: 2.8, 1: 2.4, 2: 1.9, 3: 1.6, 4: 1.5}
-# 天花板地板高于常量门槛。真正保证「被冷落后仍攒得出去」的不是这个地板，而是
-# effective_gate 里的 min()——地板只挡住了把 cap 压到 1.40 以下的极端值，挡不住
-# 随机门槛被抽到 1.40~1.95 的上段。两道保险都得在。
-STREAK_CAP_FLOOR = FIRE_THRESHOLD + 0.15
-# 冷落几次之后，没有「真有由头」时天花板收紧，但仍留在门槛之上（不再压到门槛以下）
-STREAK_NEEDS_CUE = 4
+# 被冷落后的克制：每被晾一次，开口门槛就抬高一点——越攒不出去，越要攒得更满才开口。
+# 注意克制体现在**门槛**上，不是念头天花板：天花板会被 effective_gate 的 min() 夹住，
+# 压低它反而让门槛更低、更容易发（方向是反的）。封顶值不高于 URGE_CEILING，
+# 避免「被冷落够次数后永久不再主动」的自锁。时间上的克制另由
+# engine._gap_left（最小间隔随 streak 拉长）承担，两者互补。
+STREAK_GATE_STEP = 0.2
+STREAK_GATE_MAX_STREAK = 4
 # 被冷落封顶后，隔多久没有任何来往就把冷落计数往回退一格：真人晾了很久也会
 # 「算了再找一次看看」，而不是从此当这个人不存在。默认 3 天退一次。
 STREAK_DECAY_DAYS = 3.0
@@ -200,22 +198,6 @@ def rhythm_factor(user: Dict[str, Any], hour: int) -> float:
     return RHYTHM_OFF
 
 
-def urge_cap(user: Dict[str, Any], has_live_cue: bool) -> float:
-    """念头能攒到多高。被冷落得越多，天花板越低。
-
-    过去的实现会在 streak≥STREAK_NEEDS_CUE 且没由头时把天花板压到门槛以下（×0.98），
-    于是这个人除非主动发消息（after_reply 把 streak 归零），否则永远攒不到门槛、
-    永远不会再被主动找——那就是“几百小时不发”。现在天花板不低于 STREAK_CAP_FLOOR，
-    被冷落只会拖慢节奏。能不能真的攒出去由 effective_gate 保证，不要在这里再叠门槛。
-    """
-    streak = int(user.get("no_reply_streak", 0) or 0)
-    cap = STREAK_CAP.get(streak, STREAK_CAP_FLOOR)
-    if streak >= STREAK_NEEDS_CUE and not has_live_cue:
-        # 没话找话时收紧到下限，但不再压到门槛以下：就算没具体由头，晾久了也还能慢慢攒一次
-        cap = min(cap, STREAK_CAP_FLOOR)
-    return max(cap, STREAK_CAP_FLOOR)
-
-
 def decay_streak(user: Dict[str, Any], now: float) -> None:
     """被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」。
 
@@ -245,6 +227,9 @@ def decay_streak(user: Dict[str, Any], now: float) -> None:
     steps = int((now - anchor) // window)
     if steps <= 0:
         return
+    # 推进锚点：不推进的话 steps 会一直是 1，于是「每 3 天退一格」变成
+    # 「过了 3 天之后每个心跳都退一格」，几个心跳内就清零了。
+    user["last_ignored_at"] = anchor + steps * window
     new_streak = max(0, streak - steps)
     if new_streak != streak:
         user["no_reply_streak"] = new_streak
@@ -257,7 +242,6 @@ def decay_streak(user: Dict[str, Any], now: float) -> None:
 # 于是「连发三条然后消失三天」这种最不像人的节奏照样出得来。
 MOMENTUM_WINDOW_HOURS = 14.0
 MOMENTUM_MAX = 1.45
-MOMENTUM_COOLDOWN_HOURS = 36.0
 
 
 def momentum_factor(user: Dict[str, Any], now: float) -> float:
@@ -354,11 +338,6 @@ def settle(
     return urge
 
 
-def fire_worth(urge: float, gate: float = FIRE_THRESHOLD) -> bool:
-    """念头是否已经足够到「会掏出手机说一句」的程度。"""
-    return urge >= gate
-
-
 def new_fire_gate() -> float:
     """抽下一次要把念头攒到多高才算真想说。
 
@@ -371,17 +350,20 @@ def new_fire_gate() -> float:
 def effective_gate(user: Dict[str, Any], cap: float) -> float:
     """这一轮真正生效的发出门槛。
 
-    天花板与门槛是两道独立旋钮：念头被 urge_cap 夹到 cap，而门槛是每次说完话重抽的
-    随机值（FIRE_GATE_SPAN 的抖动）。两者一旦脱节——cap 在下、gate 在上——念头就永远
-    夹在天花板上、够不着门槛，而 gate 只在发送成功后才重抽，于是谁也发不出去：这就是
-    「被冷落够次数后永久不再主动」的自锁。判定一律走这里，把门槛压在天花板之内，
-    随机性只作用在天花板之上的那一段。
+    门槛是每次说完话重抽的随机值，被冷落过之后逐次抬高（越晾越难开口）；
+    最后压进念头天花板 cap 之内，避免门槛高过念头天花板导致永久发不出去的自锁。
     """
     try:
         gate = float(user.get("fire_gate") or FIRE_THRESHOLD)
     except (TypeError, ValueError):
         gate = FIRE_THRESHOLD
-    return min(max(gate, FIRE_THRESHOLD), cap)
+    gate = max(gate, FIRE_THRESHOLD)
+    try:
+        streak = int(user.get("no_reply_streak", 0) or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    gate += STREAK_GATE_STEP * min(max(streak, 0), STREAK_GATE_MAX_STREAK)
+    return min(gate, cap)
 
 
 def after_send(user: Dict[str, Any], now: float, *, expect_reply: bool = True) -> None:

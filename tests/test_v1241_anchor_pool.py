@@ -550,7 +550,10 @@ class MainUserIsActuallyServed(unittest.TestCase):
                       "裸名在 try_once 的作用域里取不到，单测会假绿")
         i_anchor = src.index("for bid, uid, u, urge, a in anchored:")
         before = src[:i_anchor]
-        self.assertIn("budget[_b] -= 1", before,
-                      "让出配额的代码必须在 anchored 之前——它抢不到就是白写")
-        self.assertIn("budget[_b] > 1", before,
-                      "只在还有富余时才让一条，不能把配额减到 0")
+        self.assertIn("_pre_cap", before,
+                      "给 anchored 留名额的预留机制必须在 anchored 之前——它抢不到就是白写")
+        self.assertIn("pre_take", before,
+                      "前三条通道必须过 pre_take，才能把名额让给 anchored")
+        # 旧写法（整轮总量减 1）会让 max_sends_per_round=3 实际只发 2 条，已弃用。
+        self.assertNotIn("budget[_b] -= 1", before,
+                         "不能再整轮减配额，那既没留给 anchored、又少发一条")

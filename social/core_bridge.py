@@ -281,6 +281,8 @@ class CoreBridge:
             "night_window": None,
             "energy_text": "",
             "day": {},
+            # 她手上还没做完的事（Core 跨天跟着的 ongoing）：社交层拿它当由头
+            "ongoing": [],
             "persona": "",
             "holiday": "",
         }
@@ -322,16 +324,21 @@ class CoreBridge:
             "doing": str(day.get("doing") or ""),
             "done": [str(x) for x in (day.get("done") or []) if str(x).strip()],
             "next": [str(x) for x in (day.get("next") or []) if str(x).strip()],
+            # 她自己想做的事：社交层拿它当由头（「她今天想去那家书店」）。
+            "wants": [str(x) for x in (contract.get("wants") or []) if str(x).strip()],
         }
+        # 她手上还没做完的事：社交层拿它当由头（「还在整理那份个案笔记」）。
+        view["ongoing"] = [
+            str(x) for x in (contract.get("ongoing") or []) if str(x).strip()
+        ]
         view["persona"] = str(contract.get("persona") or "")
         view["holiday"] = str(contract.get("holiday") or "").strip()
-        if contract.get("weather"):
-            view["weather"] = {"env": contract.get("weather")}
-        proc = view.get("process")
-        if isinstance(proc, dict) and view["activity"].get("phase"):
-            proc = dict(proc)
-            proc["phase"] = view["activity"]["phase"]
-            view["process"] = proc
+        # 契约里的 weather 是**故意的**空串（说明书/过期/未配置都导成空）。
+        # 不能因为空就退回 `_cached_weather_obj`——那是从不清的旧缓存，
+        # 停机几天后仍会拿几天前的天气派生由头（Core 那边正是要避免这个）。
+        if "weather" in contract:
+            _env = str(contract.get("weather") or "").strip()
+            view["weather"] = {"env": _env} if _env else {}
         return view
     def load_snapshot(
         self,

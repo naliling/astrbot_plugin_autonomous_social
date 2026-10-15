@@ -82,9 +82,9 @@ def thread_reason(
     # 在不在**。这比「每两小时问一次」合理得多。
     floor = presence_after_seconds
     if presence_floor_seconds:
-        floor = max(floor, float(presence_floor_seconds))
-    seen = float(user.get("last_seen", 0) or 0)
-    spoken = float(user.get("last_spoken", 0) or 0)
+        floor = max(floor, _num(presence_floor_seconds))
+    seen = _num(user.get("last_seen", 0))
+    spoken = _num(user.get("last_spoken", 0))
     last_said = max(seen, spoken)
     if last_said <= 0 or seen <= 0:
         return "", ""
@@ -103,7 +103,7 @@ def thread_reason(
     #
     # 正确的问法是「**追过一次之后，对方说过新话吗**」：说过 → 是新断点，可以再追；
     # 没说 → 还是那个断点，别追。跟时间戳是否相等无关。
-    asked_at = float(user.get("thread_asked_at", 0) or 0)
+    asked_at = _num(user.get("thread_asked_at", 0))
     if asked_at > 0 and seen <= asked_at:
         return "", ""
     # 她**已经回过**、之后双方都没再说话 → 这段已经收尾了，不是新断点。
@@ -129,8 +129,9 @@ def thread_reason(
     # （半小时内两条以上），那就是聊得正热，不是断了。
     recent_in_count = sum(
         1 for item in (user.get("conversation") or [])
-        if str(item.get("dir", "")) != "out"
-        and 0 < now - float(item.get("ts", 0) or 0) <= ACTIVE_CHAT_WINDOW
+        if isinstance(item, dict)
+        and str(item.get("dir", "")) != "out"
+        and 0 < now - _num(item.get("ts", 0)) <= ACTIVE_CHAT_WINDOW
     )
     if recent_in_count >= ACTIVE_CHAT_MIN_MSGS:
         return "", ""
@@ -138,8 +139,9 @@ def thread_reason(
     # 得先「在聊」：断点之前还有话挨着，才叫聊到一半
     nearby = [
         item for item in (user.get("conversation") or [])
-        if float(item.get("ts", 0) or 0) < last_said
-        and last_said - float(item.get("ts", 0) or 0) <= context_seconds
+        if isinstance(item, dict)
+        and _num(item.get("ts", 0)) < last_said
+        and last_said - _num(item.get("ts", 0)) <= context_seconds
     ]
     if len(nearby) + 1 < THREAD_CONTEXT_MIN:
         return "", ""
@@ -210,10 +212,15 @@ _LOOP_WORDS = (
     "坏了", "丢了", "找不到", "弄砸",
 )
 
-# 已经说了结果的，就别再问了
+# 已经说了结果的，就别再问了。
+#
+# **只收「结果」词，不收时间副词。** 这张表原来还混着「后来 / 已经 / 早就」，
+# 而「面试还没消息，已经等了好几天」「后来一直没消息」恰恰是**还开着**的线索 ——
+# 时间副词只说明过了多久，不说明有结果。混在一起会把还开着的线索直接关掉，
+# 于是那件事再也不会被回访（`loops_resolved_by` 也拿它当「已经有结果了」的判据）。
 _LOOP_CLOSED = (
     "完了", "搞定", "结束", "黄了", "过了", "通过", "挂掉", "没通过", "算了",
-    "不说了", "不提了", "就这样", "结果就是", "后来", "已经", "早就",
+    "不说了", "不提了", "就这样", "结果就是",
 )
 
 LOOP_MIN_HOURS = 2.5      # 当时追问不礼貌，至少隔这么久
@@ -456,10 +463,9 @@ def closer_reason(
     # 永远不接话的人每天被收一次场——收场那句本身会刷新 last_sent。
     if int(user.get("no_reply_streak", 0) or 0) >= MAX_CLOSERS:
         return ""
-    # 到这里所有前置条件都过了，却还是 return ""——于是这个函数**永远**返回假值，
-    # 「没人回就自己收个尾」整条链路是死代码：_closer_pick 恒为 None，收场那句
-    # 一次也发不出去，而状态面板用的是另一套条件，照样显示「该收场」。
-    # 返回值在这里只被当作「选不选这个人」的开关（reason 本身自 v1.16.0 起
+    # 前置条件全过了就给一句人能读的说明。（早前这里写成「到这里仍 return ""」、
+    # 于是整条收场链路是死代码——那个 bug 已修，这里改成直接返回理由。）
+    # 返回值只被当作「选不选这个人」的开关（reason 本身自 v1.16.0 起
     # 已不再进 prompt，动机由模型自己产），所以给一句人能读的说明即可。
     return f"她上次主动说的那句过了 {int((now - sent) / 3600)} 小时还没人接"
 
