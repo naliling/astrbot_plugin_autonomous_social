@@ -65,6 +65,14 @@ RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 # engine._gap_left（最小间隔随 streak 拉长）承担，两者互补。
 STREAK_GATE_STEP = 0.2
 STREAK_GATE_MAX_STREAK = 4
+# `interest_level` 里冷落惩罚项 -0.03*streak 的封顶格数。取 8 的依据有两条：
+#   1. 与门槛那侧的克制封顶（STREAK_GATE_MAX_STREAK=4）同源，惩罚允许比门槛更早封顶，
+#      但都在「连着 4~8 次没回」这个真人量级内；而 streak 本身每次被晾 +1、衰减要
+#      STREAK_DECAY_DAYS(3 天) 才退一格，对一个从不回复的人可以涨到几十。
+#   2. 0.03*8 = 0.24，正好等于回复率那一项的权重（0.24）。不封顶时 streak≈12 就把
+#      interest 顶上 0.05 这个下限——而两条注释都说清了：streak 与 rate 量的是同一个
+#      人际信号，惩罚不该重到把「聊过两年」整个抹掉、更不该变成永久出不来。
+STREAK_INTEREST_PENALTY_CAP = 8
 # 被冷落封顶后，隔多久没有任何来往就把冷落计数往回退一格：真人晾了很久也会
 # 「算了再找一次看看」，而不是从此当这个人不存在。默认 3 天退一次。
 STREAK_DECAY_DAYS = 3.0
@@ -75,6 +83,69 @@ FAMILIARITY_SATURATION = 200
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
+
+
+# ─── 容错读取：这一层读的全是 state.json / Core 契约里的字段 ──────────────
+#
+# 它们可能被手改、被跨版本迁移写坏、被 Core 写成字符串（"12.5"/"false"）。读到脏值时
+# **不能抛**：调用点 `engine.settle_minds` 的 per-user 循环里一次 ValueError 就会带走
+# 这个角色这一轮的全部用户（那边有异常隔离兜底，但不该靠它兜）。统一走下面这几个
+# helper，口径只有一套。
+
+def _num(value: Any) -> Optional[float]:
+    """能读成有限浮点就读，否则 None。
+
+    nan/inf 一律当「读不出来」：它们在这几个评分里不是「很大」而是「没有意义」——
+    nan 参与比较恒为 False，会把闸门静默变成「永远不发」而不是报错。
+    """
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    out = _num(value)
+    return default if out is None else out
+
+
+def _int(value: Any, default: int = 0) -> int:
+    """容错取整：`"12.5"` → 12、`True` → 1，读不出来才退回 default。"""
+    out = _num(value)
+    if out is None:
+        return default
+    try:
+        return int(out)
+    except (OverflowError, ValueError):
+        return default
+
+
+# 布尔字段的解析词表：与 Humanoid Core 的 `_as_bool`（humanoid/config.py）是**同一套**
+# （"1/true/yes/y/on/是/开" 与 "0/false/no/n/off/否/关"）。Core 的布尔字段经常是字符串
+# ——配置面板、手改 state.json、老版本迁移都能写出来——而 `if body.get("asleep")` 这种
+# 真值判断会把 `"false"` 判成「她正在睡觉」，于是她一整天一条都不发。
+_TRUE_STRINGS = {"1", "true", "yes", "y", "on", "是", "开"}
+_FALSE_STRINGS = {"0", "false", "no", "n", "off", "否", "关"}
+
+
+def truthy(value: Any, default: bool = False) -> bool:
+    """按 Core 的口径把任意值解析成 bool；认不出来（含 list/dict）退回 default。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    return default
 
 
 def familiarity(messages: int) -> float:
@@ -111,16 +182,17 @@ def interest_level(
     """
     # 没接 Core 时拿不到好感度：按「中性偏乐观」算，否则聊得再多的人也会被封在
     # 一个上不去的在意度里，主动消息会稀疏到看不出来插件在工作。
-    a = 0.5 if affection is None else clamp(float(affection) / 100.0, 0.0, 1.0)
-    msgs = int(user.get("message_count", 0) or 0)
+    # 读到脏值（Core 的快照、手改的 state.json）时同样退回中性 50，而不是抛。
+    a = 0.5 if affection is None else clamp(_float(affection, 50.0) / 100.0, 0.0, 1.0)
+    msgs = _int(user.get("message_count", 0), 0)
     familiar = familiarity(msgs)
 
     if weigh_reply_rate:
         # 回复率做拉普拉斯收缩：只发过一次、对方当时没回，不能就把 TA 当成不想理人
-        sent = int(user.get("proactive_sent", 0) or 0)
-        replied = int(user.get("proactive_replied", 0) or 0)
+        sent = max(0, _int(user.get("proactive_sent", 0), 0))
+        replied = max(0, _int(user.get("proactive_replied", 0), 0))
         rate = (replied + 1.0) / (sent + 2.0)
-        streak = int(user.get("no_reply_streak", 0) or 0)
+        streak = max(0, _int(user.get("no_reply_streak", 0), 0))
     else:
         rate = 0.5      # 中性：不因为回没回而抬高或压低
         streak = 0
@@ -129,7 +201,12 @@ def interest_level(
     # 一起计的结果是：连着几次没回就直接把一个认识两年的人从「亲密」压到「刚认识
     # 不久」——消息一条没少，只是更冷，而那种落差本身就不像人。减半，并且熟络度
     # 单独给一条地板（见 engine 里的 affection 兜底），不让人际热度把时长抹掉。
-    raw = 0.12 + 0.34 * a + 0.30 * familiar + 0.24 * rate - 0.03 * streak
+    #
+    # 惩罚项还要**封顶**（STREAK_INTEREST_PENALTY_CAP）：不封顶时 -0.03*streak 在
+    # streak≈12 就把 raw 压到下限 0.05，而一个从不回复的人也正好能涨到十几二十次
+    # ——结果是他被永久钉在最慢档，连「晾久了算了再找一次」的衰减都救不回来。
+    penalty = 0.03 * min(streak, STREAK_INTEREST_PENALTY_CAP)
+    raw = 0.12 + 0.34 * a + 0.30 * familiar + 0.24 * rate - penalty
     return clamp(raw, 0.05, 1.0)
 
 
@@ -144,11 +221,11 @@ def smooth_interest(
     每个心跳都全量跟进会让 interest 跟着回复率小幅抖动；它应该是个慢变量，
     所以平滑系数拉得很低。
     """
-    prev = user.get("interest")
+    prev = _num(user.get("interest"))
     if prev is None:
         value = clamp(target, 0.05, 1.0)
     else:
-        value = clamp(float(prev) * (1 - alpha) + target * alpha, 0.05, 1.0)
+        value = clamp(prev * (1 - alpha) + target * alpha, 0.05, 1.0)
     user["interest"] = round(value, 4)
     if now is not None:
         user["interest_at"] = now
@@ -183,7 +260,7 @@ def rhythm_factor(user: Dict[str, Any], hour: int) -> float:
     「我是机器人」的最强证据 —— 所以不在对方活跃时段时念头攒得极慢。
     样本还不够时不做判断（中性），避免新认识的人被作息规则误伤。
     """
-    samples = int(user.get("rhythm_samples", 0) or 0)
+    samples = _int(user.get("rhythm_samples", 0), 0)
     if samples < MIN_RHYTHM_SAMPLES:
         return RHYTHM_UNKNOWN
 
@@ -207,24 +284,24 @@ def decay_streak(user: Dict[str, Any], now: float) -> None:
     被冷落够次数就再也回不到正常节奏。
     对方一旦重新接住主动消息，after_reply 会直接归零，这里只管“一直没人理”的情况。
     """
-    streak = int(user.get("no_reply_streak", 0) or 0)
+    streak = _int(user.get("no_reply_streak", 0), 0)
     if streak <= 0:
         return
     # 锚点必须是「最后一次被判定为没人理」，不能是 last_sent：只要她还在发，
     # now - last_sent 就永远小于衰减周期，冷落计数永远降不下来——对那些从不回复的
     # 联系人就变成无限期保持每天几条。老数据没有这个字段时退回 last_sent。
-    anchor = float(user.get("last_ignored_at", 0) or 0)
+    anchor = _float(user.get("last_ignored_at", 0), 0.0)
     if anchor <= 0:
-        anchor = float(user.get("last_sent", 0) or 0)
+        anchor = _float(user.get("last_sent", 0), 0.0)
     if anchor <= 0:
         # 老数据没有 last_sent，退回「最后一次有来往」宁可慢退也不能不退
-        anchor = float(user.get("last_seen", 0) or 0)
+        anchor = _float(user.get("last_seen", 0), 0.0)
     if anchor <= 0:
         return
     window = STREAK_DECAY_DAYS * 86400.0
     if window <= 0:
         return
-    steps = int((now - anchor) // window)
+    steps = _int((now - anchor) // window, 0)
     if steps <= 0:
         return
     # 推进锚点：不推进的话 steps 会一直是 1，于是「每 3 天退一格」变成
@@ -288,18 +365,21 @@ def settle(
     Returns:
         结算后的 urge
     """
-    try:
-        urge = float(user.get("urge", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        urge = 0.0
+    urge = _float(user.get("urge", 0.0) or 0.0, 0.0)
 
-    try:
-        since = float(user.get("urge_at", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        since = 0.0
+    since = _float(user.get("urge_at", 0.0), 0.0)
     if since <= 0:
-        since = float(user.get("last_seen", 0) or 0) or now
-        user["urge_at"] = since
+        # 没有 urge_at（老数据 / 从旧版本迁移过来 / 第一次见到这个人）时的播种。
+        #
+        # 以前是 `since = last_seen or now`。老用户的 last_seen 可能是几天前，于是升级
+        # 后**第一次结算的 dt 长达数天**：urge 一步冲过 URGE_CEILING 并立即过闸，同一次
+        # 结算里所有老用户一起 ready——全体老用户同时收到主动消息。那不是「她一直想着
+        # 你」，是插件刚装好／刚升级，在补算它自己没运行的那段时间。
+        #
+        # 播种只用来记「从这一刻开始攒」，不补算过去。urge 本身是落盘的，老数据里已经
+        # 攒下的那部分不会因为这里改口径而丢。
+        user["urge_at"] = now
+        since = now
 
     dt = now - since
     if dt < 0:
@@ -308,20 +388,19 @@ def settle(
         return urge
 
     # 刚聊过：话才说完，不需要再「主动」一次
-    if now - float(user.get("last_seen", 0) or 0) < recent_talk_seconds:
+    last_seen = _float(user.get("last_seen", 0), 0.0)
+    if last_seen > 0 and now - last_seen < recent_talk_seconds:
         user["urge"] = 0.0
         user["urge_at"] = now
         return 0.0
 
     hours = dt / 3600.0
     if hours > 0:
-        interest = float(user.get("interest", 0.35) or 0.35)
+        # interest 是个 0.05~1.0 的评分：落盘的脏值（手改/迁移写成 50 或 "0.4"）读不出来
+        # 就退回 0.35，读出来则夹回量程。不夹的话 rate 会被放大几十倍，urge 一步到顶。
+        interest = clamp(_float(user.get("interest", 0.35) or 0.35, 0.35), 0.0, 1.0)
         # 播种名单里的人（从没聊过）攒得慢一倍：礼貌问题，不是节奏问题
-        scale = user.get("urge_scale", 1.0)
-        try:
-            scale = clamp(float(scale), 0.1, 2.0)
-        except (TypeError, ValueError):
-            scale = 1.0
+        scale = clamp(_float(user.get("urge_scale", 1.0), 1.0), 0.1, 2.0)
         rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5) * scale
         factor = (rhythm if rhythm is not None else 1.0) * clamp(mood_factor, 0.0, 1.5)
         factor *= momentum_factor(user, now)
@@ -353,16 +432,12 @@ def effective_gate(user: Dict[str, Any], cap: float) -> float:
     门槛是每次说完话重抽的随机值，被冷落过之后逐次抬高（越晾越难开口）；
     最后压进念头天花板 cap 之内，避免门槛高过念头天花板导致永久发不出去的自锁。
     """
-    try:
-        gate = float(user.get("fire_gate") or FIRE_THRESHOLD)
-    except (TypeError, ValueError):
-        gate = FIRE_THRESHOLD
+    # nan/inf 也算读不出来（`_float` 会拒掉）：nan 参与比较恒为 False，这个人会静默地
+    # 永远发不出去——比抛异常更难查。
+    gate = _float(user.get("fire_gate") or FIRE_THRESHOLD, FIRE_THRESHOLD)
     gate = max(gate, FIRE_THRESHOLD)
-    try:
-        streak = int(user.get("no_reply_streak", 0) or 0)
-    except (TypeError, ValueError):
-        streak = 0
-    gate += STREAK_GATE_STEP * min(max(streak, 0), STREAK_GATE_MAX_STREAK)
+    streak = max(0, _int(user.get("no_reply_streak", 0), 0))
+    gate += STREAK_GATE_STEP * min(streak, STREAK_GATE_MAX_STREAK)
     return min(gate, cap)
 
 
@@ -394,7 +469,7 @@ def after_reply(user: Dict[str, Any], now: float) -> None:
 
 def after_ignored(user: Dict[str, Any], now: float) -> None:
     """过了窗口对方没回：有点扫兴，下次再想找 TA 得攒更久。"""
-    user["no_reply_streak"] = int(user.get("no_reply_streak", 0) or 0) + 1
+    user["no_reply_streak"] = max(0, _int(user.get("no_reply_streak", 0), 0)) + 1
     user["urge"] = 0.0
     user["urge_at"] = now
     user["pending_since"] = 0.0
@@ -404,7 +479,7 @@ def after_ignored(user: Dict[str, Any], now: float) -> None:
     # 轻微掋一下就好：后续的 interest_level/smooth_interest 会根据回复率与 streak 自行
     # 把基线拉回来，这里再重手只会把一个只是最近很忙的人越掋越边缘。地板拉高一点，
     # 避免 interest 被掋到 0.05 后念头慢到几乎不涨。
-    interest = float(user.get("interest", 0.35) or 0.35)
+    interest = _float(user.get("interest") or 0.35, 0.35)
     user["interest"] = round(clamp(interest - 0.03, 0.12, 1.0), 4)
 
 
@@ -433,14 +508,11 @@ def after_skip(user: Dict[str, Any], now: float) -> None:
     （这是真实代价，不是惩罚），但不该把之前的积累作废。这样 decide 的 NO 才是可以
     放心说的话，攒下的念头也不会因为一次没发成而白扔。
     """
-    urge = float(user.get("urge", 0.0) or 0.0)
+    urge = _float(user.get("urge") or 0.0, 0.0)
     user["urge"] = round(max(0.0, urge * SKIP_KEEP_RATIO), 4)
     user["urge_at"] = now
     user["last_skip_at"] = now
-    try:
-        base = float(user.get("fire_gate") or FIRE_THRESHOLD)
-    except (TypeError, ValueError):
-        base = FIRE_THRESHOLD
+    base = _float(user.get("fire_gate") or FIRE_THRESHOLD, FIRE_THRESHOLD)
     bump = random.uniform(0.0, FIRE_GATE_SPAN * 0.5)
     user["fire_gate"] = min(base + bump, URGE_CEILING)
 
@@ -464,7 +536,7 @@ def mood_multiplier(
     """
     factor = 1.0
     if energy is not None:
-        e = clamp(float(energy), 0.0, 100.0)
+        e = clamp(_float(energy), 0.0, 100.0)
         if e < energy_threshold:
             factor *= 0.30
         elif e < 35:
@@ -472,7 +544,7 @@ def mood_multiplier(
         elif e > 75:
             factor *= 1.10
     if social_energy is not None:
-        s = clamp(float(social_energy), 0.0, 100.0)
+        s = clamp(_float(social_energy), 0.0, 100.0)
         if s < social_threshold:
             factor *= 0.28
         elif s < 40:
@@ -482,7 +554,10 @@ def mood_multiplier(
 
     if body:
         # 真的在睡觉的时候不是「概率打折」，就是不该开口。
-        if body.get("asleep"):
+        # 用 truthy 而不是直接 if body.get("asleep")：Core 契约里这个字段可能是字符串
+        # （"false"/"0"/"否"），真值判断会把「她没睡」判成「她正在睡觉」，factor 被砍到
+        # 1/16，而她一整天一条都不会发——而且没有任何日志能看出原因。
+        if truthy(body.get("asleep")):
             factor *= 0.06
         pressure = _num(body.get("sleep_pressure"))
         if pressure is not None:
@@ -503,12 +578,3 @@ def mood_multiplier(
             # 她自己的心思是油门也是刹车：独处攒满了想说，刚聊过就攒不出去。
             factor *= 0.55 + 0.9 * (clamp(desire, 0.0, 100.0) / 100.0)
     return clamp(factor, 0.05, 1.65)
-
-
-def _num(value: Any) -> Optional[float]:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None

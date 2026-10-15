@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from .emoji import EMOJI as _EMOJI
+
 # 样本少的时候给统计数字是噪声（「TA 平均 7.4 个字」可能只统计了两条）
 MIN_SAMPLES = 3
 # 统计用多少条最近的
@@ -37,21 +39,40 @@ _EMOJI_BAND_TEXT = {
     EMOJI_NONE: "不用 emoji",
 }
 
-_SENTENCE_SPLIT = re.compile(r"[。！？!?\n；;…]+")
-_QUESTION_TAIL = re.compile(r"[吗呢吧呗嘛？?]+\s*$")
+# 半角句号 `.` 与半角分号 `;` 同样算句尾：`_PERIOD`（下面）把半角点当「句号收尾」，
+# 这里若只认全角，同一批话会得出「习惯用句号收尾」却「平均 11 个字，最长 11 字」——
+# 手机上打半角点的人句长整个失真。
+_SENTENCE_SPLIT = re.compile(r"[。.！!？?\n；;…]+")
+# 句尾问号，以及「吗/嘛」两个**只**用于疑问的语气词。
+# ⚠️ 不要把「呢 / 吧 / 呗」算进来：「我忙着呢」是进行体陈述、「好吧」是同意、「走呗」是建议，
+# 都不在提问。与 `reasoning._ASKING`（那边写的是 `[?？]|[吗]$`）是同一个口径：
+# 问号任意位置都算，语气词只认句尾，且只认「吗」。两处产物都会进 prompt，
+# 判错会让模型以为「TA 很爱问句」进而一直把话头递回去。
+# 比 `_ASKING` 多收一个「嘛」：这里是口语画像，不是 `busy_signal` 那种「宁可漏判」
+# 的代价函数，而「嘛」在句尾就是「吗」的口语写法（「今天忙嘛」）。测试两个都钉住了。
+_QUESTION_TAIL = re.compile(r"[吗嘛？?]+$")
+# 问号**任意位置**都算提问（「你几点回来？我等你」这种把问句夹在中间的写法）。
+# 与 `reasoning.py` 的 `_ASKING` 同口径；那边是 `[?？]|[吗]$`，
+# 这里因为拆分已经把标点吃掉了，才拆成 `_QUESTION_TAIL` + 本正则两件事——
+# `_QUESTION_TAIL` 覆盖语气词与「吗？」，本正则覆盖吃掉的问号。
+_ASKING_MARK = re.compile(r"[?？]")
 _ELLIPSIS = re.compile(r"…|\.{3,}")
 _EXCLAIM = re.compile(r"[！!]")
 _PERIOD = re.compile(r"[。\.]")
 _WAVE = re.compile(r"[~～]")
-_EMOJI = re.compile(
-    "[" "\U0001F000-\U0001FAFF" "\U00002600-\U000027BF" "\U00002B00-\U00002BFF"
-    "\uFE0F\u200D\u20E3" "]+"
-)
+# `_EMOJI`（emoji + 变体选择符）由 `social/emoji.py` 统一提供：这份字符类原本在
+# `style_profile` / `generator` / `groupflow` 各抄了一份逐字节相同的正则，
+# 现在三处 import 的是同一个对象，不会再出现「改一处漏一处」。
 # 只用来判断「有没有带称呼」，不把称呼本身写进 prompt——那等于递台词
 _ADDRESS_TOKENS = (
-    "宝", "宝儿", "老婆", "老公", "亲爱的", "宝宝", "崽", "崽崽", "丫头", "小朋友",
+    "宝儿", "宝", "老婆", "老公", "亲爱的", "宝宝", "崽崽", "崽", "丫头", "小朋友",
     "同学", "哥", "姐", "兄弟", "老板", "老师", "经理",
 )
+# 称呼必须落在**开口**（句首），且后面不能紧跟汉字——否则「宝贵」「珍贵」这类
+# 普通词会被算成称呼。原来是 `k in t[:6]` 的子串匹配：最短的 token「宝」咬住
+# 长词的前半截，于是说「时间很宝贵」的人被统计成「开口习惯带称呼」，
+# 结论整段进 prompt，模型就真的每条都开始叫「宝」。
+_ADDRESS_HEAD = re.compile(r"^(?:%s)(?![\u4e00-\u9fff])" % "|".join(_ADDRESS_TOKENS))
 _CASUAL_TOKENS = ("喂", "诶", "哎", "嘿", "欸", "呀", "哦", "噢", "嗯", "唔")
 
 # 问句占比落到这几档的描述。只写后半句，主语由调用方拼——
@@ -90,11 +111,21 @@ def _stat_line(label: str, texts: Sequence[str]) -> str:
     sentences = 0
     for t in texts:
         parts = [p.strip() for p in _SENTENCE_SPLIT.split(t) if p.strip()]
+        # 与 `reasoning._ASKING`（`[?？]|[吗]$`）同口径：问号任意位置都算，
+        # 语气词只认句尾的「吗/嘛」。「走吧 / 我忙着呢 / 好吧」三个都不该命中。
+        #
+        # ⚠️ 判据跑在**整条**消息上而不是切出来的段落上：`_SENTENCE_SPLIT` 把问号
+        # 当边界**吃掉**了，逐段判会让「你几点回来？我等你」里的问号凭空消失
+        # （段落变成「你几点回来」「我等你」，问号谁都看不到）。
+        # 计数同样按整条算并夹在句数以内，避免一个问句被算成两处提问。
+        n_marks = len([m for m in _QUESTION_TAIL.finditer(t)]) + len(
+            [m for m in _ASKING_MARK.finditer(t)]
+        )
+        if n_marks:
+            questions += min(n_marks, max(1, len(parts)))
         sentences += max(1, len(parts))
         for p in parts:
             lengths.append(len(p))
-            if _QUESTION_TAIL.search(p):
-                questions += 1
     if not lengths:
         return ""
     avg = round(sum(lengths) / len(lengths))
@@ -151,7 +182,7 @@ def _habit_line(label: str, texts: Sequence[str]) -> str:
     multi = sum(1 for t in texts if "\n" in t.strip())
     if multi / n >= 0.3:
         found.append("爱分两三段发")
-    addressed = sum(1 for t in texts if any(k in t[:6] for k in _ADDRESS_TOKENS))
+    addressed = sum(1 for t in texts if _ADDRESS_HEAD.search(t[:6]))
     if addressed / n >= 0.3:
         found.append("开口习惯带称呼")
     elif addressed > 0:
@@ -160,7 +191,9 @@ def _habit_line(label: str, texts: Sequence[str]) -> str:
         found.append("说话不带称呼")
     if not found:
         return ""
-    return f"{label}" + "、".join(found)
+    # `label` 后面还要跟空格的：原来是 `f"{label}" + "、".join(found)`，
+    # 产出「TA不用感叹号」——中文没分词，模型读到的是把主语和第一个习惯并成一个词。
+    return f"{label} " + "、".join(found)
 
 
 def _tone_line(label: str, texts: Sequence[str]) -> str:
@@ -182,10 +215,25 @@ class StyleProfile:
     """一次统计的结论：给人看的特征块，加上几个要拿去做判断的字段。"""
 
     text: str = ""
-    # 她自己发出去的消息里的 emoji 习惯（EMOJI_* 之一）
+
+    # 她自己发出去的消息里的 emoji 习惯（EMOJI_* 之一）。唯一被读的字段：
+    # `generator.py:1437` 用 `style.emoji` 决定这一轮允不允许用 emoji。
     emoji: str = EMOJI_UNKNOWN
+
+    # ── 保留字段（截至 v1.27.27 没有任何读取点，不要当成已接线）──
+    # 全仓库 grep：`avg_chars` 只在定义处出现；`.max_chars` 除定义外没有读取点
+    # （`generator.py` 里成片出现的 `form.max_chars`、`memory_bridge.py:212` 的
+    # `max_chars` 都是无关参数）。留着的原因见下：
+    #   · 删字段 = 删对外可见能力，而「这一轮该写多长」本来就有真实用途——
+    #     报告 #55 的建议是在 `generator` 里用 `style.avg_chars` 给 `max_len` 一个
+    #     习惯上的上界（现在只由人设与 Core 的 `form.max_chars` 决定）。接上去要改
+    #     `generator.py`（不归本单元），所以先保留契约并注明：
+    #   · 这两个字段与 `_stat_line` 里那段「平均 N 个字」**同一份统计**，
+    #     真接线时用字段比再解析 prompt 文字可靠。
+    # 真实代价只是 `_length_stats`（下面）每次多算一遍，纯本地计算，不碰网络。
     # 她一条平均多少字；0 表示样本不足
     avg_chars: int = 0
+    # 她最长的一条多少字；0 表示样本不足
     max_chars: int = 0
 
 
@@ -216,6 +264,8 @@ def build_style_profile(
     ):
         if text and text not in lines:
             lines.append("- " + text)
+    # avg/longest 填的是上面注释里那两个「保留字段」：与 `_stat_line` 里
+    # 「平均 N 个字」同一口径，等 `generator` 真拿它约束长度时直接用。
     avg, longest = _length_stats(mine)
     if not lines:
         return StyleProfile("", emoji_habit(mine), avg, longest)

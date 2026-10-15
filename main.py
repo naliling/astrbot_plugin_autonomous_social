@@ -260,7 +260,13 @@ class AutonomousSocial(Star):
         try:
             if not self._engine.cfg.enabled:
                 return
-            if self._engine.cfg.private_only and self._is_group(event):
+            # 私聊主动消息的原文只属于那个私聊窗口，群聊里**绝不**注入。
+            # 原条件写成 `private_only and _is_group`，于是 private_only=False
+            # （用户正是为了开群聊功能才关掉它）变成了「允许把私聊原文注入群聊
+            # 上下文」的开关：同一用户先在私聊收到主动消息，随后在群里说话，
+            # 私聊原文就被当成本轮上下文塞进群聊请求 → 私聊内容泄漏到群。
+            # private_only 的语义只是「要不要在群里主动说话」，与注入无关。
+            if self._is_group(event):
                 return
             contexts = getattr(req, "contexts", None)
             extra_parts = getattr(req, "extra_user_content_parts", None)
@@ -516,13 +522,16 @@ class AutonomousSocial(Star):
         except Exception:
             pass
         try:
+            # 白名单**无条件**构建：它的语义是「除主人外还允许谁用指令」，
+            # 与 owner_only_commands（是否额外要求主人身份）无关。原来只在
+            # owner_only_commands=False 时才构建，于是默认值 True 下这个面板项
+            # 完全不读、静默失效 —— 与它自己的 hint 直接矛盾。
             if self._engine and self._engine.cfg:
-                if not self._engine.cfg.owner_only_commands:
-                    whitelist = {
-                        self._norm_id(x)
-                        for x in self._engine.cfg.allowed_trigger_uid_set()
-                        if self._norm_id(x)
-                    }
+                whitelist = {
+                    self._norm_id(x)
+                    for x in self._engine.cfg.allowed_trigger_uid_set()
+                    if self._norm_id(x)
+                }
         except Exception:
             pass
         return owners, whitelist
@@ -548,7 +557,7 @@ class AutonomousSocial(Star):
             pass
         detail = (
             f"sender={sender or '空'} 主人={sorted(owners) or '未配置'} "
-            f"白名单={'已关闭(owner_only_commands)' if not whitelist and self._owner_only() else sorted(whitelist)}"
+            f"白名单={sorted(whitelist) or '未配置'}"
         )
         return False, detail
 
@@ -569,7 +578,7 @@ class AutonomousSocial(Star):
             "权限：仅主人可用（全局配置 admins_id）\n"
             f"  你的 ID：{sender}\n"
             f"  主人列表：{', '.join(sorted(owners)) or '（空，所以谁都会被拒）'}\n"
-            f"  额外白名单：{('关闭（owner_only_commands=true）') if not whitelist else ', '.join(sorted(whitelist))}"
+            f"  额外白名单：{', '.join(sorted(whitelist)) or '（空）'}"
         )
 
     def _is_group(self, event: AstrMessageEvent) -> bool:

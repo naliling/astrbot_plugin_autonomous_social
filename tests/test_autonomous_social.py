@@ -913,6 +913,8 @@ class _TriggerEngine:
     _trigger_precheck = SocialEngine._trigger_precheck
     _remember_clock = SocialEngine._remember_clock
     _representative_umo = SocialEngine._representative_umo
+    # trigger_once 现在按 per-(bot,uid) 取锁（手动触发与并发心跳互斥）
+    _user_lock = SocialEngine._user_lock
     trigger_once = SocialEngine.trigger_once
 
     async def _get_provider(self, umo):
@@ -930,6 +932,7 @@ class _TriggerEngine:
         self.state = SocialState(os.path.join(self._tf_dir, "state.json"))
         self._time_high = 0.0
         self._last_flush = 1.0
+        self._user_locks = {}
         self._ranked = ranked
         self._speak_impl = speak
         for uid, _u, _g in ranked or []:
@@ -1232,6 +1235,20 @@ class TestNoScriptedContent(unittest.TestCase):
         for raw in ("在吗", "吃了吗", "你干嘛呢", "困了"):
             self.assertNotIn(raw, out, f"风格特征里泄漏了原句：{raw}")
         self.assertRegex(out, r"平均 \d+ 个字")
+
+    def test_style_profile_question_habit_ignores_statement_particles(self):
+        """句尾「呢 / 吧 / 呗」是陈述、同意、建议，**不是**提问。
+
+        与 `reasoning._ASKING` 同一口径（那边同样刻意去掉了句尾「呢/吧」）。
+        两处产物都会进 prompt：判错会让模型以为「TA 很爱问句，习惯把话头递出去」，
+        于是它一直把话头递回去 —— 而对方其实只是在陈述。
+        """
+        from social.style_profile import _stat_line
+
+        statement = _stat_line("TA", ["走吧", "我忙着呢", "好吧", "走呗"])
+        self.assertNotIn("爱问句", statement, f"陈述句被当成提问：{statement}")
+        asking = _stat_line("TA", ["在吗", "吃了吗", "你几点回来？", "今天忙嘛"])
+        self.assertIn("爱问句", asking, f"真问句没被认出来：{asking}")
 
     def test_ai_produces_its_own_intent_line(self):
         """动机改由模型自己写：以 # 开头的那一行会被剥掉，不会发出去。"""
@@ -2930,6 +2947,18 @@ class TestGenericBlockSanitizing(unittest.TestCase):
             sanitize_incoming("这句还行 uid=webchat 后面是框架"),
             "这句还行",
         )
+
+    def test_frame_marker_at_the_very_start_is_kept(self):
+        """消息**本身**以标记开头时保留：那更像「用户在问这个词」，不是框架泄漏。
+
+        两种代价不对称：留下一个框架词只是让提示词脏一点；把用户整条消息吞成 `''`
+        会让 `looks_like_framework_only` 为真 → 这条消息**根本不被建档**，
+        下一轮主动消息里「对方最后说的是」还停在上一句 —— 那是记忆出错。
+        """
+        from social.sanitize import sanitize_incoming
+        for raw in ("uid=webchat 是什么", "retrieval_intent 是什么意思"):
+            with self.subTest(raw=raw):
+                self.assertEqual(sanitize_incoming(raw), raw)
 
 # ─── v1.23.1：协议残留 + 首行标题 ─────────────────────────────────
 

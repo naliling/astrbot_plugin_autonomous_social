@@ -114,13 +114,19 @@ def _to_ts(value: Any) -> float:
         except ValueError:
             pass
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
 
             if s.endswith("Z"):
                 s = s[:-1] + "+00:00"
             elif len(s) >= 11 and s[10] == " ":
                 s = s[:10] + "T" + s[11:]  # SQLite 的空格分隔写法
-            return float(datetime.fromisoformat(s).timestamp())
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                # 无时区信息：SQLite 的 "YYYY-MM-DD HH:MM:SS" 惯例是 UTC。
+                # 直接 .timestamp() 会按**容器本地时区**解释（UTC+8 时早 8 小时），
+                # 而这里的结果会直接进 last_seen / urge_at。
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
         except (ValueError, TypeError):
             return 0.0
     return 0.0
@@ -176,16 +182,25 @@ def recent_turns(content: Any, limit: int = 8) -> List[Dict[str, Any]]:
             "text": text[:CONVERSATION_TRUNCATE_LENGTH],
             "ts": 0.0,
         })
-    return out[-max(0, int(limit)):]
+    n = max(0, int(limit))
+    if n <= 0:
+        # `out[-0:]` 是 `out[0:]`，会把**全部**条目返回（Python 的 -0 == 0 陷阱）。
+        return []
+    return out[-n:]
 
 
 # 从对方说过的话里挖「一件具体的事」——比 extract_open_loop 宽：
 # 不要求「提过没结果」，只要是一件发生过或即将发生的事就能当由头。
+#
+# 全部用**多字**词：这里是子串匹配，单字词（买/订/拿/交/取/寄/修/换/退/办/签）
+# 会把「我拿不定主意」「今天换了个发型」这种普通句子判成「有件事」，存进 anchors
+# 之后还会变成主动消息的依据。由头得是一件**说得出来**的事，不是一个字。
 _ANCHOR_WORDS = (
     "面试", "体检", "搬家", "考试", "出差", "旅行", "旅游", "看医生", "复查",
     "牙医", "驾照", "签证", "续签", "入职", "离职", "开学", "放假", "结婚",
-    "报名", "房租", "还书", "买", "订", "参加", "比赛", "演出", "手术",
-    "拿", "交", "取", "寄", "修", "换", "退", "办", "签",
+    "报名", "房租", "还书", "参加", "比赛", "演出", "手术",
+    "退货", "退款", "下单", "取快递", "寄快递", "寄出", "修好", "换工作",
+    "换手机", "办完", "办好", "签约", "签合同", "交了", "买好", "买了", "订票",
 )
 
 
@@ -308,21 +323,44 @@ def _uid_of(umo: str) -> str:
 
 
 def existing_uids(state: SocialState) -> set:
-    """state 里已有的 uid 集合。给线程侧做过滤快照用（历史导入那批）。"""
-    out = set()
-    for bot in state.data.get("bots", {}).values():
-        out.update((bot or {}).get("users", {}).keys())
-    return out
+    """state 里已有用户的 **(角色, 平台, uid)** 集合（历史导入的过滤快照）。
+
+    名字保留是因为 `engine.py` 直接按这个名字取值（那个文件本轮不改），但返回的
+    是配对而不是裸 uid：uid 只在**单个平台内**唯一，跨平台同名是不同的人。用裸
+    uid 判重时，QQ 上聊过的人会让 TG 上同名的人**永远**加不进来 —— 与
+    `existing_pairs` 的 docstring 描述的是同一个 bug。
+    """
+    return existing_pairs(state)
 
 
 def existing_pairs(state: SocialState) -> set:
-    """(角色, uid) 集合。播种名单要用这个：uid 只在**单个平台内**唯一，跨平台
-    同名是不同的人。用裸 uid 判重时，QQ 上聊过的人会让 TG 上同名的人永远加不进来。"""
+    """(角色, 平台, uid) 集合。判重必须用这个：uid 只在**单个平台内**唯一，
+    跨平台同名是不同的人。用裸 uid 判重时，QQ 上聊过的人会让 TG 上同名的人永远
+    加不进来；而只用 (角色, uid) 也不行 —— 播种名单里所有平台共用一个 `default`
+    bid，两个平台的人在同一个 bid 下依然同名冲突。平台从用户自己的 `umo` 解出。
+    """
     out = set()
     for bid, bot in (state.data.get("bots", {}) or {}).items():
-        for uid in (bot or {}).get("users", {}) or {}:
-            out.add((str(bid), str(uid)))
+        if not isinstance(bot, dict):
+            continue
+        for uid, u in (bot.get("users") or {}).items():
+            umo = str((u or {}).get("umo") or "") if isinstance(u, dict) else ""
+            out.add((str(bid), str(parse_umo(umo)[0]), str(uid)))
     return out
+
+
+def _known_uid(existing: set, bid: str, platform: str, uid: str) -> bool:
+    """existing 里是否已经有这个人。
+
+    认 `(角色, 平台, uid)` 三元组，也兼容旧式 `(角色, uid)` 与裸 uid：外部调用方
+    （engine）可能还在按老形状传值，宁可多判一层，也不要把同一个人判成两个。
+    """
+    bid, platform, uid = str(bid), str(platform), str(uid)
+    return (
+        (bid, platform, uid) in existing
+        or (bid, uid) in existing
+        or uid in existing
+    )
 
 
 def collect_from_history(
@@ -361,9 +399,12 @@ def collect_from_history(
         if kind != "private":
             continue
         uid = _uid_of(umo)
-        if not uid or uid in existing:
+        platform = parse_umo(umo)[0]
+        # 判重按 (角色, 平台, uid)：uid 只在单个平台内唯一，用裸 uid 会让跨平台的
+        # 同名用户被**永久**挡住（见 existing_pairs 的 docstring）。
+        if not uid or _known_uid(existing, target_bid, platform, uid):
             continue
-        existing.add(uid)
+        existing.add((str(target_bid), str(platform), str(uid)))
         ts = conv["updated_at"]
         row: Dict[str, Any] = {
             "bid": target_bid,
@@ -462,12 +503,14 @@ def seed_diag_snapshot(
     if not out["db_path"]:
         out["reason"] = "会话库未找到（data 目录解析不对或还没聊过天）"
         return out
-    existing = existing_uids(state)
+    bid = str(seed_target_bid(state))
+    existing = existing_pairs(state)
     convs = list(iter_conversations(out["db_path"], private_only=True))
     out["private_conversations"] = len(convs)
     out["importable"] = sum(
         1 for c in convs
-        if _uid_of(c["umo"]) and _uid_of(c["umo"]) not in existing
+        if _uid_of(c["umo"])
+        and not _known_uid(existing, bid, parse_umo(c["umo"])[0], _uid_of(c["umo"]))
     )
     return out
 
@@ -542,7 +585,9 @@ def apply_seed_list(
     added = 0
     for entry in normalize_seed_entries(raw_entries, default_platform):
         platform, uid, msg_type = entry
-        if (str(bid), str(uid)) in existing:
+        # 判重键与 existing_pairs 对齐（角色, 平台, uid）：只用 (bid, uid) 时，
+        # 播种名单里所有平台共用一个 default bid，TG 的同名 uid 仍会被 QQ 的挡住。
+        if _known_uid(existing, bid, platform, uid):
             continue
         umo = f"{platform}:{msg_type}:{uid}"
         u = state.user(bid, uid)
@@ -554,7 +599,7 @@ def apply_seed_list(
             u["urge_at"] = now
         # 没聊过的人，攒念头的速度打五折
         u["urge_scale"] = 0.5
-        existing.add((str(bid), str(uid)))
+        existing.add((str(bid), str(platform), str(uid)))
         added += 1
     if added:
         state.mark_dirty()

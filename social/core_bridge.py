@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
@@ -25,6 +26,10 @@ _STATE_FILENAMES: List[str] = [
     "plugin_data/humanoid_core/state.json",
     "plugin_data/astrbot_plugin_humanoid_core/state.json",
 ]
+
+# 没找到时的负缓存时间窗（秒）。Core 后装、插件目录后建、或一次扫盘超限之后，
+# 不能永久断链：命中才永久缓存，未命中只静默这么久再重试一次。
+_SEARCH_RETRY_SECONDS = 300.0
 
 # 有界搜索的限制。搜索必须有硬上限：在超大目录树上无界遍历会把面板卡死。
 _SEARCH_MAX_DEPTH = 3
@@ -47,7 +52,10 @@ class CoreBridge:
     def __init__(self, mode: str, data_dir: Optional[str] = None):
         self.mode = mode
         self._data_dir = data_dir  # 可选：AstrBot 数据根目录
-        self._warned_missing = False  # 一次性 warning 标记
+        # 一次性 warning 标记，**按失败原因分开**：共用一个标记时，先发生的故障
+        # 会把后面所有故障都静默掉（"未找到" 置位后，"格式损坏" 就再也不提示了，
+        # 而用户刚装完 Core 最需要的恰恰是那条消息）。读到一次就整体复位。
+        self._warned: Dict[str, bool] = {}
         self._warned_no_role: set = set()  # 每个 bid 只警告一次
         self._cache_fingerprint: Optional[Tuple[str, int, int]] = None
         self._cache_root: Optional[Dict[str, Any]] = None
@@ -55,9 +63,17 @@ class CoreBridge:
         # load_snapshot，_speak 又会再调一次——1000 人的时候一遍心跳就要重建上千遍
         # 同一个视图，而它的输入（角色自身状态）压根没变。read_root 换文件时清空。
         self._view_cache: Dict[str, Dict[str, Any]] = {}
-        # 搜索结果缓存：找到一次就记住路径，不必每次心跳重新搜
+        # 搜索结果缓存：命中一次就记住路径；未命中只做短期负缓存（见 _SEARCH_RETRY_SECONDS）
         self._searched = False
+        self._searched_at = 0.0
         self._search_hit: Optional[str] = None
+
+    def _warn_once(self, reason: str, message: str) -> None:
+        """按失败原因各警告一次。不同故障互不遮蔽。"""
+        if self._warned.get(reason):
+            return
+        self._warned[reason] = True
+        logger.warning(message)
 
     # ─── 路径解析 ───────────────────────────────────────
 
@@ -66,9 +82,15 @@ class CoreBridge:
 
         只搜 data 目录及其下级（以及进程 cwd），深度和条目数都有硬上限。
         """
-        if self._searched:
+        if self._search_hit:
             return self._search_hit
+        now = time.monotonic()
+        # 未命中只做短期负缓存：原来 `_searched` 在搜索**之前**就置 True 且永不重试，
+        # 于是 Core 后装、目录后建、或一次扫盘超限都会让联动**永久断链**（只能重载插件）。
+        if self._searched and (now - self._searched_at) < _SEARCH_RETRY_SECONDS:
+            return None
         self._searched = True
+        self._searched_at = now
         roots: List[str] = []
         if self._data_dir:
             roots.append(self._data_dir)
@@ -82,11 +104,12 @@ class CoreBridge:
             base_depth = root.rstrip(os.sep).count(os.sep)
             for dirpath, dirnames, filenames in os.walk(root):
                 if entries > _SEARCH_MAX_ENTRIES:
-                    logger.warning(
+                    self._warn_once(
+                        "search_limit",
                         f"[autonomous_social] 搜索 Humanoid Core 超过 {_SEARCH_MAX_ENTRIES} "
-                        "个目录仍未找到，已停止（不再继续扫盘）"
+                        f"个目录仍未找到，已停止本次扫盘（{int(_SEARCH_RETRY_SECONDS)} 秒后会再试）",
                     )
-                    return self._search_hit
+                    return None
                 entries += 1
                 depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
                 if depth >= _SEARCH_MAX_DEPTH:
@@ -144,21 +167,21 @@ class CoreBridge:
         """
         p = self._resolve_path()
         if not p:
-            if self.mode != "standalone" and not self._warned_missing:
-                self._warned_missing = True
-                logger.warning(
+            if self.mode != "standalone":
+                self._warn_once(
+                    "missing",
                     "[autonomous_social] 未找到 Humanoid Core state.json，联动未生效。"
                     "请确认已安装 astrbot_plugin_humanoid_core 且模式配置正确。"
-                    f"当前模式：{self.mode}"
+                    f"当前模式：{self.mode}",
                 )
             return None
 
         try:
             stat = os.stat(p)
         except OSError as e:
-            if not self._warned_missing:
-                self._warned_missing = True
-                logger.warning(f"[autonomous_social] Humanoid Core state.json 读取失败: {e}")
+            self._warn_once(
+                "oserror", f"[autonomous_social] Humanoid Core state.json 读取失败: {e}"
+            )
             return None
 
         fingerprint = (p, stat.st_mtime_ns, stat.st_size)
@@ -169,21 +192,24 @@ class CoreBridge:
             with open(p, encoding="utf-8") as f:
                 root = json.load(f)
         except json.JSONDecodeError as e:
-            if not self._warned_missing:
-                self._warned_missing = True
-                logger.warning(f"[autonomous_social] Humanoid Core state.json 格式损坏: {e}")
+            self._warn_once(
+                "corrupt", f"[autonomous_social] Humanoid Core state.json 格式损坏: {e}"
+            )
             return None
         except OSError as e:
-            if not self._warned_missing:
-                self._warned_missing = True
-                logger.warning(f"[autonomous_social] Humanoid Core state.json 读取失败: {e}")
+            self._warn_once(
+                "oserror", f"[autonomous_social] Humanoid Core state.json 读取失败: {e}"
+            )
             return None
         except Exception as e:
-            if not self._warned_missing:
-                self._warned_missing = True
-                logger.warning(f"[autonomous_social] Humanoid Core state.json 读取异常: {e}")
+            self._warn_once(
+                "read_error", f"[autonomous_social] Humanoid Core state.json 读取异常: {e}"
+            )
             return None
 
+        # 成功读到一次：复位所有失败标记，下一次真出故障时还能提示（原来从不复位，
+        # 启动瞬间一次瞬时故障就把后续所有提示永久静音了）。
+        self._warned.clear()
         self._cache_fingerprint = fingerprint
         self._cache_root = root
         self._view_cache.clear()
@@ -208,27 +234,40 @@ class CoreBridge:
         Returns:
             bot 自身状态 dict，不存在返回 None
         """
-        if root is None:
-            root = self.read_root()
-        if not root:
-            return None
+        try:
+            if root is None:
+                root = self.read_root()
+            if not root:
+                return None
 
-        role = root.get("roles", {}).get(str(bot_id), {})
-        selfs = role.get("self", {}) if isinstance(role, dict) else {}
+            # roles / self 都要校验类型：Core 换结构或 state.json 被手改时，
+            # 裸 .get 链会 AttributeError，而这是每个用户每轮心跳都走的入口。
+            roles = root.get("roles")
+            role = roles.get(str(bot_id), {}) if isinstance(roles, dict) else {}
+            selfs = role.get("self") if isinstance(role, dict) else None
+            if not isinstance(selfs, dict):
+                selfs = {}
 
-        if not selfs and self.mode != "standalone" and bot_id not in self._warned_no_role:
-            self._warned_no_role.add(bot_id)
-            all_roles = list(root.get("roles", {}).keys())
-            logger.warning(
-                "[autonomous_social] state.json 中不存在角色 %r，联动可能未生效。"
-                "可能是 bot_id 取值错误。state.json 中的角色：%s",
-                bot_id, all_roles,
+            if not selfs and self.mode != "standalone" and bot_id not in self._warned_no_role:
+                self._warned_no_role.add(bot_id)
+                all_roles = list(roles.keys()) if isinstance(roles, dict) else []
+                logger.warning(
+                    "[autonomous_social] state.json 中不存在角色 %r，联动可能未生效。"
+                    "可能是 bot_id 取值错误。state.json 中的角色：%s",
+                    bot_id, all_roles,
+                )
+
+            if not selfs:
+                return None
+
+            return self._self_view(selfs, str(bot_id))
+        except Exception as e:
+            # 兜底：坏数据只该让这一层退化成「没有自身状态」，不该抛穿整轮心跳
+            self._warn_once(
+                "self_state_error",
+                f"[autonomous_social] 读取 Humanoid Core 角色自身状态失败（本轮跳过）: {e}",
             )
-
-        if not selfs:
             return None
-
-        return self._self_view(selfs, str(bot_id))
 
     # 契约里的身体轴：v1 开始承诺的字段只加不改。
     _CONTRACT_BODY_KEYS = (
@@ -258,9 +297,25 @@ class CoreBridge:
         cached = self._view_cache.get(bot_id)
         if cached is not None:
             return cached
-        view = self._build_self_view(selfs, bot_id)
+        try:
+            view = self._build_self_view(selfs, bot_id)
+        except Exception as e:
+            # 兜底：这一层的结果会被 load_snapshot 展开进快照，抛出去会连累整轮心跳
+            self._warn_once(
+                "self_view_error",
+                f"[autonomous_social] 构建 Humanoid Core 自身视图失败（退化为空视图）: {e}",
+            )
+            view = {}
         self._view_cache[bot_id] = view
         return view
+
+    @staticmethod
+    def _contract_v(contract: Any) -> int:
+        """契约版本号。旧版 Core 没有这个字段；值被手改坏时当 0，**绝不抛**。"""
+        try:
+            return int(float(contract.get("v") or 0))
+        except (TypeError, ValueError, AttributeError):
+            return 0
 
     def _build_self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
@@ -287,10 +342,12 @@ class CoreBridge:
             "holiday": "",
         }
         contract = selfs.get("contract")
-        if not isinstance(contract, dict) or int(contract.get("v") or 0) < 1:
+        # 版本号必须容错：契约里的 v 是跨插件来的值，非数字时裸 int() 会抛穿
+        # _build_self_view → _self_view → bot_self_state/load_snapshot 四层。
+        if not isinstance(contract, dict) or self._contract_v(contract) < 1:
             return view
         body = contract.get("body") if isinstance(contract.get("body"), dict) else {}
-        view["contract_v"] = int(contract.get("v") or 0)
+        view["contract_v"] = self._contract_v(contract)
         if body.get("energy") is not None:
             view["energy"] = body.get("energy")
         if body.get("social_energy") is not None:
@@ -348,6 +405,9 @@ class CoreBridge:
     ) -> Optional[Dict[str, Any]]:
         """生成单个用户的完整快照（bot 自身状态 + 用户情绪数据）。
 
+        这是每次心跳、每个用户都会调的取数入口，所以最外层必须兜底：Core 契约里
+        任何一个字段坏掉，都只让这个用户本轮没有快照，不该抛穿整轮心跳。
+
         Args:
             bot_id: bot 的 ID
             user_id: 用户 ID
@@ -356,6 +416,21 @@ class CoreBridge:
         Returns:
             快照 dict，或 None
         """
+        try:
+            return self._load_snapshot_inner(bot_id, user_id, root)
+        except Exception as e:
+            self._warn_once(
+                "snapshot_error",
+                f"[autonomous_social] 生成 Humanoid Core 快照失败（本轮跳过该用户）: {e}",
+            )
+            return None
+
+    def _load_snapshot_inner(
+        self,
+        bot_id: str,
+        user_id: str,
+        root: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         if self.mode == "standalone":
             return None
 
@@ -364,12 +439,18 @@ class CoreBridge:
         if not root:
             return None
 
-        role = root.get("roles", {}).get(str(bot_id), {})
+        roles = root.get("roles")
+        if not isinstance(roles, dict):
+            return None
+        role = roles.get(str(bot_id), {})
         if not isinstance(role, dict):
             return None
 
-        selfs = role.get("self", {}) if isinstance(role, dict) else {}
-        user = role.get("users", {}).get(str(user_id), {})
+        selfs = role.get("self") if isinstance(role, dict) else None
+        if not isinstance(selfs, dict):
+            selfs = {}
+        users = role.get("users")
+        user = users.get(str(user_id), {}) if isinstance(users, dict) else {}
         if not isinstance(user, dict):
             user = {}
 
@@ -405,14 +486,17 @@ class CoreBridge:
         # 而该被多找的恰恰是前者。Core 自己存着 base_affection 和 user 级 first_met
         # （prune 会搬、不会丢），所以**涨幅和认识时长**是拿得到的。
         base_aff = None
-        if isinstance(mood_data, dict):
-            raw_base = mood_data.get("base_affection")
-            if raw_base is None:
-                raw_base = selfs.get("base_affection")
-            try:
-                base_aff = float(raw_base) if raw_base is not None else None
-            except (TypeError, ValueError):
-                base_aff = None
+        # base_affection 是**用户级**数据（"有运营把初始好感度设成 40"这类），
+        # 原来回退到角色级 selfs 里取，取到也不是这个人的基线；而且取值被
+        # `isinstance(mood_data, dict)` 守着，mood 不是 dict 时整个分支被跳过
+        # —— 那恰恰是回退本该发挥作用的场景。
+        raw_base = mood_data.get("base_affection") if isinstance(mood_data, dict) else None
+        if raw_base is None:
+            raw_base = user.get("base_affection")
+        try:
+            base_aff = float(raw_base) if raw_base is not None else None
+        except (TypeError, ValueError):
+            base_aff = None
         try:
             first_met = float(user.get("first_met") or 0) or None
         except (TypeError, ValueError):
@@ -439,11 +523,21 @@ class CoreBridge:
             "mood_tag": str(user.get("mood_tag", "") or "").strip(),
             # 她有多在意这个人
             "attention": (
-                float(attention.get("care"))
-                if isinstance(attention, dict) and attention.get("care") is not None
+                self._float_or_none(attention.get("care"))
+                if isinstance(attention, dict)
                 else None
             ),
         }
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        """把跨插件来的值转成 float；非数字一律 None（同函数里 base_aff 已是这个口径）。"""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     # ─── 紧凑输出 ───────────────────────────────────────
 

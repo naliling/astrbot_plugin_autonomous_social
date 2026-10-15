@@ -36,6 +36,10 @@ from typing import Any, Callable
 
 FILE_NAME = "humanoid_signals.json"
 
+# ignored_by 按 uid 记，永不清理的话会随用户数**单调增长**，而这个文件每轮心跳
+# 全量重写。超出上限时丢掉最久没更新的条目（dict 保序，更新会把它移到末尾）。
+_IGNORED_BY_MAX = 500
+
 
 class SignalsWriter:
     def __init__(
@@ -94,7 +98,11 @@ class SignalsWriter:
     def note_proactive(self, target_uid: str, at: float | None = None,
                        bid: str = "") -> None:
         """一条主动消息真的发出去了。"""
-        when = float(self._time() if at is None else at)
+        try:
+            when = float(self._time() if at is None else at)
+        except (TypeError, ValueError):
+            # at 是调用方传进来的值，坏值不该让「刚替她开过口」这件事整个丢掉
+            when = float(self._time())
         slot = self._slot(bid)
         slot["last_proactive_at"] = when
         slot["last_target_uid"] = str(target_uid or "")
@@ -124,10 +132,18 @@ class SignalsWriter:
         per = slot.get("ignored_by")
         if not isinstance(per, dict):
             per = {}
-        before = int(per.get(uid) or 0)
+        try:
+            before = int(per.get(uid) or 0)
+        except (TypeError, ValueError):
+            # 盘上旧值可能是字符串/对象；按「还没有记录」处理，别让整轮心跳抛
+            before = 0
         if before == value:
             return
+        # 先删再插：让最近更新的条目排在末尾，超限时从头（最久没更新）丢
+        per.pop(uid, None)
         per[uid] = value
+        while len(per) > _IGNORED_BY_MAX:
+            per.pop(next(iter(per)), None)
         slot["ignored_by"] = per
         self._dirty = True
         self.flush()
@@ -149,7 +165,11 @@ class SignalsWriter:
         except (TypeError, ValueError):
             return
         slot = self._slot(bid)
-        if int(slot.get("ignored_streak") or 0) == value:
+        try:
+            current = int(slot.get("ignored_streak") or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current == value:
             return
         slot["ignored_streak"] = value
         if getattr(self, "_roles", 1) <= 1:
@@ -184,18 +204,55 @@ class SignalsWriter:
         if self._ttl_seconds > 0:
             # 让 Core 按我们真实的保鲜期算过期，而不是它写死的 900 秒。
             payload["ttl_seconds"] = round(self._ttl_seconds, 1)
-        directory = os.path.dirname(self.path)
+        directory = os.path.dirname(self.path) or "."
+        tmp: str | None = None
         try:
             os.makedirs(directory, exist_ok=True)
             handle, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
-            with os.fdopen(handle, "w", encoding="utf-8") as writer:
+            try:
+                writer = os.fdopen(handle, "w", encoding="utf-8")
+            except BaseException:
+                # fdopen 失败时句柄还没被接管，得自己关掉，避免泄漏 fd
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+                raise
+            with writer:
                 json.dump(payload, writer, ensure_ascii=False, separators=(",", ":"))
                 writer.flush()
                 os.fsync(writer.fileno())
             os.replace(tmp, self.path)
-        except OSError as exc:
-            self._last_error = str(exc)
+            tmp = None
+            # fsync 文件只保证内容落盘；os.replace 的目录项变更要 fsync 父目录才算落地
+            # （Windows 上目录 fsync 不可用，必须容错）
+            try:
+                dfd = os.open(directory, os.O_RDONLY)
+            except OSError:
+                dfd = -1
+            if dfd >= 0:
+                try:
+                    os.fsync(dfd)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        os.close(dfd)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            # 原来只捕获 OSError：json.dump 抛 TypeError 或 flush 抛别的异常时，
+            # tmp 已创建且**永不删除**，而 beat() 每轮心跳都调 → 每 8~15 分钟泄漏
+            # 一个临时文件；而且 _last_error 不会被设置，状态页上什么都看不到。
+            self._last_error = f"{type(exc).__name__}: {exc}"
             return False
+        finally:
+            # 成功时 tmp 已被 os.replace 消费掉（tmp 置 None）；失败/异常时清理
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         self._last_error = ""
         self._written_at = now
         self._dirty = False

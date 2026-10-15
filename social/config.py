@@ -10,8 +10,120 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:  # 插件外（脚本/测试）导入时退化为标准库，别让配置模块变成硬依赖
+    from astrbot.api import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger("autonomous_social")
+
+# 非法/越界的配置值只告警一次（按 key 去重），避免每轮心跳、每次构造刷屏
+_CONFIG_WARNED: Set[str] = set()
+
+
+def _warn_config_once(key: str, message: str) -> None:
+    """同一个配置项只告警一次。告警本身失败也不能影响配置构造。"""
+    if key in _CONFIG_WARNED:
+        return
+    _CONFIG_WARNED.add(key)
+    try:
+        logger.warning(f"[autonomous_social] {message}")
+    except Exception:
+        pass
+
+
+def _safe_int(value: Any, default: Any, key: str = "") -> int:
+    """安全取整数配置：非数字时告警一次并退回默认值，**绝不抛异常**。
+
+    AstrBot 只补缺失项、从不覆盖已有值，所以一个被手改成 "abc" 的数字项会一直
+    留在配置里。裸 `int()` 抛出会沿 `from_astrbot` → `SocialEngine.__init__` →
+    `AutonomousSocial.__init__` 一路抛穿，插件永久无法加载，面板也修不回来
+    （只能手改 JSON）。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(value))  # "2.5" / "1e3" 这类字符串写法
+    except (TypeError, ValueError):
+        pass
+    _warn_config_once(
+        key or "<unknown>",
+        f"配置项 {key} 的值 {value!r} 不是有效数字，已按默认值 {default!r} 处理；"
+        "请在 AstrBot 面板里改正（插件不会替你改配置）",
+    )
+    try:
+        return int(default)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: Any, default: Any, key: str = "") -> float:
+    """安全取浮点配置：非数字时告警一次并退回默认值，**绝不抛异常**。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    _warn_config_once(
+        key or "<unknown>",
+        f"配置项 {key} 的值 {value!r} 不是有效数字，已按默认值 {default!r} 处理；"
+        "请在 AstrBot 面板里改正（插件不会替你改配置）",
+    )
+    try:
+        return float(default)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fsync_dir(path: str) -> None:
+    """fsync 目录项，保证 os.replace 的结果真的落盘。
+
+    fsync 文件只保证内容落盘，`os.replace` 这个目录项变更没有 fsync 目录就仍在
+    页缓存里；断电时可能出现「新数据在盘上但目录项还指向旧 inode」，甚至文件消失。
+    Windows 上目录 `os.open(..., O_RDONLY)` 会失败（或不支持），必须容错。
+    """
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(dfd)
+        except OSError:
+            pass
+
+
+def _write_json_atomic(path: str, payload: Any) -> None:
+    """原子写 JSON：同目录临时文件 + fsync 文件 + os.replace + fsync 父目录。
+
+    `open(path, "w")` 会先截断再写，进程在截断后崩溃就留下 0 字节文件；与
+    「读失败即静默」组合成一条自我锁死路径。
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".config_write.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        _fsync_dir(directory)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 # 有效运行模式
 # 只有这两种：auto 会自动探测有没有 Core，standalone 则完全不读它。
@@ -38,7 +150,8 @@ URGE_REFILL_MAX = 96
 # 8 小时是对 interest=1（最在意的人）而言的，普通人按比例更慢，实际要攒十几个小时
 # 才发得出一条——那与「插件在跑但永远没动静」基本同义。降到 4；
 # v1.9.0 直接降到下限 2：再配合更低的冷却，主动消息才算真的「频繁」
-# v1.9.x 降到下限 2：更像话多的人，心里一有事就想找人说（URGE_REFILL_DEFAULT 实际为 2）
+# v1.9.x 一度降到下限 2：更像话多的人，心里一有事就想找人说
+# （注释原来写「实际为 2」，与代码和 schema 都不符：URGE_REFILL_DEFAULT 实际为 4）
 URGE_REFILL_DEFAULT = 4
 # 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
 CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
@@ -288,22 +401,50 @@ _SCHEMA_PATH = os.path.join(
 _MISSING = object()
 
 
-def _load_schema_defaults() -> Dict[str, Any]:
+def _load_schema_raw() -> Dict[str, Any]:
+    """读取 _conf_schema.json 原文；失败时**记一条告警**（原来完全静默返回 {}）。"""
     try:
         with open(_SCHEMA_PATH, encoding="utf-8") as f:
             raw = json.load(f)
-    except Exception:
+    except Exception as e:
+        _warn_config_once(
+            "<schema>",
+            f"读取配置 schema 失败（{_SCHEMA_PATH}）：{e}；默认值退回代码里的硬编码兜底",
+        )
         return {}
     if not isinstance(raw, dict):
+        _warn_config_once(
+            "<schema>",
+            f"配置 schema 顶层不是对象（{_SCHEMA_PATH}）；默认值退回代码里的硬编码兜底",
+        )
         return {}
+    return raw
+
+
+_SCHEMA_RAW: Dict[str, Any] = _load_schema_raw()
+
+
+def _load_schema_defaults() -> Dict[str, Any]:
     return {
         k: v.get("default")
-        for k, v in raw.items()
+        for k, v in _SCHEMA_RAW.items()
         if isinstance(v, dict) and "default" in v
     }
 
 
 _SCHEMA_DEFAULTS: Dict[str, Any] = _load_schema_defaults()
+
+# schema 的 min/max 与代码里的 clamp 常量逐项一致（审查报告附录 A：54 组 100% 一致），
+# 所以「取值越界」等价于「clamp 会静默改写」。在这里统一判断并告警，
+# 不必在 50 多处 max/min 上各加一份（那样改动面大得多，还容易漏）。
+_SCHEMA_BOUNDS: Dict[str, Tuple[Any, Any]] = {}
+for _key, _meta in _SCHEMA_RAW.items():
+    if not isinstance(_meta, dict):
+        continue
+    _lo, _hi = _meta.get("min"), _meta.get("max")
+    if isinstance(_lo, (int, float)) or isinstance(_hi, (int, float)):
+        _SCHEMA_BOUNDS[_key] = (_lo, _hi)
+del _key, _meta
 
 
 def _d(key: str, hard_fallback: Any = None) -> Any:
@@ -605,6 +746,36 @@ class SocialConfig:
             except Exception:
                 return default
 
+        def _warn_clamped(key: str, value: Any, lo: Any, hi: Any) -> None:
+            _warn_config_once(
+                key,
+                f"配置项 {key} 的值 {value!r} 超出允许范围（"
+                f"{lo if lo is not None else '-∞'} ~ {hi if hi is not None else '+∞'}），"
+                "已按边界值处理；请在面板里改正",
+            )
+
+        def gi(key: str, hard_default: Any) -> int:
+            """安全取整数：非数字→告警+默认值；越界→告警（外层 clamp 仍会夹住）。"""
+            default = _d(key, hard_default)
+            value = _safe_int(g(key, default), default, key)
+            lo, hi = _SCHEMA_BOUNDS.get(key, (None, None))
+            if (isinstance(lo, (int, float)) and value < lo) or (
+                isinstance(hi, (int, float)) and value > hi
+            ):
+                _warn_clamped(key, value, lo, hi)
+            return value
+
+        def gf(key: str, hard_default: Any) -> float:
+            """安全取浮点：非数字→告警+默认值；越界→告警（外层 clamp 仍会夹住）。"""
+            default = _d(key, hard_default)
+            value = _safe_float(g(key, default), default, key)
+            lo, hi = _SCHEMA_BOUNDS.get(key, (None, None))
+            if (isinstance(lo, (int, float)) and value < lo) or (
+                isinstance(hi, (int, float)) and value > hi
+            ):
+                _warn_clamped(key, value, lo, hi)
+            return value
+
         # 模式
         mode = str(g("mode", _d("mode",  "auto"))).lower().strip()
         if mode not in VALID_MODES:
@@ -613,24 +784,24 @@ class SocialConfig:
         # 跟进窗口必须比「多久算没声」长，否则永远落在空区间里一条也发不出
         followup_after = max(
             FOLLOWUP_AFTER_MIN,
-            min(FOLLOWUP_AFTER_MAX, int(g("followup_after_minutes", _d("followup_after_minutes",  FOLLOWUP_AFTER_DEFAULT)))),
+            min(FOLLOWUP_AFTER_MAX, gi("followup_after_minutes", FOLLOWUP_AFTER_DEFAULT)),
         )
         probe_after = max(
             PROBE_AFTER_MIN,
-            min(PROBE_AFTER_MAX, int(g("probe_after_minutes", _d("probe_after_minutes",  PROBE_AFTER_DEFAULT)))),
+            min(PROBE_AFTER_MAX, gi("probe_after_minutes", PROBE_AFTER_DEFAULT)),
         )
         followup_max = max(
             followup_after + 5,
-            max(FOLLOWUP_MAX_MIN, min(FOLLOWUP_MAX_MAX, int(g("followup_max_minutes", _d("followup_max_minutes",  FOLLOWUP_MAX_DEFAULT))))),
+            max(FOLLOWUP_MAX_MIN, min(FOLLOWUP_MAX_MAX, gi("followup_max_minutes", FOLLOWUP_MAX_DEFAULT))),
         )
         try:
-            loop_min = max(LOOP_MIN_HOURS_FLOOR, min(LOOP_MIN_HOURS_CEIL, float(g("loop_min_hours", _d("loop_min_hours",  LOOP_MIN_HOURS_DEFAULT)))))
+            loop_min = max(LOOP_MIN_HOURS_FLOOR, min(LOOP_MIN_HOURS_CEIL, gf("loop_min_hours", LOOP_MIN_HOURS_DEFAULT)))
         except (TypeError, ValueError):
             loop_min = LOOP_MIN_HOURS_DEFAULT
         try:
             loop_max = min(
                 LOOP_MAX_HOURS_CEIL,
-                max(loop_min + 1.0, float(g("loop_max_hours", _d("loop_max_hours",  LOOP_MAX_HOURS_DEFAULT)))),
+                max(loop_min + 1.0, gf("loop_max_hours", LOOP_MAX_HOURS_DEFAULT)),
             )
         except (TypeError, ValueError):
             loop_max = max(loop_min + 1.0, LOOP_MAX_HOURS_DEFAULT)
@@ -640,88 +811,88 @@ class SocialConfig:
             mode=mode,
             activity_level=max(
                 ACTIVITY_MIN,
-                min(ACTIVITY_MAX, int(g("activity_level", _d("activity_level",  ACTIVITY_DEFAULT)))),
+                min(ACTIVITY_MAX, gi("activity_level", ACTIVITY_DEFAULT)),
             ),
             min_gap_minutes=max(
-                10, min(MIN_GAP_MAX, int(g("min_gap_minutes", _d("min_gap_minutes",  MIN_GAP_MINUTES_DEFAULT)))),
+                10, min(MIN_GAP_MAX, gi("min_gap_minutes", MIN_GAP_MINUTES_DEFAULT)),
             ),
             miss_affection_min=max(
-                0, min(100, int(g("miss_affection_min", _d("miss_affection_min",  MISS_AFFECTION_MIN_DEFAULT)))),
+                0, min(100, gi("miss_affection_min", MISS_AFFECTION_MIN_DEFAULT)),
             ),
             miss_daily_cap=max(
-                0, min(10, int(g("miss_daily_cap", _d("miss_daily_cap",  MISS_DAILY_CAP_DEFAULT)))),
+                0, min(10, gi("miss_daily_cap", MISS_DAILY_CAP_DEFAULT)),
             ),
             cross_user_repeat_ratio=max(
-                0.1, min(1.0, float(g("cross_user_repeat_ratio", _d("cross_user_repeat_ratio",  CROSS_USER_REPEAT_RATIO_DEFAULT))))
+                0.1, min(1.0, gf("cross_user_repeat_ratio", CROSS_USER_REPEAT_RATIO_DEFAULT))
             ),
             # 0 = 整道检查关掉（面板上就写着这么用，所以这里得真的认 0，
             # 钳到 0.5 的话「设 0 关闭」就是一句骗人的话）
             cross_user_repeat_hours=max(
-                0.0, min(48.0, float(g("cross_user_repeat_hours", _d("cross_user_repeat_hours",  CROSS_USER_REPEAT_HOURS_DEFAULT))))
+                0.0, min(48.0, gf("cross_user_repeat_hours", CROSS_USER_REPEAT_HOURS_DEFAULT))
             ),
             cross_user_calibrate=bool(g("cross_user_calibrate", _d("cross_user_calibrate",  False))),
             hourly_sends_cap=max(
-                0, min(HOURLY_SENDS_CAP_MAX, int(g("hourly_sends_cap", _d("hourly_sends_cap",  HOURLY_SENDS_CAP_DEFAULT)))),
+                0, min(HOURLY_SENDS_CAP_MAX, gi("hourly_sends_cap", HOURLY_SENDS_CAP_DEFAULT)),
             ),
             user_cooldown_minutes=max(
                 USER_COOLDOWN_MIN,
-                min(USER_COOLDOWN_MAX, int(g("user_cooldown_minutes", _d("user_cooldown_minutes",  USER_COOLDOWN_DEFAULT)))),
+                min(USER_COOLDOWN_MAX, gi("user_cooldown_minutes", USER_COOLDOWN_DEFAULT)),
             ),
             quiet_start=max(
                 HOUR_MIN,
-                min(HOUR_MAX, int(g("quiet_start", _d("quiet_start",  QUIET_START_DEFAULT)))),
+                min(HOUR_MAX, gi("quiet_start", QUIET_START_DEFAULT)),
             ),
             quiet_end=max(
                 HOUR_MIN,
-                min(HOUR_MAX, int(g("quiet_end", _d("quiet_end",  QUIET_END_DEFAULT)))),
+                min(HOUR_MAX, gi("quiet_end", QUIET_END_DEFAULT)),
             ),
             private_only=bool(g("private_only", _d("private_only",  True))),
             debug=bool(g("debug", _d("debug",  False))),
             input_state_enabled=bool(g("input_state_enabled", _d("input_state_enabled", True))),
             input_state_interval_seconds=max(
-                0.1, min(10.0, float(g("input_state_interval_seconds", _d("input_state_interval_seconds", 0.5))) )
+                0.1, min(10.0, gf("input_state_interval_seconds", 0.5) )
             ),
             input_state_timeout_seconds=max(
-                10.0, min(600.0, float(g("input_state_timeout_seconds", _d("input_state_timeout_seconds", 120.0))) )
+                10.0, min(600.0, gf("input_state_timeout_seconds", 120.0) )
             ),
             max_message_length=max(
                 MAX_MSG_LEN_MIN,
-                min(MAX_MSG_LEN_MAX, int(g("max_message_length", _d("max_message_length",  MAX_MSG_LEN_DEFAULT)))),
+                min(MAX_MSG_LEN_MAX, gi("max_message_length", MAX_MSG_LEN_DEFAULT)),
             ),
             topic_memory_count=max(
                 TOPIC_MEMORY_MIN,
-                min(TOPIC_MEMORY_MAX, int(g("topic_memory_count", _d("topic_memory_count",  TOPIC_MEMORY_DEFAULT)))),
+                min(TOPIC_MEMORY_MAX, gi("topic_memory_count", TOPIC_MEMORY_DEFAULT)),
             ),
             context_inject_count=max(
                 CONTEXT_INJECT_MIN,
-                min(CONTEXT_INJECT_MAX, int(g("context_inject_count", _d("context_inject_count",  CONTEXT_INJECT_DEFAULT)))),
+                min(CONTEXT_INJECT_MAX, gi("context_inject_count", CONTEXT_INJECT_DEFAULT)),
             ),
             weekend_boost=bool(g("weekend_boost", _d("weekend_boost",  True))),
             energy_threshold=max(
                 ENERGY_THRESHOLD_MIN,
-                min(ENERGY_THRESHOLD_MAX, int(g("energy_threshold", _d("energy_threshold",  ENERGY_THRESHOLD_DEFAULT)))),
+                min(ENERGY_THRESHOLD_MAX, gi("energy_threshold", ENERGY_THRESHOLD_DEFAULT)),
             ),
             social_energy_threshold=max(
                 SOCIAL_ENERGY_THRESHOLD_MIN,
                 min(
                     SOCIAL_ENERGY_THRESHOLD_MAX,
-                    int(g("social_energy_threshold", _d("social_energy_threshold",  SOCIAL_ENERGY_THRESHOLD_DEFAULT))),
+                    gi("social_energy_threshold", SOCIAL_ENERGY_THRESHOLD_DEFAULT),
                 ),
             ),
             adaptive_reply_rate=bool(g("adaptive_reply_rate", _d("adaptive_reply_rate",  True))),
             reply_window_hours=max(
                 REPLY_WINDOW_MIN,
-                min(REPLY_WINDOW_MAX, int(g("reply_window_hours", _d("reply_window_hours",  REPLY_WINDOW_DEFAULT)))),
+                min(REPLY_WINDOW_MAX, gi("reply_window_hours", REPLY_WINDOW_DEFAULT)),
             ),
             memory_bridge_enabled=bool(g("memory_bridge_enabled", _d("memory_bridge_enabled", True))),
             intimacy_affection_min=max(
-                0, min(100, int(g("intimacy_affection_min", _d("intimacy_affection_min",  70)))),
+                0, min(100, gi("intimacy_affection_min", 70)),
             ),
             intimacy_libido_rise=max(
-                0.0, min(50.0, float(g("intimacy_libido_rise", _d("intimacy_libido_rise",  6.0)))),
+                0.0, min(50.0, gf("intimacy_libido_rise", 6.0)),
             ),
             intimacy_cooldown_hours=max(
-                1, min(720, int(g("intimacy_cooldown_hours", _d("intimacy_cooldown_hours",  48)))),
+                1, min(720, gi("intimacy_cooldown_hours", 48)),
             ),
             allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
             tier_override=g("tier_override", _d("tier_override",  None)),
@@ -731,114 +902,114 @@ class SocialConfig:
             store_message_text=bool(g("store_message_text", _d("store_message_text",  DEFAULT_STORE_MESSAGE_TEXT))),
             user_retention_days=max(
                 USER_RETENTION_MIN,
-                min(USER_RETENTION_MAX, int(g("user_retention_days", _d("user_retention_days",  USER_RETENTION_DEFAULT)))),
+                min(USER_RETENTION_MAX, gi("user_retention_days", USER_RETENTION_DEFAULT)),
             ),
             allow_burst=bool(g("allow_burst", _d("allow_burst",  True))),
             max_sends_per_round=max(
                 MAX_SENDS_PER_ROUND_MIN,
-                min(MAX_SENDS_PER_ROUND_MAX, int(g("max_sends_per_round", _d("max_sends_per_round",  MAX_SENDS_PER_ROUND_DEFAULT)))),
+                min(MAX_SENDS_PER_ROUND_MAX, gi("max_sends_per_round", MAX_SENDS_PER_ROUND_DEFAULT)),
             ),
-            batch_send_concurrency=max(1, min(10, int(g("batch_send_concurrency", _d("batch_send_concurrency", 3))))),
+            batch_send_concurrency=max(1, min(10, gi("batch_send_concurrency", 3))),
             greeting_enabled=bool(g("greeting_enabled", _d("greeting_enabled",  GREETING_ENABLED_DEFAULT))),
             greeting_morning_start=max(
-                HOUR_MIN, min(HOUR_MAX, int(g("greeting_morning_start", _d("greeting_morning_start",  GREETING_MORNING_START_DEFAULT))))
+                HOUR_MIN, min(HOUR_MAX, gi("greeting_morning_start", GREETING_MORNING_START_DEFAULT))
             ),
             greeting_morning_end=max(
-                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_morning_end", _d("greeting_morning_end",  GREETING_MORNING_END_DEFAULT))))
+                HOUR_MIN + 1, min(HOUR_MAX + 1, gi("greeting_morning_end", GREETING_MORNING_END_DEFAULT))
             ),
             greeting_midday_start=max(
-                HOUR_MIN, min(HOUR_MAX, int(g("greeting_midday_start", _d("greeting_midday_start",  GREETING_MIDDAY_START_DEFAULT))))
+                HOUR_MIN, min(HOUR_MAX, gi("greeting_midday_start", GREETING_MIDDAY_START_DEFAULT))
             ),
             greeting_midday_end=max(
-                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_midday_end", _d("greeting_midday_end",  GREETING_MIDDAY_END_DEFAULT))))
+                HOUR_MIN + 1, min(HOUR_MAX + 1, gi("greeting_midday_end", GREETING_MIDDAY_END_DEFAULT))
             ),
             greeting_night_start=max(
-                HOUR_MIN, min(HOUR_MAX, int(g("greeting_night_start", _d("greeting_night_start",  GREETING_NIGHT_START_DEFAULT))))
+                HOUR_MIN, min(HOUR_MAX, gi("greeting_night_start", GREETING_NIGHT_START_DEFAULT))
             ),
             greeting_night_end=max(
-                HOUR_MIN + 1, min(HOUR_MAX + 1, int(g("greeting_night_end", _d("greeting_night_end",  GREETING_NIGHT_END_DEFAULT))))
+                HOUR_MIN + 1, min(HOUR_MAX + 1, gi("greeting_night_end", GREETING_NIGHT_END_DEFAULT))
             ),
             group_flow_enabled=bool(g("group_flow_enabled", _d("group_flow_enabled",  True))),
             group_icebreak_enabled=bool(g("group_icebreak_enabled", _d("group_icebreak_enabled",  True))),
             group_ref_lib_enabled=bool(g("group_ref_lib_enabled", _d("group_ref_lib_enabled",  True))),
             group_store_message_text=bool(g("group_store_message_text", _d("group_store_message_text",  True))),
             flow_window_minutes=max(
-                FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, int(g("flow_window_minutes", _d("flow_window_minutes",  FLOW_WINDOW_DEFAULT))))
+                FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, gi("flow_window_minutes", FLOW_WINDOW_DEFAULT))
             ),
             flow_min_gap_seconds=max(
-                FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, int(g("flow_min_gap_seconds", _d("flow_min_gap_seconds",  FLOW_MIN_GAP_DEFAULT))))
+                FLOW_MIN_GAP_MIN, min(FLOW_MIN_GAP_MAX, gi("flow_min_gap_seconds", FLOW_MIN_GAP_DEFAULT))
             ),
             flow_hold_seconds=max(
-                FLOW_HOLD_MIN, min(FLOW_HOLD_MAX, int(g("flow_hold_seconds", _d("flow_hold_seconds",  FLOW_HOLD_DEFAULT))))
+                FLOW_HOLD_MIN, min(FLOW_HOLD_MAX, gi("flow_hold_seconds", FLOW_HOLD_DEFAULT))
             ),
             flow_max_replies_per_window=max(
                 FLOW_MAX_REPLIES_MIN,
-                min(FLOW_MAX_REPLIES_MAX, int(g("flow_max_replies_per_window", _d("flow_max_replies_per_window",  FLOW_MAX_REPLIES_DEFAULT)))),
+                min(FLOW_MAX_REPLIES_MAX, gi("flow_max_replies_per_window", FLOW_MAX_REPLIES_DEFAULT)),
             ),
             flow_hourly_cap=max(
-                FLOW_HOURLY_CAP_MIN, min(FLOW_HOURLY_CAP_MAX, int(g("flow_hourly_cap", _d("flow_hourly_cap",  FLOW_HOURLY_CAP_DEFAULT))))
+                FLOW_HOURLY_CAP_MIN, min(FLOW_HOURLY_CAP_MAX, gi("flow_hourly_cap", FLOW_HOURLY_CAP_DEFAULT))
             ),
             flow_ignored_exit=max(
                 FLOW_IGNORED_EXIT_MIN,
-                min(FLOW_IGNORED_EXIT_MAX, int(g("flow_ignored_exit", _d("flow_ignored_exit",  FLOW_IGNORED_EXIT_DEFAULT)))),
+                min(FLOW_IGNORED_EXIT_MAX, gi("flow_ignored_exit", FLOW_IGNORED_EXIT_DEFAULT)),
             ),
             group_idle_hours=max(
-                GROUP_IDLE_HOURS_MIN, min(GROUP_IDLE_HOURS_MAX, float(g("group_idle_hours", _d("group_idle_hours",  GROUP_IDLE_HOURS_DEFAULT))))
+                GROUP_IDLE_HOURS_MIN, min(GROUP_IDLE_HOURS_MAX, gf("group_idle_hours", GROUP_IDLE_HOURS_DEFAULT))
             ),
             icebreak_daily_cap=max(
                 ICEBREAK_DAILY_CAP_MIN,
-                min(ICEBREAK_DAILY_CAP_MAX, int(g("icebreak_daily_cap", _d("icebreak_daily_cap",  ICEBREAK_DAILY_CAP_DEFAULT)))),
+                min(ICEBREAK_DAILY_CAP_MAX, gi("icebreak_daily_cap", ICEBREAK_DAILY_CAP_DEFAULT)),
             ),
             group_topic_enabled=bool(g("group_topic_enabled", _d("group_topic_enabled", True))),
             group_topic_gap_hours=max(
                 GROUP_TOPIC_GAP_HOURS_MIN,
-                min(GROUP_TOPIC_GAP_HOURS_MAX, float(g("group_topic_gap_hours", _d("group_topic_gap_hours", GROUP_TOPIC_GAP_HOURS_DEFAULT)))),
+                min(GROUP_TOPIC_GAP_HOURS_MAX, gf("group_topic_gap_hours", GROUP_TOPIC_GAP_HOURS_DEFAULT)),
             ),
             group_topic_daily_cap=max(
                 GROUP_TOPIC_DAILY_CAP_MIN,
-                min(GROUP_TOPIC_DAILY_CAP_MAX, int(g("group_topic_daily_cap", _d("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)))),
+                min(GROUP_TOPIC_DAILY_CAP_MAX, gi("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)),
             ),
             group_mention_member=bool(g("group_mention_member", _d("group_mention_member", True))),
             group_stale_days=max(
-                GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, int(g("group_stale_days", _d("group_stale_days",  GROUP_STALE_DAYS_DEFAULT))))
+                GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, gi("group_stale_days", GROUP_STALE_DAYS_DEFAULT))
             ),
             group_ref_sample_size=max(
                 GROUP_REF_SAMPLE_MIN,
-                min(GROUP_REF_SAMPLE_MAX, int(g("group_ref_sample_size", _d("group_ref_sample_size",  GROUP_REF_SAMPLE_DEFAULT)))),
+                min(GROUP_REF_SAMPLE_MAX, gi("group_ref_sample_size", GROUP_REF_SAMPLE_DEFAULT)),
             ),
             group_ref_prompt_count=max(
                 GROUP_REF_PROMPT_MIN,
-                min(GROUP_REF_PROMPT_MAX, int(g("group_ref_prompt_count", _d("group_ref_prompt_count",  GROUP_REF_PROMPT_DEFAULT)))),
+                min(GROUP_REF_PROMPT_MAX, gi("group_ref_prompt_count", GROUP_REF_PROMPT_DEFAULT)),
             ),
             heartbeat_min_minutes=max(
                 HEARTBEAT_MIN_MINUTES_MIN,
                 min(
                     HEARTBEAT_MINUTES_MAX,
-                    int(g("heartbeat_min_minutes", _d("heartbeat_min_minutes",  HEARTBEAT_MIN_DEFAULT))),
+                    gi("heartbeat_min_minutes", HEARTBEAT_MIN_DEFAULT),
                 ),
             ),
             heartbeat_max_minutes=max(
                 HEARTBEAT_MIN_MINUTES_MIN,
                 min(
                     HEARTBEAT_MAX_MINUTES_MAX,
-                    int(g("heartbeat_max_minutes", _d("heartbeat_max_minutes",  HEARTBEAT_MAX_DEFAULT))),
+                    gi("heartbeat_max_minutes", HEARTBEAT_MAX_DEFAULT),
                 ),
             ),
             urge_refill_hours=max(
                 URGE_REFILL_MIN,
-                min(URGE_REFILL_MAX, int(g("urge_refill_hours", _d("urge_refill_hours",  URGE_REFILL_DEFAULT)))),
+                min(URGE_REFILL_MAX, gi("urge_refill_hours", URGE_REFILL_DEFAULT)),
             ),
             recent_talk_minutes=max(
                 RECENT_TALK_MIN,
-                min(RECENT_TALK_MAX, int(g("recent_talk_minutes", _d("recent_talk_minutes",  RECENT_TALK_DEFAULT)))),
+                min(RECENT_TALK_MAX, gi("recent_talk_minutes", RECENT_TALK_DEFAULT)),
             ),
             skip_cooldown_minutes=max(
                 SKIP_COOLDOWN_MIN,
-                min(SKIP_COOLDOWN_MAX, int(g("skip_cooldown_minutes", _d("skip_cooldown_minutes",  SKIP_COOLDOWN_DEFAULT)))),
+                min(SKIP_COOLDOWN_MAX, gi("skip_cooldown_minutes", SKIP_COOLDOWN_DEFAULT)),
             ),
             llm_gate=bool(g("llm_gate", _d("llm_gate",  True))),
             gate_energy_floor=max(
-                0, min(100, int(g("gate_energy_floor", _d("gate_energy_floor", GATE_ENERGY_FLOOR_DEFAULT))))
+                0, min(100, gi("gate_energy_floor", GATE_ENERGY_FLOOR_DEFAULT))
             ),
             respect_user_rhythm=bool(g("respect_user_rhythm", _d("respect_user_rhythm",  False))),
             cue_followup=bool(g("cue_followup", _d("cue_followup",  True))),
@@ -848,7 +1019,7 @@ class SocialConfig:
             followup_max_minutes=followup_max,
             followup_cooldown_minutes=max(
                 FOLLOWUP_COOLDOWN_MIN,
-                min(FOLLOWUP_COOLDOWN_MAX, int(g("followup_cooldown_minutes", _d("followup_cooldown_minutes",  FOLLOWUP_COOLDOWN_DEFAULT)))),
+                min(FOLLOWUP_COOLDOWN_MAX, gi("followup_cooldown_minutes", FOLLOWUP_COOLDOWN_DEFAULT)),
             ),
             loop_enabled=bool(g("loop_enabled", _d("loop_enabled",  True))),
             loop_min_hours=loop_min,
@@ -856,7 +1027,7 @@ class SocialConfig:
             closer_enabled=bool(g("closer_enabled", _d("closer_enabled",  True))),
             closer_after_hours=max(
                 CLOSER_AFTER_MIN,
-                min(CLOSER_AFTER_MAX, int(g("closer_after_hours", _d("closer_after_hours",  CLOSER_AFTER_DEFAULT)))),
+                min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
             track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
             use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
@@ -924,9 +1095,19 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
     try:
         marker = os.path.join(baseline_dir, _BASELINE_FILE)
         if os.path.exists(marker):
-            with open(marker, encoding="utf-8") as f:
-                done = json.load(f)
-            if str(done.get("version", "")) == str(version):
+            try:
+                with open(marker, encoding="utf-8") as f:
+                    done = json.load(f)
+            except Exception as e:
+                # 原来这里被外层宽 except 吞掉并直接 return []：标记文件一旦损坏，
+                # 每次启动都读一次坏文件、而且**永远不再写标记** → 提示永久静默失效。
+                # 现在告警一次并当作「没写过」，继续走到下面的重写。
+                done = None
+                _warn_config_once(
+                    "<baseline>",
+                    f"配置基线标记文件损坏（{marker}）：{e}；已忽略并重新生成",
+                )
+            if isinstance(done, dict) and str(done.get("version", "")) == str(version):
                 return []
 
         if config is None or not hasattr(config, "get"):
@@ -954,12 +1135,15 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
 
         try:
             os.makedirs(baseline_dir, exist_ok=True)
-            with open(marker, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"version": str(version), "hints": hints}, f, ensure_ascii=False
-                )
-        except OSError:
-            pass
+            # 原子写：原来 `open(marker, "w")` 先截断再写，进程在截断后崩溃就留下
+            # 0 字节文件，与「读失败即静默」正好构成一条自我锁死路径。
+            _write_json_atomic(
+                marker, {"version": str(version), "hints": hints}
+            )
+        except Exception as e:
+            _warn_config_once(
+                "<baseline>", f"写入配置基线标记失败（{marker}）：{e}"
+            )
     except Exception:
         return hints
     return hints

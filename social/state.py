@@ -156,18 +156,24 @@ class SocialState:
 
     def bot(self, bid: str) -> Dict[str, Any]:
         """获取或创建 bot 状态。"""
-        return self.data.setdefault("bots", {}).setdefault(
-            bid,
-            {"users": {}, "last_global_send": 0.0},
-        )
+        bots = self.data.get("bots")
+        if not isinstance(bots, dict):
+            # 盘上被手改/写坏成非对象时不能直接 setdefault：脏值会在这里（以及
+            # 后面几乎所有状态 API 入口）抛，而不是退化成一个空记录。
+            bots = self.data["bots"] = {}
+        bot = bots.get(bid)
+        if not isinstance(bot, dict):
+            bot = bots[bid] = {"users": {}, "last_global_send": 0.0}
+        return bot
 
     def user(self, bid: str, uid: str) -> Dict[str, Any]:
         """获取或创建用户状态。"""
-        u = (
-            self.bot(bid)
-            .setdefault("users", {})
-            .setdefault(uid, self._default_user())
-        )
+        users = self.bot(bid).get("users")
+        if not isinstance(users, dict):
+            users = self.bot(bid)["users"] = {}
+        u = users.get(uid)
+        if not isinstance(u, dict):
+            u = users[uid] = self._default_user()
         # 读路径（_min_gap_left / _note_giveup / 日志）要拿得到这个用户的 uid：
         # 记录里存一份，省得每处调用都显式传 uid。每次取都归一化重写一遍。
         u["__uid"] = str(uid)
@@ -622,8 +628,47 @@ class SocialState:
         # 先置不脏再迁移：_migrate 只在真的改了数据时才标脏。顺序反了的话，
         # 迁移的结果会被当成「已落盘」而丢弃，下次启动又重跑一遍
         self._dirty = False
+        # 盘上非对象的 bot/user/group 条目先归一化一次（只在这一处落盘修复）
+        if self._normalize_containers():
+            self._dirty = True
         self._merge_split_identities_once()
         self._migrate()
+
+    def _normalize_containers(self) -> bool:
+        """把盘上非对象的 bot / user / group 条目归一化成对象。返回是否真的改动过。
+
+        手改配置或写入损坏会把这些位置留成字符串/列表；它们处在**几乎所有状态 API
+        的入口**（`bot()` / `user()`），脏值会让每一条消息的处理都抛异常。
+        """
+        changed = False
+        bots = self.data.get("bots")
+        if not isinstance(bots, dict):
+            self.data["bots"] = {}
+            return True
+        for bid, bot in list(bots.items()):
+            if not isinstance(bot, dict):
+                bots[bid] = {"users": {}, "last_global_send": 0.0}
+                changed = True
+                continue
+            users = bot.get("users")
+            if not isinstance(users, dict):
+                bot["users"] = {}
+                changed = True
+                users = bot["users"]
+            for uid, u in list(users.items()):
+                if not isinstance(u, dict):
+                    users[uid] = self._default_user()
+                    changed = True
+            groups = bot.get("groups")
+            if groups is not None and not isinstance(groups, dict):
+                bot["groups"] = {}
+                changed = True
+            elif isinstance(groups, dict):
+                for gid, g in list(groups.items()):
+                    if not isinstance(g, dict):
+                        groups[gid] = self._default_group()
+                        changed = True
+        return changed
 
     def _merge_split_identities_once(self) -> None:
         """把「同一个人被拆成多个 uid」的记录合并回一条。
@@ -833,7 +878,6 @@ class SocialState:
                                 continue
                             users.pop(uid)
                             self._dirty = True
-            self._dirty = True
         except Exception as exc:
             # 这里以前是 `except Exception: pass`：一条坏记录会废掉整条迁移链
             # （后面所有 bot 的字段补齐、退休键清理、幽灵清扫全都不跑），
@@ -1114,6 +1158,25 @@ class SocialState:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.path)
+            # fsync 文件只保证**内容**落盘；os.replace 这个目录项变更没有 fsync 目录
+            # 就仍在页缓存里，断电时可能出现「新数据在盘上但目录项还指向旧 inode」，
+            # 甚至整个 state.json 消失（只留 social_*.tmp）。对一个全量重写、丢了就丢
+            # 全部用户历史的状态文件，这是唯一一处能造成整文件损失的窗口。
+            # Windows 上目录 fsync 不可用（os.open 直接失败），必须容错。
+            try:
+                dfd = os.open(dir_path, os.O_RDONLY)
+            except OSError:
+                dfd = -1
+            if dfd >= 0:
+                try:
+                    os.fsync(dfd)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        os.close(dfd)
+                    except OSError:
+                        pass
         finally:
             # 清理临时文件
             if os.path.exists(tmp_path):
@@ -1520,9 +1583,11 @@ class SocialState:
             types.append(msg_type)
             del types[:-RECENT_MSG_TYPES_COUNT]
 
-        # 主动发出去的那句也是「她说的话」，追问判定要能看见它
+        # 主动发出去的那句也是「她说的话」，追问判定要能看见它。
+        # 正文同样受 store_message_text 约束（本函数的 body 与 record_spoken 都是这个
+        # 口径）：关掉「更隐私」之后，主动消息原文不该还落 120 字在盘上。
         u["last_spoken"] = ts
-        u["last_spoken_text"] = str(text or "")[:120]
+        u["last_spoken_text"] = str(text or "")[:120] if store_text else ""
         # 暂存完整文本，等用户回复时由 on_llm_request 作为本轮临时内容块注入。
         # 主动消息不再写进 AstrBot 会话库；消费后清空，避免每条消息都重复注入。
         # 连发（burst）时追加而不是覆盖：两条都得让 AI 看得见。

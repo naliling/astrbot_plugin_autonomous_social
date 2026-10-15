@@ -24,8 +24,11 @@ result_decorate 阶段**——框架自己的 segmented_reply 对它本来就不
    `log_base`（间隔）。
 4. 插件自己的 `allow_burst` 退化为**总开关**：关掉时无论框架开没开都不拆。
 
-拆分与间隔的算法逐字对齐 `astrbot/core/pipeline/result_decorate/stage.py` 与
-`respond/stage.py`，差别只有一处：框架把 interval 只用在 respond 的逐段发送上，
+按 `astrbot/core/pipeline/result_decorate/stage.py` 与
+`respond/stage.py` 的**行为**对齐（三条规则：拆法、`words_count_threshold` 超长直发、
+`interval_method` 计时），但**本环境没有 AstrBot 源码，这套对齐没有逐字比对过**：
+参数名与默认值照框架文档/出厂配置写，若框架改版需以实际源码复核。
+差别只有一处：框架把 interval 只用在 respond 的逐段发送上，
 这里把它用在插件自己的逐段发送上。
 """
 
@@ -47,7 +50,8 @@ def _cap_parts(segments: List[str], limit: int = MAX_PARTS) -> List[str]:
         return segments
     return segments[: limit - 1] + ["".join(segments[limit - 1:])]
 
-# 读不到配置时的默认值：与框架 `default.py` 的 segmented_reply 出厂值一致。
+# 读不到配置时的默认值：按框架 `default.py` 的 segmented_reply 出厂值抄，
+# 同样未在本环境逐字比对（见模块 docstring）。
 _DEFAULT_REGEX = r".*?[。？！~…]+|.+$"
 _DEFAULT_SPLIT_WORDS = ["。", "？", "！", "~", "…"]
 
@@ -95,6 +99,11 @@ def split_segments(text: str, cfg: dict) -> List[str]:
 
     对齐 `result_decorate/stage.py` 的两条分支（regex / words），并同样遵守
     `words_count_threshold`：超过阈值的长消息框架也整条直发，这里保持一致。
+
+    ⚠️ 阈值比的是 `_word_count`（ASCII 按空格分词、非 ASCII 数字母）而**不是**
+    `len(text)`：原来这里用字符数，于是「你好呀？？？」这种 6 个字符、3 个字的消息
+    在阈值 5 下被判成「超长→整条直发」，而 `part_interval` 的 log 间隔法对同一条
+    文本算的却是 3 ——同一份配置在同一文件里出现两套口径，阈值附近结论正好相反。
     """
     body = str(text or "")
     if not body.strip():
@@ -103,7 +112,7 @@ def split_segments(text: str, cfg: dict) -> List[str]:
         threshold = int(cfg.get("words_count_threshold", 150))
     except (TypeError, ValueError):
         threshold = 150
-    if len(body) > threshold:
+    if _word_count(body) > threshold:
         return [body]
 
     mode = str(cfg.get("split_mode", "regex") or "regex")

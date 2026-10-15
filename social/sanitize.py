@@ -45,7 +45,17 @@ _GENERIC_BLOCK = re.compile(
     r"<([A-Za-z][A-Za-z0-9_.:-]{2,40})\b[^>]*>.*?</\1\s*>", re.S | re.I
 )
 # 同理，方括号块。Core 的事实块是〔〕不是 []，但别的插件未必。
-_GENERIC_BRACKET_BLOCK = re.compile(r"[\u3014\u3015\u3010\u3011]([^\u3014\u3015\u3010\u3011]{1,40})[\u3014\u3015\u3010\u3011]")
+#
+# ⚠️ **只在整行只有这一个块时才删。** `【】` 与 `〔〕` 在中文里是**正常的强调**
+# （「我【真的】很累」「他说【明天】见」「我〔估计〕要迟到了」），无差别删除会把
+# 用户真说的话改掉——而本模块自述「删错了就是吞掉用户真说的话，那比留着噪音严重
+# 得多」。原来的正则还会跨类型配对（`【a〕` 也算一块）并把同一句里多处块全删。
+# 框架注入的块总是**独占一行**（Core 的事实块就是「标记 + 换行 + 正文」），
+# 所以判据落在「整行只有一个块」上，句中的强调一律保留。
+_GENERIC_BRACKET_LINE = re.compile(
+    r"(?m)^[ \t]*[\u3014\u3015\u3010\u3011][^\u3014\u3015\u3010\u3011\n]{1,40}"
+    r"[\u3014\u3015\u3010\u3011][ \t]*$"
+)
 
 # 兜底：这些只可能出现在框架注入的文本里，正文里出现就是被污染了。
 # 逐个记特征也是地鼠，但这条**很便宜**——只在清洗之后扫一遍正文，命中就截断。
@@ -57,6 +67,9 @@ _FRAME_MARKERS = (
 )
 
 CORE_BLOCK_MARK = "〔她的身体与生活"
+
+# 事实块的**块头**：`〔她的身体与生活 v10 uid=xxx〕`。Core 的块是「块头 + 换行 + 事实」。
+_CORE_BLOCK_HEAD = re.compile(r"〔她的身体与生活[^〕\n]{0,40}〕")
 
 # 整块剥掉的标签。必须成对闭合才算，不闭合的留着（可能是用户在聊这段文字本身）。
 _TAG_BLOCKS = (
@@ -85,9 +98,20 @@ def sanitize_incoming(text: Any) -> str:
 
     # 1) 身体事实块：从标记处**截断**，后面整段都是框架内容。
     #    Core 也是这么清的（`main.py:126` 的 find + rstrip）。
+    #
+    #    ⚠️ 只在**块头后面就是换行**（或块头就是这条的结尾）时才向后全切。
+    #    用户在正文里引用这个标记时（`〔她的身体与生活 v10〕我很好`）只摘掉块头本身，
+    #    否则一条正常消息会被整条吞掉：清洗后为空 → `looks_like_framework_only` 为真
+    #    → 这条消息**根本不会被建档**，下一轮主动消息里「对方最后说的是」还停在上一句。
     idx = out.find(CORE_BLOCK_MARK)
     if idx >= 0:
-        out = out[:idx]
+        head = _CORE_BLOCK_HEAD.match(out, idx)
+        after = out[head.end():] if head else ""
+        at_line_start = idx == 0 or out[idx - 1] == "\n"
+        if at_line_start and (not after or after.startswith("\n")):
+            out = out[:idx]
+        elif head:
+            out = out[:idx] + after
 
     # 2) 成对的框架标签：整块删掉
     for pat in _TAG_BLOCKS:
@@ -98,7 +122,7 @@ def sanitize_incoming(text: Any) -> str:
     #    `<system_reminder>`，又冒出来 `<MemoryCompanion-Context>`。成对闭合是它们的
     #    共同形状。半截尖括号（<3、<=）不匹配，照常留在正文里。
     out = _GENERIC_BLOCK.sub("", out)
-    out = _GENERIC_BRACKET_BLOCK.sub("", out)
+    out = _GENERIC_BRACKET_LINE.sub("", out)
 
     out = out.replace("\r\n", "\n").replace("\r", "\n")
     out = _BLANK_RUN.sub("\n\n", out)
@@ -106,9 +130,19 @@ def sanitize_incoming(text: Any) -> str:
     # 4) 最后一层：正文里还留着只可能来自框架的特征，就从这里截断。
     #    上面几步都是「按块剥」，这一道是**认内容**——万一下一个插件用了我们没见过的
     #    块形状，只要它带着这些特征之一，正文就不会带着它进下一轮。
+    #
+    #    ⚠️ 只在标记**前面已经有正文**时截断（`i > 0`）。这个不对称是刻意的：
+    #      · `这句还行 uid=webchat 后面是框架` -> `这句还行`
+    #        典型的泄漏形状：框架内容被**追加**在真实消息之后，从这里往后都是垃圾。
+    #      · `uid=webchat 是什么` / `retrieval_intent 是什么意思`
+    #        消息**本身以标记开头**，更可能是用户在问/引用这个词。
+    #        无条件 `find` + 向后全切会把这类消息整条吞成 `''`，而清洗后为空会让
+    #        `looks_like_framework_only` 为真 → 这条消息**根本不被建档**，
+    #        下一轮主动消息里「对方最后说的是」还停在上一句。
+    #    两种代价不对称：留下一个框架词只是让提示词脏一点；吞掉用户一句话是记忆出错。
     for marker in _FRAME_MARKERS:
         i = out.find(marker)
-        if i >= 0:
+        if i > 0:
             out = out[:i]
     out = _BLANK_RUN.sub("\n\n", out)
     return out.strip()

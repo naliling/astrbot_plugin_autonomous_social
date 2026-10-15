@@ -9,7 +9,7 @@
   "mode": {
     "type": "string",
     "description": "运行模式",
-    "hint": "跑哪些场景（私聊/群聊）",
+    "hint": "auto：自动探测并联动 Humanoid Core；standalone：完全不读 Core。与私聊/群聊无关（那是 private_only）",
     "obvious_hint": true,
     "options": [
       "auto",
@@ -24,7 +24,12 @@
     "obvious_hint": true,
     "default": 75,
     "min": 10,
-    "max": 90
+    "max": 90,
+    "slider": {
+      "min": 10,
+      "max": 90,
+      "step": 1
+    }
   },
   "urge_refill_hours": {
     "type": "int",
@@ -33,7 +38,12 @@
     "obvious_hint": true,
     "default": 4,
     "min": 1,
-    "max": 96
+    "max": 96,
+    "slider": {
+      "min": 1,
+      "max": 96,
+      "step": 2
+    }
   },
   "recent_talk_minutes": {
     "type": "int",
@@ -42,7 +52,12 @@
     "obvious_hint": true,
     "default": 18,
     "min": 5,
-    "max": 720
+    "max": 720,
+    "slider": {
+      "min": 5,
+      "max": 720,
+      "step": 10
+    }
   },
   "heartbeat_min_minutes": {
     "type": "int",
@@ -51,7 +66,12 @@
     "obvious_hint": true,
     "default": 8,
     "min": 1,
-    "max": 60
+    "max": 60,
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    }
   },
   "heartbeat_max_minutes": {
     "type": "int",
@@ -60,7 +80,12 @@
     "obvious_hint": true,
     "default": 15,
     "min": 1,
-    "max": 120
+    "max": 120,
+    "slider": {
+      "min": 1,
+      "max": 120,
+      "step": 2
+    }
   },
   "llm_gate": {
     "type": "bool",
@@ -76,12 +101,25 @@
     "obvious_hint": true,
     "default": 10,
     "min": 5,
-    "max": 480
+    "max": 480,
+    "slider": {
+      "min": 5,
+      "max": 480,
+      "step": 10
+    }
   },
   "gate_energy_floor": {
     "type": "int",
+    "description": "精力硬闸下限（0-100）",
     "default": 35,
-    "hint": "精力低于这个值就不主动开口（0=不按精力拦）。「累到坐不住」做成硬闸，不再交给模型自己判断——它每次给的理由都不一样，拦不稳"
+    "min": 0,
+    "max": 100,
+    "hint": "精力低于这个值就不主动开口（0=不按精力拦）。「累到坐不住」做成硬闸，不再交给模型自己判断——它每次给的理由都不一样，拦不稳",
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "respect_user_rhythm": {
     "type": "bool",
@@ -111,7 +149,12 @@
     "obvious_hint": true,
     "default": 12,
     "min": 1,
-    "max": 120
+    "max": 120,
+    "slider": {
+      "min": 1,
+      "max": 120,
+      "step": 2
+    }
   },
   "followup_after_minutes": {
     "type": "int",
@@ -120,7 +163,12 @@
     "obvious_hint": true,
     "default": 30,
     "min": 3,
-    "max": 240
+    "max": 240,
+    "slider": {
+      "min": 3,
+      "max": 240,
+      "step": 5
+    }
   },
   "followup_max_minutes": {
     "type": "int",
@@ -129,7 +177,12 @@
     "obvious_hint": true,
     "default": 70,
     "min": 15,
-    "max": 720
+    "max": 720,
+    "slider": {
+      "min": 15,
+      "max": 720,
+      "step": 10
+    }
   },
   "followup_cooldown_minutes": {
     "type": "int",
@@ -138,7 +191,12 @@
     "obvious_hint": true,
     "default": 30,
     "min": 5,
-    "max": 720
+    "max": 720,
+    "slider": {
+      "min": 5,
+      "max": 720,
+      "step": 10
+    }
   },
   "loop_enabled": {
     "type": "bool",
@@ -154,7 +212,12 @@
     "obvious_hint": true,
     "default": 2.5,
     "min": 1.0,
-    "max": 24.0
+    "max": 24.0,
+    "slider": {
+      "min": 1.0,
+      "max": 24.0,
+      "step": 0.2
+    }
   },
   "loop_max_hours": {
     "type": "float",
@@ -163,7 +226,12 @@
     "obvious_hint": true,
     "default": 14.0,
     "min": 3.0,
-    "max": 48.0
+    "max": 48.0,
+    "slider": {
+      "min": 3.0,
+      "max": 48.0,
+      "step": 0.5
+    }
   },
   "closer_enabled": {
     "type": "bool",
@@ -179,7 +247,12 @@
     "obvious_hint": true,
     "default": 8,
     "min": 2,
-    "max": 72
+    "max": 72,
+    "slider": {
+      "min": 2,
+      "max": 72,
+      "step": 1
+    }
   },
   "track_own_replies": {
     "type": "bool",
@@ -202,7 +275,12 @@
     "obvious_hint": true,
     "default": 30,
     "min": 10,
-    "max": 2880
+    "max": 2880,
+    "slider": {
+      "min": 10,
+      "max": 2880,
+      "step": 50
+    }
   },
   "min_gap_minutes": {
     "type": "int",
@@ -211,7 +289,12 @@
     "obvious_hint": true,
     "default": 60,
     "min": 10,
-    "max": 720
+    "max": 720,
+    "slider": {
+      "min": 10,
+      "max": 720,
+      "step": 10
+    }
   },
   "miss_affection_min": {
     "type": "int",
@@ -220,7 +303,12 @@
     "obvious_hint": true,
     "default": 42,
     "min": 0,
-    "max": 100
+    "max": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "miss_daily_cap": {
     "type": "int",
@@ -229,7 +317,12 @@
     "obvious_hint": true,
     "default": 2,
     "min": 0,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 0,
+      "max": 10,
+      "step": 1
+    }
   },
   "max_sends_per_round": {
     "type": "int",
@@ -238,7 +331,12 @@
     "obvious_hint": true,
     "default": 3,
     "min": 1,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "batch_send_concurrency": {
     "type": "int",
@@ -246,7 +344,12 @@
     "hint": "一轮里对多个人「逐人生成、并发发送」的上限（1 = 退回串行）。只影响同一轮多个人之间的并行度，不改任何人的冷却/配额与内容。",
     "default": 3,
     "min": 1,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "cross_user_repeat_ratio": {
     "type": "float",
@@ -255,7 +358,12 @@
     "obvious_hint": true,
     "default": 0.6,
     "min": 0.1,
-    "max": 1.0
+    "max": 1.0,
+    "slider": {
+      "min": 0.1,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "cross_user_repeat_hours": {
     "type": "float",
@@ -264,7 +372,12 @@
     "obvious_hint": true,
     "default": 2.0,
     "min": 0,
-    "max": 48.0
+    "max": 48.0,
+    "slider": {
+      "min": 0,
+      "max": 48.0,
+      "step": 0.5
+    }
   },
   "cross_user_calibrate": {
     "type": "bool",
@@ -280,7 +393,12 @@
     "obvious_hint": true,
     "default": 12,
     "min": 0,
-    "max": 200
+    "max": 200,
+    "slider": {
+      "min": 0,
+      "max": 200,
+      "step": 2
+    }
   },
   "quiet_start": {
     "type": "int",
@@ -289,7 +407,12 @@
     "obvious_hint": true,
     "default": 23,
     "min": 0,
-    "max": 23
+    "max": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "quiet_end": {
     "type": "int",
@@ -298,7 +421,12 @@
     "obvious_hint": true,
     "default": 7,
     "min": 0,
-    "max": 23
+    "max": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "private_only": {
     "type": "bool",
@@ -321,7 +449,12 @@
     "obvious_hint": true,
     "default": 60,
     "min": 10,
-    "max": 500
+    "max": 500,
+    "slider": {
+      "min": 10,
+      "max": 500,
+      "step": 10
+    }
   },
   "allow_burst": {
     "type": "bool",
@@ -344,7 +477,12 @@
     "obvious_hint": true,
     "default": 0.5,
     "min": 0.1,
-    "max": 10.0
+    "max": 10.0,
+    "slider": {
+      "min": 0.1,
+      "max": 10.0,
+      "step": 0.1
+    }
   },
   "input_state_timeout_seconds": {
     "type": "float",
@@ -353,7 +491,12 @@
     "obvious_hint": true,
     "default": 120.0,
     "min": 10.0,
-    "max": 600.0
+    "max": 600.0,
+    "slider": {
+      "min": 10.0,
+      "max": 600.0,
+      "step": 5.0
+    }
   },
   "greeting_enabled": {
     "type": "bool",
@@ -369,7 +512,12 @@
     "obvious_hint": true,
     "default": 7,
     "min": 0,
-    "max": 23
+    "max": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "greeting_morning_end": {
     "type": "int",
@@ -378,7 +526,12 @@
     "obvious_hint": true,
     "default": 11,
     "min": 1,
-    "max": 24
+    "max": 24,
+    "slider": {
+      "min": 1,
+      "max": 24,
+      "step": 1
+    }
   },
   "greeting_midday_start": {
     "type": "int",
@@ -387,7 +540,12 @@
     "obvious_hint": true,
     "default": 12,
     "min": 0,
-    "max": 23
+    "max": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "greeting_midday_end": {
     "type": "int",
@@ -396,7 +554,12 @@
     "obvious_hint": true,
     "default": 14,
     "min": 1,
-    "max": 24
+    "max": 24,
+    "slider": {
+      "min": 1,
+      "max": 24,
+      "step": 1
+    }
   },
   "greeting_night_start": {
     "type": "int",
@@ -405,7 +568,12 @@
     "obvious_hint": true,
     "default": 21,
     "min": 0,
-    "max": 23
+    "max": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "greeting_night_end": {
     "type": "int",
@@ -414,7 +582,12 @@
     "obvious_hint": true,
     "default": 24,
     "min": 1,
-    "max": 24
+    "max": 24,
+    "slider": {
+      "min": 1,
+      "max": 24,
+      "step": 1
+    }
   },
   "group_flow_enabled": {
     "type": "bool",
@@ -444,7 +617,12 @@
     "obvious_hint": true,
     "default": 8.0,
     "min": 1.0,
-    "max": 72.0
+    "max": 72.0,
+    "slider": {
+      "min": 1.0,
+      "max": 72.0,
+      "step": 0.5
+    }
   },
   "group_topic_daily_cap": {
     "type": "int",
@@ -453,7 +631,12 @@
     "obvious_hint": true,
     "default": 1,
     "min": 1,
-    "max": 5
+    "max": 5,
+    "slider": {
+      "min": 1,
+      "max": 5,
+      "step": 1
+    }
   },
   "group_mention_member": {
     "type": "bool",
@@ -483,7 +666,12 @@
     "obvious_hint": true,
     "default": 8,
     "min": 1,
-    "max": 60
+    "max": 60,
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    }
   },
   "flow_min_gap_seconds": {
     "type": "int",
@@ -492,7 +680,12 @@
     "obvious_hint": true,
     "default": 120,
     "min": 10,
-    "max": 600
+    "max": 600,
+    "slider": {
+      "min": 10,
+      "max": 600,
+      "step": 10
+    }
   },
   "flow_hold_seconds": {
     "type": "int",
@@ -501,7 +694,12 @@
     "obvious_hint": true,
     "default": 120,
     "min": 0,
-    "max": 1800
+    "max": 1800,
+    "slider": {
+      "min": 0,
+      "max": 1800,
+      "step": 20
+    }
   },
   "flow_max_replies_per_window": {
     "type": "int",
@@ -510,7 +708,12 @@
     "obvious_hint": true,
     "default": 3,
     "min": 1,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "flow_hourly_cap": {
     "type": "int",
@@ -519,7 +722,12 @@
     "obvious_hint": true,
     "default": 6,
     "min": 1,
-    "max": 60
+    "max": 60,
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    }
   },
   "flow_ignored_exit": {
     "type": "int",
@@ -528,7 +736,12 @@
     "obvious_hint": true,
     "default": 2,
     "min": 1,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "group_idle_hours": {
     "type": "float",
@@ -537,7 +750,12 @@
     "obvious_hint": true,
     "default": 6.0,
     "min": 1.0,
-    "max": 240.0
+    "max": 240.0,
+    "slider": {
+      "min": 1.0,
+      "max": 240.0,
+      "step": 2.0
+    }
   },
   "icebreak_daily_cap": {
     "type": "int",
@@ -546,7 +764,12 @@
     "obvious_hint": true,
     "default": 2,
     "min": 1,
-    "max": 10
+    "max": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "group_stale_days": {
     "type": "int",
@@ -555,7 +778,12 @@
     "obvious_hint": true,
     "default": 3,
     "min": 1,
-    "max": 90
+    "max": 90,
+    "slider": {
+      "min": 1,
+      "max": 90,
+      "step": 1
+    }
   },
   "group_ref_sample_size": {
     "type": "int",
@@ -564,7 +792,12 @@
     "obvious_hint": true,
     "default": 30,
     "min": 5,
-    "max": 200
+    "max": 200,
+    "slider": {
+      "min": 5,
+      "max": 200,
+      "step": 2
+    }
   },
   "group_ref_prompt_count": {
     "type": "int",
@@ -573,7 +806,12 @@
     "obvious_hint": true,
     "default": 8,
     "min": 0,
-    "max": 30
+    "max": 30,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 1
+    }
   },
   "topic_memory_count": {
     "type": "int",
@@ -582,7 +820,12 @@
     "obvious_hint": true,
     "default": 5,
     "min": 0,
-    "max": 20
+    "max": 20,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 1
+    }
   },
   "context_inject_count": {
     "type": "int",
@@ -591,7 +834,12 @@
     "obvious_hint": true,
     "default": 10,
     "min": 0,
-    "max": 50
+    "max": 50,
+    "slider": {
+      "min": 0,
+      "max": 50,
+      "step": 1
+    }
   },
   "weekend_boost": {
     "type": "bool",
@@ -607,7 +855,12 @@
     "obvious_hint": true,
     "default": 15,
     "min": 0,
-    "max": 100
+    "max": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "social_energy_threshold": {
     "type": "int",
@@ -616,7 +869,12 @@
     "obvious_hint": true,
     "default": 20,
     "min": 0,
-    "max": 100
+    "max": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "adaptive_reply_rate": {
     "type": "bool",
@@ -632,7 +890,12 @@
     "obvious_hint": true,
     "default": 2,
     "min": 1,
-    "max": 48
+    "max": 48,
+    "slider": {
+      "min": 1,
+      "max": 48,
+      "step": 1
+    }
   },
   "memory_bridge_enabled": {
     "type": "bool",
@@ -647,13 +910,25 @@
     "hint": "好感要到这里、且真的做过色色（有过亲密史），才会被主动问（默认 70）",
     "default": 70,
     "min": 0,
-    "max": 100
+    "max": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "intimacy_libido_rise": {
     "type": "float",
     "description": "「想要了」通道的欲望门槛",
     "hint": "亲近欲比基线高多少才算「想要了」（默认 6）。有过亲密史也不免检——不然一旦有过就会一直问。",
-    "default": 6.0
+    "default": 6.0,
+    "min": 0.0,
+    "max": 50.0,
+    "slider": {
+      "min": 0.0,
+      "max": 50.0,
+      "step": 0.5
+    }
   },
   "intimacy_cooldown_hours": {
     "type": "int",
@@ -661,7 +936,12 @@
     "hint": "问过一次隔多久才会再问（默认 48）",
     "default": 48,
     "min": 1,
-    "max": 720
+    "max": 720,
+    "slider": {
+      "min": 1,
+      "max": 720,
+      "step": 10
+    }
   },
   "owner_only_commands": {
     "type": "bool",
@@ -705,7 +985,12 @@
     "obvious_hint": true,
     "default": 30,
     "min": 0,
-    "max": 3650
+    "max": 3650,
+    "slider": {
+      "min": 0,
+      "max": 3650,
+      "step": 50
+    }
   },
   "history_ingest": {
     "type": "bool",

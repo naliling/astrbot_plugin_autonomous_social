@@ -16,10 +16,40 @@ import random
 import re
 from typing import Any, Dict, List, Tuple
 
+# emoji 与变体选择符的字符类只有一份，在 `social/emoji.py`；
+# `style_profile` / `generator` 引用的是同一个对象。
+from .emoji import EMOJI as _EMOJI
+# 「外头」前缀的判据同样只有一份（Core 的 weather.env 往往已是整句）。
+from .textutil import outside_lead
+
 # 一条群消息「值不值得让模型看一眼」的便宜预筛：挡在 LLM 调用之前省钱。
 # 纯 @、纯表情/图片、太短的语气词、命令回显都先筛掉——它们接不出有意义的话。
 _STICKER_ONLY = re.compile(r"^[\s\[\]（）()【】.。~!！?？…、,，]*$")
 _AT_PREFIX = re.compile(r"^\s*@\S+\s*$")
+# 原来「纯表情先筛掉」只是句空话——正则里一个 emoji 范围都没有，于是一条
+# 「😀😀😀」长度过得了 3 字符下限、又匹配不上任何标点，照样被送去调模型。
+# 字符类现在只有一份，在 `social/emoji.py`（见顶部 import）。
+# 平台塞进群消息正文的系统占位符（图片/表情/语音…）。它们不是群友说的话，
+# ⚠️ 别把方括号里的一律当占位符：`[图片]` 是占位符，「说[重点]」里的正文不该被吃掉，
+# 所以这里列的是常见的固定名词，而不是任意中文方括号串。
+_PLACEHOLDER_CONTENT = (
+    "图片|表情|动画表情|语音|视频|文件|位置|链接|音乐|红包|转账|分享|合并转发"
+)
+_MEDIA_PLACEHOLDER = re.compile(rf"[\[【](?:{_PLACEHOLDER_CONTENT})[\]】]")
+
+
+def _has_no_body(text: str) -> bool:
+    """这条消息剥掉标点/空白/emoji/占位符之后，还剩不剩下正文。
+
+    预筛要对齐 docstring 里那句「纯 @、纯表情/图片…先筛掉」，而光靠一条正则同时
+    覆盖标点、emoji、`[图片]` 三类会写成谁也读不懂的巨型字符类。分成两步：
+    `_STICKER_ONLY` 管纯标点，这里管「装饰剥完就没正文」。
+    """
+    body = _MEDIA_PLACEHOLDER.sub("", str(text or ""))
+    body = _EMOJI.sub("", body)
+    return not re.sub(rf"[\s\W_]+", "", body)
+
+
 # 一眼就是废话/语气词，接了也是尬聊
 _LOW_INFO = {
     "哈哈", "哈哈哈", "hhh", "233", "666", "6", "。", "？", "?", "！", "!",
@@ -32,6 +62,8 @@ def flow_prefilter(text: str, is_command: bool) -> bool:
     """这条群消息值不值得让模型判断要不要接。True=可以进下一步（可能调模型）。
 
     只做便宜的常识过滤，真正「该不该接、接什么」交给模型。
+    除了 `_STICKER_ONLY` 挡掉的纯标点，纯 emoji（`😀😀😀`）与纯占位符（`[图片]`）也在
+    这一层筛掉——它们同样接不出有意义的话，却照样会白烧一次模型调用。
     """
     if is_command:
         return False
@@ -41,6 +73,8 @@ def flow_prefilter(text: str, is_command: bool) -> bool:
     if body.startswith("/"):
         return False
     if _STICKER_ONLY.match(body) or _AT_PREFIX.match(body):
+        return False
+    if _has_no_body(body):
         return False
     if body in _LOW_INFO:
         return False
@@ -102,14 +136,17 @@ def icebreak_due(
     stale_days: int,
     today: str,
     is_quiet: bool,
+    asleep: bool = False,
     has_history_minimum: int = 5,
 ) -> bool:
     """这个群现在该不该破冰。
 
-    条件：非安静时段 & 未被隔离 & 此前真的有人聊过（不是刚进的空群/机器人群）&
+    条件：非安静时段 & **她醒着** & 未被隔离 & 此前真的有人聊过（不是刚进的空群/机器人群）&
     没超 stale（超了当已退群）& 安静时长落在 [idle_hours, stale_days] 之间 &
     今天没超破冰上限。
     """
+    if asleep:
+        return False
     if is_quiet:
         return False
     if float(group.get("blocked_until", 0) or 0) > now:
@@ -125,8 +162,16 @@ def icebreak_due(
     # 超过 stale_days 没消息：当已经不在这个群，不破冰（交给 prune 清理）
     if idle > max(1, stale_days) * 86400.0:
         return False
-    # bot 自己最近刚在群里说过话，就别又破冰（含刚破过冰）
-    if now - float(group.get("last_bot_spoke", 0) or 0) < idle_hours * 3600.0:
+    # bot 自己最近刚在群里说过话，就别又破冰（含刚破过冰）。
+    # `topic_at` 是「上一次主动起话头」的时间戳，和 `icebreak_at` 是同一条对称
+    # 守卫的两半：`group_topic_due` 会读 `icebreak_at` 避免「刚破完冰又起话头」，
+    # 反过来这里也得看「刚起完话头又去破冰」——「刚说过话」是同一件事，取两者较晚者。
+    # （原来只读 `last_bot_spoke`，那条会被 `open_flow` 刷新，起话头后未必挡得住破冰。）
+    last_proactive = max(
+        float(group.get("icebreak_at", 0) or 0),
+        float(group.get("topic_at", 0) or 0),
+    )
+    if now - max(last_proactive, float(group.get("last_bot_spoke", 0) or 0)) < idle_hours * 3600.0:
         return False
     # 今天破冰次数上限
     if str(group.get("icebreak_day", "") or "") == today:
@@ -172,7 +217,7 @@ def icebreak_topics(holiday: str, weather: str) -> str:
     if holiday:
         lines.append(f"今天是{holiday}")
     if weather:
-        lines.append(f"外头{weather}")
+        lines.append(outside_lead(weather))
     return "\n".join(f"- {x}" for x in lines)
 
 
@@ -200,13 +245,16 @@ def group_topic_due(
     stale_days: int,
     today: str,
     is_quiet: bool,
+    asleep: bool = False,
     has_history_minimum: int = 5,
 ) -> bool:
     """G1：这个群现在该不该由她**主动起个话头**（不必等群彻底冷掉）。
 
     比破冰宽松（不要求群安静很久），但仍旧保守：得有人聊过、她自己在群里静了够久、
-    今天没起够、群没凉透、不在安静时段。
+    今天没起够、群没凉透、不在安静时段、**她醒着**。
     """
+    if asleep:
+        return False
     if is_quiet:
         return False
     if float(group.get("blocked_until", 0) or 0) > now:

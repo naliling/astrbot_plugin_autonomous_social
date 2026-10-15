@@ -12,12 +12,29 @@
 自己的 `core/capability_probe.py` 一致。
 
 没装 memory_companion 时全部返回空/None，主动消息照常发，只是没有记忆可用。
+
+失败不再静默：拿不到桥接 / 接口对不上 / 调用抛异常，按「没装、签名不符、抛异常」三类
+各记一条日志（`LogThrottle` 限流，同类一个窗口内只报一次，末尾汇总省略条数），并经
+`last_error()` 留一个只读出口——「装了个寂寞」与「压根没装」要能分得开。
+
+幂等键：`ts` 缺失或 `<= 0` 时改用内容摘要，避免退化成 `proactive:{umo}:0` 这个常量
+（否则同一用户的每条记忆共用一个键，被对面按幂等去重后只剩第一条）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from typing import Any, Dict, Optional
+
+from .throttle import LogThrottle
+
+try:  # 插件外（脚本/测试）导入时退化为标准库，别让日志变成硬依赖
+    from astrbot.api import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger("autonomous_social")
 
 MEMORY_PLUGIN_ID = "astrbot_plugin_memory_companion"
 # 宿主注册表里可能出现这些身份（name / display_name / 目录名）。
@@ -28,6 +45,52 @@ MEMORY_PLUGIN_NAMES = {
 }
 
 SOURCE_PLUGIN = "astrbot_plugin_autonomous_social"
+
+# 三类失败原因分开记：区分「对方插件没装」与「装了但坏了」，排查时一眼看得出方向。
+FAIL_MISSING = "missing"        # 注册表里没有它（没装 / 未激活 / 宿主没有注册表 API）
+FAIL_SIGNATURE = "signature"    # 找到了它，但桥接工厂或所需方法不可调用（接口对不上）
+FAIL_EXCEPTION = "exception"    # 注册表、工厂或桥接方法调用时抛了异常
+
+# 同类失败按窗口限流，别每轮心跳刷屏。模块自己持有一个实例，不占用引擎那本共享账。
+_THROTTLE = LogThrottle()
+# 最近一次失败分类 + 原因；空串表示这轮没出过问题。
+_LAST_ERROR = ""
+
+
+def last_error() -> str:
+    """最近一次记忆桥失败的原因（含类别）；空串表示没有失败记录。"""
+    return _LAST_ERROR
+
+
+def _note_failure(reason: str, detail: str) -> None:
+    """记一次失败：留痕（`last_error`）总是更新，日志按同类窗口限流。
+
+    「没装」是正常降级，走 debug；「签名不符」「调用抛异常」是真故障，走 warning。
+    """
+    global _LAST_ERROR
+    _LAST_ERROR = f"{reason}: {detail}"
+    if not _THROTTLE.allow(reason):
+        return
+    message = (
+        f"[autonomous_social] memory_companion 桥接不可用（{reason}）：{detail}"
+        + _THROTTLE.summary(reason)
+    )
+    try:
+        if reason == FAIL_MISSING:
+            logger.debug(message)
+        else:
+            logger.warning(message)
+    except Exception:  # 日志本身失败绝不能反过来影响发送链路
+        pass
+
+
+def _brief(exc: BaseException, limit: int = 160) -> str:
+    """异常一句话（带类型、截断）：够定位问题，又不把整段内容抄进日志。"""
+    try:
+        text = f"{type(exc).__name__}: {exc}"
+    except Exception:  # 连 __str__ 都坏了的异常
+        text = type(exc).__name__
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _text_of(value: Any) -> str:
@@ -60,12 +123,22 @@ def _module_of(meta: Any) -> Any:
 def _bridge_from(meta: Any) -> Optional[Any]:
     factory = getattr(_module_of(meta), "get_memory_companion_bridge", None)
     if not callable(factory):
+        _note_failure(
+            FAIL_SIGNATURE,
+            "已找到 memory_companion，但没有可调用的 get_memory_companion_bridge 工厂",
+        )
         return None
     try:
         bridge = factory()
-    except Exception:
+    except Exception as exc:
+        _note_failure(FAIL_EXCEPTION, f"get_memory_companion_bridge() 抛异常：{_brief(exc)}")
         return None
+    if bridge is None:
+        _note_failure(
+            FAIL_SIGNATURE, "get_memory_companion_bridge() 返回 None（对面尚未就绪）"
+        )
     return bridge if bridge is not None else None
+
 
 
 def find_memory_bridge(context: Any) -> Optional[Any]:
@@ -76,24 +149,34 @@ def find_memory_bridge(context: Any) -> Optional[Any]:
     get_registered_star = getattr(context, "get_registered_star", None)
     if not (callable(get_all_stars) or callable(get_registered_star)):
         # 老 AstrBot / 单测：没有注册表 API 就当作没装，绝不 importlib 造模块。
+        _note_failure(
+            FAIL_MISSING, "宿主没有 get_all_stars/get_registered_star，无法确认对面是否安装"
+        )
         return None
 
     seen: set = set()
+    saw_identity = False
+    lookup_failed = False
 
     def inspect(meta: Any) -> Optional[Any]:
+        nonlocal saw_identity
         if meta is None or id(meta) in seen:
             return None
         seen.add(id(meta))
         if not _identity_matches(meta):
             return None
+        saw_identity = True
         if not bool(getattr(meta, "activated", True)):
+            _note_failure(FAIL_MISSING, "memory_companion 已安装但未激活")
             return None
         return _bridge_from(meta)
 
     if callable(get_all_stars):
         try:
             stars = list(get_all_stars() or [])
-        except Exception:
+        except Exception as exc:
+            lookup_failed = True
+            _note_failure(FAIL_EXCEPTION, f"get_all_stars() 抛异常：{_brief(exc)}")
             stars = []
         for meta in stars:
             bridge = inspect(meta)
@@ -102,11 +185,16 @@ def find_memory_bridge(context: Any) -> Optional[Any]:
     if callable(get_registered_star):
         try:
             meta = get_registered_star(MEMORY_PLUGIN_ID)
-        except Exception:
+        except Exception as exc:
+            lookup_failed = True
+            _note_failure(FAIL_EXCEPTION, f"get_registered_star() 抛异常：{_brief(exc)}")
             meta = None
         bridge = inspect(meta)
         if bridge is not None:
             return bridge
+    if not saw_identity and not lookup_failed:
+        # 注册表可用却查无此人 = 真的没装。查不动（上面已记异常）时不再补一条误导性的「没装」。
+        _note_failure(FAIL_MISSING, "宿主注册表里没有 memory_companion（没装）")
     return None
 
 
@@ -128,6 +216,7 @@ async def fetch_memory_text(
         return ""
     fn = getattr(bridge, "compose_context", None)
     if not callable(fn):
+        _note_failure(FAIL_SIGNATURE, "桥接对象没有可调用的 compose_context（接口签名不符）")
         return ""
     try:
         text = await fn(
@@ -136,27 +225,65 @@ async def fetch_memory_text(
             top_k=6,
             max_chars=max_chars,
         )
-    except Exception:
+    except Exception as exc:
+        _note_failure(FAIL_EXCEPTION, f"compose_context() 调用失败：{_brief(exc)}")
         return ""
     return str(text or "").strip()
 
 
+def _safe_stamp(ts: Any) -> float:
+    """把调用方的 `ts` 收敛成秒级浮点；缺失 / 非数字 / NaN / 非正数一律当作「没有时间戳」。
+
+    旧实现直接 `int(ts or 0)`：脏值抛 `ValueError` 被吞掉 → 整条记忆静默不写。
+    """
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        return 0.0
+    return value
+
+
+def _content_digest(text: str) -> str:
+    """内容摘要（跨进程稳定：内置 hash() 按进程加盐，不能用来做幂等键）。"""
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _idempotency_key(umo: str, payload: str, ts: Any) -> str:
+    """幂等键：有时间戳就用时间戳，没有就用内容摘要。
+
+    `ts` 缺失 / `<= 0` 时若退化成常量（旧实现 `int(0.0)` → `proactive:{umo}:0`），同一
+    用户的不同内容会共用一个键，被对面按幂等去重后只剩第一条。用内容摘要则保证
+    「不同内容 → 不同键、相同内容 → 相同键」。
+    """
+    stamp = _safe_stamp(ts)
+    if stamp > 0.0:
+        return f"proactive:{umo}:{int(stamp)}"
+    return f"proactive:{umo}:c:{_content_digest(payload)}"
+
+
 async def write_proactive(bridge: Any, uid: str, content: str, *, umo: str = "", ts: float = 0.0) -> None:
-    """把一条主动消息写回记忆库；失败静默（记忆不是主链路）。"""
+    """把一条主动消息写回记忆库；失败只记日志，不影响主链路。"""
     text = str(content or "").strip()
     if bridge is None or not text:
         return
     fn = getattr(bridge, "record_external_memory", None)
     if not callable(fn):
+        _note_failure(
+            FAIL_SIGNATURE, "桥接对象没有可调用的 record_external_memory（接口签名不符）"
+        )
         return
+    payload = f"（她主动找 TA 说的）{text}"
     try:
         await fn(
             user_id=str(uid or ""),
-            content=f"（她主动找 TA 说的）{text}",
+            content=payload,
             source_plugin=SOURCE_PLUGIN,
-            idempotency_key=f"proactive:{umo}:{int(ts or 0)}",
+            idempotency_key=_idempotency_key(umo, payload, ts),
             importance=0.5,
             tags=["proactive"],
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _note_failure(FAIL_EXCEPTION, f"record_external_memory() 调用失败：{_brief(exc)}")
+

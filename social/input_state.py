@@ -131,6 +131,8 @@ class InputStateNotifier:
         deadline = self._time() + self.timeout
         try:
             while not stop_event.is_set():
+                # 失败只记日志（在 _report 里），下一个 interval 继续重试：
+                # 一次抖动不该让整段生成时间里都不显示「正在输入」。
                 await self._report(api, user_id)
                 if self._time() >= deadline:
                     self._log.debug(f"[autonomous_social] 输入状态上报超时（{self.timeout:.0f}s），停止")
@@ -153,9 +155,16 @@ class InputStateNotifier:
             if entry is not None and entry[0] is current:
                 self._tasks.pop(umo, None)
 
-    async def _report(self, api: Any, user_id: str) -> None:
+    async def _report(self, api: Any, user_id: str) -> bool:
+        """报一次「正在输入」。失败返回 False（**不抛**）。
+
+        原来这里失败后 re-raise，被 `_run` 的外层 except 捕获并**直接结束任务**：
+        一次网络抖动或 NapCat 重启，就让本次生成剩余时间里的「正在输入」全部消失。
+        现在交给调用方在每个 interval 重试。
+        """
         try:
             await api.call_action("set_input_status", user_id=str(user_id), event_type=1)
+            return True
         except Exception as exc:
             self._log.debug(f"[autonomous_social] set_input_status 失败（可能不是 NapCat）: {exc}")
-            raise
+            return False

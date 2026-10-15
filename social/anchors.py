@@ -34,30 +34,56 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .textutil import OUTSIDE_WORDS as _OUTSIDE_WORDS, outside_lead as _outside_lead
+
 # 一个人身上同时挂着几条「还没用过的事」
 ANCHOR_MAX = 5
+# 一条由头文本最多多长。**拼装与存储必须用同一个上限**：拼装处若把上限卡得比它小，
+# 句子末尾的模板（右引号、「后来呢」）会被切掉，产出一个未闭合的「引号
+# （`你上次说的「明天面试`）。所以片段各自量好自己的尺寸，模板拼完不再二次截断。
+ANCHOR_TEXT_MAX = 40
 # 用过之后多久可以再用同一件事（秒）。它同时也是「已用记录」的寿命：冷却期内这条记录
 # 既是避重依据、也不再是候选；冷却一过就淘汰，同一件事可以重新派生。
 #
 # 原来还有一个更长的 ANCHOR_HISTORY(45 天)，但它被有效期(≤24h)封着、从来活不到那天
 # ——一个写了却永不生效的窗口比没有更误导人，收掉。
 ANCHOR_COOLDOWN = 7 * 86400.0
-# 派生出来的由头最多留多久（过期的意义不大）
-ANCHOR_TTL = 14 * 86400.0
 # 一条由头最多试几次。**发出才算消费**；模型写砸了（被验收层拦下）只记一次失败，
 # 下一轮还能再试——一次抽风不该让这个话题冷 7 天。但也不能无限重试。
 ANCHOR_MAX_TRIES = 2
 
 # 由头种类，按「有多硬」排
-KIND_PROMISE = "promise"   # 她自己答应过的，到点兑现
+#
+# 这里原来还有 KIND_PROMISE / KIND_LOOP / KIND_THREAD 三个，注释写着「她自己答应
+# 过的」/「对方提过、还没下文」/「话说到一半断了」——但**全仓库没有任何地方产出
+# 它们**。三个 kind 一直占着 TTL 表、优先级表、理由表和 `anchor_meta` 的 mode
+# 分支，实际一条都没生成过。245 个真实用户的运行态实测分布是
+# {derived: 839, miss: 250, greet: 109, weather: 1}，三者均为 0。
+#
+# 「承诺」与「话说到一半」这两种语义确实有用，但它们的**生产者不在这个模块**：
+# `threads.py` 已经用一条更完整的链路发出 category=promise / presence 的线索
+# （认领人、due、live_promises 都在那边）。anchors 这边再留一份同名的空壳，只会
+# 让「由头」和「线索」两套机制看起来都管这件事、实际都没管。所以按「删掉永远不
+# 为真的分支」处理，而不是在这里补一套重复的抽取逻辑。
+#
+# 老状态里若存过这三种 kind：`_KIND_TTL` 走 KIND_TTL_FALLBACK、`KIND_RANK` 走
+# 默认 9（最低优先级）、`_REASON_BY_KIND` 走 KIND_DERIVED 的措辞，都能安全降级，
+# 且它们的 TTL 最长 24h，不会长期滞留。
 KIND_CUE = "cue"           # 对方说的时间锚点到期了
-KIND_LOOP = "loop"         # 对方提过、还没下文
-KIND_THREAD = "thread"     # 话说到一半断了
 KIND_DERIVED = "derived"   # 从她自己的状态派生的一件具体的事
 KIND_MISS = "miss"         # 想念：好感够、又想了一阵子（不是有正事要说）
 KIND_GREET = "greet"       # 问候：没事干，随口说一句看看你回不回
 KIND_HOLIDAY = "holiday"   # 节日：今天是个节，顺口提一句
 KIND_WEATHER = "weather"   # 天气：外头变了样（下雨/降温），一句观察
+
+# ── 一条用过的由头是**怎么结束的** ──────────────────────────────
+#
+# 原来「真发出去过」与「试满作废」在记录上完全一样（都只是把 `used_at` 写上），
+# 运行指标与事后排障都分不出来：两条只在 `use_count` 上差一点，而跨用户撞车那一路
+# 又另写一个 `reason` 字符串——三种去向三种记法。现在统一成一个字段、三选一。
+RETIRED_SENT = "sent"          # 真发出去过（consume）
+RETIRED_FAILED = "failed"      # 试满 ANCHOR_MAX_TRIES 都没写成（mark_failed）
+RETIRED_CROSS = "cross_user"   # 这件事刚发给过别人，主动让位（drop_anchor）
 
 # ── 有效期：按性质分三类 ──────────────────────────────────────────
 #
@@ -80,22 +106,34 @@ _KIND_TTL = {
     KIND_MISS: TTL_DAY_PART,
     KIND_GREET: TTL_DAY_PART,
     KIND_CUE: TTL_PEER_EVENT,
-    KIND_LOOP: TTL_PEER_EVENT,
-    KIND_PROMISE: TTL_PEER_EVENT,
-    KIND_THREAD: TTL_DAY_PART,
     KIND_HOLIDAY: TTL_DAY_PART,
     KIND_WEATHER: TTL_SELF_EVENT,
 }
 
+# 表外的 kind 用的兜底寿命。
+#
+# 这里原来立着一个 `ANCHOR_TTL = 14 天`，看着像「派生由头的总寿命」，实际 9 种已知
+# kind 在 `_KIND_TTL` 里全都有各自的值，它一次都不会生效——一个永不生效的数字比没有
+# 更误导人（照着它调参、照着它排障，都调不到、也排不出）。
+#
+# 取**最短**的那一档（她这边刚发生的事，2h）：忘了登记的 kind 不该悄悄多活 24 小时、
+# 白占着 ANCHOR_MAX 个位置。用例 `test_11_every_known_kind_has_a_ttl` 盯着「有无遗漏」，
+# 这个兜底只是双保险。
+KIND_TTL_FALLBACK = TTL_SELF_EVENT
+
+# 每一个已知 kind 都必须在这里有一档。漏了的话 `live_anchors` 的
+# `KIND_RANK.get(kind, 9)` 会把它当成最低优先级——`KIND_GREET` 就漏过一次，
+# 而 `derive_nag` 造的正是一堆 greet：它明明是最常见的一类，却排在**所有**派生类
+# 之后（默认 9），比天气还低。
+# 数字只用来排序，允许留空档（0 档随 KIND_PROMISE 一起删了）；
+# `live_anchors` 里 `KIND_RANK.get(kind, 9)` 的默认 9 是给表外的 kind 的兜底。
 KIND_RANK = {
-    KIND_PROMISE: 0,
     KIND_CUE: 1,
-    KIND_LOOP: 2,
-    KIND_THREAD: 3,
     KIND_HOLIDAY: 3,
     KIND_MISS: 4,
-    KIND_DERIVED: 5,
-    KIND_WEATHER: 6,
+    KIND_GREET: 5,
+    KIND_DERIVED: 6,
+    KIND_WEATHER: 7,
 }
 
 
@@ -144,8 +182,13 @@ TIER_LOW = "low"
 
 # 各档的最小间隔（分钟）。高档很近，因为她常聊；低档隔一两天，试试就好。
 TIER_MIN_GAP_MINUTES = {TIER_HIGH: 20, TIER_MID: 60, TIER_LOW: 720}
-# 各档同时挂几件事。高档可以挂多点（一天的机会本来就多）
-TIER_POOL_MAX = {TIER_HIGH: 12, TIER_MID: 8, TIER_LOW: 4}
+# 各档同时挂几件事。**上限不许超过 ANCHOR_MAX**：池子本身只收 ANCHOR_MAX 条未用的
+# 由头（见 `add_anchor`），原来写 12/8/4 的时候高档那两档是假的——`live_anchors(limit=12)`
+# 永远取不满（池里最多 5 条），分档在这一维上等于没有；更糟的是派生循环会一路
+# `picked.append` 到 12，而每加一条都可能把池子里最不急的那条挤掉，于是 `picked`
+# 里留下**池子里已经没有的**悬空记录，`consume` / `mark_failed` 全都找不到它。
+# 现在三档都在池子容量之内，高的那档就等于满池。
+TIER_POOL_MAX = {TIER_HIGH: 5, TIER_MID: 4, TIER_LOW: 3}
 
 # 涨幅：关系从起点长出来多少才算「真的在升温」
 # 绝对好感低于这个值，且没涨过 → 封在中档以下
@@ -268,19 +311,70 @@ def prune_anchors(u: Dict[str, Any], now: float) -> None:
         if used and used + ANCHOR_COOLDOWN <= now:
             continue
         if exp and exp <= now:
+            # 用过的记录过期了，但它**还在冷却期内**——先把「这件事用过了」抄进独立
+            # 台账（`_note_used`），再扔掉记录。老状态的记录带着当初那条短 TTL
+            # （派生类 2h），池子一 prune 避重就跟着没了，同一件事两小时后又能重新
+            # 派生、再发给同一个人。
+            if used:
+                _note_used(u, _s(a.get("about")), used, why=_s(a.get("retired")))
             continue
         kept.append(a)
     if len(kept) != len(load_anchors(u)) or kept != u.get("anchors"):
         u["anchors"] = kept
 
 
+# 「最近用过的事」独立记一本账，不挂在由头池上。
+#
+# 避重（`_remembered`）原来只在 `u["anchors"]` 里找 `used_at` 还在冷却期里的记录，
+# 于是避重成不成立，取决于那条记录**有没有在池子里活下来**：池子满了会被挤掉、
+# 状态保留会把池子整个清空、老记录还带着当初的短 TTL 被 prune 掉——任何一次池外
+# 淘汰都让避重整体失效，同一件事又能被重新派生一遍（「23 条沙发追剧」的成因）。
+_ANCHOR_USED_KEY = "anchor_used"
+_ANCHOR_USED_KEEP = 64
+
+
+def _used_log(u: Dict[str, Any]) -> List[Dict[str, Any]]:
+    log = u.get(_ANCHOR_USED_KEY)
+    return log if isinstance(log, list) else []
+
+
+def _note_used(u: Dict[str, Any], about: str, now: float, why: str = "") -> None:
+    """把「这件事用过了」记进独立的那本账——池子怎么清都不影响避重。
+
+    `why` 是结束方式（RETIRED_*），排障时不用再去池子里交叉比对（池子可能已经空了）。
+    """
+    text = _s(about)
+    if not text:
+        return
+    log = [
+        r for r in _used_log(u)
+        if isinstance(r, dict)
+        and _s(r.get("about")) != text
+        and now - _f(r.get("at")) < ANCHOR_COOLDOWN
+    ]
+    log.append({"about": text, "at": now, "why": _s(why)})
+    u[_ANCHOR_USED_KEY] = log[-_ANCHOR_USED_KEEP:]
+
+
 def _remembered(u: Dict[str, Any], now: float) -> set:
-    """最近已经用过的由头文本——派生时拿它避重。"""
+    """最近已经用过的由头文本——派生时拿它避重。
+
+    池内记录与独立台账两处都看：前者是既有状态（老数据里只有它），后者是
+    「记录已经不在池子里了，但这件事还在冷却里」的那部分。
+    """
     out = set()
     for a in load_anchors(u):
         used = _f(a.get("used_at"))
         if used and now - used < ANCHOR_COOLDOWN:
             out.add(_s(a.get("about")))
+    for r in _used_log(u):
+        if not isinstance(r, dict):
+            continue
+        at = _f(r.get("at"))
+        if at and now - at < ANCHOR_COOLDOWN:
+            text = _s(r.get("about"))
+            if text:
+                out.add(text)
     return out
 
 
@@ -298,8 +392,11 @@ def add_anchor(
     有效期默认按种类走（见 _KIND_TTL），也可以显式给。
     """
     if ttl is None:
-        ttl = _KIND_TTL.get(str(kind or KIND_DERIVED), ANCHOR_TTL)
-    text = _s(about)[:40]
+        ttl = _KIND_TTL.get(str(kind or KIND_DERIVED), KIND_TTL_FALLBACK)
+    # 截到 ANCHOR_TEXT_MAX，与 `offer` 用的是**同一个**上限：两边不一致的话，返回给
+    # 调用方的文本和存进池子的文本会不一样，`consume` / `mark_failed` 按文本查找就
+    # 找不到对象了。
+    text = _s(about)[:ANCHOR_TEXT_MAX]
     if not text:
         return None
     prune_anchors(u, now)
@@ -324,9 +421,21 @@ def add_anchor(
     # 未用的最多 ANCHOR_MAX 条，满了挤掉最老的（已用的不参与这个上限）。
     # 注意这是**存储**上限，而实际每轮能派生的条数更少——未用的会被 prune 当过期丢掉
     # （见 prune_anchors 的说明），所以真正起作用的是「一条用完就让位」。
-    free_items.sort(key=lambda a: _f(a.get("due")) or now)
+    #
+    # 淘汰必须从**最不急的那条**开始（`due` 最大的先走）。原来按 `due` 升序 `pop(0)`
+    # 挤掉的是 `due` 最近、最该先发的那条：刚派生的新由头 `due=now` 会被自己立即挤出
+    # 池子，而这里仍把它返回给调用方 → 悬空记录（`consume` / `mark_failed` 都找不到它），
+    # 同一句话每轮重新派生、白烧 LLM。池里若已有 5 条带未来 `due` 的由头
+    # （如 cue 由头），这个人此后任何新由头都发不出去。
     while len(free_items) > ANCHOR_MAX:
-        free_items.pop(0)
+        victim = max(
+            (a for a in free_items if a is not item),
+            key=lambda a: _f(a.get("due")) or now,
+            default=None,
+        )
+        if victim is None:
+            break          # 池里只剩刚加入的这条，不能再淘汰
+        free_items.remove(victim)
     u["anchors"] = used_items + free_items
     return item
 
@@ -366,24 +475,43 @@ def live_anchors(
 
 
 def consume(u: Dict[str, Any], about: str, now: float) -> None:
-    """标记某条由头已用过。
+    """标记某条由头已用过：**真发出去了**。
 
     同时把它的 expire_at 推到冷却末：这条记录从此是「避重依据」而不再是候选，寿命该跟着
     冷却走，而不是被当初那条短有效期（派生类 2h）提前抹掉——不然 7 天冷却形同虚设。
+
+    记账分两处写：池内记录（`retired=sent`，看得见来源）+ 独立台账（池子被清也还在）。
+    池内那条找不到也照样记台账——消息确实发出去了，这件事就该被避开。
     """
+    _note_used(u, about, now, why=RETIRED_SENT)
     for a in load_anchors(u):
         if _s(a.get("about")) == _s(about):
             a["used_at"] = now
             a["tries"] = 0
             a["use_count"] = int(_f(a.get("use_count"))) + 1
             a["expire_at"] = now + ANCHOR_COOLDOWN
+            a["retired"] = RETIRED_SENT
 
 
 # ── 派生 ──────────────────────────────────────────────────────
 
-def _short(text: Any, n: int = 14) -> str:
+def _short(text: Any, n: int = ANCHOR_TEXT_MAX) -> str:
     s = _s(text)
     return s[:n] if s else ""
+
+
+def _clause(text: Any, n: int) -> str:
+    """按停顿截到 n 字以内，别在句子中间硬切。
+
+    给**整句原文**用（Core 的天气 `env`、对方说过的原话片段）：那种句子没有模板
+    兜着，硬切出来的「外面下着大雨，风也很」就是一句断话，而「你上次说今天加班到
+    十一点整个人，后来好点没」也一样。模板拼接的片段各自量好了尺寸，不需要它。
+    """
+    s = _s(text)
+    if not s or len(s) <= n:
+        return s
+    head = re.split(r"[，。！？；、,.!?;]", s, maxsplit=1)[0]
+    return head if 0 < len(head) <= n else s[:n]
 
 
 def _derive_from_state(
@@ -401,7 +529,10 @@ def _derive_from_state(
     day = body.get("day") if isinstance(body.get("day"), dict) else {}
 
     def offer(text: str) -> None:
-        text = _short(text)
+        # 上限与 `add_anchor` 的存储上限是同一个数：碎片各自量好尺寸再拼，模板
+        # （引号、「后来呢」）永远不会被这一层切掉。原来这里统一 `_short(text, 14)`，
+        # 于是**每一条**派生由头都被从尾巴上剁掉一截——不是零星几条，是所有。
+        text = _short(text, ANCHOR_TEXT_MAX)
         if not text or text in taken:
             return
         taken.add(text)
@@ -424,7 +555,7 @@ def _derive_from_state(
         weather = weather.get("env") or weather.get("weather")
     weather = _s(weather)
     if weather:
-        offer(_short(weather, 12))
+        offer(_clause(weather, 16))
 
     # 沉默时长是一句真实的话，但**不能按天数逐天变**。写成 f"快{N}天没说话了" 的话，
     # 每天都是一句新的话：既不会被「已用过」挡掉（于是每天都能重新派生），
@@ -462,7 +593,9 @@ def _derive_from_state(
     # 账本里的 `said` 就是这个用途，之前只在 prompt 里当背景给模型看，
     # 没有人拿它当由头——于是这类最自然的开口方式从来没被用过。
     for item in _said_recent(u, now):
-        offer(f"想起你之前说的{item}")
+        # 片段自己量好尺寸（模板「想起你之前说的」7 字 + 24 = 31 ≤ ANCHOR_TEXT_MAX）。
+        # 原来这里一个字的余量都没留，全靠 offer 的 14 字硬切——切出来的正是句子中间。
+        offer(f"想起你之前说的{_short(item, 24)}")
 
     # ③ 今天特别闲。
     #
@@ -488,6 +621,13 @@ def _derive_from_state(
     return out
 
 
+# 原句自己已经交代了方位时，不要再补一层前缀。Core 的 `weather.env` 给的就是
+# 「外面在下雨」这种**整句**，硬加「外头」得到的是「外头外面在下雨」。
+# 判据与词表搬到了 `social/textutil.py`：`groupflow.icebreak_topics` 原来各写了一份
+# `f"外头{text}"`，同一个毛病在破冰链路上又犯一次。这里保留私有别名，
+# 名字不变、行为不变（`_OUTSIDE_WORDS` / `_outside_lead` 见上面的 import）。
+
+
 def _notable_weather(body: Dict[str, Any]) -> str:
     """外头「变了样」才值得专门说一句：下雨下雪、大热大冷。
 
@@ -500,7 +640,7 @@ def _notable_weather(body: Dict[str, Any]) -> str:
     if not text:
         return ""
     if any(w in text for w in ("雨", "雪", "雷", "雹", "雾", "霾")):
-        return f"外头{text}"
+        return _clause(_outside_lead(text), 16)
     m = re.search(r"(-?\d+(?:\.\d+)?)\s*[℃°]", text)
     if m:
         try:
@@ -508,7 +648,7 @@ def _notable_weather(body: Dict[str, Any]) -> str:
         except ValueError:
             temp = None
         if temp is not None and (temp <= 5.0 or temp >= 33.0):
-            return f"外头{text}"
+            return _clause(_outside_lead(text), 16)
     return ""
 
 
@@ -523,14 +663,15 @@ def derive_extras(
     out: List[Tuple[str, str]] = []
 
     def offer(kind: str, text: str) -> None:
-        text = _short(text, 16)
+        # 同 `_derive_from_state.offer`：模板自己量好，这一层只兜底、不二次截断。
+        text = _short(text, ANCHOR_TEXT_MAX)
         if not text or text in taken:
             return
         taken.add(text)
         out.append((kind, text))
 
     body = body if isinstance(body, dict) else {}
-    holiday = _s(body.get("holiday"))
+    holiday = _short(body.get("holiday"), 12)
     if holiday:
         offer(KIND_HOLIDAY, f"今天是{holiday}")
     wx = _notable_weather(body)
@@ -621,7 +762,13 @@ def prepare_round_anchors(
             limit = max(1, int(TIER_POOL_MAX.get(tier, ANCHOR_MAX)))
         except (TypeError, ValueError):
             pass
-    RELATIONAL_KINDS = (KIND_MISS, KIND_GREET, KIND_LOOP, KIND_CUE, KIND_PROMISE)
+    # `limit` 是「要几条」的愿望，池子只装得下 ANCHOR_MAX 条——再往上要就只能靠
+    # 把池子里已有的挤出去来凑数，于是 (a) 返回的 `picked` 里混进**池子里已经
+    # 没有的**悬空记录（`consume` / `mark_failed` 按文本找不到它），(b) 分档在上限
+    # 这一维上纯属摆设。这里把上限收到池容量，三档才真的有区别：
+    #   high 5 / mid 4 / low 3（变更前 12 / 8 / 4，而实际永远 ≤ 5）。
+    limit = min(int(limit), ANCHOR_MAX)
+    RELATIONAL_KINDS = (KIND_MISS, KIND_GREET, KIND_CUE)
     picked: List[Dict[str, Any]] = live_anchors(
         u, now, limit=limit,
         kinds=RELATIONAL_KINDS if relational else None,
@@ -641,7 +788,11 @@ def prepare_round_anchors(
         if not candidates:
             gap_candidates = derive_nag(u, now, used, tier=tier, last_talk=last_talk)
             if gap_candidates:
-                return [c for c in gap_candidates]
+                # 存量优先：`picked` 里已到点的关系向由头不能因为「当场也派生出了
+                # 一句搭话」就整批丢掉——那会让 `_miss_pick` 本来能在旧由头上开口的
+                # 机会白挂一轮，还把那句通用搭话消费进 7 天冷却。
+                # 原来直接 `return gap_candidates` 就是这个后果。
+                return list(picked) + list(gap_candidates)
     else:
         candidates = _derive_from_state(body, u, now, used, last_talk=last_talk)
         kind = KIND_DERIVED
@@ -660,6 +811,10 @@ def prepare_round_anchors(
     # 关于 TA 的，插一句「今天是中秋」就跑题了。
     if not relational:
         for extra_kind, text in derive_extras(u, body, now, used):
+            if len(picked) >= limit:
+                # 到量就停：再 `add_anchor` 会把池子里最不急的一条挤出去，
+                # 而那条可能正好在 `picked` 里——留下一条池中已无的悬空记录。
+                break
             item = add_anchor(u, extra_kind, text, now=now)
             if item is not None:
                 item.setdefault("tries", 0)
@@ -676,6 +831,15 @@ def mark_failed(u: Dict[str, Any], about: str, now: float) -> None:
         a["tries"] = tries
         if tries >= ANCHOR_MAX_TRIES:
             a["used_at"] = now
+            # 与 `consume` 同一口径：一旦作废，这条记录只剩「避重依据」这一个身份，
+            # 寿命就该跟着 7 天冷却走。只写 `used_at` 的话，它会被当初那条短 TTL
+            # （派生类 2h / 时段类 3h / 对方类 24h）删掉——7 天冷却与 `_remembered`
+            # 避重同时失效，同一句话两小时后就能重新派生、再发给同一个人。
+            a["expire_at"] = now + ANCHOR_COOLDOWN
+            # 「试满作废」与「真发出去了」必须分得开：排障时要能一眼看出这条是
+            # 模型三次都没写成、而不是发出去过了。
+            a["retired"] = RETIRED_FAILED
+            _note_used(u, about, now, why=RETIRED_FAILED)
         return
 
 
@@ -690,6 +854,10 @@ def drop_anchor(u: Dict[str, Any], about: str, now: float) -> None:
         if _s(a.get("about")) == _s(about) and not _f(a.get("used_at")):
             a["used_at"] = now
             a["reason"] = "跨用户撞车，换一件事"
+            a["retired"] = RETIRED_CROSS
+            # 同上：作废记录活到冷却末，而不是被自己的短有效期提前抹掉。
+            a["expire_at"] = now + ANCHOR_COOLDOWN
+            _note_used(u, about, now, why=RETIRED_CROSS)
         kept.append(a)
     u["anchors"] = kept
 
@@ -713,6 +881,39 @@ _CARE_WORDS = (
     "emo", "崩溃", "撑不住", "头疼", "生病", "感冒", "发烧", "胃疼",
     "焦虑", "紧张", "难过", "委屈", "孤独", "一个人",
 )
+
+# 单字状态词的「假朋友」：它们跟别的字组成完全无关的常用词，子串匹配会把
+# 「帮忙 / 积累 / 困难 / 赶紧 / 麻烦」通通读成「对方状态不好」，于是派出一句
+# 「你上次说忙，后来好点没」——而对方从没说过自己忙。双字以上（好累、加班、
+# 撑不住…）没有这个问题，照旧子串匹配。
+_CARE_FALSE_FRIENDS = (
+    "帮忙", "急忙", "连忙", "赶忙",
+    "积累", "累计",
+    "困难", "困住", "围困",
+    "赶紧", "赶路", "追赶", "赶车", "赶集",
+    "麻烦", "烦琐", "繁琐",
+)
+
+
+def _care_hit(text: str) -> str:
+    """在 text 里找第一个「对方说自己状态不好」的词；找不到返回空串。
+
+    单字词命中后要再看一眼上下文：只要它和相邻那个字凑成 `_CARE_FALSE_FRIENDS`
+    里的词，就跳过这一处、接着往后找（同一句里可能还有真的）。
+    """
+    for w in _CARE_WORDS:
+        if len(w) > 1:
+            if w in text:
+                return w
+            continue
+        for m in re.finditer(re.escape(w), text):
+            i = m.start()
+            if text[i:i + 2] in _CARE_FALSE_FRIENDS:
+                continue
+            if text[max(0, i - 1):i + 1] in _CARE_FALSE_FRIENDS:
+                continue
+            return w
+    return ""
 
 
 def _conversation(u: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -743,7 +944,9 @@ def derive_relations(
     theirs = [t for t, d in turn_texts if d != "out"]
 
     def offer(text: str) -> None:
-        text = _short(text, 16)
+        # 与 `_derive_from_state.offer` 同理：模板先按 ANCHOR_TEXT_MAX 兜底，
+        # 片段的尺寸由各自的构造点负责（见下面「你上次说的…」那句）。
+        text = _short(text, ANCHOR_TEXT_MAX)
         if not text or text in taken:
             return
         taken.add(text)
@@ -755,19 +958,31 @@ def derive_relations(
     except (TypeError, ValueError):
         since = 0.0
     if theirs and 0 < since <= care_hours * 3600.0:
-        joined = " ".join(theirs[-6:])
-        for w in _CARE_WORDS:
-            if w in joined:
-                offer(f"你上次说{w}，后来好点没")
-                break
+        # 带**对方原句片段**，不是光一个状态词：原来输出的是裸词「你上次说忙，后来
+        # 好点没」——对方到底说了什么，读这句话的模型根本不知道，只能顺着那个字编。
+        # 从最近一条往上找第一条真的说了状态不好的消息。
+        for text in reversed(theirs[-6:]):
+            if not _care_hit(text):
+                continue
+            clause = _clause(text, 12)
+            if clause:
+                offer(f"你上次说{clause}，后来好点没")
+            break
 
     # 续聊：对方说过的、还没结果的具体事（排除已经问过的那件）
     for text in reversed(theirs[-8:]):
         for seg in re.split(r"[，。！？；、,.!?;\s]+", text):
             seg = seg.strip()
-            if not seg or len(seg) < 2 or len(seg) > 14:
+            if not seg or len(seg) < 2:
                 continue
-            if seg in taken:
+            # 先量好再拼：模板「你上次说的「…」后来呢」一共 6+len(seg)+4 个字，
+            # seg 截到 12 之后整句最长 22 字，ANCHOR_TEXT_MAX=40 装得下。
+            # 原来这里 seg 放到 14、拼接完再统一 `_short(text, 14)`：整句被从
+            # 第 14 个字剁掉，右引号和「后来呢」全没了，产出的是「你上次说的「明天面试」
+            # 这种**未闭合的引号**——不是在说事，是在掉字。截断必须发生在片段上，
+            # 不能发生在模板上（#4 与 #5 是同一个根因）。
+            seg = _short(seg, 12)
+            if len(seg) < 2 or seg in taken:
                 continue
             offer(f"你上次说的「{seg}」后来呢")
             break
@@ -836,15 +1051,21 @@ def derive_nag(u: Dict[str, Any], now: float, taken: set, *, tier: str = "",
 # ── 转成给模型看的一句「为什么现在说这个」 ───────────────────────
 
 _REASON_BY_KIND = {
-    KIND_PROMISE: "你答应过TA这件事",
     KIND_CUE: "TA之前说过的那个时间到了",
-    KIND_LOOP: "TA提过、一直没下文的那件事",
-    KIND_THREAD: "刚才那句话说到一半断了",
     KIND_MISS: "你最近一直在想TA",
     KIND_GREET: "你们有一阵子没说话了",
     KIND_DERIVED: "你自己这边刚发生的事",
     KIND_HOLIDAY: "今天是个节日",
     KIND_WEATHER: "外头的天气变了样",
+}
+
+# 「这条由头是怎么结束的」给人看的话。原来是三种去向三种记法（`used_at`、
+# `tries`、`reason` 各写各的），运行指标与面板都分不出「真发出去过」与
+# 「试满作废」；现在一律看 `retired` 这一个字段。
+_RETIRED_NOTE = {
+    RETIRED_SENT: "已发出",
+    RETIRED_FAILED: "试满作废",
+    RETIRED_CROSS: "跨用户撞车，换一件事",
 }
 
 
@@ -870,11 +1091,9 @@ def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
     """
     about = _s(a.get("about")) or "这件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
+    retired = _s(a.get("retired"))
     mode = {
-        KIND_PROMISE: "promise",
         KIND_CUE: "loop",
-        KIND_LOOP: "loop",
-        KIND_THREAD: "presence",
         KIND_MISS: "miss",
         KIND_HOLIDAY: "holiday",
     }.get(kind, "share")
@@ -894,6 +1113,12 @@ def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "about": about,
         "anchor": dict(a),
+        # 这条由头的去向，一栏说清："" 还没结束 / sent 真发出去了 /
+        # failed 试满 ANCHOR_MAX_TRIES 没写成 / cross_user 让位给别人。
+        # `reason` 保留给老面板看（跨用户撞车那一路原来把话写在这里）。
+        "retired": retired,
+        "retired_note": _RETIRED_NOTE.get(retired, ""),
+        "reason": _s(a.get("reason")) or _RETIRED_NOTE.get(retired, ""),
         # 给提示词的那句「给定事实」
         "anchor_fact": anchor_sentence(a),
     }

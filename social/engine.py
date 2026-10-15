@@ -234,6 +234,46 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+def _body_asleep(body: Any) -> bool:
+    """Core 契约里「她现在在睡吗」。
+
+    读它必须用**解析**而不是真值判断：Core 的布尔字段可能是字符串（配置面板、手改
+    state.json、老版本迁移都能写出来），而 `bool("false")` 是 True —— 那会把她一整天
+    当成「正在睡觉」，所有主动开口整体静默。口径统一在 `desire.truthy`（与 Core 的
+    `_as_bool` 同一套词表），别在各处另判一套。
+
+    `body` 不是 dict（Core 返回了字符串/None）时按「没在睡」处理：宁可让她说一句话，
+    也不要因为一个读不出来的字段把人永久静音。
+    """
+    if not isinstance(body, dict):
+        return False
+    return desire.truthy(body.get("asleep"))
+
+
+def _person_flow_state(engine: Any, bid: str, now: float) -> Tuple[bool, bool]:
+    """现在是不是安静时段、她是不是在睡（人物侧那两道闸）。
+
+    私聊侧五道闸都查了这两项，只有群心流漏了；而群心流是事件驱动的（群消息一到就走，
+    不经过心跳），于是深夜群里有人说话她照样插一句。
+
+    之所以是模块级函数而不是方法：调用它的地方（群心流、事件回调、测试桩）有的只装配了
+    部分依赖，`engine` 上可能没有 `core`/`_remember_night`/`_moment_of`——缺哪样就按
+    「不安静、没在睡」降级，绝不因为查不到而把整轮卡死。
+    """
+    asleep = False
+    try:
+        body = engine.core.bot_self_state(bid)
+        engine._remember_night(bid, body)
+        asleep = _body_asleep(body)
+    except Exception:
+        pass
+    try:
+        is_quiet = engine._quiet_now(bid, engine._moment_of(bid, now).hour)
+    except Exception:
+        is_quiet = False
+    return is_quiet, asleep
+
+
 class _SendFailed(Exception):
     """发送失败。
 
@@ -370,9 +410,9 @@ class SocialEngine:
         # 每角色「这一小时已经发了几个」。安全闸，防 180 人同时攒满时一次涌出。
         # 计数是滚动的一小时窗口（记时间戳列表），不是自然小时——跨零点不会归零重来。
         self._hourly: Dict[str, List[float]] = {}
-        # 清洗前的原始模型输出：验收不过时记下来，下次能分辨
-        # 「模型自己漏写了括号」还是「清洗/截断弄坏的」
-        self._raw_generated = ""
+        # 清洗前的原始模型输出原来存在这里（实例级单字段），并发发送会互相污染；
+        # 现在是 `_speak_inner` 的局部变量，验收失败时记下来，下次能分辨
+        # 「模型自己漏写了括号」还是「清洗/截断弄坏的」。
         self._m: Dict[str, Any] = {
             "last_heartbeat": 0.0,      # 最后一次心跳进来的时刻
             "last_settled": 0.0,        # 最后一次真正结算了念头
@@ -384,6 +424,7 @@ class SocialEngine:
             "last_failure": "",         # 失败在哪一步（短标签）
             "rounds": 0,                # 累计心跳轮数
             "sent_total": 0,            # 累计主动消息
+            "settle_user_errors": 0,    # 累计被跳过的坏用户数（见 settle_minds 的逐用户兜底）
             "blocked_reasons": {},      # 各闸门各拦下多少（近 N 轮滚动）
         }
         # 累计类指标从上次落盘的地方接上。`last_*` 那几个不接——它们本来就该是
@@ -393,7 +434,8 @@ class SocialEngine:
         except Exception:
             _prev = {}
         for _key in ("rounds", "sent_total", "rejected_total", "rule_total",
-                     "veto_total", "anchor_cross_user_total"):
+                     "veto_total", "anchor_cross_user_total",
+                     "settle_user_errors"):
             try:
                 self._m[_key] = int(_prev.get(_key, 0) or 0)
             except (TypeError, ValueError):
@@ -704,9 +746,16 @@ class SocialEngine:
             # 于是它会在每条主动消息的提示词里挂满 36 小时。
             if cue_text and cue_due:
                 try:
-                    anchors.add_anchor(
+                    item = anchors.add_anchor(
                         u, anchors.KIND_CUE, cue_text, due=cue_due, now=self._time()
                     )
+                    # 由头池的 schema 是「每条都带 tries」：live_anchors / mark_failed
+                    # 都读它。add_anchor 自己不写，别处都是在调用点补（prepare_round_anchors、
+                    # derive_nag 都补了），只有这一条以前漏了——读侧虽然容错不崩，
+                    # 但这条由头的重试计数与 ANCHOR_MAX_TRIES 淘汰判断就失去了意义。
+                    # 这里拿到的是**已经存进 u["anchors"] 的那个 dict**，setdefault 即生效。
+                    if isinstance(item, dict):
+                        item.setdefault("tries", 0)
                 except Exception as e:
                     self.log(f"挂时间锚点由头失败: {e}")
             # T2：对方这条里带了某件未完事的**结果** → 这件不必再回访了。
@@ -1221,7 +1270,7 @@ class SocialEngine:
             return
         if not groupflow.flow_prefilter(msg, is_command=False):
             return
-        is_quiet, asleep = self._flow_person_state(bid, now)
+        is_quiet, asleep = _person_flow_state(self, bid, now)
         # 上一波「插了没人理」的账要能随时间作废，否则这个群会被**永久**钉在退出阈值上：
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
@@ -1292,7 +1341,7 @@ class SocialEngine:
         umo = str(g.get("umo", "") or "")
         if not umo:
             return
-        is_quiet, asleep = self._flow_person_state(bid, now)
+        is_quiet, asleep = _person_flow_state(self, bid, now)
         # 上一波「插了没人理」的账要能随时间作废，否则这个群会被**永久**钉在退出阈值上：
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
@@ -1461,25 +1510,43 @@ class SocialEngine:
         return groupflow.icebreak_topics(holiday, weather)
 
     async def _run_icebreaks(self, bots: List[str], now: float) -> None:
-        """每个角色一轮最多给一个冷得最久的群破冰（别一口气把好几个群都点一遍）。"""
+        """每个角色一轮最多给一个冷得最久的群破冰（别一口气把好几个群都点一遍）。
+
+        每个角色包在自己的 try 里（与 `try_once` 的 per-bot 隔离同一套写法）：
+        一个坏群条目、一条脏群记录抛出来，只该让这个角色这一轮不破冰，
+        不该掀翻整轮心跳——异常逃到 `run()` 会触发崩溃退避（30s→30min），
+        而且每轮复发，表现就是**所有角色一起永久安静**。
+        """
         for bid in bots:
-            due = self._icebreak_pick(bid, now)
-            if not due:
-                continue
-            due.sort(key=lambda item: float(item[1].get("last_seen", 0) or 0))
-            gid, g = due[0]
-            await self._icebreak(bid, gid, g, now)
+            try:
+                due = self._icebreak_pick(bid, now)
+                if not due:
+                    continue
+                due.sort(key=lambda item: float(item[1].get("last_seen", 0) or 0))
+                gid, g = due[0]
+                await self._icebreak(bid, gid, g, now)
+            except Exception as e:
+                if throttle.allow(f"icebreak.round.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social][{bid}] 本轮破冰出错，这个角色这轮不破冰"
+                        f"（其它角色照常）：{e}" + throttle.summary(f"icebreak.round.{bid}")
+                    )
 
     def _icebreak_pick(self, bid: str, now: float) -> List[Tuple[str, Dict[str, Any]]]:
         """这个角色名下，哪些群冷场到该破冰了。返回 [(gid, g)]。"""
         if not self.cfg.group_icebreak_enabled:
             return []
         dt = self._moment_of(bid, now)
-        is_quiet = self._quiet_now(bid, dt.hour)
+        # 安静时段与「她是不是在睡」都走人物侧那道闸（与私聊/心流同一个口径，见
+        # `_flow_person_state`）。原来这里只查 quiet，漏了 asleep：深夜群里有人说话，
+        # 她照样去破冰——而「别在人家睡着时把人叫醒闲聊」正是这道闸要挡的事。
+        is_quiet, asleep = _person_flow_state(self, bid, now)
         today = dt.strftime("%Y-%m-%d")
         out: List[Tuple[str, Dict[str, Any]]] = []
         for gid, g in self.state.groups(bid).items():
-            if not g.get("umo"):
+            # 群条目可能是 null/非 dict（手改、旧版残留、外部工具写入）：
+            # 直接 `g.get()` 会让整个角色这一轮破冰报废，跳过这一个就好。
+            if not isinstance(g, dict) or not g.get("umo"):
                 continue
             if groupflow.icebreak_due(
                 g, now,
@@ -1488,31 +1555,45 @@ class SocialEngine:
                 stale_days=self.cfg.group_stale_days,
                 today=today,
                 is_quiet=is_quiet,
+                asleep=asleep,
             ):
                 out.append((gid, g))
         return out
 
     async def _run_group_topics(self, bots: List[str], now: float) -> None:
-        """G1：每个角色一轮最多在一个群里主动起个话头（不只在冷场时）。"""
+        """G1：每个角色一轮最多在一个群里主动起个话头（不只在冷场时）。
+
+        与 `_run_icebreaks` 同样按角色隔离：这条 await 在 `try_once` 末尾，
+        异常逃出去就是整轮丢失 + 崩溃退避，而且每轮复发。
+        """
         for bid in bots:
-            due = self._group_topic_pick(bid, now)
-            if not due:
-                continue
-            # 静得最久的那个群优先
-            due.sort(key=lambda item: float(item[1].get("last_bot_spoke", 0) or 0))
-            gid, g = due[0]
-            await self._icebreak(bid, gid, g, now, mode="topic")
+            try:
+                due = self._group_topic_pick(bid, now)
+                if not due:
+                    continue
+                # 静得最久的那个群优先
+                due.sort(key=lambda item: float(item[1].get("last_bot_spoke", 0) or 0))
+                gid, g = due[0]
+                await self._icebreak(bid, gid, g, now, mode="topic")
+            except Exception as e:
+                if throttle.allow(f"grouptopic.round.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social][{bid}] 本轮起话头出错，这个角色这轮不开口"
+                        f"（其它角色照常）：{e}" + throttle.summary(f"grouptopic.round.{bid}")
+                    )
 
     def _group_topic_pick(self, bid: str, now: float) -> List[Tuple[str, Dict[str, Any]]]:
         """这个角色名下，哪些群该由她主动起个话头。返回 [(gid, g)]。"""
         if not self.cfg.group_topic_enabled:
             return []
         dt = self._moment_of(bid, now)
-        is_quiet = self._quiet_now(bid, dt.hour)
+        # 同上：起话头也要看她是不是在睡，不然半夜群里冒一句「今天怎么样」。
+        is_quiet, asleep = _person_flow_state(self, bid, now)
         today = dt.strftime("%Y-%m-%d")
         out: List[Tuple[str, Dict[str, Any]]] = []
         for gid, g in self.state.groups(bid).items():
-            if not g.get("umo"):
+            # 同上：坏群条目只跳过它自己，别让整个角色这一轮起不了话头。
+            if not isinstance(g, dict) or not g.get("umo"):
                 continue
             if groupflow.group_topic_due(
                 g, now,
@@ -1521,6 +1602,7 @@ class SocialEngine:
                 stale_days=self.cfg.group_stale_days,
                 today=today,
                 is_quiet=is_quiet,
+                asleep=asleep,
             ):
                 out.append((gid, g))
         return out
@@ -1731,70 +1813,97 @@ class SocialEngine:
 
         ready: List[Tuple[str, Dict[str, Any], float]] = []
         for uid, u in users.items():
-            if not u.get("umo"):
+            # 一个用户坏掉不能带走这一轮里其它用户。下面的每一步都在读/写这个人的
+            # 持久化字段（settle_pending / decay_streak / interest_level / settle），
+            # 而 state.json 里的字段可能被手改或跨版本迁移写坏；`u` 本身甚至可能是
+            # null（非 dict）。以前这里没有 try：一次 ValueError/AttributeError 直接
+            # 逃出 settle_minds，整个角色这一轮**所有人**都不结算（try_once 外面那道
+            # per-bot 兜底只保证别的角色照常）。
+            #
+            # 但不静默吞掉：记一次数、打一条限流日志——「哪个人坏了、坏在哪」必须查得到，
+            # 否则表现只是「有些人永远收不到消息」，没人能排。
+            try:
+                if not isinstance(u, dict):
+                    # state.json 里这个人被写坏了（null/字符串/数字）：这不是「没配 umo」
+                    # 那种正常跳过，扔进下面的异常分支记一笔，别让这个人无声无息地永不结算。
+                    raise TypeError(f"用户状态不是 dict：{type(u).__name__}")
+                if not u.get("umo"):
+                    continue
+                if self.state.is_send_blocked(bid, uid, now):
+                    # 发送隔离期内（非好友/不支持主动消息等）：不攒念头、不选中，避免反复撞失败
+                    continue
+
+                # 上次主动联系有没有被接住（对方再也没回的情况在这里结算）
+                self.state.settle_pending(bid, uid, now, reply_window)
+                # 被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」，
+                # 而不是从此对这个人永久静默
+                desire.decay_streak(u, now)
+
+                affection = None
+                if core_root is not None:
+                    try:
+                        snap = self.core.load_snapshot(bid, uid, root=core_root)
+                        if snap:
+                            affection = snap.get("affection")
+                            self._sync_peer_said(u, snap.get("said"))
+                    except Exception as e:
+                        self.log(f"加载用户 {uid} Core 快照失败: {e}")
+
+                target = desire.interest_level(
+                    u, affection, weigh_reply_rate=self.cfg.adaptive_reply_rate
+                )
+                desire.smooth_interest(u, target, now)
+
+                rhythm = (
+                    desire.rhythm_factor(u, dt.hour)
+                    if self.cfg.respect_user_rhythm
+                    else 1.0
+                )
+                cue = live_cue(u, now) if self.cfg.cue_followup else None
+                urge = desire.settle(
+                    u,
+                    now,
+                    refill_hours=self.cfg.urge_refill_hours,
+                    recent_talk_seconds=self.cfg.recent_talk_minutes * 60,
+                    mood_factor=mood,
+                    rhythm=rhythm,
+                    quiet=quiet,
+                    live_cue=bool(cue),
+                )
+                # 念头天花板：只防长期不结算攒出离谱值；克制由 effective_gate 按 streak 抬门槛承担。
+                cap = desire.URGE_CEILING
+                if urge > cap:
+                    # 被冷落够了，没正事就攒不过这道坎
+                    u["urge"] = round(cap, 4)
+                    urge = cap
+                    self.state.mark_dirty()  # cap 改了内存 urge 就落盘，否则这轮无人 ready 时不写盘
+                # 到点的由头本身就是一次念头落地：「想起一件具体的事」不需要再等时候攒满
+                if cue:
+                    urge = max(urge, desire.FIRE_THRESHOLD)
+                    qualified = urge >= min_urge
+                elif min_urge >= desire.FIRE_THRESHOLD:
+                    # 自动循环：随机门槛只调节节奏快慢，由 effective_gate 压在天花板之内。
+                    # 不能直接拿 fire_gate 比——cap 在下、gate 在上时念头永远够不着，
+                    # 而 gate 只在发送成功后重抽，等于把这个人永久锁死。
+                    qualified = urge >= desire.effective_gate(u, cap)
+                else:
+                    # 手动触发（min_urge 降到 0）：把所有人都列出来给主人看
+                    qualified = urge >= min_urge
+                if qualified:
+                    ready.append((uid, u, urge))
+            except Exception as e:
+                metrics = getattr(self, "_m", None)
+                if isinstance(metrics, dict):
+                    metrics["settle_user_errors"] = (
+                        int(_num(metrics.get("settle_user_errors"))) + 1
+                    )
+                if throttle.allow(f"settle.user.{bid}.{uid}"):
+                    logger.warning(
+                        f"[autonomous_social][{bid}] 结算用户 {uid} 的念头出错，本轮跳过"
+                        f"这个人（其它用户照常）：{e}"
+                        + throttle.summary(f"settle.user.{bid}.{uid}")
+                    )
                 continue
-            if self.state.is_send_blocked(bid, uid, now):
-                # 发送隔离期内（非好友/不支持主动消息等）：不攒念头、不选中，避免反复撞失败
-                continue
-
-            # 上次主动联系有没有被接住（对方再也没回的情况在这里结算）
-            self.state.settle_pending(bid, uid, now, reply_window)
-            # 被冷落封顶后晾了很久：把冷落计数往回退，让她「算了再找一次」，
-            # 而不是从此对这个人永久静默
-            desire.decay_streak(u, now)
-
-            affection = None
-            if core_root is not None:
-                try:
-                    snap = self.core.load_snapshot(bid, uid, root=core_root)
-                    if snap:
-                        affection = snap.get("affection")
-                        self._sync_peer_said(u, snap.get("said"))
-                except Exception as e:
-                    self.log(f"加载用户 {uid} Core 快照失败: {e}")
-
-            target = desire.interest_level(
-                u, affection, weigh_reply_rate=self.cfg.adaptive_reply_rate
-            )
-            desire.smooth_interest(u, target, now)
-
-            rhythm = (
-                desire.rhythm_factor(u, dt.hour)
-                if self.cfg.respect_user_rhythm
-                else 1.0
-            )
-            cue = live_cue(u, now) if self.cfg.cue_followup else None
-            urge = desire.settle(
-                u,
-                now,
-                refill_hours=self.cfg.urge_refill_hours,
-                recent_talk_seconds=self.cfg.recent_talk_minutes * 60,
-                mood_factor=mood,
-                rhythm=rhythm,
-                quiet=quiet,
-                live_cue=bool(cue),
-            )
-            # 念头天花板：只防长期不结算攒出离谱值；克制由 effective_gate 按 streak 抬门槛承担。
-            cap = desire.URGE_CEILING
-            if urge > cap:
-                # 被冷落够了，没正事就攒不过这道坎
-                u["urge"] = round(cap, 4)
-                urge = cap
-                self.state.mark_dirty()  # cap 改了内存 urge 就落盘，否则这轮无人 ready 时不写盘
-            # 到点的由头本身就是一次念头落地：「想起一件具体的事」不需要再等时候攒满
-            if cue:
-                urge = max(urge, desire.FIRE_THRESHOLD)
-                qualified = urge >= min_urge
-            elif min_urge >= desire.FIRE_THRESHOLD:
-                # 自动循环：随机门槛只调节节奏快慢，由 effective_gate 压在天花板之内。
-                # 不能直接拿 fire_gate 比——cap 在下、gate 在上时念头永远够不着，
-                # 而 gate 只在发送成功后重抽，等于把这个人永久锁死。
-                qualified = urge >= desire.effective_gate(u, cap)
-            else:
-                # 手动触发（min_urge 降到 0）：把所有人都列出来给主人看
-                qualified = urge >= min_urge
-            if qualified:
-                ready.append((uid, u, urge))
 
         if ready:
             self.state.mark_dirty()
@@ -1816,19 +1925,10 @@ class SocialEngine:
 
         私聊侧五道闸都查了这两项，只有群心流漏了；而群心流是事件驱动的（群消息一到
         就走，不经过心跳），于是深夜群里有人说话她照样插一句。
+
+        实现统一在模块级的 `_person_flow_state`（那里对缺失的依赖降级）。
         """
-        asleep = False
-        try:
-            body = self.core.bot_self_state(bid)
-            self._remember_night(bid, body)
-            asleep = bool((body or {}).get("asleep"))
-        except Exception:
-            body = None
-        try:
-            is_quiet = self._quiet_now(bid, self._moment_of(bid, now).hour)
-        except Exception:
-            is_quiet = False
-        return is_quiet, asleep
+        return _person_flow_state(self, bid, now)
 
     def _remember_night(self, bid: str, body: Optional[Dict[str, Any]]) -> None:
         """记下 Core 算出的生物钟夜。读不到就清掉，退回插件自己的配置。"""
@@ -1941,6 +2041,18 @@ class SocialEngine:
         u["loop_expire_at"] = _num(newest.get("expire_at")) if newest else 0.0
         u["loop_retry_at"] = 0.0
         u["loop_tries"] = 0
+
+    def _closer_marker(self, u: Dict[str, Any], sent_ts: float) -> float:
+        """记下「这条主动消息是冲谁去的」，供收场判断用。
+
+        `threads.closer_reason` 拿这个值跟 `last_sent` **按等值**比较
+        （`closer_for == sent` 就认为这条已经收过场了），所以两边必须是同一个数。
+        `last_sent` 由 `state.record_outgoing` 自己取一次时钟写下，而 `sent_ts` 是
+        发送前在 `_speak_inner` 里另取的一次——两次取时钟可能差一个 tick（Windows 上
+        粗粒度时钟尤其容易），一差等值守卫就失效，同一条消息会被反复当成「该收场」
+        的候选。所以统一以刚落盘的 `last_sent` 为准，取不到才退回 `sent_ts`。
+        """
+        return _num(u.get("last_sent")) or sent_ts
 
     @staticmethod
     def _is_unreachable_error(err: str) -> bool:
@@ -2092,7 +2204,7 @@ class SocialEngine:
         """
         # 身体在睡就不是「概率打折」的问题：把人从睡梦中叫醒闲聊不是拟人，是打扰。
         # 作息与安静时段同样的教训：这类东西做成权重会漏，必须是闸。
-        if body and body.get("asleep"):
+        if _body_asleep(body):
             return "她正在睡觉"
         # C5/D4：Core 那边的情绪也参与——她正在冷静期就不找这个人；
         # 对这个人的气还没消（攻击性远高于基线）也不找。
@@ -2151,7 +2263,7 @@ class SocialEngine:
         真人追问恰恰发生在「刚聊完」之后，拿「不久前才说过话」去挡它，等于把
         这条路径永远堵死。同理不查对方作息：TA 几分钟前还在说话，这个点肯定醒着。
         """
-        if body and body.get("asleep"):
+        if _body_asleep(body):
             return "她正在睡觉"
         # 「刚聊过」也要拦。追问与「在吗」都是**接续型**——对方刚说完话就追一句
         # 是打断。对方一小时一条「在吗」，她每两小时（最小间隔一过）追问一次，
@@ -2242,7 +2354,7 @@ class SocialEngine:
         22:52 就收到一句「晚安，今天过得怎么样呀」。晚安本身豁免——对方要睡了，回一句
         晚安是合理的。
         """
-        if body and body.get("asleep"):
+        if _body_asleep(body):
             return "她正在睡觉"
         if kind != "night" and sleep_signal(u, now):
             return "TA 说过要去睡了，这时发过去不合适"
@@ -2394,7 +2506,7 @@ class SocialEngine:
                 continue
             if self._quiet_now(bid, hour):
                 continue
-            if body and body.get("asleep"):
+            if _body_asleep(body):
                 continue
             # 只问候最近有来往的人：对素未谋面或早就不聊的人道早安，像定时群发
             if now - self._last_said(u) > GREET_FRESH_SECONDS:
@@ -2436,7 +2548,7 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """回访那件事的闸门：不看 recent_talk（那件事本来就是聊出来的），但要等这场话凉下来。"""
-        if body and body.get("asleep"):
+        if _body_asleep(body):
             return "她正在睡觉"
         # 以前只有另起话题查「TA 说过要去睡」，于是 09:00 说完「我出门了」，
         # 09:20 就收到「你上次说的那个体检后来咋样」。
@@ -2521,7 +2633,7 @@ class SocialEngine:
             if not hits:
                 continue
             # 兑现的场合比随口搭话正经：她正在等对方 asleep 或安静时段时先不说
-            if body and body.get("asleep"):
+            if _body_asleep(body):
                 continue
             if self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
@@ -2562,7 +2674,7 @@ class SocialEngine:
                 continue
             if self._miss_sent_today(u, day) >= cap:
                 continue
-            if body and body.get("asleep"):
+            if _body_asleep(body):
                 continue
             if self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
@@ -2669,7 +2781,7 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """收场那句的闸门：它存在的意义恰恰是绕过「上一条没人回」，所以不查那条。"""
-        if body and body.get("asleep"):
+        if _body_asleep(body):
             return "她正在睡觉"
         hour = self._moment_of(bid, now).hour
         if self._quiet_now(bid, hour):
@@ -2766,7 +2878,7 @@ class SocialEngine:
             logger.warning(f"[autonomous_social] dry-run 读 Core 失败: {exc}")
 
         bots = [b for b, x in self.state.data.get("bots", {}).items()
-                if (x.get("users") or {})]
+                if ((x if isinstance(x, dict) else {}).get("users") or {})]
         total = ready = 0
         for bid in bots:
             bot_state = None
@@ -2859,9 +2971,12 @@ class SocialEngine:
         # UMO 就能让这个 bot 下**所有**用户停止攒念头（180 人规模实测就是这么零发送的）。
         # 现在没有这层探测：provider 真正取不到时由 _compose 报（已按 bid 节流），
         # 状态页的「LLM 生成」行也看得见。
+        # 这里在所有 try 之外：state.json 里任一 `bots[bid]` 是 null/非 dict
+        # （手改、旧版残留、外部工具写入）时 `x.get` 会抛 AttributeError，
+        # 每轮心跳都抛、退避 30 分钟且永久复发 —— 引擎彻底不工作，面板还显示「启用」。
         bots = [
             b for b, x in self.state.data.get("bots", {}).items()
-            if (x.get("users") or {})
+            if ((x if isinstance(x, dict) else {}).get("users") or {})
         ]
         if not bots:
             return
@@ -2990,7 +3105,7 @@ class SocialEngine:
         self._m["last_ready"] = len(anchored) + len(greets)
         self._m["last_candidate"] = (len(anchored) + len(greets) + len(threads)
                                      + len(loops) + len(promises) + len(closers)
-                                     + len(misses))
+                                     + len(misses) + len(intimacies))
 
         # ⚠️ 早退条件必须**逐个列出**所有候选桶。漏掉 misses 时，念想通道虽然被收集了
         # 却永远走不到发送段（它在最后面），表现是「好感 90% 的人一条都收不到」。
@@ -2999,10 +3114,16 @@ class SocialEngine:
             self.log("没有人攒够念头，本轮只是把时间补算上")
             # 没人可找时仍可能有冷群该破冰（破冰走群数据，不依赖 per-user 念头）
             if self.cfg.group_icebreak_enabled:
-                await self._run_icebreaks(bots, now)
+                try:
+                    await self._run_icebreaks(bots, now)
+                except Exception as e:
+                    self.log(f"群破冰这一轮出错（不影响其它流程）：{e}")
             # G1：没冷场也可能该由她主动起个话头。
             if self.cfg.group_topic_enabled:
-                await self._run_group_topics(bots, now)
+                try:
+                    await self._run_group_topics(bots, now)
+                except Exception as e:
+                    self.log(f"群起话头这一轮出错（不影响其它流程）：{e}")
             # 早退也要落指标。`last_heartbeat` 是在 try_once 开头写进内存的，而落盘只
             # 发生在下面的发送段——于是**安静的时候仪表盘永远是死的**（last_heartbeat=0、
             # sent_total=0），而那恰恰是最需要它说话的时候：主人正要确认「她到底跑没跑」。
@@ -3030,10 +3151,11 @@ class SocialEngine:
             require_about_peer: bool = False,
             post: Optional[Any] = None,
         ) -> Dict[str, Any]:
+            # 不再把 `u` 塞进 job：`speak` 拿到锁之后会自己重新取一次
+            # （`self.state.user(bid, uid)`），job 里那个引用是等锁前的旧快照。
             return {
                 "bid": bid,
                 "uid": uid,
-                "u": u,
                 "urge": urge,
                 "preset": preset,
                 "note": note,
@@ -3058,10 +3180,12 @@ class SocialEngine:
             note = job["note"]
             if budget.get(bid, 0) <= 0:
                 return False
-            # 锁在这一层，而不是每个调用点：`_speak` 里有 LLM 调用（秒级），这段时间里
-            # `observe` 可以从另一个协程插进来改**同一个** user dict（收到新消息会清
-            # urge、刷 last_seen、追加 conversation）。不锁的后果不是崩，是慢慢漂：
-            # urge 少加一点、last_seen 被覆盖、conversation 顺序错乱。
+            # 短临界区：只做「检查 + 占位 + 取 u」。`_speak` 里有两次 LLM 调用
+            # （秒级~数十秒），锁跨过它们就会把 `observe` 堵在锁上（它是
+            # EventMessageType.ALL 的入口，同一个人连发两条消息时第二条要等第一条
+            # 生成+发送完），而且第一条的 `record_outgoing` 会把 out 记在 in 前面，
+            # conversation 顺序倒置 —— 正是这段注释声称要防的事，实际由锁的粒度造成。
+            # 所以生成/发送放锁外，写回（退还/记账）时再取一次锁（读改写分离）。
             # 锁是 per-(bot,uid) 的，所以发 A 的时候不会把发 B 一起堵住。
             async with self._user_lock(bid, uid):
                 if budget.get(bid, 0) <= 0 or (bid, uid) in served:
@@ -3081,12 +3205,22 @@ class SocialEngine:
                     preset_meta.setdefault("_interest", u.get("interest"))
                     preset_meta.setdefault("_message_count", u.get("message_count", 0))
                     preset_meta.setdefault("_avg_reply_seconds", u.get("avg_reply_seconds", 0.0))
+            try:
                 sent, result = await self._speak(
                     bid, uid, u, job["urge"], now, preset=preset,
                     require_about_peer=job["require_about_peer"],
                 )
-                if not sent:
-                    # 没发成：把占的位和名额都还回去，让后面的候选还有机会。
+            except BaseException:
+                # 生成/发送抛异常时把占的位和名额还回去：调用方只记一行
+                # 「发送任务异常」，没人归还的话这一轮这个人和这个角色都被占死，
+                # 后面的候选跟着少发。退还之后再抛，别把异常吞掉。
+                async with self._user_lock(bid, uid):
+                    served.discard((bid, uid))
+                    budget[bid] += 1
+                raise
+            if not sent:
+                # 写回（重新取锁）：没发成就把占的位和名额都还回去，让后面的候选还有机会。
+                async with self._user_lock(bid, uid):
                     served.discard((bid, uid))
                     budget[bid] += 1
             self.log(f"{note}{uid} → {result}")
@@ -3099,7 +3233,10 @@ class SocialEngine:
             self._note_decision(uid, f"发了：{note}")
             post = job.get("post")
             if post is not None:
-                post()
+                # post 直接改 user dict（念想写 miss_day、想要了写 intimacy_asked_at），
+                # 与 observe 的记账共用一把锁。
+                async with self._user_lock(bid, uid):
+                    post()
             if budget.get(bid, 0) > 0:
                 # 这一轮还会找下一个人：稍微隔开几秒，别一口气把所有话说完
                 await asyncio.sleep(random.uniform(2.0, 5.0))
@@ -3332,11 +3469,19 @@ class SocialEngine:
 
         # 群冷场破冰：每个角色一轮最多给一个冷群破冰，别一口气把好几个群都点一遍。
         # 破冰与私聊发送各走各的配额，不与 per-user 互抢。
+        # 这两条 await 在整轮的最末尾：异常逃出去 = 这一轮白跑 + `run()` 崩溃退避
+        # （30s→30min），而且每轮复发。runner 内部已经按角色隔离，这里再兜一层。
         if self.cfg.group_icebreak_enabled:
-            await self._run_icebreaks(bots, now)
+            try:
+                await self._run_icebreaks(bots, now)
+            except Exception as e:
+                self.log(f"群破冰这一轮出错（不影响其它流程）：{e}")
         # G1：不只在冷场时——她也可以在群里主动起个新话头。
         if self.cfg.group_topic_enabled:
-            await self._run_group_topics(bots, now)
+            try:
+                await self._run_group_topics(bots, now)
+            except Exception as e:
+                self.log(f"群起话头这一轮出错（不影响其它流程）：{e}")
 
     async def _speak(
         self,
@@ -3389,6 +3534,12 @@ class SocialEngine:
         preset 用于「跟进断掉的话」：那条的动机不是从念头里长出来的，不能交给
         generate_reason 重新找一个开口的理由。
         """
+        # `now` 是这一**轮**心跳开始时刻，而一轮里前面的人各跑了两次 LLM，
+        # 轮到这个人时它可能已经是几十秒到几分钟前。下面的闸门与记账
+        # （`_track_aggression` 写 `aggr_note_at`、`_note_giveup` 写 `quiesced_at`）
+        # 都当它是「现在」用，与同一函数里其它 `self._time()` 的口径分裂。
+        # 这里重取一次，全函数统一；轮次指标仍用 `try_once` 那个 now。
+        now = self._time()
         umo = str(u.get("umo", "") or "")
         if not umo:
             return False, "没有可用的会话来源（umo），发不出去"
@@ -3583,6 +3734,18 @@ class SocialEngine:
             """
             self._defer_cue_only(u, reason_meta)
 
+        def fail_anchor() -> None:
+            """这条由头这次没能说成（后续段验收不过 / 后续段撞车）：记一次失败。
+
+            `defer_cue()` 只推 cue/loop 的重试节奏，对普通由头
+            （`category=="anchor"` 且 `kind != KIND_CUE`）是**空操作**：少了这一步，
+            同一条由头下一轮心跳会被重新挑中、再跑一遍完整 LLM，模型持续产出坏尾段
+            时每轮复发，直到 14 天 TTL —— 一条都发不出去却持续烧 token。
+            """
+            _ra = (reason_meta or {}).get("anchor")
+            if isinstance(_ra, dict) and _ra.get("about"):
+                anchor_mod.mark_failed(u, str(_ra.get("about")), self._time())
+
         thread_anchor = self._last_said(u)
         # 从现在起她开始写话了：报「正在输入」。放到这一行而不是函数开头——前面
         # 全是本地的闸门与准备，没过闸门就返回的话不该点灯。
@@ -3595,6 +3758,10 @@ class SocialEngine:
         # 承诺只从 decide 的结构化输出里取（generate 路径没有那行 >），所以两条分支
         # 都得有这个变量——原来只在 llm_gate 分支里定义，关掉闸门时下面读它会 NameError。
         decision = None
+        # 清洗前的原始模型输出。**必须是局部变量**：原来存在 `self._raw_generated`
+        # 这个实例级单字段上，`batch_send_concurrency=3` 时 A 的验收失败日志与
+        # `last_rejected` 可能是 B 的原文，跨用户内容串台、还会经状态页显示给主人。
+        raw_generated = ""
         # 记忆联动：装了记忆插件就先把这个人的长期记忆拉出来，揉进这次生成。
         memory_note = await self._fetch_memory_note(umo, uid)
         if allow_veto and self.cfg.llm_gate:
@@ -3609,7 +3776,7 @@ class SocialEngine:
                         f"[autonomous_social] 判断该不该说时出错: {e}"
                         + throttle.summary(f"speak.decide.{bid}")
                     )
-            self._raw_generated = str(getattr(decision, "raw_text", "") or "")
+            raw_generated = str(getattr(decision, "raw_text", "") or "")
             if decision is None:
                 # LLM 不可用/退避中/超时：这是基础设施故障，不是「模型觉得不该说」。
                 # 两者走同一条 defer_cue 会把一个真实的由头（如「明天面试」）静默作废：
@@ -3716,13 +3883,13 @@ class SocialEngine:
                 ok, why = False, hit
         if not ok:
             self._m["last_failure"] = f"[{bid}] 验收不过：{why}"
-            self._m["last_rejected"] = (self._raw_generated or parts[0])[:200]
+            self._m["last_rejected"] = (raw_generated or parts[0])[:200]
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
             self._m["rule_total"] = int(self._m.get("rule_total", 0)) + 1
             if throttle.allow("verify.rejected", window=1800.0):
                 logger.info(
                     f"[autonomous_social][{bid}] 验收不过，未发送：{why}｜"
-                    f"原文：{(self._raw_generated or parts[0])[:120]!r}"
+                    f"原文：{(raw_generated or parts[0])[:120]!r}"
                     + throttle.summary("verify.rejected")
                 )
             # 记下来，主人能在状态页/主动消息记录里看到「本来要发什么、被哪条拦下」
@@ -3770,6 +3937,9 @@ class SocialEngine:
                 )
             u["last_rejected"] = seg_why
             self.state.mark_dirty()
+            # 这条由头这次是「她驾驭不了这句话」，得记一次失败——否则 `defer_cue()`
+            # 对普通由头是空操作，下一轮会被重新挑中，每轮复发。
+            fail_anchor()
             defer_cue()
             return False, f"后续段验收不过：{seg_why}"
         # 后续段的跨用户撞车也补一道：旧版只拿 parts[0] 比，补发的段会绕过去。
@@ -3783,6 +3953,8 @@ class SocialEngine:
                     self._m["last_failure"] = f"[{bid}] 后续段和发给别人的太像：{hit}"
                     u["last_rejected"] = hit
                     self.state.mark_dirty()
+                    # 同上：这件事该换一件，记一次失败，别每轮重试同一条由头。
+                    fail_anchor()
                     defer_cue()
                     return False, hit
         # 配额在**发送之前**占掉，且与发送之间不留 await（见 `_hourly_reserve`）。
@@ -3795,8 +3967,13 @@ class SocialEngine:
             # 发送失败是可以重试的（换一轮心跳、换个时间再来），但不该拿掉这件事
             # 本身——所以推的是 retry_at，寿命 expire_at 不动。
             self._defer_cue_only(u, reason_meta)
-            self._mark_send_failed(u, platform_side=self._platform_problem(err or ""))
-            self._note_giveup(u, bid, self._time())
+            platform_side = self._platform_problem(err or "")
+            self._mark_send_failed(u, platform_side=platform_side)
+            # 平台侧的问题（适配器没就绪/不支持主动消息/抖动）与「他」无关：
+            # 无条件计 giveup 时，两次这样的失败就把**低档**用户写 `quiesced_at`，
+            # 而它只由「对方先开口」解除 —— 平台恢复后她再也不主动找这个人。
+            if not platform_side:
+                self._note_giveup(u, bid, self._time())
             self._m["last_failed"] = self._time()
             self._m["last_failure"] = f"[{bid}] 发送失败：{(err or '原因未知')[:70]}"
             # 只在平台明确说「这个人发不了」（非好友/已注销）时才隔离。平台没就绪、
@@ -3895,7 +4072,7 @@ class SocialEngine:
             u["cue_retry_at"] = 0.0
             u["cue_tries"] = 0
         elif category == "closer":
-            u["closer_for"] = float(u.get("last_sent", 0) or 0) or sent_ts
+            u["closer_for"] = self._closer_marker(u, sent_ts)
             u["closer_at"] = sent_ts
         elif category == "greet":
             # 今天这个窗口已经问候过：记下日期与种类，同一窗口不再发第二遍
@@ -3903,8 +4080,10 @@ class SocialEngine:
             u["greet_day"] = self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
             u["greet_at"] = sent_ts
             # 问候本来就是「不用回」的话（晚安没人理很正常）：预先记成已收场，
-            # 别让收场路径 8 小时后给一句没被回的早安补「没事 我就是随口一说」
-            u["closer_for"] = sent_ts
+            # 别让收场路径 8 小时后给一句没被回的早安补「没事 我就是随口一说」。
+            # 与 closer 分支走同一个标记助手，免得写成 sent_ts 与 last_sent 不等值，
+            # 让 closer_reason 的等值守卫失效（等于预告收场没生效）。
+            u["closer_for"] = self._closer_marker(u, sent_ts)
         bot = self.state.bot(bid)
         bot["last_global_send"] = sent_ts
         self.state.save()
@@ -4183,7 +4362,12 @@ class SocialEngine:
                     # 的真实记账一起抹掉。只有真被改过的那几个人才需要还原。
                     if not isinstance(cur, dict) or cur == snap:
                         continue
-                    live[uid] = snap
+                    # **逐字段就地还原，不换 dict**：`live[uid] = snap` 会把 live 树里
+                    # 那个 dict 换成快照副本，而并发 `_speak_inner` 手里还攥着旧引用
+                    # （它在锁外跑两次 LLM），后续所有 per-user 记账会写进一个已经不在
+                    # 树里的 dict，然后被 GC —— 用户收到了消息，一半记账在盘上、一半蒸发。
+                    cur.clear()
+                    cur.update(snap)
 
     async def _preview_run(self, bid: str, now: float, uid_filter: str) -> str:
         """（预览实现，无副作用）拼上下文、调模型拿一句，不发送不改状态。"""
@@ -4284,7 +4468,7 @@ class SocialEngine:
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
-            if body and body.get("asleep"):
+            if _body_asleep(body):
                 continue
             if self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
@@ -4296,8 +4480,17 @@ class SocialEngine:
             try:
                 if self.gate_reason(bid, uid, u, now, body):
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                # 闸门自己出错时**绝不能当「过了」**：原来这里 `except: pass`，
+                # 等于一个坏字段就让「想要了」这条通道整体绕过闸门。
+                # 宁可这个人这一轮不选，也不能绕过。
+                if throttle.allow(f"intimacy.gate.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social][{bid}] {uid} 的闸门判断出错，"
+                        f"跳过这个人（不绕过闸门）：{e}"
+                        + throttle.summary(f"intimacy.gate.{bid}")
+                    )
+                continue
             snap = None
             try:
                 snap = self.core.load_snapshot(bid, uid, root=core_root) if core_root else None
@@ -4500,9 +4693,14 @@ class SocialEngine:
                 )
                 continue
             try:
-                sent, note = await self._speak(
-                    bid, uid, u, urge, now, allow_veto=False
-                )
+                # 取 per-(bot,uid) 锁：手动触发与并发心跳可能同时挑中同一个人，
+                # 两边都过 gap/pending 检查就会各发一条（也绕过 observe 的互斥）。
+                # 手动触发本身有 60 秒限频，锁内跑一次 LLM 可以接受。
+                async with self._user_lock(bid, uid):
+                    u = self.state.user(bid, uid)
+                    sent, note = await self._speak(
+                        bid, uid, u, urge, now, allow_veto=False
+                    )
             except Exception as e:
                 # 单个人失败不该让整次触发报废：记一笔，继续试下一个
                 self.log(f"手动触发 {uid} 异常：{e}")
@@ -4515,6 +4713,7 @@ class SocialEngine:
                 return note
             tried.append(f"{uid}：{note}")
         return "候选都试过了，没发出去：" + "；".join(tried)
+
     async def _send_message(self, target: str, text: str) -> None:
         """发送消息，兼容多种 API。
 
@@ -4599,15 +4798,44 @@ class SocialEngine:
                     unknown=True,
                 ) from e
             except Exception as e:
+                # 与 MessageChain 路径同构：这里异常发生在**调用之后**（回执处理/
+                # 序列化阶段才炸），消息可能已经送达 —— 标 `unknown=True`，
+                # `_send_with_retry` 就不会再发一遍（否则用户收到两条一样的话）。
                 raise _SendFailed(
-                    f"context.send_message 调用失败: {e}",
+                    f"context.send_message 调用失败（结果未知，不重发）: {e}",
                     peer_unreachable=self._is_unreachable_error(str(e)),
+                    unknown=True,
                 ) from e
 
         # 方式2: 通过 platform 客户端发送（旧版兼容）
         if hasattr(self.context, "platform") and hasattr(self.context.platform, "send_message"):
-            await self.context.platform.send_message(target, text)
-            return
+            # 与方式1 同构的异常分类。原来这里是**裸 await**：旧版部署走这条路时，
+            # 「非好友/已注销」变成通用异常 → `_send_with_retry` 视为可重试且
+            # `peer_unreachable=False` → 该用户永不被隔离（每轮重试、每轮一次 LLM），
+            # 同时把 bid 级熔断累到让整个角色停发。
+            try:
+                await self.context.platform.send_message(target, text)
+                return
+            except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                # 投递结果未知：消息可能已经送达，不能再发一遍。
+                raise _SendFailed(
+                    f"platform.send_message 发送超时或连接中断，结果未知（不重发）: "
+                    f"{type(e).__name__}: {e}",
+                    unknown=True,
+                ) from e
+            except Exception as e:
+                _err_text = str(e)
+                if self._is_unreachable_error(_err_text):
+                    # 平台明确说「这个人发不了」：消息**确定没送达**，据此隔离该用户。
+                    raise _SendFailed(
+                        f"platform.send_message 调用失败: {_err_text}",
+                        peer_unreachable=True,
+                    ) from e
+                # 其余异常来自发送本身：结果未知，不重发（否则用户收到两条一样的）。
+                raise _SendFailed(
+                    f"platform.send_message 调用失败（结果未知，不重发）: {_err_text}",
+                    unknown=True,
+                ) from e
 
         # 方式3: 兜底
         raise _SendFailed("无法找到可用的发送消息 API")
@@ -4765,7 +4993,10 @@ class SocialEngine:
             for idx, text in enumerate(rest):
                 wait = waits[idx] if idx < len(waits) else random.uniform(1.5, 3.5)
                 await asyncio.sleep(max(0.0, wait))
-                if not self.running:
+                # 与群版（`_send_group_burst_followup`）一致：插件停了**或已停用**
+                # 都不该再补发。只查 `self.running` 时，配置里关掉 enabled
+                # 也照样把剩下的旧话一条条发出去。
+                if not self.running or not self.cfg.enabled:
                     return
                 if self.send_breaker_left(bid) > 0:
                     return
@@ -5523,7 +5754,11 @@ class SocialEngine:
     async def status_text(self) -> str:
         """获取插件状态文本。"""
         bots = self.state.data.get("bots", {})
-        users = sum(len(x.get("users", {})) for x in bots.values())
+        # 面板是排障第一入口：一个 null/非 dict 的 bot 条目不该让它整体报错。
+        users = sum(
+            len((x if isinstance(x, dict) else {}).get("users", {}))
+            for x in bots.values()
+        )
         total_sent = 0
         total_replied = 0
         for bot_data in bots.values():

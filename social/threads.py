@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import random
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .clock import city_epoch, city_now
@@ -39,13 +40,29 @@ ACTIVE_CHAT_MIN_MSGS = 2
 THREAD_CONTEXT_MIN = 2
 
 
+def _is_inbound(item: Any) -> bool:
+    """这条账是不是**对方说的**。
+
+    口径统一在这里：`dir == "out"` 才是她自己说的，**缺 `dir` 一律算对方说的**。
+    写侧（state 的 record_incoming / record_outgoing、engine 归档历史）一律显式带 dir，
+    所以缺 dir 只可能是老数据；老数据的 conversation 来自「只记对方说过的话」那会儿，
+    而且 `engine` 归一化历史时写的就是「不是 out 就是 in」。
+
+    统一到「缺 dir 当对方说的」比统一到「当自己说的」安全得多：前者最多多看一句
+    对方说过的话，后者会把对方真说过的那句当成她自己的而整条丢掉——`last_in_text`
+    会因此判不出「回得敷衍」，`recent_exchange` 会退化成空。全库其余地方
+    （anchors / reasoning / style_profile）也都是「只认 == "out" 是她说的」。
+    """
+    return isinstance(item, dict) and str(item.get("dir", "") or "") != "out"
+
+
 def last_in_text(user: Dict[str, Any], now: float, within_seconds: float) -> str:
     """对方最近一句说了什么（跳过她自己说的话）。找不到就返回空串。
 
     判「回得敷衍」必须看**对方**那句，而账本里最后一条往往是她自己的回复。
     """
     for item in reversed(user.get("conversation") or []):
-        if str(item.get("dir") or "") != "in":
+        if not _is_inbound(item):
             continue
         try:
             ts = float(item.get("ts", 0) or 0)
@@ -129,8 +146,7 @@ def thread_reason(
     # （半小时内两条以上），那就是聊得正热，不是断了。
     recent_in_count = sum(
         1 for item in (user.get("conversation") or [])
-        if isinstance(item, dict)
-        and str(item.get("dir", "")) != "out"
+        if _is_inbound(item)
         and 0 < now - _num(item.get("ts", 0)) <= ACTIVE_CHAT_WINDOW
     )
     if recent_in_count >= ACTIVE_CHAT_MIN_MSGS:
@@ -206,7 +222,7 @@ _LOOP_WORDS = (
     "面试", "考试", "答辩", "汇报", "演讲", "宣讲", "培训", "复查", "体检", "手术",
     "看诊", "挂号", "打针", "拆线", "检查结果", "报告", "成绩", "分数", "录取",
     "offer", "入职", "离职", "跳槽", "转正", "评审", "上线", "交付", "验收",
-    "搬家", "退租", "看房", "装修", "出差", "旅行", "旅游", "到家", "开学",
+    "搬家", "退租", "看房", "装修", "出差", "旅行", "旅游", "开学",
     "比赛", "约了", "在弄", "在改", "在写", "在等", "等结果", "等通知",
     "吵架", "分手", "表白", "闹翻", "冷战", "相亲", "复合", "摊牌",
     "坏了", "丢了", "找不到", "弄砸",
@@ -218,16 +234,61 @@ _LOOP_WORDS = (
 # 而「面试还没消息，已经等了好几天」「后来一直没消息」恰恰是**还开着**的线索 ——
 # 时间副词只说明过了多久，不说明有结果。混在一起会把还开着的线索直接关掉，
 # 于是那件事再也不会被回访（`loops_resolved_by` 也拿它当「已经有结果了」的判据）。
-_LOOP_CLOSED = (
-    "完了", "搞定", "结束", "黄了", "过了", "通过", "挂掉", "没通过", "算了",
+#
+# 光有词表还不够：`word in body` 是**无词边界子串匹配**，而「通过 / 过了 / 算了」
+# 是最容易被借用的三个——「通过朋友打听也没用」「我算了算时间」「路过了那家公司」，
+# 正常聊天里一句就把整条线索关掉。所以判据拆成两层：
+#   1. `_LOOP_CLOSED_ANY`：换个语境也还是结果，出现即算；
+#   2. `_LOOP_CLOSED_TAIL`：得看清楚**整句是不是在给这件事收场**——词尾要收住
+#      （句读或句末，可以先带一个完成体语气词），词首不能是否定/将来，也不能长在
+#      别的词里（路过了 / 经过了）。「还没结束」「还没搞定」是还没有结果，不算收场。
+_LOOP_CLOSED_ANY = (
     "不说了", "不提了", "就这样", "结果就是",
 )
+_LOOP_CLOSED_TAIL = (
+    "完了", "搞定", "结束", "黄了", "挂掉", "没通过",
+    "过了", "通过了", "通过", "算了",
+)
+_LOOP_CLOSED_RE = re.compile("|".join(_LOOP_CLOSED_TAIL))
+# 词尾：可以断句，也可以先带一个完成体语气词再断句（「结束了」「搞定了」「过了，还行」）。
+_LOOP_CLOSED_TAIL_RE = re.compile(r"^[了啦咯哟嘞呀的吧呢]?(?:[，,。！!？?；;、~～…\s]|$)")
+# 词首：否定或将来——「还没结束」「快结束了」都还开着，不是结果。
+_LOOP_OPEN_PREFIXES = (
+    "没", "未", "别", "想", "快", "将", "要", "还", "马上", "就要", "即将", "打算", "准备",
+)
+# 「过了」长在这些字后面是路过，不是「这件事过了」。
+_LOOP_PASS_PREFIXES = ("路", "经", "跨", "越")
+
+
+def _closes_loop(body: str) -> bool:
+    """这句话是不是在给某件事**收场**（说了结果）。
+
+    `extract_open_loop`（还开不开一条线索）与 `loops_resolved_by`（关掉哪条线索）
+    共用这一个判据：两边口径必须一致，否则会出现「该关的不关」或「开着却被关掉」。
+    """
+    text = str(body or "")
+    if not text:
+        return False
+    if any(word in text for word in _LOOP_CLOSED_ANY):
+        return True
+    for match in _LOOP_CLOSED_RE.finditer(text):
+        word = match.group(0)
+        head = text[: match.start()]
+        tail = text[match.end():]
+        if tail and not _LOOP_CLOSED_TAIL_RE.match(tail):
+            continue
+        if any(head.endswith(prefix) for prefix in _LOOP_OPEN_PREFIXES):
+            continue
+        if word == "过了" and any(head.endswith(p) for p in _LOOP_PASS_PREFIXES):
+            continue
+        return True
+    return False
+
 
 LOOP_MIN_HOURS = 2.5      # 当时追问不礼貌，至少隔这么久
 LOOP_MAX_HOURS = 14.0     # 再晚就不像「记得」，像翻旧账
 LOOP_LATE_HOURS = 40.0    # 过了到期点多久之内还算「想起来问」
 LOOP_TEXT_MAX = 34
-
 
 
 def extract_open_loop(
@@ -245,7 +306,7 @@ def extract_open_loop(
     body = str(text or "").strip()
     if len(body) < 4 or len(body) > 300:
         return None, 0.0
-    if any(word in body for word in _LOOP_CLOSED):
+    if _closes_loop(body):
         return None, 0.0
     hit: Optional[Tuple[int, str]] = None
     for word in _LOOP_WORDS:
@@ -256,7 +317,7 @@ def extract_open_loop(
         return None, 0.0
     start = max(0, hit[0] - 10)
     snippet = body[start: min(len(body), hit[0] + LOOP_TEXT_MAX)].strip()
-    if not snippet or any(word in snippet for word in _LOOP_CLOSED):
+    if not snippet or _closes_loop(snippet):
         return None, 0.0
     # 顺嘴说要去洗澡/开会（一两小时就能完的事），拿它当「隔半天回访」不成立
     if is_leaving(body) and len(body) <= 24:
@@ -272,7 +333,12 @@ def _loop_due(
 ) -> float:
     """回访时间：至少隔几小时，且落在她当地的白天。"""
     low = max(0.5, float(min_hours))
-    high = max(low + 0.5, low * 2.2)
+    # 上界同时受 `low * 2.2`（「大概睡一觉就问」的旧体感）和 `max_hours` 约束：
+    # 以前只写 `low * 2.2`，`max_hours` 只在最后做一次 `min()` 截断，
+    # 于是抽出来的样本有约 1/29 正好堆在 max_hours 上——那批线索看着像「掐着表问的」，
+    # 而 `LOOP_MAX_HOURS = 14` 想表达的「再晚就不像记得」，在默认配置下也永远用不到
+    # （2.5~5.5h 全在 14h 以内）。现在让它参与抽样本身：抽不到，就不会有那撮堆积。
+    high = max(low, min(float(max_hours), low * 2.2))
     stamp = now + random.uniform(low, min(high, 6.0 if low <= 6.0 else high)) * 3600.0
     local = city_now(stamp, clock_offset_minutes)
     if local.hour < 9:
@@ -306,14 +372,43 @@ def promise_entries(user: Dict[str, Any]) -> list:
     return out
 
 
+def _promise_due(item: Dict[str, Any]) -> float:
+    """这条诺**该兑现**的时刻（epoch 秒）；判不出来返回 0。
+
+    老数据里只有 `at`、没有 `due`（写侧后来才补上 `due` 字段），原来的
+    `if due <= 0: continue` 会让这批诺**永久静默**——既不会到点被兑现，
+    还一直占着 `PROMISE_SLOTS_MAX` 的名额，新的诺挤不进来。
+    补的基准取 `at`：那是「她自己许下这句话」的那一刻，与写侧 `note_promise` 同源
+    （due = at + PROMISE_WAIT_SECONDS）。**不拿 now 当基准**——那等于一读到就立刻到点，
+    上线瞬间把陈年旧诺全抖出来，反而更像 bug。
+    """
+    due = _num(item.get("due"))
+    if due > 0:
+        return due
+    at = _num(item.get("at"))
+    if at > 0:
+        return at + PROMISE_WAIT_SECONDS
+    return 0.0
+
+
 def live_promises(user: Dict[str, Any], now: float, limit: int = PROMISE_SLOTS_MAX) -> list:
     """到点、还没兑现的诺，按到期先后排。"""
     out: list = []
+    dead: list = []
     for item in promise_entries(user):
-        due = _num(item.get("due"))
-        if due <= 0 or now < due:
+        due = _promise_due(item)
+        if due <= 0:
+            # 连「什么时候许的」都没有（不是本插件写的条目）→ 永远不会到点。
+            # 留着只会白占名额，顺手摘掉（engine 的 save 会落盘）。
+            dead.append(item)
+            continue
+        if now < due:
             continue
         out.append((due, str(item.get("about", "")).strip(), item))
+    if dead:
+        raw = user.get("promises")
+        if isinstance(raw, list):
+            user["promises"] = [item for item in raw if item not in dead]
     out.sort(key=lambda x: x[0])
     return out[:max(1, int(limit))]
 
@@ -395,7 +490,7 @@ def loops_resolved_by(user: Dict[str, Any], msg: str) -> List[str]:
     返回被关掉的那些 about（供调用方落账/日志）。
     """
     body = str(msg or "").strip()
-    if not body or not any(w in body for w in _LOOP_CLOSED):
+    if not body or not _closes_loop(body):
         return []
     out: List[str] = []
     for item in loop_entries(user):
@@ -435,6 +530,28 @@ CLOSER_MIN_HOURS = 5.0
 MAX_CLOSERS = 3
 
 
+def _closer_count(user: Dict[str, Any]) -> int:
+    """她**实际收过几次场**（`MAX_CLOSERS` 要数的是这个）。
+
+    `MAX_CLOSERS` 写的是「一共允许收几次场」，可原来读的是 `no_reply_streak`——
+    那是**被冷落的次数**：desire 里要 `after_ignored` 满 12 小时才 +1，
+    和收场用的 `CLOSER_MIN_HOURS`（5 小时）根本不同源。于是
+    「被冷落 3 次、一次场都没收过」的人被永久禁掉收场，
+    而「被冷落 1 次、已经收了 5 次场」的人照收不误——两边都反着来。
+
+    真正的计数只能在**把收场那句发出去**的那一处 +1（engine 发 closer 时）。
+    读侧先认新字段 `closer_count`；老数据没有这个字段时退回沿用 `no_reply_streak`
+    （也就是维持现状，不会因为这次改动突然对老用户多收几场场），
+    等写侧补上以后自然按真实次数走。
+    """
+    key = "closer_count" if "closer_count" in user else "no_reply_streak"
+    try:
+        return max(0, int(user.get(key, 0) or 0))
+    except (TypeError, ValueError):
+        # 状态文件是外部可改的：读坏了就当作没收过场，别让心跳在这里崩
+        return 0
+
+
 def closer_reason(
     user: Dict[str, Any],
     now: float,
@@ -461,7 +578,7 @@ def closer_reason(
         return ""
     # 收过三次场还在没人回，那就不是尴尬是没兴趣了。没有这条会变成一个
     # 永远不接话的人每天被收一次场——收场那句本身会刷新 last_sent。
-    if int(user.get("no_reply_streak", 0) or 0) >= MAX_CLOSERS:
+    if _closer_count(user) >= MAX_CLOSERS:
         return ""
     # 前置条件全过了就给一句人能读的说明。（早前这里写成「到这里仍 return ""」、
     # 于是整条收场链路是死代码——那个 bug 已修，这里改成直接返回理由。）
@@ -477,13 +594,22 @@ def recent_exchange(u: Dict[str, Any], limit: int = 3) -> List[str]:
     之后又没声了，这时候补一句该接着那几句说，而不是干巴巴一句「没事我就是想说说话」。
     """
     out: List[str] = []
-    for item in (u.get("conversation") or [])[-limit * 2:]:
-        if not isinstance(item, dict) or str(item.get("dir", "")) != "in":
+    want = int(limit)
+    if want <= 0:
+        return []
+    # 只看最后 `limit * 2` 条，再筛 `dir == "in"`：她连着发三条（她自己接自己的话茬）时，
+    # 这几条会把窗口整个占满，一条对方的话都取不到，于是「已读续接」退化成了
+    # 「没事我就是想说说话」。改成从尾巴往回**收集够 limit 条对方的话**再正序返回。
+    for item in reversed(u.get("conversation") or []):
+        if not _is_inbound(item):
             continue
         text = str(item.get("text", "") or "").strip()
         if text:
             out.append(text)
-    return out[-limit:]
+        if len(out) >= want:
+            break
+    out.reverse()
+    return out
 
 
 def closer_meta(about: str = "", exchange: Optional[Sequence[str]] = None) -> Dict[str, Any]:
