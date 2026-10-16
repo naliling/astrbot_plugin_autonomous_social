@@ -397,6 +397,7 @@ class CoreBridge:
             _env = str(contract.get("weather") or "").strip()
             view["weather"] = {"env": _env} if _env else {}
         return view
+
     def load_snapshot(
         self,
         bot_id: str,

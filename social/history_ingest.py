@@ -456,32 +456,6 @@ def apply_history_rows(state: SocialState, rows: List[Dict[str, Any]]) -> int:
     return added
 
 
-def seed_from_history(
-    state: SocialState,
-    data_dir: Optional[str],
-    *,
-    private_only: bool = True,
-    store_text: bool = True,
-    now: Optional[float] = None,
-) -> int:
-    """从 AstrBot 会话数据库导入还没进插件状态的历史用户（同步入口）。
-
-    已在 state.json 里的用户一律不动：插件装好之后攒下的实时数据永远比数据库里的
-    旧快照新。返回新导入的人数。引擎走的是 collect + apply 两段式，这里保留给
-    同步调用方与测试。
-    """
-    now = float(now if now is not None else time.time())
-    rows = collect_from_history(
-        data_dir,
-        private_only=private_only,
-        store_text=store_text,
-        existing_uids=existing_uids(state),
-        target_bid=seed_target_bid(state),
-        now=now,
-    )
-    return apply_history_rows(state, rows)
-
-
 def seed_diag_snapshot(
     state: SocialState,
     data_dir: Optional[str],
@@ -534,7 +508,7 @@ def normalize_seed_entries(raw: Any, default_platform: str) -> List[Tuple[str, s
     elif not isinstance(raw, (list, tuple)):
         items = [raw] if raw else []
 
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str, str]] = []
     seen: set = set()
     for x in items:
         if x is None:
@@ -591,8 +565,18 @@ def apply_seed_list(
             continue
         umo = f"{platform}:{msg_type}:{uid}"
         u = state.user(bid, uid)
-        if not u.get("umo"):
-            u["umo"] = umo
+        # 上面那个三元组判重挡不住「同一个 uid 出现在另一个平台」：用户记录**只按
+        # (角色, uid) 索引**（`state.user(bid, uid)`），所以 `aiocqhttp:123` 与
+        # `telegram:123` 拿到的是**同一条记录**，`existing_pairs` 里那两个三元组却是
+        # 两条 —— 判重放行，然后写进别人的档案。`umo` 已经有值就说明这个人早就进来了
+        # （另一个平台，或历史导入），此时必须原样放过：继续往下走会把老用户
+        # `added` 重复计数，还会把 `urge_scale` 按「没聊过的人」覆盖成 0.5 ——
+        # 一个已经聊熟的人被按播种名单的慢节奏重算。
+        # 跨平台同名到底是不是同一个人，这套存储回答不了（一条记录只放得下一个 umo），
+        # 所以这里选**不动已有档案**：宁可漏掉一个新人，也不改错一个老用户。
+        if u.get("umo"):
+            continue
+        u["umo"] = umo
         u["source"] = u.get("source") or "seed"
         if float(u.get("last_seen", 0) or 0) <= 0:
             u["last_seen"] = now

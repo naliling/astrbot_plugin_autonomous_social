@@ -3,8 +3,9 @@
 两边各写各的文件：Core 写它的 state.json（内含 contract），这里写 `humanoid_signals.json`。
 没有并发写同一个文件的问题，Core 那边只读，并且超过 15 分钟就不采信。
 
-写回的只有两件事，都是 Core 自己算不出来、但会影响她「现在是什么状态」的：
-刚替她主动开过口（想说的心思该泄掉）、被谁连着冷落了几次（会变成一句压着的挂念）。
+写回的都是 Core 自己算不出来、但会影响她「现在是什么状态」的：刚替她主动开过口
+（想说的心思该泄掉）、被谁连着冷落了几次（会变成一句压着的挂念）、她手上还开着的事
+（对话历史被压缩后，她仍然记得自己答应过谁什么）。
 
 v1.19.0（多 Bot）：
 - 文件里多一份 `by_bid: {bid: {...}}`，每个角色各记各的。这是**为将来准备的**：Core
@@ -24,6 +25,15 @@ v2.24.0：
   契约给过来的 social_desire，一个没人接收的闭环，还让每轮心跳多触发一次文件重写。
 - 写失败不再静默：记下来，状态页能看见（原来返回 False 就完事，表现是社交侧一切
   正常、Core 侧永远显示「装了个寂寞」）。
+
+v1.27.31（schema 1 → 2）：
+- 多写一件事：`open_items` —— 她手上**还开着**的事（对方提了没下文的、她自己许下还没
+  兑现的）。Core 那边把它渲染成「昨天/三天前」的相对时间放进 system_prompt 的稳定段，
+  于是对话历史被压缩之后，她还记得自己手上开着什么。
+- `schema` 升到 2 是**只加不改**：既有字段名与语义一个都没动，两边版本可以互相容忍
+  （旧 Core 忽略多出来的字段，新 Core 在字段缺失时按「没有开着的事」处理）。
+- 这条通道的方向是单向的：`open_items` 由社交层算好发出去，Core **不许**把它当成
+  「她最近做过什么」再喂回来——那会形成闭环（见 `core_bridge` 里 `life_log` 只认 `did`）。
 """
 
 from __future__ import annotations
@@ -40,6 +50,16 @@ FILE_NAME = "humanoid_signals.json"
 # 全量重写。超出上限时丢掉最久没更新的条目（dict 保序，更新会把它移到末尾）。
 _IGNORED_BY_MAX = 500
 
+# 发给 Core 的「她手上还开着的事」条数上限。这段会被渲染进 system_prompt 的**稳定段**
+# （靠前缀缓存省成本），条数直接换算成每轮固定开销，所以宁可少给：她同时开着的正事
+# 本来也就一两件。
+MAX_OPEN_ITEMS = 4
+# 单条字数上限。Core 侧还会再截，这里先截是为了别把这个每轮全量重写的文件写大。
+OPEN_ITEM_TEXT_MAX = 40
+# 允许的 kind。写死白名单而不是原样透传：Core 按 kind 分类渲染，一个拼错的 kind 会落进
+# 「不认识」的分支，症状是那条事项静默消失，而这边看起来一切正常。
+_OPEN_ITEM_KINDS = ("loop", "promise")
+
 
 class SignalsWriter:
     def __init__(
@@ -50,10 +70,13 @@ class SignalsWriter:
         self.path = path
         self._time = time_source
         self._payload: dict[str, Any] = {
-            "schema": 1,
+            "schema": 2,
             "last_proactive_at": 0.0,
             "last_target_uid": "",
             "ignored_streak": 0,
+            # 她手上还开着的事（见 note_open_items）。默认写空列表而不是省略这个键：
+            # 「没有开着的事」是一个**有意义的结论**，Core 靠它判断「这件事结了没有」。
+            "open_items": [],
             # 每个角色各记各的（Core 将来按角色读时直接用）
             "by_bid": {},
         }
@@ -84,15 +107,49 @@ class SignalsWriter:
         self._ttl_seconds = value
         self._dirty = True
 
-    def _slot(self, bid: str) -> dict[str, Any]:
-        by_bid = self._payload.setdefault("by_bid", {})
-        return by_bid.setdefault(str(bid or ""), {"last_proactive_at": 0.0,
-                                                   "last_target_uid": "",
-                                                   "ignored_streak": 0})
+    def _slot(self, bid: str, *, create: bool = True) -> dict[str, Any]:
+        """按角色取那一格。`create=False` 是给**读路径**用的。
+
+        读路径（`ignored_by_uid`）以前也走 `setdefault`：查一个人就凭空建出一个空
+        slot 并改 payload，而 `beat()` 的 `flush(force=True)` 是无条件整份重写的，
+        于是这个空壳被写进文件。查一个不存在的人不该在盘上留下痕迹。
+        """
+        by_bid = self._payload.get("by_bid")
+        if not isinstance(by_bid, dict):
+            if not create:
+                return {}
+            by_bid = {}
+            self._payload["by_bid"] = by_bid
+        key = str(bid or "")
+        slot = by_bid.get(key)
+        if isinstance(slot, dict):
+            return slot
+        if not create:
+            return {}
+        slot = {"last_proactive_at": 0.0,
+                "last_target_uid": "",
+                "ignored_streak": 0,
+                "open_items": []}
+        by_bid[key] = slot
+        return slot
 
     def set_role_count(self, count: int) -> None:
-        """当前有几个角色在跑。>1 时不再写会串台的顶层字段（见模块说明）。"""
+        """当前有几个角色在跑。>1 时不再写会串台的顶层字段（见模块说明）。
+
+        从 1 变 2 时还要把**已经写下的**顶层标量清掉：它们是单角色时留下的，而 Core
+        每个角色实例都读同一份文件、不按角色过滤（见模块说明），留着的话 B 会读到 A 的
+        「刚跟谁说过话 / 被冷落了几次」。`open_items` 那格原先只在 `note_open_items` 里
+        处理，这里一并补上，免得第二个角色在下次心跳之前先读到 A 的事。
+        """
+        was = max(0, int(getattr(self, "_roles", 1) or 1))
         self._roles = max(0, int(count))
+        if self._roles > 1 and was <= 1:
+            for key, empty in (("last_proactive_at", 0.0),
+                               ("last_target_uid", ""),
+                               ("ignored_streak", 0),
+                               ("open_items", [])):
+                if self._payload.get(key) != empty:
+                    self._payload[key] = empty
         self._dirty = True
 
     def note_proactive(self, target_uid: str, at: float | None = None,
@@ -137,20 +194,27 @@ class SignalsWriter:
         except (TypeError, ValueError):
             # 盘上旧值可能是字符串/对象；按「还没有记录」处理，别让整轮心跳抛
             before = 0
-        if before == value:
-            return
-        # 先删再插：让最近更新的条目排在末尾，超限时从头（最久没更新）丢
+        # 先删再插：让最近更新的条目排在末尾，超限时从头（最久没更新）丢。
+        #
+        # 这一步必须在 `before == value` 的提前返回**之前**做：同一个 streak 被反复确认
+        # 是这条路径上最常见的情形（每轮心跳都报同一个数），值没变，但它正是「这个人还
+        # 在被记着」的证据，位置必须刷新——否则最活跃的那个人永远停在队首，`_IGNORED_BY_MAX`
+        # 满了先被淘汰的偏偏是他。
         per.pop(uid, None)
         per[uid] = value
         while len(per) > _IGNORED_BY_MAX:
             per.pop(next(iter(per)), None)
         slot["ignored_by"] = per
+        if before == value:
+            # 值没变：只留着重排后的顺序在内存里，交给下一次真实写入（或 `beat()` 的
+            # 强制 flush）落盘，不为一个位置变化单独触发一次写。
+            return
         self._dirty = True
         self.flush()
 
     def ignored_by_uid(self, uid: str, bid: str = "") -> int:
         """给 Core 读：这个人在社交层的累计「没理我」次数。"""
-        slot = self._slot(bid)
+        slot = self._slot(bid, create=False)
         per = slot.get("ignored_by")
         if not isinstance(per, dict):
             return 0
@@ -176,6 +240,80 @@ class SignalsWriter:
             self._payload["ignored_streak"] = value
         self._dirty = True
         self.flush()
+
+    def note_open_items(self, items: Any, bid: str = "") -> None:
+        """把「她手上还开着的事」整份发布出去（每轮心跳重算并**整体覆盖**）。
+
+        为什么必须整体覆盖、而且空列表也有意义：Core 靠这份列表判断「这件事结了没有」。
+        只增不减的话，一件对方早就给出结果的事会永远挂在她提示词里——正是「过程系统
+        锁死」那个老毛病的另一个入口。所以没有开着的事时也要写 `[]`，而不是保留上一轮。
+
+        `at` 一律取这件事**被记下的那一刻**（loop 的 `at`、promise 的 `at`），绝不能盖成
+        now：Core 把它渲染成「三天前答应的事」这种相对时间，而这段文本进的是 system_prompt
+        的稳定段。每轮重盖会让语义漂移（三天前的事变成「刚答应的」），并且文本每轮都变，
+        把整段前缀缓存打掉——比不发布更贵。
+        """
+        normalized = self._normalize_open_items(items)
+        slot = self._slot(bid)
+        # 多 Bot 时顶层那格必须留空：顶层以前被单 Bot 那条路径写过（角色数从 1 变 2 之后
+        # 它不会自己消失），留着的话 Core 会把 A 手上开着的事认成 B 自己的。
+        top = normalized if getattr(self, "_roles", 1) <= 1 else []
+        if slot.get("open_items") == normalized \
+                and self._payload.get("open_items") == top:
+            # 内容没变就不标脏：`flush` 的 120 秒闸门本来就是为这个准备的，
+            # 别让每轮心跳都白重写一遍整份文件。
+            return
+        slot["open_items"] = normalized
+        self._payload["open_items"] = top
+        self._dirty = True
+        self.flush()
+
+    @staticmethod
+    def _normalize_open_items(items: Any) -> list[dict[str, Any]]:
+        """规范化 + 截断 + 排序，产出**可逐字节比较**的稳定列表。
+
+        排序必须确定（at 降序，同 at 再按 kind/text/uid）：同一批内容每轮渲染出不同顺序
+        = 文本每轮都变 = Core 那边的前缀缓存整段失效。所以既不能依赖 dict/set 的迭代顺序，
+        也不能把调用方给的顺序当数——去重也放在排序**之后**，「留下哪条」才与传入顺序无关。
+        """
+        if not isinstance(items, (list, tuple)):
+            return []
+        out: list[dict[str, Any]] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            # 空白折叠：Core 按整行渲染，一条里带换行会把后面几行挤出它自己的格式
+            text = " ".join(str(raw.get("text", "") or "").split())
+            text = text[:OPEN_ITEM_TEXT_MAX]
+            if not text:
+                continue
+            kind = str(raw.get("kind", "") or "").strip()
+            if kind not in _OPEN_ITEM_KINDS:
+                continue
+            try:
+                at = float(raw.get("at", 0) or 0)
+            except (TypeError, ValueError):
+                at = 0.0
+            if at != at:                # NaN：坏时间戳当 0，别让它污染排序（NaN 比较恒假）
+                at = 0.0
+            out.append({
+                "text": text,
+                "uid": str(raw.get("uid", "") or ""),
+                "at": at,
+                "kind": kind,
+            })
+        out.sort(key=lambda i: (-i["at"], i["kind"], i["text"], i["uid"]))
+        # 同一件事可能从两个来源各来一次（她许的诺也可能被抽成未完话题）：
+        # 按 (kind, text) 去重，排序之后的第一条胜出。
+        seen: set = set()
+        uniq: list[dict[str, Any]] = []
+        for item in out:
+            key = (item["kind"], item["text"])
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(item)
+        return uniq[:MAX_OPEN_ITEMS]
 
     def beat(self) -> bool:
         """每个周期无条件重写一遍：内容没变也要刷新 mtime。

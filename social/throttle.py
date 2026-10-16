@@ -24,7 +24,17 @@ class LogThrottle:
     def allow(self, key: str, window: float = DEFAULT_WINDOW) -> bool:
         """这条日志现在该不该打。返回 False 表示被节流掉了。"""
         now = time.monotonic()
-        last, pending = self._last.get(key, (0.0, 0))
+        entry = self._last.get(key)
+        if entry is None:
+            # 这个 key 从没打过，必须放行。
+            #
+            # 不能用 `get(key, (0.0, 0))` 再比 `now - 0.0 >= window`：`time.monotonic()`
+            # 在 Linux 与 Windows 上都是「开机以来的秒数」，机器/容器刚起来时它小于
+            # window，于是第一条日志会被当成「窗口内重复」吞掉，还会把 pending 记成 1 ——
+            # 调用方紧接着打出「另有 1 次同类已省略」，而那次根本不存在。
+            self._last[key] = (now, 0)
+            return True
+        last, pending = entry
         if now - last >= window:
             # 推进窗口但**保留** pending：调用方紧接着用 summary() 读它。
             # 这里清零的话「另有 N 次已省略」永远是 0（旧实现就是这个毛病）。

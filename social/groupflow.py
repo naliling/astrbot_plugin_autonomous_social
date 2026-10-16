@@ -12,6 +12,7 @@ v1.11.0 新增。这一层是纯逻辑（不碰 IO、不 import astrbot），可
 
 from __future__ import annotations
 
+import math
 import random
 import re
 from typing import Any, Dict, List, Tuple
@@ -21,6 +22,33 @@ from typing import Any, Dict, List, Tuple
 from .emoji import EMOJI as _EMOJI
 # 「外头」前缀的判据同样只有一份（Core 的 weather.env 往往已是整句）。
 from .textutil import outside_lead
+
+
+def _f(x: Any) -> float:
+    """容错取时间戳/计数：读不出来、或非有限值，一律当 0.0（等同字段没写）。
+
+    群状态里这些字段（`blocked_until` / `flow_open_until` / `last_seen` …）都是
+    外部可改的 JSON，裸 `float()` 有两个方向相反的后果：
+      * 坏字符串 → 未捕获的 ValueError，群消息链路与心跳当场断掉；
+      * nan → 所有 `> now` / `<= now` 比较恒为 False，于是**发送隔离失效**
+        （`blocked_until=nan` 不再拦），而 `flow_open_until=nan` 又让
+        **关注窗口恒开、心流永远可接**。
+    归零后语义统一成「这个字段没写」：隔离不生效（与缺字段一致），
+    关注窗口关闭（`0 <= now` 为真 → 走保守那条分支）。
+    """
+    try:
+        out = float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
+def _i(x: Any) -> int:
+    """同上，取整数计数。`int(nan)` 会直接抛 ValueError，`int(inf)` 抛 OverflowError。"""
+    try:
+        return int(_f(x))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 # 一条群消息「值不值得让模型看一眼」的便宜预筛：挡在 LLM 调用之前省钱。
 # 纯 @、纯表情/图片、太短的语气词、命令回显都先筛掉——它们接不出有意义的话。
@@ -109,19 +137,19 @@ def flow_should_consider(
         return False, "她正在睡觉"
     if is_quiet:
         return False, "现在是安静时段"
-    if float(group.get("blocked_until", 0) or 0) > now:
+    if _f(group.get("blocked_until", 0)) > now:
         return False, "发送隔离中（被踢/会话失效）"
-    if float(group.get("flow_open_until", 0) or 0) <= now:
+    if _f(group.get("flow_open_until", 0)) <= now:
         return False, "关注窗口没开（bot 最近没在这个群说话）"
-    if float(group.get("flow_hold_until", 0) or 0) > now:
+    if _f(group.get("flow_hold_until", 0)) > now:
         return False, "她自己刚说完话，先缓一下"
-    if int(group.get("flow_ignored", 0) or 0) >= max(1, ignored_exit):
+    if _i(group.get("flow_ignored", 0)) >= max(1, ignored_exit):
         return False, "连着插话没人接，先安静下来"
-    if int(group.get("flow_replies", 0) or 0) >= max(1, max_replies):
+    if _i(group.get("flow_replies", 0)) >= max(1, max_replies):
         return False, "这个窗口已经接够了"
     if hour_count >= max(1, hourly_cap):
         return False, "这一小时插话到上限了"
-    gap = now - float(group.get("flow_last_reply_at", 0) or 0)
+    gap = now - _f(group.get("flow_last_reply_at", 0))
     if gap < max(0.0, min_gap_seconds):
         return False, "距上一句插话太近"
     return True, ""
@@ -149,11 +177,11 @@ def icebreak_due(
         return False
     if is_quiet:
         return False
-    if float(group.get("blocked_until", 0) or 0) > now:
+    if _f(group.get("blocked_until", 0)) > now:
         return False
-    if int(group.get("msg_count", 0) or 0) < has_history_minimum:
+    if _i(group.get("msg_count", 0)) < has_history_minimum:
         return False
-    last_seen = float(group.get("last_seen", 0) or 0)
+    last_seen = _f(group.get("last_seen", 0))
     if last_seen <= 0:
         return False
     idle = now - last_seen
@@ -168,14 +196,14 @@ def icebreak_due(
     # 反过来这里也得看「刚起完话头又去破冰」——「刚说过话」是同一件事，取两者较晚者。
     # （原来只读 `last_bot_spoke`，那条会被 `open_flow` 刷新，起话头后未必挡得住破冰。）
     last_proactive = max(
-        float(group.get("icebreak_at", 0) or 0),
-        float(group.get("topic_at", 0) or 0),
+        _f(group.get("icebreak_at", 0)),
+        _f(group.get("topic_at", 0)),
     )
-    if now - max(last_proactive, float(group.get("last_bot_spoke", 0) or 0)) < idle_hours * 3600.0:
+    if now - max(last_proactive, _f(group.get("last_bot_spoke", 0))) < idle_hours * 3600.0:
         return False
     # 今天破冰次数上限
     if str(group.get("icebreak_day", "") or "") == today:
-        if int(group.get("icebreak_count_day", 0) or 0) >= max(1, daily_cap):
+        if _i(group.get("icebreak_count_day", 0)) >= max(1, daily_cap):
             return False
     return True
 
@@ -257,22 +285,22 @@ def group_topic_due(
         return False
     if is_quiet:
         return False
-    if float(group.get("blocked_until", 0) or 0) > now:
+    if _f(group.get("blocked_until", 0)) > now:
         return False
-    if int(group.get("msg_count", 0) or 0) < has_history_minimum:
+    if _i(group.get("msg_count", 0)) < has_history_minimum:
         return False
-    last_seen = float(group.get("last_seen", 0) or 0)
+    last_seen = _f(group.get("last_seen", 0))
     if last_seen <= 0:
         return False
     if now - last_seen > max(1, stale_days) * 86400.0:
         return False
-    gap = max(1.0, float(gap_hours)) * 3600.0
-    if now - float(group.get("last_bot_spoke", 0) or 0) < gap:
+    gap = max(1.0, _f(gap_hours)) * 3600.0
+    if now - _f(group.get("last_bot_spoke", 0)) < gap:
         return False
     # 刚破过冰就别又起话头——那是同一件事连着做两遍。
-    if now - float(group.get("icebreak_at", 0) or 0) < gap:
+    if now - _f(group.get("icebreak_at", 0)) < gap:
         return False
     if str(group.get("topic_day", "") or "") == today:
-        if int(group.get("topic_count_day", 0) or 0) >= max(1, daily_cap):
+        if _i(group.get("topic_count_day", 0)) >= max(1, daily_cap):
             return False
     return True

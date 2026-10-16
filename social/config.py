@@ -9,6 +9,7 @@ v1.19.0：
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -36,6 +37,23 @@ def _warn_config_once(key: str, message: str) -> None:
         pass
 
 
+def _finite_float(value: Any) -> Optional[float]:
+    """读到**有限**浮点就返回，否则 None（坏字符串 / nan / ±inf / 大得转不动）。
+
+    为什么必须在这里挡住 inf：`_safe_*` 的兜底是「退回默认值」，而 inf 不是
+    「读不出来」——`float('inf')`、`float('1e999')` 都**成功**返回 inf，于是它一路
+    走到下游的 `int(...)`：`int(float('inf'))` 抛的是 **OverflowError**，而这类异常
+    既不是 TypeError 也不是 ValueError，会直接抛穿 `from_astrbot` →
+    `SocialEngine.__init__` → 插件永久加载不了，用户只能在面板外手改 JSON 才救得回来。
+    一个手滑填出来的 `inf` 不该有这个代价。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _safe_int(value: Any, default: Any, key: str = "") -> int:
     """安全取整数配置：非数字时告警一次并退回默认值，**绝不抛异常**。
 
@@ -44,40 +62,30 @@ def _safe_int(value: Any, default: Any, key: str = "") -> int:
     `AutonomousSocial.__init__` 一路抛穿，插件永久无法加载，面板也修不回来
     （只能手改 JSON）。
     """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        pass
-    try:
-        return int(float(value))  # "2.5" / "1e3" 这类字符串写法
-    except (TypeError, ValueError):
-        pass
+    out = _finite_float(value)
+    if out is not None:
+        return int(out)
     _warn_config_once(
         key or "<unknown>",
         f"配置项 {key} 的值 {value!r} 不是有效数字，已按默认值 {default!r} 处理；"
         "请在 AstrBot 面板里改正（插件不会替你改配置）",
     )
-    try:
-        return int(default)
-    except (TypeError, ValueError):
-        return 0
+    fallback = _finite_float(default)
+    return int(fallback) if fallback is not None else 0
 
 
 def _safe_float(value: Any, default: Any, key: str = "") -> float:
     """安全取浮点配置：非数字时告警一次并退回默认值，**绝不抛异常**。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        pass
+    out = _finite_float(value)
+    if out is not None:
+        return out
     _warn_config_once(
         key or "<unknown>",
         f"配置项 {key} 的值 {value!r} 不是有效数字，已按默认值 {default!r} 处理；"
         "请在 AstrBot 面板里改正（插件不会替你改配置）",
     )
-    try:
-        return float(default)
-    except (TypeError, ValueError):
-        return 0.0
+    fallback = _finite_float(default)
+    return fallback if fallback is not None else 0.0
 
 
 def _fsync_dir(path: str) -> None:

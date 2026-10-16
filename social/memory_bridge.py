@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .throttle import LogThrottle
 
@@ -45,6 +45,13 @@ MEMORY_PLUGIN_NAMES = {
 }
 
 SOURCE_PLUGIN = "astrbot_plugin_autonomous_social"
+
+# umo 里表示「群」的消息类型。与 `state._GROUP_UMO_TYPES` / `history_ingest._GROUP_TYPES`
+# 必须是同一套写法（`guildmessage` 曾经只出现在其中一个里，于是 QQ 频道的幽灵永远清不掉）。
+# 这里**故意复制**而不 import：`history_ingest` 顶部是无保护的 `from astrbot.api import logger`，
+# 而本模块的 astrbot 导入是 try/except 的（插件外也能 import，见文件头）。漂移由
+# `tests/test_v12733_state_gen.py::ScopeSetDriftTest` 钉住：三处不一致就直接失败。
+_GROUP_UMO_TYPES = frozenset({"group", "g", "groupmessage", "guild", "guildmessage"})
 
 # 三类失败原因分开记：区分「对方插件没装」与「装了但坏了」，排查时一眼看得出方向。
 FAIL_MISSING = "missing"        # 注册表里没有它（没装 / 未激活 / 宿主没有注册表 API）
@@ -82,6 +89,17 @@ def _note_failure(reason: str, detail: str) -> None:
             logger.warning(message)
     except Exception:  # 日志本身失败绝不能反过来影响发送链路
         pass
+
+
+def _note_success() -> None:
+    """一次调用真的成功了，就把上一次的失败记录清掉。
+
+    `_LAST_ERROR` 原来只被 `_note_failure` 赋值、**永不重置**，于是 `last_error()` 会永久
+    返回历史失败：状态页上看不出「刚才坏了、现在好了」，只看到一条永远不消失的旧报错。
+    `signals.py` 的成功路径是清空的（`self._last_error = ""`），两边语义应该一致。
+    """
+    global _LAST_ERROR
+    _LAST_ERROR = ""
 
 
 def _brief(exc: BaseException, limit: int = 160) -> str:
@@ -198,13 +216,33 @@ def find_memory_bridge(context: Any) -> Optional[Any]:
     return None
 
 
+def _umo_parts(umo: str) -> Tuple[str, str]:
+    """拆出 (平台, 消息类型)。与 `history_ingest.parse_umo` 同一套规则，但不 import 它。
+
+    AstrBot 的 umo 形如 ``aiocqhttp:private:12345`` / ``aiocqhttp:group:67890``；
+    拆不开时平台退回冒号前那段（与旧实现一致），类型给空串。
+    """
+    parts = str(umo or "").split(":")
+    if len(parts) >= 2:
+        return parts[0], parts[1].strip().lower()
+    if parts and parts[0]:
+        return parts[0], ""
+    return "", ""
+
+
 def _session_context(umo: str, uid: str) -> Dict[str, Any]:
-    """拼一个 memory_companion 认的会话上下文（它同时接受 dict）。"""
+    """拼一个 memory_companion 认的会话上下文（它同时接受 dict）。
+
+    `scope` 以前硬编码 "private"：群聊里检索长期记忆时，对面会按私聊作用域去过滤，
+    群里聊过的事可能整段检索不到。这里按 umo 的真实类型给；认不出来时仍按私聊，
+    与旧行为一致。
+    """
+    platform, msg_type = _umo_parts(umo)
     return {
         "session_id": str(umo or ""),
-        "scope": "private",
+        "scope": "group" if msg_type in _GROUP_UMO_TYPES else "private",
         "user_id": str(uid or ""),
-        "platform": str(umo or "").split(":", 1)[0],
+        "platform": platform,
     }
 
 
@@ -228,6 +266,7 @@ async def fetch_memory_text(
     except Exception as exc:
         _note_failure(FAIL_EXCEPTION, f"compose_context() 调用失败：{_brief(exc)}")
         return ""
+    _note_success()
     return str(text or "").strip()
 
 
@@ -263,10 +302,21 @@ def _idempotency_key(umo: str, payload: str, ts: Any) -> str:
     return f"proactive:{umo}:c:{_content_digest(payload)}"
 
 
-async def write_proactive(bridge: Any, uid: str, content: str, *, umo: str = "", ts: float = 0.0) -> None:
-    """把一条主动消息写回记忆库；失败只记日志，不影响主链路。"""
+async def write_proactive(
+    bridge: Any, uid: str, content: str, *, umo: str = "", ts: float = 0.0, about: str = ""
+) -> None:
+    """把一条主动消息写回记忆库；失败只记日志，不影响主链路。
+
+    `about` 是这次开口的**由头**（`generate_reason` 说的那件事）。带上它，记忆库里
+    这条才不是一句孤零零的话——将来按由头检索时，它就是「这件事她开过口」的证据；
+    不带的话，三个月后谁都看不出她当时为什么忽然说这句话。
+
+    `uid` 是必填的：记忆插件那边 `user_id` 是**唯一**的身份字段，整条记忆固定写进这个
+    用户的私有作用域。空 uid 会写出一条没有主人的记录（谁检索都可能撞上），所以直接跳过。
+    """
     text = str(content or "").strip()
-    if bridge is None or not text:
+    uid = str(uid or "").strip()
+    if bridge is None or not text or not uid:
         return
     fn = getattr(bridge, "record_external_memory", None)
     if not callable(fn):
@@ -274,10 +324,12 @@ async def write_proactive(bridge: Any, uid: str, content: str, *, umo: str = "",
             FAIL_SIGNATURE, "桥接对象没有可调用的 record_external_memory（接口签名不符）"
         )
         return
-    payload = f"（她主动找 TA 说的）{text}"
+    topic = str(about or "").strip()[:60]
+    head = f"（她主动找 TA 说的，由头：{topic}）" if topic else "（她主动找 TA 说的）"
+    payload = f"{head}{text}"
     try:
         await fn(
-            user_id=str(uid or ""),
+            user_id=uid,
             content=payload,
             source_plugin=SOURCE_PLUGIN,
             idempotency_key=_idempotency_key(umo, payload, ts),
@@ -286,4 +338,59 @@ async def write_proactive(bridge: Any, uid: str, content: str, *, umo: str = "",
         )
     except Exception as exc:
         _note_failure(FAIL_EXCEPTION, f"record_external_memory() 调用失败：{_brief(exc)}")
+        return
+    _note_success()
+
+
+async def write_open_closed(
+    bridge: Any,
+    uid: str,
+    about: str,
+    *,
+    result: str = "",
+    kind: str = "loop",
+    umo: str = "",
+    ts: float = 0.0,
+) -> None:
+    """一件「还开着的事」有了结果时写回记忆库；失败只记日志。
+
+    这是中间层（`life_log`）交棒给长期层的那一刻：这件事在插件里到此为止——
+    不再回访、也不再进注入——但它不该就此消失，所以在这里落一条长期记忆。
+
+    幂等键按**这件事本身**算（内容摘要），不按时刻：同一件事被重放两次只该留一条。
+    但键里必须带上 `uid`：这条记忆写进的是 `user_id=uid` 的私有作用域，而同一个群
+    （同一个 umo）里两个人完全可以有同名的事（都要「面试结果」），只按 umo + 内容
+    算键的话，第二个人那条会被对面按幂等当成重复丢掉。
+
+    `uid` 与 `topic` 一样是必填的：空 uid 会写出一条没有主人的记录。
+    """
+    topic = str(about or "").strip()[:80]
+    uid = str(uid or "").strip()
+    if bridge is None or not topic or not uid:
+        return
+    fn = getattr(bridge, "record_external_memory", None)
+    if not callable(fn):
+        _note_failure(
+            FAIL_SIGNATURE, "桥接对象没有可调用的 record_external_memory（接口签名不符）"
+        )
+        return
+    outcome = str(result or "").strip()[:80]
+    payload = f"（这件之前一直没完的事有结果了）{topic}"
+    if outcome:
+        payload = f"{payload}：{outcome}"
+    key = f"closed:{umo}:{uid}:{kind}:{_content_digest(topic)}"
+    try:
+        await fn(
+            user_id=uid,
+            content=payload,
+            source_plugin=SOURCE_PLUGIN,
+            idempotency_key=key,
+            # 比一条主动消息重：`promise` / `open_loop` 正是记忆插件给最高权重的那两类。
+            importance=0.62,
+            tags=["open_loop" if kind != "promise" else "promise"],
+        )
+    except Exception as exc:
+        _note_failure(FAIL_EXCEPTION, f"record_external_memory() 调用失败：{_brief(exc)}")
+        return
+    _note_success()
 

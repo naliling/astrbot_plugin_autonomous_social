@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -56,17 +57,34 @@ def _is_inbound(item: Any) -> bool:
     return isinstance(item, dict) and str(item.get("dir", "") or "") != "out"
 
 
+def _conversation(user: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """账本里能当条目看的那几条。
+
+    `conversation` 是 state.json 里的字段，可能被手改、被迁移写坏、被写成字符串或数字。
+    这里统一收成「元素是 dict」的列表：`reversed("abc")` 会把每个字符当一条
+    （再 `.get` 就抛 AttributeError），`reversed(nan)` 直接 TypeError，而这条路径在
+    心跳里每轮都走。**只筛 dict，不筛 text**——空文本的条目在调用点各有各的处理，
+    在这里筛掉会悄悄改变「在聊」的判定。
+    """
+    conv = user.get("conversation")
+    if not isinstance(conv, list):
+        return []
+    return [item for item in conv if isinstance(item, dict)]
+
+
 def last_in_text(user: Dict[str, Any], now: float, within_seconds: float) -> str:
     """对方最近一句说了什么（跳过她自己说的话）。找不到就返回空串。
 
     判「回得敷衍」必须看**对方**那句，而账本里最后一条往往是她自己的回复。
     """
-    for item in reversed(user.get("conversation") or []):
+    for item in reversed(_conversation(user)):
         if not _is_inbound(item):
             continue
-        try:
-            ts = float(item.get("ts", 0) or 0)
-        except (TypeError, ValueError):
+        ts = _num(item.get("ts", 0))
+        if ts <= 0:
+            # 时间戳不可信（缺字段 / nan / 脏字符串）：跳过这一条，别把很久以前那句
+            # 当成「刚说的」。原来走裸 float + except，nan 会让 `now - ts > within`
+            # 恒为 False，于是脏时间戳反而被当成最新的一句。
             continue
         if now - ts > within_seconds:
             return ""
@@ -145,7 +163,7 @@ def thread_reason(
     # 真正的断点是**这场话本来在继续、却停在这儿了**：对方最近还在连着说话
     # （半小时内两条以上），那就是聊得正热，不是断了。
     recent_in_count = sum(
-        1 for item in (user.get("conversation") or [])
+        1 for item in _conversation(user)
         if _is_inbound(item)
         and 0 < now - _num(item.get("ts", 0)) <= ACTIVE_CHAT_WINDOW
     )
@@ -154,9 +172,8 @@ def thread_reason(
 
     # 得先「在聊」：断点之前还有话挨着，才叫聊到一半
     nearby = [
-        item for item in (user.get("conversation") or [])
-        if isinstance(item, dict)
-        and _num(item.get("ts", 0)) < last_said
+        item for item in _conversation(user)
+        if _num(item.get("ts", 0)) < last_said
         and last_said - _num(item.get("ts", 0)) <= context_seconds
     ]
     if len(nearby) + 1 < THREAD_CONTEXT_MIN:
@@ -325,6 +342,21 @@ def extract_open_loop(
     return snippet, _loop_due(now, clock_offset_minutes, min_hours, max_hours)
 
 
+def _hours(value: Any, default: float) -> float:
+    """回访间隔的小时数：读不出来或非有限值退回默认。
+
+    `min_hours`/`max_hours` 正常来自 `config.py`（那里有 floor/ceil 夹取），但这两个值
+    一旦是 nan，`now + nan * 3600.0` 会让 `stamp` 变成 nan —— 这条回访就**永远不到点**
+    （`live_loops` 的 `now < due` 对 nan 为假，等于「还没到」永真）。inf 同理，
+    永远到不了。所以这里不许放行，退回默认值。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
 def _loop_due(
     now: float,
     clock_offset_minutes: Optional[int] = None,
@@ -332,20 +364,20 @@ def _loop_due(
     max_hours: float = LOOP_MAX_HOURS,
 ) -> float:
     """回访时间：至少隔几小时，且落在她当地的白天。"""
-    low = max(0.5, float(min_hours))
+    low = max(0.5, _hours(min_hours, LOOP_MIN_HOURS))
     # 上界同时受 `low * 2.2`（「大概睡一觉就问」的旧体感）和 `max_hours` 约束：
     # 以前只写 `low * 2.2`，`max_hours` 只在最后做一次 `min()` 截断，
     # 于是抽出来的样本有约 1/29 正好堆在 max_hours 上——那批线索看着像「掐着表问的」，
     # 而 `LOOP_MAX_HOURS = 14` 想表达的「再晚就不像记得」，在默认配置下也永远用不到
     # （2.5~5.5h 全在 14h 以内）。现在让它参与抽样本身：抽不到，就不会有那撮堆积。
-    high = max(low, min(float(max_hours), low * 2.2))
+    high = max(low, min(_hours(max_hours, LOOP_MAX_HOURS), low * 2.2))
     stamp = now + random.uniform(low, min(high, 6.0 if low <= 6.0 else high)) * 3600.0
     local = city_now(stamp, clock_offset_minutes)
     if local.hour < 9:
         # 凌晨到点的事留到当天上午：真人不会半夜三点问「你面试咋样了」
         moved = local.replace(hour=10, minute=random.randint(0, 50), second=0, microsecond=0)
         stamp = city_epoch(moved, clock_offset_minutes)
-    return min(stamp, now + max_hours * 3600.0)
+    return min(stamp, now + _hours(max_hours, LOOP_MAX_HOURS) * 3600.0)
 
 
 # 一个人身上同时记几件「提了但没说结果的事」。以前只记一件，新的直接覆盖旧的——
@@ -428,10 +460,17 @@ def promise_meta(about: str) -> Dict[str, Any]:
 
 
 def _num(x: Any) -> float:
+    """容错取时间戳/计数，读不出来或非有限值一律当 0.0。
+
+    nan 不能放行：`due <= 0 or now < due` 这类守卫对 nan 全为 False，一条
+    `due=nan` 的事就**永远到点**；而 `int(nan)` 会直接抛 ValueError，
+    带走这个用户这一整轮的观察。inf 同理（会永久占住一个槽位）。
+    """
     try:
-        return float(x or 0)
+        out = float(x or 0)
     except (TypeError, ValueError):
         return 0.0
+    return out if math.isfinite(out) else 0.0
 
 
 def loop_entries(user: Dict[str, Any]) -> list:
@@ -566,10 +605,10 @@ def closer_reason(
     pend = str(user.get("pending_result", "") or "")
     if pend not in ("waiting", "ignored"):
         return ""
-    sent = float(user.get("last_sent", 0) or 0)
+    sent = _num(user.get("last_sent", 0))
     if sent <= 0:
         return ""
-    if float(user.get("closer_for", 0) or 0) == sent:
+    if _num(user.get("closer_for", 0)) == sent:
         return ""
     if now - sent < max(after_seconds, CLOSER_MIN_HOURS * 3600.0):
         return ""
@@ -600,7 +639,7 @@ def recent_exchange(u: Dict[str, Any], limit: int = 3) -> List[str]:
     # 只看最后 `limit * 2` 条，再筛 `dir == "in"`：她连着发三条（她自己接自己的话茬）时，
     # 这几条会把窗口整个占满，一条对方的话都取不到，于是「已读续接」退化成了
     # 「没事我就是想说说话」。改成从尾巴往回**收集够 limit 条对方的话**再正序返回。
-    for item in reversed(u.get("conversation") or []):
+    for item in reversed(_conversation(u)):
         if not _is_inbound(item):
             continue
         text = str(item.get("text", "") or "").strip()

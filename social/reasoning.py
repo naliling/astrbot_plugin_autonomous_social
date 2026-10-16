@@ -9,6 +9,7 @@ v1.19.0：
 
 from __future__ import annotations
 
+import math
 import random
 import re
 import time
@@ -23,14 +24,27 @@ def _num(value: Any) -> float:
 
     state.json 里的脏数据（字符串、None）不该让整条观察链路抛异常 —— 那会一路冒到
     心跳的崩溃退避里，插件降级成 30 分钟一轮，而且坏值不修就**每轮都在同一个点崩**。
+
+    非有限值（nan/inf）与「读不出来」同等对待，都归 0.0：`float("nan")` 不抛异常，
+    会一路穿过后面所有比较（`x < lo` / `x > hi` / `x >= 阈值` 对 nan 恒为 False），
+    于是「未知」被静默当成「最低」或「最高」——比抛异常难查得多。
     """
     try:
-        return float(value or 0)
+        out = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+    return out if math.isfinite(out) else 0.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
+    """夹到 [lo, hi]。nan 会穿过两个比较原样返回，调用方再拿它做权重/概率，
+    整条链路（含 `random.uniform`）都会变成 nan，所以这里先归一到 lo。"""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return lo
+    if not math.isfinite(x):
+        return lo
     return lo if x < lo else hi if x > hi else x
 
 
@@ -294,24 +308,19 @@ def live_cue(user: Dict[str, Any], now: float) -> Optional[str]:
     同一件事才不会被每 6 小时重试一次、永不作废。
     """
     cue = str(user.get("cue", "") or "")
-    try:
-        due = float(user.get("cue_due", 0) or 0)
-    except (TypeError, ValueError):
-        return None
+    # 三个时间戳都走 `_num`（非有限归 0）。原来裸 `float()` 放行 nan：
+    # `due=nan` 让 `now < due` 恒假（当作已到点），`expire_at=nan` 又让
+    # `expire_at > 0` 恒假、退回 `due + CUE_LATE_LIMIT` = nan → `now > nan` 恒假，
+    # 于是**这个由头永远到点、永不过期**，每次主动都拿它去问同一件事。
+    due = _num(user.get("cue_due", 0))
     if not cue or due <= 0:
         return None
     if now < due:
         return None
-    try:
-        retry_at = float(user.get("cue_retry_at", 0) or 0)
-    except (TypeError, ValueError):
-        retry_at = 0.0
+    retry_at = _num(user.get("cue_retry_at", 0))
     if retry_at > 0 and now < retry_at:
         return None
-    try:
-        expire_at = float(user.get("cue_expire_at", 0) or 0)
-    except (TypeError, ValueError):
-        expire_at = 0.0
+    expire_at = _num(user.get("cue_expire_at", 0))
     if now > (expire_at if expire_at > 0 else due + CUE_LATE_LIMIT):
         return None
     return cue
@@ -326,6 +335,20 @@ _SLEEP_WORDS = (
 SLEEP_SUPPRESS_SECONDS = 8 * 3600
 
 
+def _conversation(user: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """账本里能当条目看的那几条（元素是 dict）。
+
+    `conversation` 来自 state.json，可能被手改、被迁移写坏、被写成字符串或数字。
+    `[m for m in nan]` 抛 TypeError、`reversed(nan)` 也抛，`reversed("abc")` 更糟——
+    每个字符都被当成一条账。**只筛 dict，不筛 text**：空文本的条目在调用点各有各的
+    处理，在这里筛掉会悄悄改变判定。
+    """
+    conv = user.get("conversation")
+    if not isinstance(conv, list):
+        return []
+    return [item for item in conv if isinstance(item, dict)]
+
+
 def sleep_signal(user: Dict[str, Any], now: float) -> bool:
     """对方最近说过要睡了：这时候再去发消息（尤其别再说「该睡了」）很不对。
 
@@ -333,10 +356,7 @@ def sleep_signal(user: Dict[str, Any], now: float) -> bool:
     旧实现用 `text in _SLEEP_WORDS` 先 continue，把正好等于一个睡意词的消息（如「晚安」）
     跳掉了，导致对方明明道了晚安却判不出来；也没按 dir 过滤，bot 自己的「晚安」也会被扫到。
     """
-    conv = user.get("conversation") or []
-    # 元素可能不是 dict（脏数据），那时 `m.get` 抛的是 AttributeError，
-    # 而原来只接了 TypeError —— 异常于是逃出观察链路。
-    recent = [m for m in conv if isinstance(m, dict) and str(m.get("text", ""))][-4:]
+    recent = [m for m in _conversation(user) if str(m.get("text", ""))][-4:]
     for m in reversed(recent):
         # 只看对方说的；她自己说的（dir=='out'）跳过
         if str(m.get("dir", "")) == "out":
@@ -392,9 +412,7 @@ def busy_signal(user: Dict[str, Any], now: float) -> bool:
 
     只看**对方**（dir != 'out'）说的话；她自己说的「忙」不算。
     """
-    conv = user.get("conversation") or []
-    # 元素可能不是 dict（脏数据）：`m.get` 抛的是 AttributeError，接不住。
-    recent = [m for m in conv if isinstance(m, dict) and str(m.get("text", ""))][-4:]
+    recent = [m for m in _conversation(user) if str(m.get("text", ""))][-4:]
     for m in reversed(recent):
         if str(m.get("dir", "")) == "out":
             continue
@@ -413,7 +431,7 @@ def busy_signal(user: Dict[str, Any], now: float) -> bool:
 
 def last_direction(user: Dict[str, Any]) -> str:
     """对话历史里最后一句是谁说的：'in' / 'out' / ''。"""
-    for item in reversed(user.get("conversation") or []):
+    for item in reversed(_conversation(user)):
         direction = str(item.get("dir") or "")
         if direction in ("in", "out"):
             return direction
@@ -614,6 +632,24 @@ def slot_name_cn(slot: str) -> str:
     return _SLOT_NAMES_CN.get(slot, "未知")
 
 
+def _optional_number(value: Any) -> Optional[float]:
+    """把可能脏的数值读成「有限 float 或 None」。
+
+    和 `_num` 的区别：`_num` 把读不出来归 0，适合时间戳/计数；这里归 None，
+    因为下面这几个函数是**按区间分档**的，归 0 会把「未知」判成最低档，
+    而归 None 才能走回各自那句「未知，保持自然距离」。
+    真正要防的是 nan：`affection < threshold` 对 nan 恒为 False，循环走完
+    直接落到最后那句最亲密/最有精神的分支。
+    """
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def relationship_tier(affection: Optional[float]) -> Tuple[str, str]:
     """根据好感度获取关系等级。
 
@@ -623,6 +659,7 @@ def relationship_tier(affection: Optional[float]) -> Tuple[str, str]:
     Returns:
         (等级 key, 等级描述)
     """
+    affection = _optional_number(affection)
     if affection is None:
         return "unknown", "关系未知，保持自然的社交距离。"
     for threshold, name, desc in _RELATIONSHIP_TIERS:
@@ -633,6 +670,7 @@ def relationship_tier(affection: Optional[float]) -> Tuple[str, str]:
 
 def energy_descriptor(energy: Optional[float]) -> str:
     """根据精力值获取描述词。"""
+    energy = _optional_number(energy)
     if energy is None:
         return "unknown"
     for threshold, desc in ENERGY_THRESHOLDS:
@@ -643,6 +681,7 @@ def energy_descriptor(energy: Optional[float]) -> str:
 
 def social_energy_descriptor(social_energy: Optional[float]) -> str:
     """根据社交能量值获取描述词。"""
+    social_energy = _optional_number(social_energy)
     if social_energy is None:
         return "unknown"
     for threshold, desc in SOCIAL_ENERGY_THRESHOLDS:
@@ -667,7 +706,10 @@ def _detect_continuity(user_data: Dict[str, Any], now: float) -> Optional[str]:
         连续性理由文本，没有则返回 None
     """
     msg = str(user_data.get("last_message", ""))
-    age = now - float(user_data.get("last_seen", now))
+    # `last_seen` 读不出来（含 nan）与「没写过」同等对待，退回 now → age 归 0，
+    # 走「刚聊完」以外的保守分支。裸 float 会让 nan 一路传到所有 `age < 阈值` 比较。
+    seen = _optional_number(user_data.get("last_seen"))
+    age = now - (seen if seen is not None else now)
 
     # 有可延续的话题：主动方视角（我这边有了下文），不是回答对方
     topics = user_data.get("topics", [])
@@ -706,9 +748,14 @@ def select_message_type(
         (type_key, type_info) 元组
     """
     recent_types = recent_types or []
-    age = now - float(user_data.get("last_seen", now))
-    msg_count = int(user_data.get("message_count", 0))
-    affection = user_data.get("_affection")  # 0-100，可能为 None
+    seen = _optional_number(user_data.get("last_seen"))
+    age = now - (seen if seen is not None else now)
+    msg_count = int(_num(user_data.get("message_count", 0)))
+    # 好感与身体数值一律先过 `_optional_number`：读不出来/非有限 = 「未知」，
+    # 走各自 `is not None` 的跳过分支。原来裸 `float()` 放行 nan，于是
+    # `aff` 变 nan、所有乘数变 nan、`total` 变 nan，`r = random.uniform(0, nan)`
+    # 与全部 `r <= cumulative` 都为假 → **永远落到兜底的 share_thought**。
+    affection = _optional_number(user_data.get("_affection"))  # 0-100，可能为 None
     body = user_data.get("_body")  # Core 契约里的身体状态，可能为 None
 
     # 复制基础权重
@@ -720,7 +767,7 @@ def select_message_type(
     # ─── 关系远近影响类型分布 ──────────────────────────
     # 越亲近，表达感受和吐槽的比例越高；不熟的人以分享日常和想法为主
     if affection is not None:
-        aff = clamp(float(affection) / 100.0, 0.0, 1.0)
+        aff = clamp(_num(affection) / 100.0, 0.0, 1.0)
         # express_feeling：亲近的人表达感受更多（2.2x），不熟的人少一点（0.7x）
         weights["express_feeling"] *= 0.7 + 1.5 * aff
         # complain：越亲近越敢吐槽（越熟越不掩饰）
@@ -737,7 +784,7 @@ def select_message_type(
     if days_absent > 0.5:  # 半天以上没聊
         # 「想你」的峰值在 1-3 天左右，之后慢慢回落（太久了说想你有点突兀）
         missing_peak = min(days_absent / 1.5, 1.0) if days_absent < 3 else max(0.3, 1.0 - (days_absent - 3) / 10)
-        if affection is not None and float(affection) >= 60:
+        if affection is not None and affection >= 60:
             # 只有关系够近才会说想你
             weights["express_feeling"] *= 1.0 + missing_peak * 1.5
         # 久未联系时 check_in 也会增加
@@ -748,35 +795,37 @@ def select_message_type(
 
     # ─── 身体状态影响类型 ──────────────────────────
     if body and isinstance(body, dict):
-        energy = body.get("energy")
-        social_desire = body.get("social_desire")
-        hunger = body.get("hunger")
-        discomfort = body.get("discomfort")
+        # 同样过 `_optional_number`：nan 会让 `energy < 35` 恒 False，
+        # 「累」这条分支静默失效；归 None 则明确跳过。
+        energy = _optional_number(body.get("energy"))
+        social_desire = _optional_number(body.get("social_desire"))
+        hunger = _optional_number(body.get("hunger"))
+        discomfort = _optional_number(body.get("discomfort"))
 
         # 累/困的时候：抱怨多、分享想法少、更多表达感受
-        if energy is not None and float(energy) < 35:
+        if energy is not None and energy < 35:
             weights["complain"] *= 1.4
             weights["share_thought"] *= 0.7
             weights["express_feeling"] *= 1.2
             weights["share_daily"] *= 0.8
 
         # 不舒服的时候：更想找人说话（表达感受 + 吐槽）
-        if discomfort is not None and float(discomfort) >= 50:
+        if discomfort is not None and discomfort >= 50:
             weights["express_feeling"] *= 1.3
             weights["complain"] *= 1.2
 
         # 饿的时候：吐槽食物相关，分享日常（吃的）更多
-        if hunger is not None and float(hunger) >= 70:
+        if hunger is not None and hunger >= 70:
             weights["share_daily"] *= 1.2
             weights["complain"] *= 1.1
 
         # 社交欲望高的时候：更想搭话，招呼类更多
-        if social_desire is not None and float(social_desire) >= 70:
+        if social_desire is not None and social_desire >= 70:
             weights["casual_hello"] *= 1.3
             weights["express_feeling"] *= 1.1
 
         # 社交欲望低的时候：更少主动搭话，更多分享（就是随手发一句）
-        if social_desire is not None and float(social_desire) < 30:
+        if social_desire is not None and social_desire < 30:
             weights["casual_hello"] *= 0.7
             weights["share_daily"] *= 1.2
 
@@ -819,7 +868,9 @@ def select_message_type(
 
     # 加权随机选择
     total = sum(weights.values())
-    if total <= 0:
+    # `not isfinite` 兜住 inf/nan：total 一旦是 nan，`random.uniform(0, nan)` 与
+    # 全部 `r <= cumulative` 都为假，会静默落到兜底类型（不是崩溃，所以更难发现）。
+    if not math.isfinite(total) or total <= 0:
         return "share_thought", MESSAGE_TYPES["share_thought"]
 
     r = random.uniform(0, total)
@@ -855,7 +906,8 @@ def generate_reason(
         - msg_type_desc: 消息类型描述（用于 prompt）
         - style_hint: 这一类的写法要求（不包含任何例句）
     """
-    age = now - float(user_data.get("last_seen", now))
+    seen = _optional_number(user_data.get("last_seen"))
+    age = now - (seen if seen is not None else now)
     recent_types = user_data.get("recent_msg_types", [])
 
     msg_type, msg_info = select_message_type(user_data, now, recent_types)

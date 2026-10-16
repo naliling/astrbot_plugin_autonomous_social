@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import os
 import random
 import time
@@ -76,6 +77,8 @@ from .threads import (
     thread_meta,
     thread_reason,
     loops_resolved_by,
+    LOOP_LATE_HOURS,
+    PROMISE_WAIT_SECONDS,
 )
 
 # ─── 常量定义 ───────────────────────────────────────
@@ -175,6 +178,9 @@ AFFECTION_FAMILIAR_WEIGHT = 0.45
 SEND_BREAKER_TRIP = 3
 SEND_BREAKER_BASE_SECONDS = 900.0    # 15 分钟起步
 SEND_BREAKER_MAX_SECONDS = 7200.0    # 连续失败越多翻倍，2 小时封顶
+# 翻倍指数的上限（见 `_note_send_failure`）。只为挡住 `2 ** 1000` 那种 OverflowError，
+# 数值本身远大于 SEND_BREAKER_MAX_SECONDS，所以不影响任何实际退避时长。
+_BREAKER_EXP_CAP = 16
 
 # 念头超出门槛多少算「很想说」：很想说的时候不因为最小间隔再等——真人急着说某件事时
 # 不会先看一眼上次是几点发的。
@@ -226,12 +232,27 @@ _PLATFORM_UNAVAILABLE_MARKERS = (
 )
 
 
-def _num(value: Any) -> float:
-    """容错取数。state.json 里的脏数据不该让正常流程抛异常。"""
+def _num(value: Any, default: float = 0.0) -> float:
+    """容错取数：读不出来、或读出来不是有限值（nan/inf），一律当 default。
+
+    两个来源都不是我们能控制的：`state.json` 是主人能手改的文件，Core 快照是另一个
+    插件写的。它们出现 `"2 小时前"`、`""`、`null` 时，裸 `float()` 抛的 ValueError
+    会冒泡到闸门/挑选/轮内记账，而那条链路上大多没有逐用户兜底——一条脏数据就作废
+    一整轮心跳，事后还看不出是谁。
+
+    更要紧的是 nan/inf 会**静默改变判定**，一个异常都不抛：
+      * `now - nan < cooldown` 恒假 → 护栏冷却、最小间隔、48 小时冷静期全部失效
+      * `nan <= stopped` 恒假 → 「停发」永不成立，她会一直追一个不回话的人
+      * `nan - base < rise`、`nan < affection_min` 恒假 → 硬门槛被静默放过
+      * 反过来 `inf >= 急切线` 恒真 → 凭空多出一张「很想说」的豁免券
+      * `int(nan)` / `int(inf)` 则直接抛 ValueError / OverflowError
+    归到 default 之后这些都变成**确定行为**，与「字段没写」同义，不再看她当天像谁。
+    """
     try:
-        return float(value or 0)
+        out = float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return default
+    return out if math.isfinite(out) else default
 
 
 def _body_asleep(body: Any) -> bool:
@@ -485,6 +506,60 @@ class SocialEngine:
             pass
         self.signals.beat()
 
+    def _open_items(self, bid: str, now: float) -> List[Dict[str, Any]]:
+        """她手上**还开着**的事：对方提了没下文的（loop）+ 她自己许下还没兑现的（promise）。
+
+        这是发给 Core 的那份「她此刻在惦记什么」。Core 把它渲染进 system_prompt 的稳定段，
+        所以两点必须守住：
+        1. `at` 取这件事**被记下的那一刻**（条目自己的 `at`），不是 now。每轮重盖成 now 会让
+           「三天前答应的事」被说成「刚答应的」，而且那段文本每轮都变，把整段前缀缓存打掉。
+        2. 整体重算、整体覆盖（见 `SignalsWriter.note_open_items`）。只增不减的话，对方早就
+           给出结果的事会永远挂在她的提示词里。
+
+        与 `live_loops` / `live_promises` 的区别：那两个回答的是「**现在该问 / 该兑现**了吗」，
+        这里回答的是「**还开着**吗」。一件三小时后才到点回访的事现在照样是开着的——而对话
+        历史一旦被压缩，它就只剩这条通道能留下。
+        """
+        out: List[Dict[str, Any]] = []
+        for uid, u in (self.state.bot(bid).get("users") or {}).items():
+            try:
+                for item in loop_entries(u):
+                    about = str(item.get("about", "") or "").strip()
+                    due = _num(item.get("due"))
+                    # due<=0 的条目永远不会被回访（live_loops 也跳过它），不该挂在她手上
+                    if not about or due <= 0:
+                        continue
+                    expire_at = _num(item.get("expire_at"))
+                    # 老数据没有 expire_at：与 live_loops 用同一个兜底口径，否则同一件事
+                    # 会一边被当成「凉过头了」、一边还挂在提示词里
+                    if now > (expire_at if expire_at > 0
+                              else due + LOOP_LATE_HOURS * 3600.0):
+                        continue
+                    at = _num(item.get("at"))
+                    if at <= 0:
+                        # 不知道什么时候记下的：宁可不发，也不能编一个时间戳——Core 把它
+                        # 渲染成「三天前」这种相对时间，编出来的比没有更糟
+                        continue
+                    out.append({"text": about, "uid": str(uid),
+                                "at": at, "kind": "loop"})
+                for item in promise_entries(u):
+                    about = str(item.get("about", "") or "").strip()
+                    if not about:
+                        continue
+                    at = _num(item.get("at"))
+                    if at <= 0:
+                        # 老数据只有 due：按写侧的公式反推许下的时刻
+                        # （due = at + PROMISE_WAIT_SECONDS），而不是拿 0 当 1970 年发过去
+                        at = _num(item.get("due")) - PROMISE_WAIT_SECONDS
+                    if at <= 0:
+                        continue
+                    out.append({"text": about, "uid": str(uid),
+                                "at": at, "kind": "promise"})
+            except Exception as e:
+                # 一条脏记录只该让这个用户这轮不上报，不该连累整轮心跳的信号写回
+                self.log(f"整理 {bid}/{uid} 的未完事项失败: {e}")
+        return out
+
     def start(self) -> None:
         """启动引擎。"""
         self.running = True
@@ -575,24 +650,56 @@ class SocialEngine:
                 self._memory_bridge_obj = None
         return getattr(self, "_memory_bridge_obj", None)
 
-    async def _fetch_memory_note(self, umo: str, uid: str) -> str:
-        """生成前拉这个人的长期记忆（拿不到返回空串，不影响发送）。"""
+    async def _fetch_memory_note(self, umo: str, uid: str, query: str = "") -> str:
+        """生成前拉这个人的长期记忆（拿不到返回空串，不影响发送）。
+
+        `query` 给的是这次开口的**由头**，不是空串：空串等于「把这个人的记忆按时间
+        倒出来」，而由头才是这次真正要谈的事——检索该跟着这件事走，记忆插件才判断得
+        出哪些旧事相关（旧写法传空串，于是每次都倒出同一批最久远的条目）。
+        """
         bridge = self._memory_bridge()
         if bridge is None:
             return ""
         try:
-            return await memory_bridge.fetch_memory_text(bridge, umo, uid)
+            return await memory_bridge.fetch_memory_text(bridge, umo, uid, query=query)
         except Exception:
             return ""
 
-    def _remember_proactive(self, umo: str, uid: str, text: str, ts: float) -> None:
+    def _remember_proactive(
+        self, umo: str, uid: str, text: str, ts: float, about: str = ""
+    ) -> None:
         """发出后把这条主动消息写回记忆库（后台任务，失败不影响主链路）。"""
         bridge = self._memory_bridge()
         if bridge is None:
             return
         try:
             task = asyncio.create_task(
-                memory_bridge.write_proactive(bridge, uid, text, umo=umo, ts=ts)
+                memory_bridge.write_proactive(
+                    bridge, uid, text, umo=umo, ts=ts, about=about
+                )
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except Exception:
+            pass
+
+    def _remember_open_closed(
+        self, umo: str, uid: str, about: str, result: str = "", kind: str = "loop"
+    ) -> None:
+        """一件还开着的事有了结果 → 落一条长期记忆（后台任务，失败不影响主链路）。
+
+        中间层（Core 的 `life_log`）到此就不再管它了：不再回访、也不再进注入。
+        棒子在这里交给长期层——「对方终于答了」是这段关系里真实发生过的事，
+        不该随账本一起消失。
+        """
+        bridge = self._memory_bridge()
+        if bridge is None:
+            return
+        try:
+            task = asyncio.create_task(
+                memory_bridge.write_open_closed(
+                    bridge, uid, about, result=result, kind=kind, umo=umo
+                )
             )
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
@@ -759,11 +866,13 @@ class SocialEngine:
                 except Exception as e:
                     self.log(f"挂时间锚点由头失败: {e}")
             # T2：对方这条里带了某件未完事的**结果** → 这件不必再回访了。
-            # 只关掉一件已经结束的话题，不把结果存成记忆（那不是本插件的事）。
+            # 中间层到此为止（不再回访、也不再进注入），但**棒子交给长期层**：
+            # 「对方终于答了」是这段关系里真实发生过的事，不该随账本一起消失。
             try:
                 for about in loops_resolved_by(u, msg):
                     self._drop_loop(u, about)
                     self.state.mark_dirty()
+                    self._remember_open_closed(umo, uid, about, msg)
                     self.log(f"未完话题「{about[:20]}」对方已给出结果，不再回访")
             except Exception as e:
                 self.log(f"关闭已了结的未完话题失败: {e}")
@@ -1252,7 +1361,7 @@ class SocialEngine:
             not is_bot
             and not is_sibling
             and self._mentions_bot(event, bid)
-            and float(g.get("flow_open_until", 0) or 0) > now
+            and _num(g.get("flow_open_until", 0) or 0) > now
         ):
             self.state.note_flow_pickup(bid, gid)
         # 心流：窗口开着、不是 bot（自己和兄弟都算）发的、**没有任何 @**、预筛过了，
@@ -1266,7 +1375,7 @@ class SocialEngine:
             return
         if self._at_targets(event):
             return
-        if float(g.get("flow_open_until", 0) or 0) <= now:
+        if _num(g.get("flow_open_until", 0) or 0) <= now:
             return
         if not groupflow.flow_prefilter(msg, is_command=False):
             return
@@ -1522,7 +1631,7 @@ class SocialEngine:
                 due = self._icebreak_pick(bid, now)
                 if not due:
                     continue
-                due.sort(key=lambda item: float(item[1].get("last_seen", 0) or 0))
+                due.sort(key=lambda item: _num(item[1].get("last_seen", 0) or 0))
                 gid, g = due[0]
                 await self._icebreak(bid, gid, g, now)
             except Exception as e:
@@ -1572,7 +1681,7 @@ class SocialEngine:
                 if not due:
                     continue
                 # 静得最久的那个群优先
-                due.sort(key=lambda item: float(item[1].get("last_bot_spoke", 0) or 0))
+                due.sort(key=lambda item: _num(item[1].get("last_bot_spoke", 0) or 0))
                 gid, g = due[0]
                 await self._icebreak(bid, gid, g, now, mode="topic")
             except Exception as e:
@@ -1768,7 +1877,7 @@ class SocialEngine:
             if not text:
                 continue
             try:
-                ts = float(item.get("at") or 0.0)
+                ts = _num(item.get("at") or 0.0)
             except (TypeError, ValueError):
                 ts = 0.0
             fresh.append({"said": text, "ts": ts})
@@ -1938,7 +2047,14 @@ class SocialEngine:
             return
         try:
             if window and len(window) == 2:
-                self._night_windows[key] = (float(window[0]) % 24.0, float(window[1]) % 24.0)
+                start, end = _num(window[0], math.nan), _num(window[1], math.nan)
+                # nan 躲得过 `float()`（它不抛），却躲不过 `_quiet_now` 里的比较：
+                # `nan < end`、`hour >= nan` 全假，于是这道「安静时段」硬闸静默失效、
+                # 深夜照样开口。和「读不到」同等处理——清掉，退回插件自己的配置窗口。
+                if math.isfinite(start) and math.isfinite(end):
+                    self._night_windows[key] = (start % 24.0, end % 24.0)
+                else:
+                    self._night_windows.pop(key, None)
             else:
                 self._night_windows.pop(key, None)
         except (TypeError, ValueError):
@@ -2117,7 +2233,14 @@ class SocialEngine:
     @classmethod
     def _relation_bucket(cls, user: Dict[str, Any]) -> int:
         try:
-            iv = float(user.get("interest") or 0.35)
+            # 不能用 `or 0.35`：`0.0` 是个**读得出来的值**（`interest` 的正规下限是
+            # 0.05，但手改/旧版迁移可能写成 0.0），而 `0.0 or 0.35` 会把它当成
+            # 「没这个字段」抬到默认档——一个本该最边缘的人被排到中档，间隔反而更短。
+            raw = user.get("interest")
+            # 同理不能放 nan 进来：`iv < floor` 对 nan 恒假，循环走完直接落到
+            # `return len(_REL_BUCKETS)`——一个读不出来的在意度被抬到**最高**档，
+            # 比「缺失」还激进。nan 归到与缺失同一个默认值。
+            iv = 0.35 if raw is None or raw == "" else _num(raw, 0.35)
         except (TypeError, ValueError):
             iv = 0.35
         for idx, floor in enumerate(cls._REL_BUCKETS):
@@ -2149,7 +2272,7 @@ class SocialEngine:
             if not isinstance(r, dict):
                 continue
             try:
-                if float(r.get("t", 0) or 0) >= cutoff:
+                if _num(r.get("t", 0) or 0) >= cutoff:
                     kept.append(r)
             except (TypeError, ValueError):
                 continue
@@ -2169,7 +2292,7 @@ class SocialEngine:
             if not isinstance(r, dict):
                 continue
             try:
-                ago = max(0, int((now - float(r.get("t", now) or now)) / 60))
+                ago = max(0, int((now - _num(r.get("t", now) or now)) / 60))
             except (TypeError, ValueError):
                 ago = 0
             lines.append(f"    {ago} 分钟前 · {r.get('text', '')}")
@@ -2215,30 +2338,35 @@ class SocialEngine:
         if isinstance(snap, dict):
             mood = snap.get("mood") if isinstance(snap.get("mood"), dict) else {}
             try:
-                cool_until = float(mood.get("cool_no_proactive_until", 0.0) or 0.0)
+                cool_until = _num(mood.get("cool_no_proactive_until", 0.0) or 0.0)
             except (TypeError, ValueError):
                 cool_until = 0.0
             if cool_until > now:
                 return "她还在为之前的事生这个人的气"
             try:
-                aggr = float(mood.get("aggression", 0.0) or 0.0)
-                base_aggr = float(mood.get("base_aggression", aggr) or aggr)
+                aggr = _num(mood.get("aggression", 0.0) or 0.0)
+                # 基线不能写成 `mood.get(...) or aggr`：基线**正常就是 0**（她平时没在生谁
+                # 的气），而 `0.0 or aggr` 会把它当成「Core 没报基线」，于是 base 变成当前值、
+                # 差值恒为 0——「气还没消」这道闸永远不会成立。同 `_relation_bucket` 的老账：
+                # 只有「缺失」才回退，`0.0` 是个读得出来的值。
+                raw_base = mood.get("base_aggression")
+                base_aggr = aggr if raw_base is None or raw_base == "" else _num(raw_base, aggr)
             except (TypeError, ValueError):
                 aggr = base_aggr = 0.0
             if aggr - base_aggr >= 10.0:
                 return "她这会儿对这个人的气还没消"
         # 「累」的闸不在这里，而在 `_speak`：那里才是所有开口的唯一收口。
         # 放这儿只挡住了有由头的那一路（实测 61 条里过了 57 条）。
-        seen = float(u.get("last_seen", 0) or 0)
+        seen = _num(u.get("last_seen", 0) or 0)
         if now - seen < HOT_CHAT_THRESHOLD:
             return "刚聊上，不插话"
         if now - seen < self.cfg.recent_talk_minutes * 60:
             return "不久前才说过话，再另起一句很突兀"
         if str(u.get("pending_result", "") or "") == "waiting":
             return "上一条主动发的还没回，现在再发就是追着说"
-        if now - float(u.get("last_sent", 0) or 0) < self.cfg.user_cooldown_minutes * 60:
+        if now - _num(u.get("last_sent", 0) or 0) < self.cfg.user_cooldown_minutes * 60:
             return "护栏冷却未过"
-        if now - float(u.get("last_skip_at", 0) or 0) < self.cfg.skip_cooldown_minutes * 60:
+        if now - _num(u.get("last_skip_at", 0) or 0) < self.cfg.skip_cooldown_minutes * 60:
             return "刚想过一次决定不说，缓缓"
         if sleep_signal(u, now):
             return "TA 说过要去睡了，这时发过去不合适"
@@ -2268,12 +2396,12 @@ class SocialEngine:
         # 「刚聊过」也要拦。追问与「在吗」都是**接续型**——对方刚说完话就追一句
         # 是打断。对方一小时一条「在吗」，她每两小时（最小间隔一过）追问一次，
         # 7 天 44 次。
-        if now - float(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
+        if now - _num(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
             return "刚聊过，不追"
         last_said = self._last_said(u)
-        if last_said > 0 and float(u.get("thread_for", 0) or 0) == last_said:
+        if last_said > 0 and _num(u.get("thread_for", 0) or 0) == last_said:
             return "这段沉默已经接过一回了，再问就是催"
-        if now - float(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
+        if now - _num(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
             return "刚接过一次，给 TA 点时间"
         if self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
@@ -2282,7 +2410,7 @@ class SocialEngine:
     @staticmethod
     def _last_said(u: Dict[str, Any]) -> float:
         """这一段对话里最后一个人说话的时刻。沉默从这一刻算起。"""
-        return max(float(u.get("last_seen", 0) or 0), float(u.get("last_spoken", 0) or 0))
+        return max(_num(u.get("last_seen", 0) or 0), _num(u.get("last_spoken", 0) or 0))
 
     def _thread_windows(self) -> Tuple[float, float, float, float]:
         """四个时间窗：多久算能追问 / 多久算能问在吗 / 最长追到多久 / 之前多久内得有过话。
@@ -2435,7 +2563,14 @@ class SocialEngine:
             first_met = None
         if aff is None:
             try:
-                aff = float(u.get("interest", 0.35) or 0.35) * 100.0
+                # 同 `_relation_bucket`：`0.0 or 0.35` 会把「读出来的 0.0」当成
+                # 「没有这个字段」。这里的后果更重——`aff = 35.0` 越过了
+                # `anchors.TIER_AFFECTION_FLOOR = 25.0`，一个在意度为 0 的人不会
+                # 被判成 TIER_LOW，于是 `_note_giveup` 永远不会让他静默下来。
+                raw_interest = u.get("interest")
+                if raw_interest is None or raw_interest == "":
+                    raw_interest = 0.35
+                aff = float(raw_interest) * 100.0
             except (TypeError, ValueError):
                 aff = None
         tier = anchors.relation_tier(
@@ -2466,12 +2601,12 @@ class SocialEngine:
         minutes = float(table.get(tier, mid)) * (max(0.0, base) / mid)
         minutes = min(max(minutes, 1.0), 1440.0)
         try:
-            streak = max(0, int(u.get("no_reply_streak", 0) or 0))
+            streak = max(0, int(_num(u.get("no_reply_streak", 0) or 0)))
         except (TypeError, ValueError):
             streak = 0
         # 被冷落过就再拉远一点：真人不会一直追一个不回话的人
         minutes *= min(3.0, 1.0 + 0.4 * streak)
-        last = float(u.get("last_sent", 0) or 0)
+        last = _num(u.get("last_sent", 0) or 0)
         if last <= 0:
             return 0.0
         return max(0.0, minutes * 60.0 - (now - last))
@@ -2533,8 +2668,8 @@ class SocialEngine:
         真人不会一直追一个不回话的人。解除条件只有一个——对方先开口。
         """
         try:
-            seen = float(u.get("last_seen", 0) or 0)
-            stopped = float(u.get("quiesced_at", 0) or 0)
+            seen = _num(u.get("last_seen", 0) or 0)
+            stopped = _num(u.get("quiesced_at", 0) or 0)
         except (TypeError, ValueError):
             return False
         return stopped > 0 and seen <= stopped
@@ -2575,7 +2710,7 @@ class SocialEngine:
             user = (
                 ((core_root or {}).get("roles", {}) or {}).get(str(bid), {}) or {}
             ).get("users", {}) or {}
-            ts = float((user.get(str(uid), {}) or {}).get("last_interaction") or 0)
+            ts = _num((user.get(str(uid), {}) or {}).get("last_interaction") or 0)
         except (TypeError, ValueError, AttributeError):
             return None
         return ts if ts > 0 else None
@@ -2734,11 +2869,16 @@ class SocialEngine:
         aff = (snap or {}).get("affection")
         if aff is not None:
             try:
-                return float(aff)
+                out = float(aff)
             except (TypeError, ValueError):
-                pass
+                out = None
+            # 只认有限值：nan 既不是「有值」也不该原样传出去——`aff is not None`
+            # 会放它进门，接着所有 `aff < 门槛` 恒假，这条通道的硬门槛就白设了。
+            # 读不出来就当没有，退回在意度折算（那才是这条通道的本意）。
+            if out is not None and math.isfinite(out):
+                return out
         try:
-            return float(u.get("interest", 0.35) or 0.35) * 100.0
+            return _num(u.get("interest", 0.35) or 0.35) * 100.0
         except (TypeError, ValueError):
             return None
 
@@ -2764,13 +2904,13 @@ class SocialEngine:
             if self.loop_gate(bid, uid, u, now, body):
                 continue
             # 等得越久的越该先问；同一轮里多个候选时按到期时间排
-            weight = -(now - due) - float(u.get("interest", 0) or 0) * 3600.0
+            weight = -(now - due) - _num(u.get("interest", 0) or 0) * 3600.0
             if best is None or weight < best[0]:
                 best = (weight, uid, u, about)
         if best is None:
             return None
         _, uid, u, about = best
-        return uid, u, about, now - float(u.get("loop_due", 0) or 0)
+        return uid, u, about, now - _num(u.get("loop_due", 0) or 0)
 
     def closer_gate(
         self,
@@ -2811,7 +2951,7 @@ class SocialEngine:
                 continue
             if self.closer_gate(bid, uid, u, now, body):
                 continue
-            waited = now - float(u.get("last_sent", 0) or 0)
+            waited = now - _num(u.get("last_sent", 0) or 0)
             if best is None or waited > best[0]:
                 best = (waited, uid, u, reason)
         if best is None:
@@ -2822,10 +2962,10 @@ class SocialEngine:
         """把念头状态整理成给模型看的内心描述。"""
         return {
             "urge": urge,
-            "interest": float(u.get("interest", 0.35) or 0.35),
-            "silence_hours": (now - float(u.get("last_seen", 0) or 0)) / 3600.0,
+            "interest": _num(u.get("interest", 0.35) or 0.35),
+            "silence_hours": (now - _num(u.get("last_seen", 0) or 0)) / 3600.0,
             "pending_result": str(u.get("pending_result", "") or ""),
-            "no_reply_streak": int(u.get("no_reply_streak", 0) or 0),
+            "no_reply_streak": int(_num(u.get("no_reply_streak", 0) or 0)),
             "they_slept": sleep_signal(u, now),
             # 只在这个开关开着时才算：关着时（默认）引擎压根不用作息画像挑点，
             # 提示词里却写着「按对方作息这个点可能不在线」——和上一段
@@ -3088,11 +3228,15 @@ class SocialEngine:
                 # 「对 TA 的好感下降」，必须知道是谁没理她。
                 for uid, u in (self.state.bot(bid).get("users") or {}).items():
                     try:
-                        streak = int(u.get("no_reply_streak", 0) or 0)
+                        streak = int(_num(u.get("no_reply_streak", 0) or 0))
                     except (TypeError, ValueError):
                         continue
                     if streak > 0:
                         self.signals.note_ignored(uid, streak, bid)
+                # 她手上还开着的事（对方提了没下文的 + 她自己许下还没兑现的）：
+                # **每轮重算并整体覆盖**。Core 靠它判断「这件事结了没有」，只增不减会让
+                # 早就了结的事永远挂在她的提示词里（见 SignalsWriter.note_open_items）。
+                self.signals.note_open_items(self._open_items(bid, now), bid)
             # 无条件重写：Core 那边靠 mtime 判信号是否过期，而心跳间隔远大于它的
             # 默认阈值，靠「内容没变就跳过」是撑不过去的。顺便把真实保鲜期写进
             # `ttl_seconds`（见 `_beat_signals`）。
@@ -3357,7 +3501,7 @@ class SocialEngine:
         # 轮转**，于是同一档里没人会被饿死，各档之间又按亲疏分出先后。
         anchored.sort(key=lambda x: (
             -self._relation_bucket(x[2]),
-            float(x[2].get("last_sent", 0) or 0),
+            _num(x[2].get("last_sent", 0) or 0),
             -x[3],
         ))
         # 走「另起话题」之前，前三条通道已经按 pre_cap 让出了名额（见上）。
@@ -3424,7 +3568,7 @@ class SocialEngine:
         for bid, uid, u, reason in closers:
             if budget.get(bid, 0) <= 0:
                 continue
-            hung = (now - float(u.get("last_sent", 0) or 0)) / 3600.0
+            hung = (now - _num(u.get("last_sent", 0) or 0)) / 3600.0
             # 已读续接：对方回过（那句回话走的是正常聊天链路，不是插件发的）之后又
             # 没声了，这时候补的一句该**接着那几句说**。没有素材时退回老做法。
             jobs.append(job_of(
@@ -3558,10 +3702,10 @@ class SocialEngine:
             body = self.core.bot_self_state(bid)
         except Exception:
             body = None
-        try:
-            energy = float((body or {}).get("energy"))
-        except (TypeError, ValueError):
-            energy = 100.0
+        # 读不出来时按 100.0（满精力）而不是 0：Core 没接上、或契约里没这个字段是
+        # 常态，把它当「累到不能说话」会让整个插件在没接 Core 的机器上永久静默。
+        # nan/inf 也走这条：一个坏字段不该让她一整天不开口。
+        energy = _num((body or {}).get("energy"), 100.0)
         if energy < self.cfg.gate_energy_floor:
             self.log(f"没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
@@ -3600,7 +3744,7 @@ class SocialEngine:
         has_cue = bool(live_cue(u, self._time()) if self.cfg.cue_followup else False)
         if not (is_greet or has_cue):
             try:
-                silent_sent = int(u.get("silent_sent", 0) or 0)
+                silent_sent = int(_num(u.get("silent_sent", 0) or 0))
             except (TypeError, ValueError):
                 silent_sent = 0
             if silent_sent >= COLD_SILENCE_SENT:
@@ -3623,7 +3767,7 @@ class SocialEngine:
         # 这个人的上一次发送失败过：这会儿写好了也送不到。
         # 以前只有 cue/loop 两条路有重试节奏，收场/问候/追问发不出去时下一轮心跳
         # 照旧各写一遍完整 LLM——收场那条能空烧 8 小时。
-        fail_left = float(u.get("send_fail_until", 0) or 0) - self._time()
+        fail_left = _num(u.get("send_fail_until", 0) or 0) - self._time()
         if fail_left > 0:
             return False, f"上次发给 TA 没发出去，{int(fail_left / 60)} 分钟内不再试"
 
@@ -3661,11 +3805,11 @@ class SocialEngine:
             # 「刚认识不久」（<20）——那种落差大到不像人。所以按熟络度加权混合成
             # 连续的滑动，而不是加一道会把它钉死的地板。
             try:
-                msgs = int(u.get("message_count", 0) or 0)
+                msgs = int(_num(u.get("message_count", 0) or 0))
             except (TypeError, ValueError):
                 msgs = 0
             blended = (
-                AFFECTION_INTEREST_WEIGHT * float(u.get("interest", 0.35) or 0.35)
+                AFFECTION_INTEREST_WEIGHT * _num(u.get("interest", 0.35) or 0.35)
                 + AFFECTION_FAMILIAR_WEIGHT * desire.familiarity(msgs)
             )
             affection = round(blended * 100, 1)
@@ -3684,9 +3828,9 @@ class SocialEngine:
         u_copy["_body"] = user_core if (user_core or {}).get("contract_v") else None
         # 「记仇」的三道限在这里记账，生成器只读 target（它是 u 的副本，改不回去）
         self._track_aggression(u, user_core, now)
-        u_copy["_aggr_high_n"] = int(u.get("aggr_high_n", 0) or 0)
+        u_copy["_aggr_high_n"] = int(_num(u.get("aggr_high_n", 0) or 0))
         u_copy["_aggr_recently_acted"] = bool(
-            now - float(u.get("aggr_note_at", 0) or 0) < AGGR_NOTE_COOLDOWN
+            now - _num(u.get("aggr_note_at", 0) or 0) < AGGR_NOTE_COOLDOWN
         )
         # Core 替她记着的对方信息：称呼、对方说过什么、对方此刻的状态。
         # 以前这些只躺在 Core 的状态文件里，主动消息一条也用不上。
@@ -3763,7 +3907,8 @@ class SocialEngine:
         # `last_rejected` 可能是 B 的原文，跨用户内容串台、还会经状态页显示给主人。
         raw_generated = ""
         # 记忆联动：装了记忆插件就先把这个人的长期记忆拉出来，揉进这次生成。
-        memory_note = await self._fetch_memory_note(umo, uid)
+        # 检索跟着**这次的由头**走，不是空串。
+        memory_note = await self._fetch_memory_note(umo, uid, query=reason)
         if allow_veto and self.cfg.llm_gate:
             try:
                 decision = await self.generator.decide(
@@ -3823,7 +3968,7 @@ class SocialEngine:
 
         # 生成期间对方可能发了新消息
         latest = self.state.user(bid, uid)
-        if self._time() - float(latest.get("last_seen", 0)) < FINAL_CHECK_GAP_SECONDS:
+        if self._time() - _num(latest.get("last_seen", 0)) < FINAL_CHECK_GAP_SECONDS:
             defer_cue()
             return False, "对方刚发了新消息，不插话"
 
@@ -3999,7 +4144,7 @@ class SocialEngine:
         # 「你有多长时间没回我」——记下来，写进运行指标，主人一眼能看到
         try:
             u["reply_gap_hours"] = round(
-                max(0.0, sent_ts - float(u.get("last_seen", 0) or 0)) / 3600.0, 1
+                max(0.0, sent_ts - _num(u.get("last_seen", 0) or 0)) / 3600.0, 1
             )
         except (TypeError, ValueError):
             pass
@@ -4017,11 +4162,17 @@ class SocialEngine:
             self.state.note_promise(u, promise, sent_ts)
         if category == "promise":
             # 这件已经做了，别再提醒自己
+            _done_about = str((reason_meta or {}).get("about") or "").strip()
             kept = [
                 i for i in promise_entries(u)
-                if str(i.get("about", "")).strip() != str((reason_meta or {}).get("about") or "").strip()
+                if str(i.get("about", "")).strip() != _done_about
             ]
             u["promises"] = kept
+            # 兑现了 → 落一条长期记忆。中间层不再管它，但这件事真的发生过。
+            if _done_about:
+                self._remember_open_closed(
+                    umo, uid, _done_about, segments[0], kind="promise"
+                )
         # 问候与收场本来就不要求对方回：它们不进「等一句回话」的计时器，
         # 否则「从来没回过早安」会被当成「连着被冷落」，念头天花板永久压死，
         # 而衰减的锚点（last_sent）又每天被问候刷新，永远等不到。
@@ -4038,7 +4189,8 @@ class SocialEngine:
             store_text=self.cfg.store_message_text,
         )
         # 记忆联动：把这条主动消息写回记忆库（后台任务，失败不影响主链路）。
-        self._remember_proactive(umo, uid, segments[0], sent_ts)
+        # 带上由头：将来按由头检索时，它就是「这件事她开过口」的证据。
+        self._remember_proactive(umo, uid, segments[0], sent_ts, about=_sent_about)
         # 发成功了，之前那次失败就不再约束他
         u["send_fail_count"] = 0
         u["send_fail_until"] = 0.0
@@ -4116,14 +4268,14 @@ class SocialEngine:
         except (TypeError, ValueError):
             value = 0.0
         try:
-            prev = int(u.get("aggr_high_n", 0) or 0)
+            prev = int(_num(u.get("aggr_high_n", 0) or 0))
         except (TypeError, ValueError):
             prev = 0
         n = prev + 1 if value >= AGGR_NOTE_THRESHOLD else 0
         if n != prev:
             u["aggr_high_n"] = n
             self.state.mark_dirty()
-        if n >= AGGR_NOTE_SAMPLES and now - float(u.get("aggr_note_at", 0) or 0) >= AGGR_NOTE_COOLDOWN:
+        if n >= AGGR_NOTE_SAMPLES and now - _num(u.get("aggr_note_at", 0) or 0) >= AGGR_NOTE_COOLDOWN:
             u["aggr_note_at"] = now
             self.state.mark_dirty()
 
@@ -4144,7 +4296,7 @@ class SocialEngine:
         """
         bits: List[str] = []
         try:
-            urge = float(u.get("urge", 0.0) or 0.0)
+            urge = _num(u.get("urge", 0.0) or 0.0)
         except (TypeError, ValueError):
             urge = 0.0
         if urge > 0:
@@ -4244,8 +4396,8 @@ class SocialEngine:
     def _urge_is_eager(u: Dict[str, Any]) -> bool:
         """念头是否远超门槛（她现在确实很想说这句话）。"""
         try:
-            urge = float(u.get("urge", 0.0) or 0.0)
-            gate = float(u.get("fire_gate") or desire.FIRE_THRESHOLD)
+            urge = _num(u.get("urge", 0.0) or 0.0)
+            gate = _num(u.get("fire_gate") or desire.FIRE_THRESHOLD)
         except (TypeError, ValueError):
             return False
         # 念头天花板是 URGE_CEILING（3.0），而门槛 ~2.1 乘 1.45 已经越过它——
@@ -4276,8 +4428,8 @@ class SocialEngine:
             if not umo:
                 continue
             ts = max(
-                float(u.get("last_seen", 0) or 0),
-                float(u.get("last_sent", 0) or 0),
+                _num(u.get("last_seen", 0) or 0),
+                _num(u.get("last_sent", 0) or 0),
             )
             if ts > best_ts:
                 best, best_ts = umo, ts
@@ -4408,7 +4560,7 @@ class SocialEngine:
                 continue
             # 与 trigger_once 同一道「正在热聊」过滤：刚聊过的人真实不会开口，
             # 预览也不该拿它当样例。
-            seen_gap = now - float(u.get("last_seen", 0) or 0)
+            seen_gap = now - _num(u.get("last_seen", 0) or 0)
             if seen_gap < HOT_CHAT_THRESHOLD:
                 tried.append(f"{uid}：刚聊过，现在不会开口")
                 continue
@@ -4447,7 +4599,7 @@ class SocialEngine:
         if why:
             return why
         try:
-            urge = float(u.get("urge", 0.0) or 0.0)
+            urge = _num(u.get("urge", 0.0) or 0.0)
         except (TypeError, ValueError):
             urge = 0.0
         return f"闸门都过了，只是念头还没攒够（现在 {urge:.2f}，要到 {desire.FIRE_THRESHOLD:.2f} 左右）"
@@ -4499,19 +4651,23 @@ class SocialEngine:
             if not isinstance(snap, dict):
                 continue
             try:
-                aff = float(snap.get("affection") or 0.0)
+                aff = _num(snap.get("affection") or 0.0)
             except (TypeError, ValueError):
                 aff = 0.0
             if aff < float(getattr(self.cfg, "intimacy_affection_min", 70) or 70):
                 continue
             mood = snap.get("mood") if isinstance(snap.get("mood"), dict) else {}
             try:
-                lib = float(mood.get("libido", 0.0) or 0.0)
-                base_lib = float(mood.get("base_libido", lib) or lib)
+                lib = _num(mood.get("libido", 0.0) or 0.0)
+                # 同 gate_reason 的 `base_aggression`：基线常常就是 0（她从没什么欲望），
+                # `base_libido or lib` 会把 0 当缺失、base 变成当前值，「欲望涨上来」这道
+                # 硬门槛于是永不成立——整条「想要了」通道形同不存在。
+                raw_base = mood.get("base_libido")
+                base_lib = lib if raw_base is None or raw_base == "" else _num(raw_base, lib)
             except (TypeError, ValueError):
                 lib = base_lib = 0.0
             try:
-                done = float(snap.get("ccb_done_count") or 0.0)
+                done = _num(snap.get("ccb_done_count") or 0.0)
             except (TypeError, ValueError):
                 done = 0.0
             if done <= 0:
@@ -4520,7 +4676,7 @@ class SocialEngine:
             if (lib - base_lib) < rise:
                 continue
             try:
-                last = float(u.get("intimacy_asked_at", 0.0) or 0.0)
+                last = _num(u.get("intimacy_asked_at", 0.0) or 0.0)
             except (TypeError, ValueError):
                 last = 0.0
             cool = float(getattr(self.cfg, "intimacy_cooldown_hours", 48) or 48) * 3600.0
@@ -4556,11 +4712,11 @@ class SocialEngine:
             affection = user_core.get("affection") if user_core else None
             if affection is None:
                 try:
-                    msgs = int(u.get("message_count", 0) or 0)
+                    msgs = int(_num(u.get("message_count", 0) or 0))
                 except (TypeError, ValueError):
                     msgs = 0
                 blended = (
-                    AFFECTION_INTEREST_WEIGHT * float(u.get("interest", 0.35) or 0.35)
+                    AFFECTION_INTEREST_WEIGHT * _num(u.get("interest", 0.35) or 0.35)
                     + AFFECTION_FAMILIAR_WEIGHT * desire.familiarity(msgs)
                 )
                 affection = round(blended * 100, 1)
@@ -4593,7 +4749,7 @@ class SocialEngine:
                 self.log(f"预览解析人格失败: {e}")
                 persona_prompt = ""
             mind = self._mind(bid, u, now, urge)
-            memory_note = await self._fetch_memory_note(umo, uid)
+            memory_note = await self._fetch_memory_note(umo, uid, query=reason)
             decision = None
             if self.cfg.llm_gate:
                 try:
@@ -4686,7 +4842,7 @@ class SocialEngine:
         ordered = sorted(ranked, key=lambda x: x[2], reverse=True)
         tried: List[str] = []
         for uid, u, urge in ordered[:TRIGGER_CANDIDATE_LIMIT]:
-            seen_gap = now - float(u.get("last_seen", 0) or 0)
+            seen_gap = now - _num(u.get("last_seen", 0) or 0)
             if seen_gap < HOT_CHAT_THRESHOLD:
                 tried.append(
                     f"{uid} 正在热聊（{int(seen_gap / 60)} 分钟前还在说话），跳过"
@@ -4869,7 +5025,12 @@ class SocialEngine:
                             + throttle.summary(f"send.unknown.{bid or '-'}")
                         )
                     self._note_send_failure(bid, last_err, peer_unreachable)
-                    return False, last_err, False
+                    # 第三个值必须原样带出去：`_send_message` 的纯文本回退路径会同时
+                    # 置 unknown 与 peer_unreachable（「调用失败，结果未知」+ 平台说
+                    # 这个人不是好友）。这里写死 False 的话，平台明说的「不是好友」
+                    # 永远传不到 `_speak_inner`，那个人就不会被隔离 24 小时——每轮
+                    # 心跳仍然花一次 LLM 生成再失败，退避也走通用档而不是隔离档。
+                    return False, last_err, peer_unreachable
             except Exception as e:
                 last_err = str(e)
             if attempt < SEND_RETRY_COUNT:
@@ -4905,8 +5066,15 @@ class SocialEngine:
         slot["err"] = str(err or "")
         if slot["streak"] < SEND_BREAKER_TRIP:
             return
+        # 指数也要封顶。`streak` 本身不封顶是对的（它记录真实失败次数），但
+        # `2 ** (streak - TRIP)` 在 streak 上千时会抛 `OverflowError: int too large
+        # to convert to float`——而抛点就在这里，由 `_send_with_retry` 的 except 分支
+        # 调用，异常会冒泡出 `_speak_inner`，把这次失败的记账（streak / until / err）
+        # 连同 `_mark_send_failed`、`_note_giveup` 一起丢掉，且此后每次失败都复发。
+        # 2**16 已经远超 SEND_BREAKER_MAX_SECONDS，再大没有意义。
         delay = min(
-            SEND_BREAKER_BASE_SECONDS * (2 ** (slot["streak"] - SEND_BREAKER_TRIP)),
+            SEND_BREAKER_BASE_SECONDS
+            * (2 ** min(slot["streak"] - SEND_BREAKER_TRIP, _BREAKER_EXP_CAP)),
             SEND_BREAKER_MAX_SECONDS,
         )
         slot["until"] = self._time() + delay
@@ -4942,7 +5110,7 @@ class SocialEngine:
         if tier != anchors.TIER_LOW:
             return
         try:
-            n = int(u.get("giveup_count", 0) or 0) + 1
+            n = int(_num(u.get("giveup_count", 0) or 0)) + 1
         except (TypeError, ValueError):
             n = 1
         u["giveup_count"] = n
@@ -4963,7 +5131,7 @@ class SocialEngine:
             self.state.mark_dirty()
             return
         try:
-            n = int(u.get("send_fail_count", 0) or 0) + 1
+            n = int(_num(u.get("send_fail_count", 0) or 0)) + 1
         except (TypeError, ValueError):
             n = 1
         delay = min(
@@ -5001,7 +5169,7 @@ class SocialEngine:
                 if self.send_breaker_left(bid) > 0:
                     return
                 u = self.state.user(bid, uid)
-                if float(u.get("last_seen", 0)) > sent_ts:
+                if _num(u.get("last_seen", 0)) > sent_ts:
                     self.log(f"用户 {uid} 已有新消息，取消连发补充")
                     return
                 umo = str(u.get("umo", "") or "")
@@ -5057,7 +5225,7 @@ class SocialEngine:
                     return
                 # 群里有人（非 bot）在本次连发首句之后说过话：取消剩下的补发
                 g = self.state.group(bid, gid)
-                if float(g.get("last_human_at", 0) or 0) > sent_ts:
+                if _num(g.get("last_human_at", 0) or 0) > sent_ts:
                     self.log(f"群 {gid} 有新群友发言，取消连发补充")
                     return
                 ok, _, _ = await self._send_with_retry(umo, text, bid)
@@ -5317,9 +5485,9 @@ class SocialEngine:
                 if not isinstance(u, dict):
                     continue
                 try:
-                    hot += 1 if float(u.get("urge", 0.0) or 0.0) >= desire.FIRE_THRESHOLD else 0
-                    last_send = max(last_send, float(u.get("last_sent", 0) or 0))
-                    streak = max(streak, int(u.get("no_reply_streak", 0) or 0))
+                    hot += 1 if _num(u.get("urge", 0.0) or 0.0) >= desire.FIRE_THRESHOLD else 0
+                    last_send = max(last_send, _num(u.get("last_sent", 0) or 0))
+                    streak = max(streak, int(_num(u.get("no_reply_streak", 0) or 0)))
                 except (TypeError, ValueError):
                     continue
             when = (
@@ -5375,7 +5543,7 @@ class SocialEngine:
         last_run = m.get("last_heartbeat") or m.get("dry_run_at") or 0.0
         if not last_run:
             return "⏳ 后台循环还没跑过第一轮（启动后会先等一个心跳间隔）"
-        since_hb = now - float(last_run)
+        since_hb = now - _num(last_run)
         stale = since_hb > (self.cfg.heartbeat_max_minutes * 60 * 2)
         hb = f"{int(since_hb / 60)} 分钟前" if since_hb < 3600 else f"{since_hb / 3600:.1f} 小时前"
         settled = m.get("last_settled") or 0.0
@@ -5399,13 +5567,13 @@ class SocialEngine:
         if fail:
             lines.append(f"最后卡住：{fail}")
         # 「没发出去」要分清三种，混成一个数就看不出是哪道防线在起作用
-        vetoed = int(m.get("veto_total", 0) or 0)
+        vetoed = int(_num(m.get("veto_total", 0) or 0))
         if vetoed:
             lines.append(
                 f"模型否决：累计 {vetoed} 次（她说此刻不该找这个人——由头留着，"
                 f"下轮状态变了还可以说）"
             )
-        rejected = int(m.get("rejected_total", 0) or 0)
+        rejected = int(_num(m.get("rejected_total", 0) or 0))
         if rejected:
             lines.append(
                 f"验收拦下：累计 {rejected} 条（这由头她驾驭不了，已消耗；"
@@ -5418,10 +5586,10 @@ class SocialEngine:
         # 的地方——以前只知道总数，调阈值全凭感觉。
         blocked = m.get("blocked_reasons") or {}
         if isinstance(blocked, dict) and blocked:
-            total_blocked = sum(int(v or 0) for v in blocked.values())
+            total_blocked = sum(int(_num(v or 0)) for v in blocked.values())
             lines.append(f"没发出去的去向（累计 {total_blocked} 次）：")
-            for cat, cnt in sorted(blocked.items(), key=lambda kv: -int(kv[1] or 0))[:8]:
-                lines.append(f"  {cat}：{int(cnt)} 次")
+            for cat, cnt in sorted(blocked.items(), key=lambda kv: -int(_num(kv[1] or 0)))[:8]:
+                lines.append(f"  {cat}：{int(_num(cnt))} 次")
         # 关系档位与「多久没回」
         tier_rows = []
         for bid in sorted(self.state.data.get("bots", {})):
@@ -5435,7 +5603,7 @@ class SocialEngine:
             lines.extend(tier_rows[:8])
             if len(tier_rows) > 8:
                 lines.append(f"  ……另有 {len(tier_rows) - 8} 人")
-        cleaned = int(self.state.data.get("_sanitized_users", 0) or 0)
+        cleaned = int(_num(self.state.data.get("_sanitized_users", 0) or 0))
         if cleaned:
             lines.append(
                 f"正文清洗：已洗过 {cleaned} 个用户（之前录进过框架注入内容，"
@@ -5519,7 +5687,7 @@ class SocialEngine:
                 if not umo:
                     continue
                 try:
-                    ts = float(u.get("last_seen", 0) or 0)
+                    ts = _num(u.get("last_seen", 0) or 0)
                 except (TypeError, ValueError):
                     ts = 0.0
                 if ts > rep_ts:
@@ -5550,14 +5718,14 @@ class SocialEngine:
         for bid, bot in self.state.data.get("bots", {}).items():
             for uid, u in (bot.get("users") or {}).items():
                 try:
-                    urge = float(u.get("urge", 0) or 0)
-                    interest = float(u.get("interest", 0) or 0)
+                    urge = _num(u.get("urge", 0) or 0)
+                    interest = _num(u.get("interest", 0) or 0)
                 except (TypeError, ValueError):
                     continue
                 rows.append((
                     bid, uid, urge, interest,
                     str(u.get("pending_result", "") or ""),
-                    float(u.get("last_seen", 0) or 0),
+                    _num(u.get("last_seen", 0) or 0),
                 ))
         if not rows:
             return "  还没有用户记录（没人说过话，也没播种进来任何人）"
@@ -5598,7 +5766,7 @@ class SocialEngine:
                     context_seconds=context,
                     presence_floor_seconds=presence,
                 )
-                if float(u.get("thread_for", 0) or 0) == last_said:
+                if _num(u.get("thread_for", 0) or 0) == last_said:
                     bits.append(f"｜话断了 {silence / 60:.0f} 分钟（已接过一回）")
                 elif kind:
                     why = self.thread_gate(bid, uid, u, now)
@@ -5610,7 +5778,7 @@ class SocialEngine:
         if about:
             bits.append(f"｜记着「{about[:14]}」该回访")
         if self.cfg.closer_enabled and str(u.get("pending_result", "") or "") == "waiting":
-            sent = float(u.get("last_sent", 0) or 0)
+            sent = _num(u.get("last_sent", 0) or 0)
             waited = (now - sent) / 3600.0 if sent else 0.0
             if waited >= self.cfg.closer_after_hours:
                 bits.append(f"｜那句没人回已 {waited:.0f} 小时（该收场）")
@@ -5623,7 +5791,7 @@ class SocialEngine:
         skip: Optional[Tuple[float, str, str, str]] = None
         for bid, bot in self.state.data.get("bots", {}).items():
             for uid, u in (bot.get("users") or {}).items():
-                sent = float(u.get("last_sent", 0) or 0)
+                sent = _num(u.get("last_sent", 0) or 0)
                 if sent and (best is None or sent > best[0]):
                     text = ""
                     for m in reversed(u.get("conversation") or []):
@@ -5631,7 +5799,7 @@ class SocialEngine:
                             text = str(m.get("text", ""))[:40]
                             break
                     best = (sent, bid, uid, text)
-                skipped = float(u.get("last_skip_at", 0) or 0)
+                skipped = _num(u.get("last_skip_at", 0) or 0)
                 if skipped and (skip is None or skipped > skip[0]):
                     skip = (skipped, bid, uid, str(u.get("last_skip_reason", ""))[:60])
         lines: List[str] = []
@@ -5661,7 +5829,7 @@ class SocialEngine:
                 log = self.state.recent_proactive(bid, uid, now)
                 if not log:
                     continue
-                last_ts = max((float(e.get("ts", 0) or 0) for e in log), default=0.0)
+                last_ts = max((_num(e.get("ts", 0) or 0) for e in log), default=0.0)
                 rows.append((last_ts, bid, uid, log))
         if not rows:
             if want:
@@ -5675,7 +5843,7 @@ class SocialEngine:
             lines.append(f"◆ {name}（{uid}·{self._bot_label(bid)}）共 {len(log)} 条")
             for e in log[-limit_each:]:
                 try:
-                    ts = float(e.get("ts", 0) or 0)
+                    ts = _num(e.get("ts", 0) or 0)
                 except (TypeError, ValueError):
                     ts = 0.0
                 when = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "??"
@@ -5703,10 +5871,10 @@ class SocialEngine:
         rows: List[Tuple[float, str]] = []
         for bid, bot in self.state.data.get("bots", {}).items():
             for gid, g in (bot.get("groups") or {}).items():
-                seen = float(g.get("last_seen", 0) or 0)
+                seen = _num(g.get("last_seen", 0) or 0)
                 idle_h = (now - seen) / 3600.0 if seen > 0 else -1
-                flow_open = float(g.get("flow_open_until", 0) or 0) > now
-                blocked = float(g.get("blocked_until", 0) or 0) > now
+                flow_open = _num(g.get("flow_open_until", 0) or 0) > now
+                blocked = _num(g.get("blocked_until", 0) or 0) > now
                 name = str(g.get("name", "") or gid)
                 mark = "⛔" if blocked else ("🟢" if flow_open else "○")
                 idle_txt = f"{idle_h:.1f} 小时前" if idle_h >= 0 else "未知"
@@ -5763,8 +5931,8 @@ class SocialEngine:
         total_replied = 0
         for bot_data in bots.values():
             for u in bot_data.get("users", {}).values():
-                total_sent += int(u.get("proactive_sent", 0))
-                total_replied += int(u.get("proactive_replied", 0))
+                total_sent += int(_num(u.get("proactive_sent", 0)))
+                total_replied += int(_num(u.get("proactive_replied", 0)))
         reply_rate = f"{total_replied}/{total_sent}" if total_sent > 0 else "—"
 
         ref_bid = next(iter(bots), "")

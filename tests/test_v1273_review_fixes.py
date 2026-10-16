@@ -500,7 +500,7 @@ def _speak_inner_stub(*, parts, raw_text="原始输出", tier=None,
     async def _load_history(umo):
         return []
 
-    async def _memory(umo, uid):
+    async def _memory(umo, uid, query=""):
         return ""
 
     async def _persona(umo, bid):
@@ -1584,7 +1584,9 @@ class SignalsWriterRobustnessTest(unittest.TestCase):
         self.assertTrue(self.writer.flush(force=True))
         self.assertEqual(self._tmp_files(), [])
         with open(self.path, encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["schema"], 1)
+            # v1.27.31 起 schema=2（多了 open_items）。这条用例钉的是「写盘成功、留下
+            # 的是一份合法 JSON、没有 .tmp 残留」，schema 只是顺带证明它真的是我们写的那份。
+            self.assertEqual(json.load(f)["schema"], 2)
 
     def test_bad_at_and_streak_values_do_not_raise(self):
         self.writer.note_proactive("u1", at="坏")

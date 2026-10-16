@@ -45,6 +45,19 @@ _CLOSERS = "）)】]"
 # 只剩标点与空白
 _PUNCT_ONLY = re.compile(r"[\s，。！？、；：,.!?;:\-—~～…·「」『』\"'“”‘’]+")
 
+# 「有内容的字符」：汉字、假名、拉丁字母、数字、emoji。
+#
+# 判「只剩符号、没有正文」**不能**靠上面那张标点表反过来做——标点表永远列不全：
+# 《》〈〉〖〗、全角 ASCII 符号、以及 `# @ { } | / \ * & ^ % $ + = _` 全在漏网，
+# 于是 `###`、`《》〈〉`、`〖〗〖〗`、`@@@@` 这种长度 ≥3 的纯符号正文一路通过
+# `_check_structure`，再因为 `_check_thin` 只拒 `len(body) <= 2` 而直接发给用户。
+# 反过来问「有没有一个字符是真正的内容」才是封闭判据：不随标点表增补而失效。
+_CONTENT_CHAR = re.compile(
+    r"[0-9A-Za-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\uff10-\uff19\uff21-\uff3a\uff41-\uff5a"
+    r"\U0001F000-\U0001FAFF\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]"
+)
+
 # ── 「关于说话」的判据 ────────────────────────────────────────
 # 关键不是「开头是不是 想/要」，而是**这句话有多大比例在描述说话这个动作**。
 # 语料里泄漏的写法五花八门：
@@ -209,6 +222,8 @@ def _check_structure(text: str) -> Optional[str]:
     body = _PUNCT_ONLY.sub("", strip_actions(text)).strip()
     if not body:
         return "只剩括号动作，没有正文"
+    if not _CONTENT_CHAR.search(body):
+        return f"只有符号，没有正文（{body[:8]!r}）"
     return None
 
 

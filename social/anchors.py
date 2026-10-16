@@ -138,10 +138,48 @@ KIND_RANK = {
 
 
 def _f(x: Any) -> float:
+    """容错取时间戳/计数：读不出来、或非有限值，一律当 0.0（等同字段缺失）。
+
+    nan/inf 放行的后果是静默的，而且每个调用点表现都不同：
+      * `live_anchors` 的 `int(_f(a["tries"]))` → ValueError 带走该用户整轮派生
+      * `consume` 的 `int(_f(a["use_count"])) + 1`、`mark_failed` 的 `int(_f(a["tries"])) + 1` 同样抛
+      * `now - used < ANCHOR_COOLDOWN`（`used_at=nan`）→ 恒 False，冷却形同不存在
+      * `due and due > now`（`due=nan`）→ 恒 False，那条由头永远「已经到点」
+      * `exp and exp <= now`（`expire_at=nan`）→ 恒 False，永不淘汰，长期占住 ANCHOR_MAX 的槽
+    归零以后这些都变成**确定行为**：0 就是「这个字段没写」。用过的由头再被派一次的风险
+    由独立台账 `_remembered` 兜（见 `_note_used`），不靠这条记录本身活着。
+    """
     try:
-        return float(x or 0)
+        out = float(x or 0)
     except (TypeError, ValueError):
         return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
+def _finite(x: Any) -> Optional[float]:
+    """读得出且有限就返回，否则 None。
+
+    与 `_f` 的分工：`_f` 给「0 是个合法默认值」的场合（时间戳、计数）；
+    `_finite` 给「没有值就该整段略过、不许编一个 0」的场合（渲染给模型看的话）。
+    """
+    try:
+        out = float(x)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _corrupt(data: Dict[str, Any], key: str) -> bool:
+    """这个字段「在、但读不出来」吗（坏字符串 / nan / inf）。
+
+    `_f` 把读不出来的值归 0，而 0 在这些时间戳字段上的语义正好是「从没用过 / 没有约束」
+    ——于是坏值等于**永久放行**：冷却失效、试次上限失效、那条由头永远「已经到点」。
+    `_f` 的归零只在「字段整个缺失」（老数据）时才是对的，所以判断时要区分两者：
+    字段缺失 → False（按 0 处理）；字段在但读不出来 → True（调用方跳过这条记录）。
+    """
+    if key not in data:
+        return False
+    return _finite(data.get(key)) is None
 
 
 def _s(x: Any) -> str:
@@ -217,15 +255,13 @@ def relation_tier(
     输入里最关键的是**涨幅**（现在的好感 - 基线），它不受「初始值被调高」影响。
     绝对好感只当参考，不单独决定档位。
     """
-    aff = affection if affection is not None else 0.0
-    try:
-        aff = float(aff)
-    except (TypeError, ValueError):
+    # 读不出来 / 非有限一律当 0：未知好感不是「很高」。原来裸 float 放行 nan，
+    # 于是 `aff < TIER_AFFECTION_FLOOR` 恒为 False，一个好感度坏掉的用户会被判成
+    # 中档、按中档的间隔去主动找人（这与 reasoning.relationship_tier 是同一个坑）。
+    aff = _finite(affection)
+    if aff is None:
         aff = 0.0
-    try:
-        base = float(base_affection) if base_affection is not None else None
-    except (TypeError, ValueError):
-        base = None
+    base = _finite(base_affection)
     warmth = (aff - base) if base is not None else aff * 0.5
 
     # 最近这段时间对方说了多少句
@@ -234,10 +270,7 @@ def relation_tier(
     for item in _conversation(user):
         if str(item.get("dir", "")) == "out":
             continue
-        try:
-            ts = float(item.get("ts", 0) or 0)
-        except (TypeError, ValueError):
-            ts = 0.0
+        ts = _f(item.get("ts", 0))
         if ts >= cutoff or not cutoff:
             talk += 1
 
@@ -264,16 +297,18 @@ def tier_note(tier: str, affection: Optional[float], warmth: Optional[float]) ->
     """把档位写成一句人话给模型看——它要靠这句判断「现在找 TA 合不合适」。"""
     label = {TIER_HIGH: "你们很熟", TIER_MID: "算熟", TIER_LOW: "其实没怎么说过话"}.get(tier, "关系一般")
     bits = [label]
+    # 用 _finite 而不是裸 float：nan 能通过 `float()`，于是 `f"{nan:.0f}"` 把字面
+    # 「nan」直接写进提示词（实测 `tier_note('mid', nan, nan)` →
+    # `'算熟、TA 对你的好感 nan、比刚开始高了 nan'`）。读不出来就整段略过，
+    # 不许编一个 0 —— 「好感 0」和「不知道好感」对模型是两句完全不同的话。
     if affection is not None:
-        try:
-            bits.append(f"TA 对你的好感 {float(affection):.0f}")
-        except (TypeError, ValueError):
-            pass
+        value = _finite(affection)
+        if value is not None:
+            bits.append(f"TA 对你的好感 {value:.0f}")
     if warmth is not None:
-        try:
-            bits.append(f"比刚开始高了 {float(warmth):.0f}")
-        except (TypeError, ValueError):
-            pass
+        value = _finite(warmth)
+        if value is not None:
+            bits.append(f"比刚开始高了 {value:.0f}")
     return "、".join(bits)
 
 
@@ -306,6 +341,13 @@ def prune_anchors(u: Dict[str, Any], now: float) -> None:
     """
     kept = []
     for a in load_anchors(u):
+        # 时间戳读不出来的记录直接扔掉：`_f` 归零后 `exp` 是 0，而 `if exp and exp <= now`
+        # 对 0 恒假 —— 一条垃圾记录从此永不淘汰，长期占住 ANCHOR_MAX 的槽，把正常候选
+        # 挤出去（实测 `expire_at=nan` 的记录 prune 之后还在）。正常记录都带这两个字段
+        # （`add_anchor` 必写），读不出来就是坏的；`used_at` 坏掉时它的「用过了」也没法
+        # 抄进台账（`_note_used` 需要那个时间戳），只能丢。
+        if any(_corrupt(a, k) for k in ("used_at", "expire_at")):
+            continue
         used = _f(a.get("used_at"))
         exp = _f(a.get("expire_at"))
         if used and used + ANCHOR_COOLDOWN <= now:
@@ -457,6 +499,13 @@ def live_anchors(
     for a in load_anchors(u):
         if kinds is not None and _s(a.get("kind")) not in kinds:
             continue
+        # 状态坏掉的记录一律跳过，不拿它去开口。四个字段都用 `_corrupt` 判，而不是靠
+        # `_f` 归零：归零在 `used_at` 上等于「从没用过」（冷却失效）、在 `due` 上等于
+        # 「已经到点」（永远到点）、在 `expire_at` 上等于「永不过期」。字段整个缺失的
+        # 老数据不算坏（`tries` 平时就不存在）。它自己的 `expire_at` 到点会由
+        # `prune_anchors` 收走，所以跳过不会把它永久留在池子里。
+        if any(_corrupt(a, k) for k in ("used_at", "tries", "due", "expire_at")):
+            continue
         used = _f(a.get("used_at"))
         if used:
             if now - used < ANCHOR_COOLDOWN:
@@ -586,6 +635,15 @@ def _derive_from_state(
     # 而且明天还能接着说——不像天气（说完就没了）也不像沉默时长（说一次就过期）。
     for task in _ongoing_tasks(body):
         offer(f"还在{_short(task, 14)}")
+
+    # ①-bis 她最近**做过**的事（Core 的经历账本，只认 `did`）。
+    #
+    # 与 ① 的分工：① 是「手上还开着的事」（明天还能接着说），这条是「刚做完的事」——
+    # 前者让话题能延续，后者让此刻有话说。Core 那边把 ① 反向同步进她的提示词，
+    # 所以这条**绝不能**把 `open` 也读进来，否则她自己刚发布的承诺会被当成
+    # 「我最近做过的事」再说一遍（见 `_life_log_done`）。
+    for done in _life_log_done(body, now):
+        offer(f"刚做完{_short(done, 14)}")
 
     # ② 她突然想起 TA 说过的一件事。
     #
@@ -719,6 +777,46 @@ def _ongoing_tasks(body: Dict[str, Any]) -> List[str]:
     return out[:3]
 
 
+# 「她做过的事」当由头时的新鲜度上限（秒）。文案是「刚做完X」，那就必须是**刚**做完的：
+# Core 的经历账本按天留，把隔了一天的事说成「刚做完」是句假话，而由头池里的假话模型会照说。
+LIFE_LOG_FRESH_SECONDS = 24 * 3600.0
+
+
+def _life_log_done(body: Dict[str, Any], now: float) -> List[str]:
+    """Core 经历账本里她**做过**的事（`kind == "did"`）。
+
+    接不到就返回空——没装 Core、Core 还没记、或者最近确实什么都没做，三种都不该编一个出来。
+
+    只认 `did`：`open` 那批**本来就是社交层自己通过 signals 发过去的**（见
+    `SignalsWriter.note_open_items`），读回来当话题就成了一条闭环——她会把
+    「我答应过问对方那个面试结果」当成「我最近做过的事」再说一遍。
+
+    时间戳读不出来（老数据 / 坏值）时一律**留着**，同 `recall._fresh` 的口径：
+    不拿一个不可信的数字凭空抹掉一条真实的经历。
+    """
+    out: List[str] = []
+    raw = (body or {}).get("life_log")
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "") or "").strip() != "did":
+            continue
+        text = ""
+        for key in ("text", "what", "about", "desc"):
+            text = _s(item.get(key, "")).strip()
+            if text:
+                break
+        if not text:
+            continue
+        at = _f(item.get("at", 0))
+        if at > 0 and now - at > LIFE_LOG_FRESH_SECONDS:
+            continue
+        out.append(text)
+    return out[:3]
+
+
 def _said_recent(u: Dict[str, Any], now: float) -> List[str]:
     """TA 说过、而且还没有下文的那些话（够新，说出来才像刚想起）。"""
     window = 14 * 86400.0
@@ -729,10 +827,7 @@ def _said_recent(u: Dict[str, Any], now: float) -> List[str]:
         text = _s(item.get("said", "")).strip()
         if not text or len(text) > 24:
             continue
-        try:
-            seen = float(item.get("ts", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            seen = 0.0
+        seen = _f(item.get("ts", 0.0))
         if seen and (now - seen) <= window:
             out.append(text)
     return out[:2]
@@ -989,16 +1084,20 @@ def derive_relations(
         if out and out[-1].startswith("你上次说的"):
             break
 
-    # 想念：好感够 + 安静了一阵子
-    try:
-        aff = float(affection) if affection is not None else 0.0
-    except (TypeError, ValueError):
+    # 想念：好感够 + 安静了一阵子。
+    # 走 _finite：nan 会让下面两个 `aff >= floor` 恒为 False，一个好感度坏掉的用户
+    # 连「有点想你了」和搭话都永远开不出口（静默少发，没有任何日志）。
+    aff = _finite(affection)
+    if aff is None:
         aff = 0.0
-    if aff >= float(missing_floor) and since >= 5 * 3600.0:
+    floor = _finite(missing_floor)
+    if floor is None:
+        floor = 0.0
+    if aff >= floor and since >= 5 * 3600.0:
         offer("有点想你了")
     # 搭话：没什么事，就是想找 TA 说句话。关系不算生、也安静了一会儿，就开个口。
     # 这是「她会主动打开话头」的那一类——**不需要对方先说过什么**。
-    if aff >= float(missing_floor) and since >= 2 * 3600.0:
+    if aff >= floor and since >= 2 * 3600.0:
         for text in _CASUAL_OPENERS:
             if text not in taken:
                 offer(text)

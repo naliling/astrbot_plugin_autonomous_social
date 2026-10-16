@@ -9,6 +9,7 @@ v1.7.4：
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -34,19 +35,25 @@ from astrbot.api import logger
 
 
 def _num(value: Any) -> float:
-    """时间戳/计数的容错取值。state.json 里的脏数据不该让正常流程抛异常。"""
+    """时间戳/计数的容错取值。state.json 里的脏数据不该让正常流程抛异常。
+
+    `inf` 也算脏：它能让「冷却还没到吗」这类比较全假、让 `int()` 抛 OverflowError。
+    读不出来与非有限一律归 0——0 在这里的语义就是「这个字段没写」。
+    """
     try:
-        return float(value or 0)
-    except (TypeError, ValueError):
+        out = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return out if math.isfinite(out) else 0.0
 
 
 def _safe_ts(value: Any, default: float = 0.0) -> float:
     """时间戳容错转换。state.json 里的脏数据不该让正常流程抛异常。"""
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
         return default
+    return out if math.isfinite(out) else default
 
 # ─── 常量定义 ───────────────────────────────────────
 
@@ -758,6 +765,20 @@ class SocialState:
                     (i for i in rows if isinstance(i, dict)),
                     key=lambda i: _safe_ts(i.get("ts")),
                 )
+        # 上面只做了并集，**没有重新夹长度**：两份各自合规（各 10 条）的记录并起来就是
+        # 20 条，而写路径要等到**下一次** `record_incoming` / `record_outgoing` 才会
+        # `del conv[:-MAX_CONVERSATION_HISTORY]`。中间这段时间 `state.json` 是超容的，
+        # `reversed(conversation)` 取「最近一句」也会取到本该被砍掉的那批。
+        # 口径与写路径完全一致：留最新的那几条（列表是时间升序，所以切尾巴）。
+        conv = target.get("conversation")
+        if isinstance(conv, list) and len(conv) > MAX_CONVERSATION_HISTORY:
+            target["conversation"] = conv[-MAX_CONVERSATION_HISTORY:]
+        log = target.get("proactive_log")
+        if isinstance(log, list) and len(log) > PROACTIVE_LOG_MAX:
+            target["proactive_log"] = log[-PROACTIVE_LOG_MAX:]
+        types = target.get("recent_msg_types")
+        if isinstance(types, list) and len(types) > RECENT_MSG_TYPES_COUNT:
+            target["recent_msg_types"] = types[-RECENT_MSG_TYPES_COUNT:]
         # 冷落计数取小的：合并的是同一个人，保留较宽松的那个判断更合理
         try:
             target["no_reply_streak"] = min(int(target.get("no_reply_streak", 0) or 0),

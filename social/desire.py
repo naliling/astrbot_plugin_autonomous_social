@@ -82,7 +82,17 @@ FAMILIARITY_SATURATION = 200
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
+    # nan/inf 一律退回下界：这两个函数夹的是评分，非有限值不是「很大」而是「没意义」，
+    # 直接放行会让调用点拿到 nan，再顺着比较（恒为 False）静默变成「永远不发」。
+    # 连数值都不是的（"abc"/None）走同一条路：`math.isfinite` 对它们本身就会抛 TypeError，
+    # 而这个函数的调用点全在决策链路上，不该在这里把整轮带走。
+    try:
+        value = float(x)
+    except (TypeError, ValueError):
+        return lo
+    if not math.isfinite(value):
+        return lo
+    return lo if value < lo else hi if value > hi else value
 
 
 # ─── 容错读取：这一层读的全是 state.json / Core 契约里的字段 ──────────────
@@ -237,10 +247,10 @@ def hour_weight(user: Dict[str, Any], hour: int) -> float:
     hours = user.get("active_hours")
     if not isinstance(hours, list) or len(hours) != 24:
         return 0.0
-    try:
-        return float(hours[hour % 24] or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    # 走 _float 而不是裸 float：nan/inf 会顺着 smoothed_weight 传到 rhythm_factor，
+    # 那里 `mine >= peak * 0.6` 对 nan 恒为 False，于是静默退成 RHYTHM_OFF(0.48) ——
+    # 本该是「样本不可信 → 中性 1.10」，结果这个人的主动念头被砍掉一半多，还没有日志。
+    return _float(hours[hour % 24], 0.0)
 
 
 def smoothed_weight(user: Dict[str, Any], hour: int) -> float:
@@ -323,14 +333,14 @@ MOMENTUM_MAX = 1.45
 
 def momentum_factor(user: Dict[str, Any], now: float) -> float:
     """最近聊得密 → 攒得快（最多 ×1.45）；隔了很久 → 回到 1.0。"""
-    try:
-        last_spoken = float(user.get("last_spoken", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 1.0
-    if last_spoken <= 0:
+    # 走 _num 而不是裸 float：nan 会让 hours 也是 nan，下面两个守卫
+    # （hours < 0 / hours > MOMENTUM_WINDOW_HOURS）对 nan 全为 False，
+    # 于是这里返回 nan，顺着 settle 写进 user["urge"]，这一轮的闸门静默永不通过。
+    last_spoken = _num(user.get("last_spoken", 0.0))
+    if last_spoken is None or last_spoken <= 0:
         return 1.0
     hours = (now - last_spoken) / 3600.0
-    if hours < 0 or hours > MOMENTUM_WINDOW_HOURS:
+    if not math.isfinite(hours) or hours < 0 or hours > MOMENTUM_WINDOW_HOURS:
         return 1.0
     # 刚说完的那会儿势头最足，几小时后淡掉
     ratio = 1.0 - (hours / MOMENTUM_WINDOW_HOURS)
@@ -402,7 +412,12 @@ def settle(
         # 播种名单里的人（从没聊过）攒得慢一倍：礼貌问题，不是节奏问题
         scale = clamp(_float(user.get("urge_scale", 1.0), 1.0), 0.1, 2.0)
         rate = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5) * scale
-        factor = (rhythm if rhythm is not None else 1.0) * clamp(mood_factor, 0.0, 1.5)
+        # 两个入参都可能是外面算出来的脏值：rhythm 传进来 nan 会让 factor 变 nan，
+        # 而 nan 一路走到 `user["urge"] = round(nan, 4)`，这一轮的闸门比较就恒为 False。
+        rhythm_value = 1.0 if rhythm is None else _num(rhythm)
+        if rhythm_value is None:
+            rhythm_value = 1.0
+        factor = rhythm_value * clamp(_float(mood_factor, 1.0), 0.0, 1.5)
         factor *= momentum_factor(user, now)
         if quiet:
             factor *= 0.12
