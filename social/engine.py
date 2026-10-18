@@ -27,7 +27,7 @@ try:
 except ImportError:
     MessageChain = None
 
-from . import __version__, anchors, anchors as anchor_mod, desire
+from . import __version__, anchors, anchors as anchor_mod, core_facade, desire
 from . import history_ingest
 from . import memory_bridge
 from . import pacing
@@ -396,6 +396,10 @@ class SocialEngine:
             )
         self.state = SocialState(state_path, time_source=self._time)
         self.core = CoreBridge(self.cfg.mode, data_dir=data_dir)
+        # 契约 v2 的同进程只读门面。懒解析：插件加载顺序不保证，构造时 Core 可能还没起来。
+        # `None` 表示「还没查过」或「查过但没找到」，两者都由 `core_facade` 的缓存区分。
+        self._facade: Any = None
+        self._facade_tried = False
         # 写回给 Humanoid Core 的信号（它替她主动开过口、被谁冷落了几次）。写自己目录下的
         # 单独文件，两边不会并发写同一个文件。
         self.signals = SignalsWriter(
@@ -1832,11 +1836,48 @@ class SocialEngine:
 
     # ─── 她的时钟 ─────────────────────────────────────
 
+    def _core_facade(self) -> Any:
+        """取 Core 的只读门面；拿不到返回 None（调用方退回读 state.json）。
+
+        `use_core_facade`：
+        * `auto`（默认）——找到就用，找不到静默退回，**行为与旧版一致**；
+        * `on`——只走门面（验证用），找不到也不退回；
+        * `off`——完全不碰门面（逃生门，与 1.27.38 逐字一致）。
+
+        这里只在第一次真的去查注册表；之后走 `core_facade` 自己的缓存（含负缓存重试）。
+        """
+        mode = str(getattr(self.cfg, "use_core_facade", "auto") or "auto").lower()
+        if mode == "off":
+            return None
+        if self._facade is not None:
+            return self._facade
+        if self._facade_tried and mode != "on":
+            return None
+        self._facade_tried = True
+        try:
+            self._facade = core_facade.find_core_facade(self.context)
+        except Exception as exc:  # 门面这一路坏掉不该影响任何既有行为
+            self.log(f"门面解析失败（退回读文件）: {exc}")
+            self._facade = None
+        return self._facade
+
     def _remember_clock(self, bid: str, body: Optional[Dict[str, Any]]) -> None:
-        """从 Core 契约里记下她所在城市的时区偏移。"""
-        if not self.cfg.use_core_clock or not body:
+        """从 Core 记下她所在城市的时区偏移。
+
+        优先问门面（现算，不会旧）；门面不在时退回契约快照里的 `clock_offset_minutes`。
+        两条路拿到的是同一个量，所以 `off` 模式下的行为与旧版逐字一致。
+        """
+        if not self.cfg.use_core_clock:
             return
-        offset = body.get("clock_offset_minutes")
+        offset = None
+        facade = self._core_facade()
+        if facade is not None:
+            clock = core_facade.clock(facade, bid)
+            offset = clock.get("utc_offset_minutes")
+        if offset is None:
+            if not body:
+                return
+            offset = body.get("clock_offset_minutes")
         if offset is None:
             return
         try:
@@ -5482,6 +5523,28 @@ class SocialEngine:
             "升级 Core 到 v2.14+ 才能用上睡意/饥饿/时区/句长约束。"
         )
 
+    def _facade_status_text(self) -> str:
+        """门面（契约 v2 同进程只读接口）这一路的状态。
+
+        单独一行是刻意的：读文件和走门面是**两条路**，一条坏了另一条可能还在，
+        混成一句「联动正常」等于把「正在用哪条路」这件事藏起来——而排查时最需要
+        知道的恰恰是这个。
+        """
+        mode = str(getattr(self.cfg, "use_core_facade", "auto") or "auto")
+        if mode == "off":
+            return "门面：已关闭（use_core_facade=off，与 1.27.38 行为一致）"
+        info = core_facade.status()
+        if info.get("connected"):
+            caps = "、".join(info.get("capabilities") or []) or "（无）"
+            return (
+                f"✅ 门面：已连接（Core API v{info.get('api_version')}；能力：{caps}）"
+                "；主动消息的上下文改由 Core 直接给"
+            )
+        reason = str(info.get("reason") or "还没查过")
+        if mode == "on":
+            return f"❌ 门面：未连接（{reason}）；use_core_facade=on，所以不读 state.json"
+        return f"⚠️ 门面：未连接（{reason}）；已退回读 state.json"
+
     def _per_bot_status_text(self) -> str:
         """按角色分行：念头、冷却、发送、熔断、退避各自一格。
 
@@ -5990,6 +6053,7 @@ class SocialEngine:
         sections.append(
             "【联动】\n"
             f"- Core：{self._core_status_text()}\n"
+            f"- {self._facade_status_text()}\n"
             f"- 写回：{self._signals_status_text()}\n"
             f"- 模型：{self._llm_status_text()}\n"
             f"- 发送：{self._send_status_text()}"

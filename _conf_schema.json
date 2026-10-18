@@ -268,6 +268,18 @@
     "obvious_hint": true,
     "default": true
   },
+  "use_core_facade": {
+    "type": "string",
+    "description": "走 Core 门面",
+    "hint": "同进程直连 Core 取情境（契约 v2）。auto=找得到就用，找不到退回读状态文件；on=只走门面；off=完全不碰（与 1.27.38 一致）",
+    "obvious_hint": false,
+    "default": "auto",
+    "options": [
+      "auto",
+      "on",
+      "off"
+    ]
+  },
   "user_cooldown_minutes": {
     "type": "int",
     "description": "单人联系冷却（分钟）",

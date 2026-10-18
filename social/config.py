@@ -139,6 +139,12 @@ def _write_json_atomic(path: str, payload: Any) -> None:
 # 选它和 auto 行为完全一样——一个假装存在的档位比没有更误导人。
 VALID_MODES = {"auto", "standalone"}
 
+# 门面（契约 v2 的同进程只读接口）开关。认不出的值按 auto。
+#   auto —— 找得到就用，找不到退回读 state.json（默认，行为与旧版一致）
+#   on   —— 只走门面（用来验证门面真的在工作）
+#   off  —— 完全不碰门面（逃生门：与 1.27.38 逐字一致）
+VALID_FACADE_MODES = {"auto", "on", "off"}
+
 # 配置范围常量
 ACTIVITY_MIN = 10
 ACTIVITY_MAX = 90
@@ -527,6 +533,12 @@ class SocialConfig:
     # 安静时段与作息画像按她所在城市的小时走（需要 Humanoid Core 提供时区偏移）
     use_core_clock: bool = True
 
+    # 要不要走 Humanoid Core 的只读门面（同进程直连，契约 v2）。
+    #   auto（默认）——找得到就用，找不到静默退回读 state.json，行为与旧版一致；
+    #   on        ——只走门面，找不到就不读 Core（用来验证门面确实在工作）；
+    #   off       ——完全不碰门面，与 1.27.38 逐字一致（出问题时的逃生门）。
+    use_core_facade: str = "auto"
+
     # 时段设置
     quiet_start: int = QUIET_START_DEFAULT
     quiet_end: int = QUIET_END_DEFAULT
@@ -789,6 +801,11 @@ class SocialConfig:
         if mode not in VALID_MODES:
             mode = "auto"
 
+        # 门面开关：认不出的值一律按 auto（最保守——能用就用，用不了退回读文件）
+        facade_mode = str(g("use_core_facade", _d("use_core_facade", "auto"))).lower().strip()
+        if facade_mode not in VALID_FACADE_MODES:
+            facade_mode = "auto"
+
         # 跟进窗口必须比「多久算没声」长，否则永远落在空区间里一条也发不出
         followup_after = max(
             FOLLOWUP_AFTER_MIN,
@@ -1039,6 +1056,7 @@ class SocialConfig:
             ),
             track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
             use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
+            use_core_facade=facade_mode,
             owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
             trigger_group_requires_at=bool(g("trigger_group_requires_at", _d("trigger_group_requires_at",  True))),
         )

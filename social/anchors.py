@@ -636,14 +636,16 @@ def _derive_from_state(
     for task in _ongoing_tasks(body):
         offer(f"还在{_short(task, 14)}")
 
-    # ①-bis 她最近**做过**的事（Core 的经历账本，只认 `did`）。
+    # ①-bis 她最近**做过**的事：**已删除**（v1.27.39）。
     #
-    # 与 ① 的分工：① 是「手上还开着的事」（明天还能接着说），这条是「刚做完的事」——
-    # 前者让话题能延续，后者让此刻有话说。Core 那边把 ① 反向同步进她的提示词，
-    # 所以这条**绝不能**把 `open` 也读进来，否则她自己刚发布的承诺会被当成
-    # 「我最近做过的事」再说一遍（见 `_life_log_done`）。
-    for done in _life_log_done(body, now):
-        offer(f"刚做完{_short(done, 14)}")
+    # 原来这里调 `_life_log_done(body, now)`，读 `body["life_log"]` 里 `kind=="did"`
+    # 的条目。但它永远不可能命中，两处断在同一个地方：
+    #   1. `core_bridge` 从不映射 `life_log` 这个键（Core 侧存在 `self.life_log`，
+    #      契约里没有它）→ 拿到的永远是 None；
+    #   2. 就算映射了，Core 的经历账本条目是 `{text, uid, at, until, src}`，**没有
+    #      `kind` 字段**，而 Core 也没有任何一处写「did」条目。
+    # 与其留一条永远不产出、却让读代码的人以为「刚做完X」在工作的死路，不如删掉。
+    # 要恢复它，先让 Core 在账本里写 `kind`，再在 `core_bridge` 里映射——两步都得做。
 
     # ② 她突然想起 TA 说过的一件事。
     #
@@ -741,8 +743,13 @@ def derive_extras(
 def _is_idle(body: Dict[str, Any]) -> bool:
     """她此刻闲不闲。
 
-    `feelings` 在契约里是**列表**（`[{"text":…, "weight":…}]`），也有版本给的是
-    字典（`{"spare": 0.8}`）。两种都认。
+    `feelings` 有三种形状，都得认：
+
+    * `list[str]`——**契约实际给的就是这个**（`link.build_contract` 的 `feelings`
+      是 `[str]`，按显著度取前几条）。以前这里只认 `list[dict]`，于是字符串元素全被
+      `isinstance(item, dict)` 跳过，「今天挺空的」这条由头**一次都没产出过**；
+    * `list[dict]`——旧版/别的写方给 `[{"text":…, "weight":…}]`；
+    * `dict`——`{"spare": 0.8}` 这种老形状。
     """
     feelings = (body or {}).get("feelings")
     if isinstance(feelings, dict):
@@ -752,9 +759,12 @@ def _is_idle(body: Dict[str, Any]) -> bool:
             return False
     if isinstance(feelings, list):
         for item in feelings:
-            if not isinstance(item, dict):
+            if isinstance(item, dict):
+                text = str(item.get("text", "") or "")
+            elif isinstance(item, str):
+                text = item
+            else:
                 continue
-            text = str(item.get("text", "") or "")
             if "很闲" in text or "挺闲" in text or "不忙" in text:
                 return True
     return False
@@ -777,44 +787,9 @@ def _ongoing_tasks(body: Dict[str, Any]) -> List[str]:
     return out[:3]
 
 
-# 「她做过的事」当由头时的新鲜度上限（秒）。文案是「刚做完X」，那就必须是**刚**做完的：
-# Core 的经历账本按天留，把隔了一天的事说成「刚做完」是句假话，而由头池里的假话模型会照说。
-LIFE_LOG_FRESH_SECONDS = 24 * 3600.0
-
-
-def _life_log_done(body: Dict[str, Any], now: float) -> List[str]:
-    """Core 经历账本里她**做过**的事（`kind == "did"`）。
-
-    接不到就返回空——没装 Core、Core 还没记、或者最近确实什么都没做，三种都不该编一个出来。
-
-    只认 `did`：`open` 那批**本来就是社交层自己通过 signals 发过去的**（见
-    `SignalsWriter.note_open_items`），读回来当话题就成了一条闭环——她会把
-    「我答应过问对方那个面试结果」当成「我最近做过的事」再说一遍。
-
-    时间戳读不出来（老数据 / 坏值）时一律**留着**，同 `recall._fresh` 的口径：
-    不拿一个不可信的数字凭空抹掉一条真实的经历。
-    """
-    out: List[str] = []
-    raw = (body or {}).get("life_log")
-    if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("kind", "") or "").strip() != "did":
-            continue
-        text = ""
-        for key in ("text", "what", "about", "desc"):
-            text = _s(item.get(key, "")).strip()
-            if text:
-                break
-        if not text:
-            continue
-        at = _f(item.get("at", 0))
-        if at > 0 and now - at > LIFE_LOG_FRESH_SECONDS:
-            continue
-        out.append(text)
-    return out[:3]
+# 「她做过的事」当由头的那条派生**已删除**（v1.27.39）：Core 的账本没有 `kind`
+# 字段、`core_bridge` 也不映射 `life_log`，那条路永远不产出。原因写在 `_derive_from_state`
+# 的 ①-bis 注释里。恢复它需要先让 Core 写 `kind`，再在 bridge 里映射。
 
 
 def _said_recent(u: Dict[str, Any], now: float) -> List[str]:
