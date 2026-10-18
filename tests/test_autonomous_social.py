@@ -1603,6 +1603,41 @@ class TestRelationshipCont(unittest.TestCase):
         self.assertEqual(u["pending_result"], "replied")
         self.assertEqual(u["proactive_replied"], 2, "回复率分母口径不变，不该被这笔算进去")
 
+    def test_fallback_bucket_reply_is_credited(self):
+        """兜底桶（`default`）里的人回复了，要记到 `default` 那条记录上。
+
+        历史导入时（2+ 个真实 bot）用户被统一归到 `default`，主动消息也从那里发；
+        但他们的回复从**真实 bid** 进来，落在那边新建的记录上。只结算 bid 那条的话，
+        兜底桶里 `proactive_replied` 永远是 0、`no_reply_streak` 永远停在 1——
+        「发了一堆没人理」对这批人永远不成立，退避也就永远不触发。
+        线上 `default` 里 41 条主动消息、0 条回复就是这么来的。
+        """
+        now = 1_700_000_000.0
+        fb = self.state.user("default", "u1")
+        fb.update({
+            "proactive_sent": 1,
+            "proactive_replied": 0,
+            "last_proactive_sent": now - 600,
+            "last_proactive_replied": False,
+            "no_reply_streak": 1,
+            "pending_since": now - 600,
+            "pending_result": "waiting",
+        })
+        # 回复从真实 bid 进来
+        self.state.record_incoming("realbot", "u1", "来了", reply_window_seconds=6 * 3600,
+                                   hour_override=9)
+        fb = self.state.user("default", "u1")
+        self.assertEqual(fb["proactive_replied"], 1, "兜底桶的回复率没记上")
+        self.assertTrue(fb["last_proactive_replied"], "上一次主动该被标成「被回了」")
+        self.assertEqual(fb["no_reply_streak"], 0, "人回来了，冷落计数该归零")
+
+    def test_fallback_bucket_reply_does_not_create_entries(self):
+        """没有兜底桶记录的人不该被凭空建出一条 `default` 记录。"""
+        self.state.record_incoming("realbot", "u9", "在吗", hour_override=9)
+        bots = self.state.data.get("bots", {})
+        self.assertNotIn("u9", (bots.get("default") or {}).get("users") or {},
+                         "读路径凭空建了 default 条目")
+
     def test_streak_decays_while_she_keeps_sending(self):
         """锚点原来是 last_sent：只要她还在发，衰减就永远等不到。"""
         u = {"no_reply_streak": 5, "last_sent": 1_700_000_000.0,

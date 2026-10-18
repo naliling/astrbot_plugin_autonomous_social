@@ -70,6 +70,14 @@ _GROUP_UMO_TYPES = frozenset(
 # 「这个群永久不许她开口」—— 见 `forgive_stale_flow_ignored`。
 FLOW_IGNORED_RESET_SECONDS = 3 * 3600.0
 
+# 她插完一句之后，群里**一个人都没再说**，过多久就认定「这波散了」而不是「没人理我」。
+#
+# 原来的账只按「有没有 @ 她」记：她插一句、群里就此安静，也照样 +1 被冷落，
+# 两次就把这个群的心流关掉。线上 59 个关注窗口只接了 13 次话、其中 15 次记成被冷落，
+# 里面相当一部分其实是「话题自然结束」，不是「她说话没人搭理」。
+# 3 分钟：够群里有人接着聊，又不至于把真正冷场的那次漏记成被接住。
+FLOW_QUIET_AFTER_REPLY_SECONDS = 3 * 60.0
+
 STATE_VERSION = 2
 DEFAULT_BOT_KEY = "default"
 
@@ -512,7 +520,15 @@ class SocialState:
             self.mark_dirty()
 
     def forgive_stale_flow_ignored(self, bid: str, gid: str, now: float) -> None:
-        """距上一次心流插话够久 → 上一波已经结束，把「连着插没人理」的计数清零。
+        """把「连着插话没人理」的账作废。两种情形都算：
+
+        ① **时间到**：距上一次插话超过 `FLOW_IGNORED_RESET_SECONDS`，上一波早结束了。
+        ② **这波散了**：她插完话之后群里**一个人都没再说**（`last_human_at` 没往前走），
+           且已过 `FLOW_QUIET_AFTER_REPLY_SECONDS`。那不是「没人理我」，是话题自然结束——
+           原来只有 ①，于是「她插一句、群里安静了」也照样记成被冷落，两次就把这个群的
+           心流关掉。
+
+        反过来，如果**有人接着说**（只是没 @ 她），那才是真的被冷落，账留着。
 
         原来这个计数只有两处会清零：新开关注窗口（`open_flow` 里 `not was_open` 那一支）
         与被 @（`note_flow_pickup`）。而它一旦到过退出阈值，她就不再插话
@@ -523,7 +539,16 @@ class SocialState:
         if int(g.get("flow_ignored", 0) or 0) <= 0:
             return
         last = _num(g.get("flow_last_reply_at"))
-        if last <= 0 or (now - last) < FLOW_IGNORED_RESET_SECONDS:
+        if last <= 0:
+            return
+        if (now - last) >= FLOW_IGNORED_RESET_SECONDS:
+            g["flow_ignored"] = 0
+            self.mark_dirty()
+            return
+        if (now - last) < FLOW_QUIET_AFTER_REPLY_SECONDS:
+            return
+        if _num(g.get("last_human_at")) > last:
+            # 有人接着说了话（只是没 @ 她）→ 这才是真的「插了没人理」，账留着。
             return
         g["flow_ignored"] = 0
         self.mark_dirty()
@@ -1208,6 +1233,66 @@ class SocialState:
 
     # ─── 消息记录 ───────────────────────────────────────
 
+    def _fallback_user(self, uid: str) -> Optional[Dict[str, Any]]:
+        """兜底桶（`default`）里同一个人的记录；没有就 None。**只读，不建条目。**"""
+        bots = self.data.get("bots", {})
+        bot = bots.get(DEFAULT_BOT_KEY) if isinstance(bots, dict) else None
+        if not isinstance(bot, dict):
+            return None
+        users = bot.get("users")
+        if not isinstance(users, dict):
+            return None
+        rec = users.get(str(uid or ""))
+        return rec if isinstance(rec, dict) else None
+
+    def _settle_pending_reply(
+        self,
+        u: Dict[str, Any],
+        ts: float,
+        reply_window_seconds: int,
+        pending_window_seconds: Optional[float],
+    ) -> None:
+        """结算「上一次主动联系有没有被接住」，并给回复率记账。
+
+        抽成独立方法是因为它要对**两条**记录各跑一次：当前 bot 下的那条，以及兜底桶
+        （`default`）里同一个人的那条。历史导入时（2+ 个真实 bot）用户被统一归到
+        `default`，主动消息也从那里发出去；但他们的回复从**真实 bid** 进来，落到那边
+        新建的记录上。只结算 bid 那条的话，兜底桶里的 `proactive_replied` 永远是 0、
+        `no_reply_streak` 永远停在 1——「发了一堆没人理」对这批人永远不成立，
+        退避也就永远不触发。线上 `default` 里 41 条主动消息、0 条回复就是这么来的。
+        """
+        pending_window = pending_window_seconds or reply_window_seconds
+        pending = _num(u.get("pending_since", 0))
+        if pending > 0 and u.get("pending_result") == "waiting":
+            if ts - pending <= pending_window:
+                desire.after_reply(u, ts)
+            else:
+                desire.after_ignored(u, ts)
+        elif u.get("pending_result") == "ignored":
+            # 12 小时没回就已经被判过 ignored、pending_since 也被清零了。等到对方
+            # 隔夜回一句，那条记账压根不在了——after_reply 永远不会被调用，人就一直
+            # 冷着。人回来了就是回来了，这里把他叫回来；不进回复率分母（那是 2 小时
+            # 的另一个口径）。
+            desire.forgive_late(u, ts)
+
+        # 回复检测：只有在回复窗口内才算
+        last_pro = _num(u.get("last_proactive_sent", 0))
+        if last_pro > 0 and not u.get("last_proactive_replied", True):
+            if ts - last_pro <= reply_window_seconds:
+                u["last_proactive_replied"] = True
+                u["proactive_replied"] = int(u.get("proactive_replied", 0)) + 1
+                # 滚动平均回复时间
+                reply_time = ts - last_pro
+                samples = int(u.get("reply_samples", 0))
+                old_avg = _num(u.get("avg_reply_seconds", 0))
+                if samples == 0:
+                    u["avg_reply_seconds"] = reply_time
+                else:
+                    u["avg_reply_seconds"] = (old_avg * samples + reply_time) / (samples + 1)
+                u["reply_samples"] = samples + 1
+            # else: 超过窗口了，不算回复，但 last_proactive_replied 保持 False
+            # （下一次主动消息会重置它）
+
     def record_incoming(
         self,
         bid: str,
@@ -1260,37 +1345,15 @@ class SocialState:
 
         # 上一次主动联系有没有被接住。这里的窗口比回复率统计宽：晚上发的话对方早上回，
         # 算不算「回了我的主动消息」可以商量，但因此判定 TA 不想理我就太武断了。
-        pending_window = pending_window_seconds or reply_window_seconds
-        pending = _num(u.get("pending_since", 0))
-        if pending > 0 and u.get("pending_result") == "waiting":
-            if ts - pending <= pending_window:
-                desire.after_reply(u, ts)
-            else:
-                desire.after_ignored(u, ts)
-        elif u.get("pending_result") == "ignored":
-            # 12 小时没回就已经被判过 ignored、pending_since 也被清零了。等到对方
-            # 隔夜回一句，那条记账压根不在了——after_reply 永远不会被调用，人就一直
-            # 冷着。人回来了就是回来了，这里把他叫回来；不进回复率分母（那是 2 小时
-            # 的另一个口径）。
-            desire.forgive_late(u, ts)
-
-        # 回复检测：只有在回复窗口内才算
-        last_pro = _num(u.get("last_proactive_sent", 0))
-        if last_pro > 0 and not u.get("last_proactive_replied", True):
-            if ts - last_pro <= reply_window_seconds:
-                u["last_proactive_replied"] = True
-                u["proactive_replied"] = int(u.get("proactive_replied", 0)) + 1
-                # 滚动平均回复时间
-                reply_time = ts - last_pro
-                samples = int(u.get("reply_samples", 0))
-                old_avg = _num(u.get("avg_reply_seconds", 0))
-                if samples == 0:
-                    u["avg_reply_seconds"] = reply_time
-                else:
-                    u["avg_reply_seconds"] = (old_avg * samples + reply_time) / (samples + 1)
-                u["reply_samples"] = samples + 1
-            # else: 超过窗口了，不算回复，但 last_proactive_replied 保持 False
-            # （下一次主动消息会重置它）
+        self._settle_pending_reply(u, ts, reply_window_seconds, pending_window_seconds)
+        if bid != DEFAULT_BOT_KEY:
+            # 兜底桶里的那个人：主动消息从 `default` 发出去，回复却从真实 bid 进来。
+            # 不补这一步，那批人的回复率永远是 0、退避永远不触发（见方法注释）。
+            fallback = self._fallback_user(uid)
+            if fallback is not None and fallback is not u:
+                self._settle_pending_reply(
+                    fallback, ts, reply_window_seconds, pending_window_seconds
+                )
 
         # 提取话题（store_text 关闭时不提取，避免落盘派生关键词）
         if store_text:

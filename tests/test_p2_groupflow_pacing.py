@@ -350,5 +350,121 @@ class WeatherPrefixTest(unittest.TestCase):
         self.assertIn("from .textutil import outside_lead", src)
 
 
+class FlowContextTest(unittest.TestCase):
+    """心流不该只看「这一条消息」，还要看这个群现在在干什么（v1.27.37）。
+
+    线上数据：59 个群开过关注窗口，只接了 13 次话，其中 15 次被记成「插了没人理」。
+    说明判定层太粗——它只问「这条消息有没有 @」，不问「这会儿是不是有人在对着说」。
+    """
+
+    def _group(self, **kw):
+        g = {
+            "blocked_until": 0.0,
+            "flow_open_until": NOW + 600,
+            "flow_hold_until": 0.0,
+            "flow_ignored": 0,
+            "flow_replies": 0,
+            "flow_last_reply_at": NOW - 600,
+        }
+        g.update(kw)
+        return g
+
+    def _gate(self, g, **kw):
+        args = dict(
+            max_replies=3,
+            min_gap_seconds=45,
+            hourly_cap=6,
+            hour_count=0,
+            ignored_exit=2,
+        )
+        args.update(kw)
+        return groupflow.flow_should_consider(g, NOW, **args)
+
+    def test_baseline_is_allowed(self):
+        ok, why = self._gate(self._group())
+        self.assertTrue(ok, why)
+
+    def test_named_address_without_at_is_not_interrupted(self):
+        """「小明你那个面试怎么样了」没有 @，但明显是冲着小明的。"""
+        ok, why = self._gate(self._group(), addressed_to_name="小明")
+        self.assertFalse(ok)
+        self.assertIn("小明", why)
+
+    def test_two_person_exchange_is_not_interrupted(self):
+        ok, why = self._gate(self._group(), recent_speakers=["阿哲", "小鱼", "阿哲"])
+        self.assertFalse(ok)
+        self.assertIn("对聊", why)
+
+    def test_three_speakers_is_still_fair_game(self):
+        """三个人在说话就不算对聊——别把正常群聊也挡了。"""
+        ok, why = self._gate(self._group(), recent_speakers=["阿哲", "小鱼", "阿岚"])
+        self.assertTrue(ok, why)
+
+    def test_two_speakers_without_alternation_is_not_a_duet(self):
+        """A,A,B 只是一个人连说两句，不是对聊。"""
+        self.assertFalse(groupflow.two_person_exchange(["阿哲", "阿哲", "小鱼"]))
+
+    def test_not_enough_samples_never_blocks(self):
+        """样本不足 3 条一律放行——宁可让它接，也别用一两条消息就下结论。"""
+        self.assertFalse(groupflow.two_person_exchange([]))
+        self.assertFalse(groupflow.two_person_exchange(["阿哲"]))
+        self.assertFalse(groupflow.two_person_exchange(["阿哲", "小鱼"]))
+
+    def test_addressed_to_only_looks_at_the_opening(self):
+        """句中提到名字是评论，不是叫人说。"""
+        self.assertEqual(groupflow.addressed_to("小明你昨天说的那个", ["小明"]), "小明")
+        self.assertEqual(groupflow.addressed_to("我觉得小明说得对", ["小明"]), "")
+
+    def test_one_char_names_are_ignored(self):
+        """单字名太容易误中（「小」「阿」），不参与点名判定。"""
+        self.assertEqual(groupflow.addressed_to("小心点", ["小"]), "")
+
+
+class FlowIgnoredForgivenessTest(unittest.TestCase):
+    """「插一句然后大家散了」不该算成「没人理我」（v1.27.38）。
+
+    原来的账只按「有没有 @ 她」记：她插一句、群里就此安静，也照样 +1 被冷落，
+    两次就把这个群的心流关掉。线上 59 个窗口只接 13 次话、其中 15 次记成被冷落。
+    """
+
+    def _state(self):
+        import os
+        import tempfile
+
+        from social.state import SocialState
+
+        return SocialState(
+            os.path.join(tempfile.mkdtemp(), "state.json"), time_source=lambda: NOW
+        )
+
+    def _group(self, st, *, ignored=2, last_reply, last_human):
+        g = st.group("b", "g")
+        g["flow_ignored"] = ignored
+        g["flow_last_reply_at"] = last_reply
+        g["last_human_at"] = last_human
+        return g
+
+    def test_quiet_group_clears_the_ignored_count(self):
+        """她插完话，群里一个人都没再说 → 话题结束，不是被冷落。"""
+        st = self._state()
+        g = self._group(st, last_reply=NOW - 600, last_human=NOW - 3600)
+        st.forgive_stale_flow_ignored("b", "g", NOW)
+        self.assertEqual(g["flow_ignored"], 0)
+
+    def test_someone_spoke_after_her_keeps_the_count(self):
+        """有人接着说（只是没 @ 她）→ 真的被冷落，账留着。"""
+        st = self._state()
+        g = self._group(st, last_reply=NOW - 600, last_human=NOW - 60)
+        st.forgive_stale_flow_ignored("b", "g", NOW)
+        self.assertEqual(g["flow_ignored"], 2)
+
+    def test_too_soon_keeps_the_count(self):
+        """刚插完 1 分钟就判「散场」太急——3 分钟内不动。"""
+        st = self._state()
+        g = self._group(st, last_reply=NOW - 60, last_human=NOW - 3600)
+        st.forgive_stale_flow_ignored("b", "g", NOW)
+        self.assertEqual(g["flow_ignored"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

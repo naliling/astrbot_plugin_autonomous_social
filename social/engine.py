@@ -1384,6 +1384,15 @@ class SocialEngine:
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
         self.state.forgive_stale_flow_ignored(bid, gid, now)
+        # 语境：她要看这个群**现在在干什么**，而不是只盯着这一条消息。
+        # 近几条真人发言（去掉她自己）用来判断「是不是两个人在对聊」；本条消息开头
+        # 如果叫了某个群友的名字，那它就是冲那个人说的，不插。
+        speakers = [
+            str(s.get("name", "") or "").strip()
+            for s in (g.get("samples") or [])
+            if not s.get("self") and str(s.get("name", "") or "").strip()
+        ]
+        addressed = groupflow.addressed_to(msg, speakers)
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -1393,6 +1402,8 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
+            recent_speakers=speakers,
+            addressed_to_name=addressed,
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -1455,6 +1466,13 @@ class SocialEngine:
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
         self.state.forgive_stale_flow_ignored(bid, gid, now)
+        # 生成前重校也要看语境：生成要几秒，这几秒里群里可能已经变成两个人对聊了。
+        # 那时候她已经写好的话就不该再发出去——「在两个人中间插一句」是最招人烦的。
+        speakers = [
+            str(s.get("name", "") or "").strip()
+            for s in (g.get("samples") or [])
+            if not s.get("self") and str(s.get("name", "") or "").strip()
+        ]
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -1464,6 +1482,7 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
+            recent_speakers=speakers,
         )
         if not ok:
             return

@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import random
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # emoji 与变体选择符的字符类只有一份，在 `social/emoji.py`；
 # `style_profile` / `generator` 引用的是同一个对象。
@@ -109,6 +109,46 @@ def flow_prefilter(text: str, is_command: bool) -> bool:
     return True
 
 
+def addressed_to(text: str, known_names: List[str]) -> str:
+    """这句话开头是不是在叫某个群友（「小明你昨天…」）。返回那个名字，没有就空串。
+
+    没有 @、但一开口就叫了名字，等价于对着某个人说——心流不该插进去。原来只看
+    `@`，于是「小明你那个面试怎么样了」这种明显是一对一的话，她照样会接一句。
+    只认**开头**：句中提到（「我觉得小明说得对」）是评论，不是叫人说。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    names = sorted(
+        {str(n or "").strip() for n in (known_names or []) if len(str(n or "").strip()) >= 2},
+        key=len,
+        reverse=True,
+    )
+    for name in names:
+        if body.startswith(name):
+            return name
+    return ""
+
+
+def two_person_exchange(speakers: List[str], *, lookback: int = 4) -> bool:
+    """最近的真人发言是不是「恰好两个人在来回」。
+
+    两个人对聊时插一句是最招人烦的一种主动：他们的话都是冲着对方说的，第三个人
+    接一句既接不上、也打断。原来心流完全不看这个，只要「没有 @」就当可以接。
+
+    判定刻意便宜：取最近 `lookback` 条**真人**发言，去重后恰好 2 个人，且相邻两条
+    不同人（A,B,A 或 A,B,A,B）。样本不足 3 条一律 False——宁可让它接，
+    也别用一两条消息就断定「他们在对聊」。
+    """
+    recent = [str(s or "").strip() for s in (speakers or []) if str(s or "").strip()]
+    recent = recent[-max(3, int(lookback)) :]
+    if len(recent) < 3:
+        return False
+    if len(set(recent)) != 2:
+        return False
+    return all(recent[i] != recent[i + 1] for i in range(len(recent) - 1))
+
+
 def flow_should_consider(
     group: Dict[str, Any],
     now: float,
@@ -120,6 +160,8 @@ def flow_should_consider(
     ignored_exit: int,
     is_quiet: bool = False,
     asleep: bool = False,
+    recent_speakers: Optional[List[str]] = None,
+    addressed_to_name: str = "",
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -131,7 +173,9 @@ def flow_should_consider(
       观感是同一个她在连续刷屏；
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
-    - 连续插话没人接，已经到退出阈值。
+    - 连续插话没人接，已经到退出阈值；
+    - **语境**（v1.27.36）：这句话开头在叫某个群友（没 @ 也算），或者群里就是
+      两个人在来回对聊——都不是「可以插一句」的场合。
     """
     if asleep:
         return False, "她正在睡觉"
@@ -152,6 +196,13 @@ def flow_should_consider(
     gap = now - _f(group.get("flow_last_reply_at", 0))
     if gap < max(0.0, min_gap_seconds):
         return False, "距上一句插话太近"
+    # 语境：她要看这个群**现在在干什么**，而不只是「这一条消息过不过关」。
+    # 放在配额检查之后：配额是「她还能不能开口」，这两条是「这会儿该不该开口」，
+    # 前者更该出现在日志里（调参看的是它）。
+    if str(addressed_to_name or "").strip():
+        return False, f"这句话是冲着「{str(addressed_to_name).strip()}」说的"
+    if two_person_exchange(recent_speakers or []):
+        return False, "两个人正在对聊，先不插"
     return True, ""
 
 
