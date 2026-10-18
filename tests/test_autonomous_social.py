@@ -1191,7 +1191,11 @@ class TestNoScriptedContent(unittest.TestCase):
         )
         self.assertIn("3 天没跟你说话", block)
         self.assertIn("我下周要面试", block)
-        self.assertIn("在下雨", block)
+        # 天气**不再**进素材块（v1.27.41）：它是唯一「永远有、永远具体」的素材，
+        # 摆在这儿模型就会顺手拿去凑一句，线上真实记录是「天亮了/今早阴冷/天还阴着」
+        # 连着几条。天气要出现只能作为由头，由 `anchors.weather_worth_telling` 管着
+        # 「变了没有、隔了多久」。
+        self.assertNotIn("在下雨", block)
         self.assertEqual(block.count("改方案"), 1, "同一件事被列了两遍")
         self.assertIn("别编这里没有的事", block)
 
@@ -1555,9 +1559,20 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
         self.assertIn("\n", out, "换行被拼掉了——那等于把停顿也拼掉")
 
     def test_markdown_heading_is_not_mistaken_for_intent(self):
+        """协议里的 `# 事件名` 是标题，不是正文；只有标题就等于没有正文。
+
+        旧行为是把 `# 今天天气真好` 当成正文发出去（`_strip_intent` 当 markdown 保留、
+        `_clean_output` 再剥掉 `#`）。线上后果是每条消息都以一个孤零零的名词开头：
+        `'想念\\n刚眯醒…'`、`'答应带回来的吃的\\n出门时…'`。
+        """
         d = generator.MessageGenerator._parse_decision("SEND\n# 今天天气真好", 120, None)
+        self.assertFalse(d.send, "只有标题、没有正文，不该发")
+
+    def test_heading_plus_body_sends_only_the_body(self):
+        d = generator.MessageGenerator._parse_decision(
+            "SEND\n# 今天天气真好\n太阳晒到被子上，不想起", 120, None)
         self.assertTrue(d and d.send)
-        self.assertEqual(d.parts, ["今天天气真好"])
+        self.assertEqual(d.parts, ["太阳晒到被子上，不想起"])
 
     def test_promise_line_is_extracted(self):
         d = generator.MessageGenerator._parse_decision(

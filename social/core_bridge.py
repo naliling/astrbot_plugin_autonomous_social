@@ -542,11 +542,15 @@ class CoreBridge:
 
     # ─── 紧凑输出 ───────────────────────────────────────
 
-    def compact(self, s: Optional[Dict[str, Any]]) -> str:
+    def compact(self, s: Optional[Dict[str, Any]], *, include_weather: bool = True) -> str:
         """将快照转为人类可读的简要文本（供 prompt 使用）。
 
         Args:
             s: 快照 dict
+            include_weather: 要不要把天气写进来。主动消息传 `False`——天气是唯一
+                「永远有、永远具体」的素材，摆在背景里模型就会顺手拿去凑一句，
+                于是「不是天气就是天气」。它要出现只能作为由头（由 `anchors` 管着
+                「变了没有、隔了多久」）。
 
         Returns:
             格式化的状态描述文本
@@ -597,10 +601,14 @@ class CoreBridge:
             parts.append("今天: " + "；".join(today_bits))
 
         weather = s.get("weather")
-        if isinstance(weather, dict) and weather:
+        if include_weather and isinstance(weather, dict) and weather:
             # 契约路径写的是 {"env": ...}，旧字段路径写的是 {"weather": ..., "env": ...}。
             # 原来只读 "weather"，于是接了 Core 的新契约时天气这一行恒为空。
-            w = weather.get("env") or weather.get("weather") or ""
+            w = str(weather.get("env") or weather.get("weather") or "").strip()
+            # 旧版 Core 的 env 自带「天气：」前缀，这里再加一个标签就成了
+            # 「天气: 天气：晴…」。剥掉前缀（新 Core 已经不写了）。
+            if w.startswith("天气："):
+                w = w[len("天气："):].strip()
             if w:
                 parts.append(f"天气: {w}")
 

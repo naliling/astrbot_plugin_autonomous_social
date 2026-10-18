@@ -216,6 +216,8 @@ _NO_LEADING = re.compile(r"^\s*(?:NO|SKIP)\b|^\s*(?:不发|算了|不要发|不�
 # 首行同行写法：「SEND: 刚下班」。英文缩写要求带冒号，否则「OK啦今天真累」会被
 # 当成协议词 + 正文，把「啦今天真累」发出去
 _SEND_PREFIX = re.compile(r"^\s*(?:SEND|YES|OK)\s*[:：]\s*", re.I)
+# 协议里的「# 事件名」那一行。`#` 与文字之间可能有空格（模型两种都写）。
+_TITLE_LINE = re.compile(r"^#{1,6}\s*(.+)$")
 _DECISION_SEND = "SEND"
 _DECISION_NO_ALIASES = ("NO", "SKIP", "不发", "算了", "不要发", "不该发")
 
@@ -422,7 +424,7 @@ _MODE_NOTES = {
     ),
     "greet_morning": (
         "现在是早上，你想跟TA道个早安。\n"
-        "- 别只发「早安」两个字，后面自然带一句你刚醒的状态、或者今天的头一件小事；\n"
+        "- 别只发「早安」两个字；有真事就带一句，没有就只问这一句，别拿天气和「刚睡醒」凑；\n"
         "- 可以顺势问一句TA今天有什么安排，一个就够，别问一串；\n"
         "- 想拆成两条发也行（先一句早安，再补一句今天的状态）。"
     ),
@@ -1610,7 +1612,8 @@ class MessageGenerator:
                     # 没有给定的事，就让它从上面摆着的素材里挑。
                     *(["下面已经给了具体的那件事（# 那行就是它），就照着那件事说。"]
                       if anchor_line else
-                      ["上面摆着的那些里，挑一件你此刻真想说的。"]),
+                      ["这次没有具体的事要说——就从「你想跟 TA 说句话」这件事本身出发。"
+                       "别拿天气、饿、困、刚睡醒这类背景凑一句，那些不是话。"]),
                     "",
                     "但你手上还有一道否决权，**对谁都成立，不分关系好坏**：",
                     "看完「你们的关系」和上面的事，如果此刻你根本不会主动找这个人说话，"
@@ -1914,6 +1917,10 @@ class MessageGenerator:
 
         # 到这里首行确实是 SEND（或中途找到过 SEND）。同行写法的正文已在上面拆进
         # body，body 为空就说明模型只给了一个光秃秃的协议词，没正文可发
+        # 协议要求正文前有一行「# 事件名」。这一行是**协议**，不是内容——必须在这里
+        # 吃掉，不能留给 `_strip_intent`（它把「# 空格」当 markdown 标题保留）和
+        # `_clean_output`（它把 `#` 剥掉）联手变成正文第一行。
+        title, body = cls._take_title(body)
         body, promise = cls._strip_intent(body)
         parts = cls._split_parts(body, max_len, cfg, allow_emoji)
         if not parts:
@@ -1926,6 +1933,45 @@ class MessageGenerator:
                 )
             return Decision(send=False, why_not="模型只回了 SEND，没有正文", raw=raw)
         return Decision(send=True, parts=parts, raw=raw, promise=promise, raw_text=raw)
+
+    @staticmethod
+    def _take_title(body: str) -> tuple:
+        """吃掉协议要求的「# 事件名」那一行，返回 (标题, 正文)。
+
+        提示词要求模型第二行以 `#` 开头写事件名。但解析链上曾经是这样漏掉的：
+
+        1. `_strip_intent` 把「`# ` 带空格」当成 markdown 标题**保留**下来（它的本意
+           是别误伤模型自己写的 markdown）；
+        2. 随后 `_clean_output` 又把开头的 `#` 剥掉。
+
+        两步合起来，那行标题变成了**正文第一行**，跟着消息一起发出去。线上真实记录：
+
+            '想念\\n刚眯醒，脑子里全是你，有些想你了💕'
+            '答应带回来的吃的\\n出门时许诺带给我的美味，现在到哪儿了呢？💕'
+
+        用户收到的是一条半截话：开头一个孤零零的名词，既不像想念，也不像问候。
+
+        只在**确实是标题**时吃：第一行、`#` 开头、短、不带句末标点、后面还有正文。
+        后面没正文的说明整条只有一个标题——那就该按「只有标题没有正文」判掉，不吃。
+        """
+        lines = str(body or "").split("\n")
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            return "", body
+        matched = _TITLE_LINE.match(lines[idx].strip())
+        if not matched:
+            return "", body
+        title = matched.group(1).strip()
+        rest = [ln for ln in lines[idx + 1:] if ln.strip()]
+        if not title or len(title) > 16:
+            return "", body
+        if title.endswith(("。", "！", "？", ".", "!", "?")):
+            return "", body
+        # 没有正文时也把它当标题吃掉：这时 body 变空，上层按「只回了 SEND 没有正文」
+        # 判掉这一轮。留着它就会把「想念」两个字当消息发出去。
+        return title, "\n".join(lines[idx + 1:]).strip()
 
     @staticmethod
     def _strip_intent(body: str) -> tuple:
@@ -2332,9 +2378,10 @@ class MessageGenerator:
         # 排查方向被带到模型侧。同文件 `_body_line` 早就是这个写法。
         day = body.get("day") if isinstance(body.get("day"), dict) else {}
         add("你手上在做的事", day.get("doing", ""))
-        weather = body.get("weather")
-        if isinstance(weather, dict):
-            add("外面", weather.get("env", ""))
+        # **天气不在这里**（v1.27.41）。它是唯一「永远有、永远具体」的素材，别的都由头
+        # 都可能空，于是它成了默认台词——线上真实记录是「天亮了」「今早阴冷」「天还阴着」
+        # 连着几条。天气要出现，只能作为**由头**（`anchors.weather_worth_telling` 管着
+        # 「变了没有、隔了多久」），不能当背景摆在这儿让模型顺手拿去凑一句。
 
         if not facts:
             return ""

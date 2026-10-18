@@ -588,23 +588,27 @@ def _derive_from_state(
         out.append(text)
 
     doing = _short(day.get("doing") or activity.get("schedule_event"), 12)
-    if doing:
+    # 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「刚忙完忙手里的活」等于没说，
+    # 而模型拿到这种由头只会顺着编一句更空的。真实记录里这类由头出现过 11 次
+    # （「刚忙完忙自己的事」×5、「刚忙完醒神」×6）。
+    if doing and not is_vague_doing(doing):
         offer(f"刚忙完{doing}")
 
     nxt = day.get("next")
     if isinstance(nxt, list) and nxt:
         first = _short(nxt[0], 12)
-        if first:
+        if first and not is_vague_doing(first):
             offer(f"接下来是{first}")
 
-    # 天气可能是 {"env": "外面在下雨"} 这种结构。先取字典再转字符串——顺序反了
-    # 会得到 "{'env': '外面在" 这种字面量，混进由头里一路发给模型。
-    weather = body.get("weather")
-    if isinstance(weather, dict):
-        weather = weather.get("env") or weather.get("weather")
-    weather = _s(weather)
+    # 天气（v1.27.41 起加闸）：只在**变了**、且距上次说天气够久时才当由头。
+    # 原来这里是「有天气就给」——而天气永远有，于是它成了最稳定的一条由头；
+    # 用户那边的真实记录就是「不是天气就是天气」。
+    weather = weather_worth_telling(u, body, now)
     if weather:
-        offer(_clause(weather, 16))
+        before = len(out)
+        offer(weather)
+        if len(out) > before:  # 真进了池子才算「说过」
+            mark_weather_told(u, body, now)
 
     # 沉默时长是一句真实的话，但**不能按天数逐天变**。写成 f"快{N}天没说话了" 的话，
     # 每天都是一句新的话：既不会被「已用过」挡掉（于是每天都能重新派生），
@@ -738,6 +742,81 @@ def derive_extras(
     if wx:
         offer(KIND_WEATHER, wx)
     return out
+
+
+# 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「刚忙完忙手里的活」等于没说，
+# 模型拿到这种由头只会顺着编一句更空的。线上真实记录里这类由头出现过 11 次
+# （「刚忙完忙自己的事」×5、「刚忙完醒神」×6），消息读起来就是「刚忙完事」。
+_VAGUE_DOING = (
+    "忙手里的活", "忙自己的事", "忙点事", "忙事情", "处理事情", "手头的事",
+    "手边的事", "自己的事", "发呆", "休息", "闲着", "在家", "没什么", "没事",
+)
+
+
+def is_vague_doing(text: str) -> bool:
+    """这句「在做什么」是不是等于什么都没说。
+
+    只按**词表**判，不按长度：「追剧」「加班」「通勤」都是两个字，但它们是具体的事。
+    """
+    t = _s(text).strip()
+    # 一个字不构成「在做什么」（「嗯」「忙」）；两个字可能是具体的（「追剧」「加班」）。
+    if len(t) <= 1:
+        return True
+    return any(word in t for word in _VAGUE_DOING)
+
+
+# ── 天气：只在**变了**的时候才值得说 ────────────────────────────
+#
+# 天气是唯一「永远有、永远具体」的素材：别的由头（手上在做的事、没做完的事、想做的事）
+# 都可能空，天气不会空。于是它变成了默认台词——线上真实记录就是「不是天气就是天气」：
+# 「天亮了」「今早阴冷」「天还阴着」「你那边也冻透了罢」连着几条。
+#
+# 加两道闸：① 和上次说过的**一字不差**就不说；② 距上次说天气不足 6 小时也不说
+# （天气偶尔一小时里变一次，不该因此又开一次口）。
+WEATHER_SEEN_KEY = "weather_seen"
+WEATHER_SEEN_AT_KEY = "weather_seen_at"
+WEATHER_REPEAT_MIN_SECONDS = 6 * 3600.0
+
+
+def _weather_text(body: Any) -> str:
+    """从契约的 weather 里取一句人话。取不到返回空串（不编）。"""
+    weather = (body or {}).get("weather") if isinstance(body, dict) else None
+    if isinstance(weather, dict):
+        weather = weather.get("env") or weather.get("weather")
+    return _s(weather).strip()
+
+
+def weather_worth_telling(u: Dict[str, Any], body: Any, now: float) -> str:
+    """这次值得说的天气；不值得返回空串。"""
+    text = _weather_text(body)
+    if not text:
+        return ""
+    last = _s((u or {}).get(WEATHER_SEEN_KEY))
+    if last == text:
+        return ""
+    try:
+        at = float((u or {}).get(WEATHER_SEEN_AT_KEY) or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    if at > 0 and now - at < WEATHER_REPEAT_MIN_SECONDS:
+        return ""
+    return _short(text, 16)
+
+
+def mark_weather_told(u: Dict[str, Any], body: Any, now: float) -> None:
+    """记下「这次说过天气了」。
+
+    记在**派生**的时候而不是发送成功之后：这一层的目的是别让天气变成默认台词，
+    宁可偶尔少说一次，也不要因为「没发出去」而下一轮再说一遍同样的天气。
+    """
+    text = _weather_text(body)
+    if not text or not isinstance(u, dict):
+        return
+    u[WEATHER_SEEN_KEY] = text
+    try:
+        u[WEATHER_SEEN_AT_KEY] = float(now or 0.0)
+    except (TypeError, ValueError):
+        u[WEATHER_SEEN_AT_KEY] = 0.0
 
 
 def _is_idle(body: Dict[str, Any]) -> bool:

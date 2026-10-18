@@ -3845,7 +3845,7 @@ class SocialEngine:
             if core_root:
                 user_core = self.core.load_snapshot(bid, uid, root=core_root)
                 if user_core:
-                    core_context = self.core.compact(user_core)
+                    core_context = self.core.compact(user_core, include_weather=False)
         except Exception as e:
             self.log(f"加载用户 {uid} Core 快照失败: {e}")
 
@@ -4765,7 +4765,7 @@ class SocialEngine:
                 if core_root:
                     user_core = self.core.load_snapshot(bid, uid, root=core_root)
                     if user_core:
-                        core_context = self.core.compact(user_core)
+                        core_context = self.core.compact(user_core, include_weather=False)
             except Exception as e:
                 self.log(f"预览加载用户 {uid} Core 快照失败: {e}")
             u_copy = dict(u)
