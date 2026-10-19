@@ -306,15 +306,20 @@ class SendFailAttributionTest(unittest.TestCase):
         stub._time = lambda: 1000.0
         return stub
 
-    def test_platform_side_failure_uses_a_short_fixed_cooldown(self):
-        from social.engine import SEND_FAIL_COOLDOWN_BASE, SEND_FAIL_PLATFORM_COOLDOWN
+    def test_platform_side_failure_escalates_but_never_counts_as_giveup(self):
+        from social.engine import SEND_FAIL_PLATFORM_COOLDOWN, SEND_FAIL_PLATFORM_MAX
 
         stub = self._stub()
         u: dict = {}
         SocialEngine._mark_send_failed(stub, u, platform_side=True)
         self.assertEqual(u["send_fail_until"], 1000.0 + SEND_FAIL_PLATFORM_COOLDOWN)
         self.assertNotIn("send_fail_count", u, "平台侧失败不该累加这个人的退避计数")
-        self.assertLess(SEND_FAIL_PLATFORM_COOLDOWN, SEND_FAIL_COOLDOWN_BASE)
+        for _ in range(10):
+            SocialEngine._mark_send_failed(stub, u, platform_side=True)
+        self.assertLessEqual(
+            u["send_fail_until"] - 1000.0, SEND_FAIL_PLATFORM_MAX,
+            "升档必须封顶，否则一个死人会被隔离几年",
+        )
 
     def test_user_side_failure_still_backs_off(self):
         stub = self._stub()
@@ -518,8 +523,10 @@ def _speak_inner_stub(*, parts, raw_text="原始输出", tier=None,
     stub._hourly_refund = lambda bid: SocialEngine._hourly_refund(stub, bid)
     stub._platform_problem = SocialEngine._platform_problem
     stub._mark_send_failed = (
-        lambda u2, platform_side=False:
-        SocialEngine._mark_send_failed(stub, u2, platform_side=platform_side)
+        lambda u2, platform_side=False, reason="":
+        SocialEngine._mark_send_failed(
+            stub, u2, platform_side=platform_side, reason=reason
+        )
     )
     stub._note_giveup = lambda u2, bid, now: SocialEngine._note_giveup(stub, u2, bid, now)
 
