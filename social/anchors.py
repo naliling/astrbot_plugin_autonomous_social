@@ -35,6 +35,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .textutil import OUTSIDE_WORDS as _OUTSIDE_WORDS, outside_lead as _outside_lead
+from .textutil import is_quotable
 
 # 一个人身上同时挂着几条「还没用过的事」
 ANCHOR_MAX = 5
@@ -1075,6 +1076,15 @@ def _conversation(u: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _quotable(seg: str) -> bool:
+    """这个片段能不能被当成「TA 上次说的那件事」引回去。
+
+    判据在 `textutil.is_quotable`：占位符 / 纯应答词 / 汉字不足两个都不行。
+    线上真实产出是「yep」「怎么」「不是」「打你」「[图片][Image」——见那里的注释。
+    """
+    return is_quotable(seg)
+
+
 def derive_relations(
     u: Dict[str, Any],
     affection: Optional[float],
@@ -1132,6 +1142,10 @@ def derive_relations(
             # 不能发生在模板上（#4 与 #5 是同一个根因）。
             seg = _short(seg, 12)
             if len(seg) < 2 or seg in taken:
+                continue
+            # 「后来呢」引的必须是一件真的事：`yep`/`怎么`/`[图片][Image`/`打你`
+            # 这类碎片被捧回去，是整条消息里最假的地方（逐条见 `_quotable` 上面）。
+            if not _quotable(seg):
                 continue
             offer(f"你上次说的「{seg}」后来呢")
             break
