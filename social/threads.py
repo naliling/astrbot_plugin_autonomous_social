@@ -392,6 +392,31 @@ PROMISE_MAX_CHARS = 24
 # 到点她自己会挑一个合适的时机把这件事做了。
 PROMISE_WAIT_SECONDS = 20 * 3600.0
 
+# 许诺正文的「像不像一件事」检查。
+#
+# 这个字段会**原样**进下一轮的 prompt（`【你现在知道的】· 你们说好的：…`），
+# 所以它既是记忆也是素材。线上真实样本里混进来过：
+#     · 你们说好的：了强烈的红光，你猛的惊喜回头望去发现这红光的指向点正是…
+#     · ？：…
+# 一条是从半句开始、括号都没闭合的正文碎片；一条是纯符号。模型会接着它们演一段
+# 根本不存在的剧情。宁可少记一件，也不能把这种东西喂回去。
+_PROMISE_MAX_SANE_CHARS = 16
+_PROMISE_BAD_HEAD = "？?：:…，,。.、）)】」》"
+
+
+def _promise_looks_sane(text: str) -> bool:
+    """这句「许诺」像不像一件真事。"""
+    s = str(text or "").strip()
+    if not s or len(s) > _PROMISE_MAX_SANE_CHARS:
+        return False
+    if s[0] in _PROMISE_BAD_HEAD:
+        return False
+    # 括号不配平 = 从一段带括注的正文里切出来的碎片
+    if s.count("（") + s.count("(") != s.count("）") + s.count(")"):
+        return False
+    # 至少得有中文/字母/数字，纯标点不算
+    return bool(re.search(r"[0-9A-Za-z\u4e00-\u9fff]", s))
+
 
 def promise_entries(user: Dict[str, Any]) -> list:
     """她自己许下、还没兑现的那些事。老数据里没有这个字段，返回空列表。"""
