@@ -229,7 +229,12 @@ def plan_segments(
     if not segs:
         return [], []
     if len(segs) == 1:
-        return plan_parts(segs[0], umo, context, allow_burst=allow_burst)
+        out, waits = plan_parts(segs[0], umo, context, allow_burst=allow_burst)
+        if allow_burst and len(out) == 1:
+            auto = _auto_split(out[0])
+            if auto:
+                return auto, [random.uniform(2.0, 4.0) for _ in auto[1:]]
+        return out, waits
     if not allow_burst:
         return ["\n".join(segs)], []
     cfg = read_segmented_reply(context, umo)
@@ -238,3 +243,33 @@ def plan_segments(
     segs = _cap_parts(segs)
     waits = [part_interval(seg, cfg) for seg in segs[1:]]
     return segs, waits
+
+# 自动连发的下限：太短拆了像结巴，太长的才值得分两条说（线上真实主动消息中位数 20 字）。
+AUTO_BURST_MIN_CHARS = 26
+AUTO_BURST_MIN_PART = 6
+_BREAK_CHARS = "。！？…～!?\n"
+
+
+def _auto_split(text: str) -> List[str]:
+    """一段话拆成两条（在自然断点处），拆不了返回空列表。
+
+    为什么要这个：`plan_segments` 只在「框架开了分段 + 模型写了 `---`」时才连发，
+    而模型几乎从不写 `---`，主人也从没在主动消息里见过连发。线上 20 条里 0 条连发。
+    「一个人想到什么分两条发」是最像真人的动作，不该只靠模型自觉。
+    """
+    body = str(text or "").strip()
+    if len(body) < AUTO_BURST_MIN_CHARS:
+        return []
+    # 从中间偏后找断点：太靠前第一条太短，太靠后第二条太短
+    lo, hi = int(len(body) * 0.35), int(len(body) * 0.75)
+    best = -1
+    for i in range(hi, lo - 1, -1):
+        if body[i - 1] in _BREAK_CHARS:
+            best = i
+            break
+    if best < 0:
+        return []
+    first, second = body[:best].strip(), body[best:].strip()
+    if len(first) < AUTO_BURST_MIN_PART or len(second) < AUTO_BURST_MIN_PART:
+        return []
+    return [first, second]
