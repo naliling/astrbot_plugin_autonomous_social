@@ -260,6 +260,49 @@ def _check_repeat(text: str, recent: Sequence[str], threshold: float = 0.72) -> 
     return None
 
 
+# 至少这么长的动作标签才算「有辨识度」，短标签（轻笑/休息/沉默）不算——
+# 那是人设的固定招牌，拦它等于不许她用自己的人设。
+_ACTION_TAG_MIN = 4
+
+
+def _action_tags(text: str) -> List[str]:
+    """取出这条消息里的括号动作，归一化后取前 4 个字。
+
+    取前缀而不是全串：`(停下进食的动作)` 与 `(停下进食)`、`(停下进食的动作，看着他)`
+    在用户眼里是同一个动作，逐字比会全放过。
+    """
+    out: List[str] = []
+    for m in _ACTION_BLOCKS.finditer(str(text or "")):
+        # `_ACTION_BLOCKS` 没有捕获组（它先于这个检查存在），从整段里剥掉首尾括号
+        raw = m.group(0).strip().strip(_OPENERS + _CLOSERS)
+        tag = _PUNCT_ONLY.sub("", raw).strip()
+        if len(tag) >= _ACTION_TAG_MIN:
+            out.append(tag[:_ACTION_TAG_MIN])
+    return out
+
+
+def _check_action_repeat(text: str, recent: Sequence[str], limit: int = 20) -> Optional[str]:
+    """同一个动作标签在最近几条里已经用过。
+
+    线上真实数据（3 小时 20 条里有 4 条撞上）：`(停下进食的动作)` 用了两次、
+    `(放下餐具)` 两次。正文措辞每条都不同，所以 `_check_repeat` 的二元组重合度
+    抓不到；用户看到的却是「她又来了同一句」，而且这类动作往往跟当下在聊的事
+    毫无关系（「放下手里的活」——她在跟人聊微信，哪来的活）。
+
+    只比**同一人**最近几条（`recent` 就是这个人的发言），且只认 ≥4 字的标签。
+    窗口给 20：8 条只盖住一次连发，隔了十几条换个措辞挂同一个动作照样「重复出现」。
+    """
+    cur = _action_tags(text)
+    if not cur:
+        return None
+    olds = [_action_tags(o) for o in list(recent or [])[-limit:]]
+    for tag in cur:
+        for old_tags in olds:
+            if tag in old_tags:
+                return f"动作标签复读（「{tag}」最近已经用过）"
+    return None
+
+
 def _check_cross_user(
     text: str, others: Sequence[Tuple[str, str]], threshold: float = 0.6
 ) -> Optional[str]:
@@ -285,6 +328,36 @@ def _check_cross_user(
         ratio = _jaccard(cur, _bigrams(strip_actions(old_text)))
         if ratio >= threshold:
             return f"和刚发给{who}的那条太像（{ratio:.0%}），换一句"
+    return None
+
+
+def _check_cross_user_action(
+    text: str, others: Sequence[Tuple[str, str]], min_others: int = 1, limit: int = 40
+) -> Optional[str]:
+    """这条的**括号动作**已经被套用在好几个聊天对象身上了。
+
+    线上的真实形态（524 条主动消息里统计出来的）：15 个动作标签被套在多个聊天对象
+    身上——「蜷在沙发」10 个人、「伸个懒腰」9 个、「窝在沙发」6 个。正文各不相同，
+    所以 `_check_cross_user`（比正文）不响；而按人比对的 `_check_action_repeat`
+    只看得到「这一位」的历史，也永远不响。用户看到的是：她跟谁都窝在沙发里。
+
+    `min_others` 默认 2：只跟**一个**别人撞过的动作可能是巧合（同一时段两个人都在
+    说累），只有到处都在用才说明这是模板。门槛低会把发送量砍掉一截。
+    """
+    cur = _action_tags(text)
+    if not cur:
+        return None
+    for tag in cur:
+        hit_by = [
+            other_uid
+            for other_uid, other_text in list(others or [])[:limit]
+            if tag in _action_tags(other_text)
+        ]
+        if len(set(hit_by)) >= min_others:
+            return (
+                f"动作标签「{tag}」已经被套在 {len(set(hit_by))} 个人身上了"
+                f"（不止一位刚收到过类似的），换一个跟她这句话有关的"
+            )
     return None
 
 
@@ -386,6 +459,92 @@ def strip_title_line(text: str) -> str:
     rest = "\n".join(lines).strip()
     # 剥完空了 = 整条只有一行标题，那这条本身就没内容，不该发
     return rest if rest else raw
+
+
+def strip_echoed_label(text: str) -> str:
+    """剥掉「第一行是把正文里的话又说了一遍」的那种标签行。
+
+    ## 为什么不再用「首字抽签」去判标题
+
+    `strip_title_line` 判的是**形状**（短、没有第二人称、没有句末标点）。它挡住了
+    一部分，但线上仍然在念标题，漏掉的全是形状合法的：
+
+        '你的状态\\n(揉眼)还在想你说的「状态」，饿得慌，你呢？'
+        '想念\\n 特尔瓦大帅'
+        '有点想你了\\n(伸个懒腰) 暮色余晖，刚才咨询时总走神，想你了。'
+
+    这些首行有第二人称（你的状态）、有语气词（想你了），形状判据天然要放过它们。
+    再给形状加条件就是在抽签——每加一条都可能误伤一句真人话。
+
+    ## 换一条与措辞无关的判据：内容重复
+
+    这些标签的共同点不是长什么样，而是**它的内容已经出现在正文里**。所以这里只看
+    一件事：首行的字有多少出现在后面的正文里。出现 ≥80% 就说明它是复述，删掉不会
+    丢信息（那层意思正文里有），删了就是净收益。
+
+    反例都应该留下：「刚忙完\\n好累啊」（刚忙完三个字不在正文里）、
+    「今天加班到九点\\n累死了」、「嗯\\n(笑) 好啊」。纯问候也不必特殊照顾：
+    「早安\\n……早安」里的「早安」删掉后正文里还有一个。
+
+    只剥**第一行**，且只在后面还有正文时剥；整条只有一行时它就是一个完整消息，
+    不归这里管（那是 `is_title_like` 的事）。
+    """
+    raw = str(text or "")
+    lines = raw.split("\n")
+    if len(lines) < 2:
+        return raw
+    head = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+    if not head or not rest:
+        return raw
+    # 太长的不可能是标签；带句末标点的是一整句话（「我回来了」这种开头常被误判）。
+    if len(head) > 16 or head[-1] in "。！？!?…":
+        return raw
+    if head.startswith(("（", "(", "［", "[", "【")):
+        return raw                       # 括号开头是语C动作，不是标签
+    # 首行里的「实字」（去掉标点与空白）有多少在后文出现过。
+    core = [ch for ch in head if not ch.isspace() and ch not in "，。！？；、,.!?;~～…「」『』\"'“”‘’（）()【】"]
+    if len(core) < 2:
+        return raw                       # 一两个字（「早」「嗯」）不是标签
+    hit = sum(1 for ch in core if ch in rest)
+    if hit / len(core) < 0.8:
+        return raw
+    return rest
+
+
+def merge_lead_line(text: str) -> str:
+    """把「短首行 + 括号动作 + 正文」并成一段，消掉标题的形状。
+
+    前面两道（`strip_title_line` / `strip_echoed_label`）管的是**该删**的首行；
+    这一道管**不该删、但也不该单独成行**的那种，而且只认一种确凿的形状——
+    正文以括号动作开头：
+
+        '有点想你了\\n(伸个懒腰) 今天风大，你那边冷不冷'
+        '你的状态\\n(揉眼) 还在想你说的那句'
+        '想你了\\n(轻轻舒展羽翼) 突然很想你，昨晚睡得好吗？'
+
+    这三条的内容都没问题，问题是第一行孤零零几个字，读起来就是一条小标题。
+    并成一段之后它至少是一条正常消息，内容一字不动。
+
+    **只认括号动作这一种形状**：「早\\n起了」这种是同一句话被换行切成两半
+    （`_join_lines` 特意保留换行就是为了这个停顿），并起来会把停顿也拼掉。
+    判据越窄越安全——这一层宁可少并一条，也不能把正常断句拼成一句。
+    """
+    raw = str(text or "")
+    lines = raw.split("\n")
+    if len(lines) < 2:
+        return raw
+    head = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+    if not head or not rest:
+        return raw
+    if len(head) > 12 or head[-1] in "。！？!?…，、；：":
+        return raw
+    if head.startswith(("（", "(", "［", "[", "【", "#")):
+        return raw
+    if not rest.startswith(("（", "(", "［", "[")):
+        return raw
+    return f"{head}{rest}"
 
 
 def _title_shaped(line: str) -> bool:
@@ -508,6 +667,9 @@ def verify_message(
     reason = _check_repeat(text, recent)
     if reason:
         return False, reason
+    reason = _check_action_repeat(text, recent)
+    if reason:
+        return False, reason
     reason = _check_protocol_residue(text)
     if reason:
         return False, reason
@@ -521,3 +683,18 @@ def verify_message(
     if require_about_peer and not _PEER_REF.search(strip_actions(text)):
         return False, "没有指向对方（这一类要说给 TA 听，不是讲她自己）"
     return True, ""
+
+# 最后通牒式：把对方逼到必须给个说法。线上真实样本 `到底想怎样，直说`。
+# 只认**命令/逼问**的固定说法，不碰普通的问句——她当然可以问事情。
+_ULTIMATUM = re.compile(
+    r"到底想怎样|你到底要|给个说法|把话说清楚|说清楚|别装|少来这套|直说"
+)
+
+
+def _check_ultimatum(text: str) -> Optional[str]:
+    """这条是不是在逼对方表态（把话堵死）。"""
+    body = strip_actions(text)
+    hit = _ULTIMATUM.search(body)
+    if hit:
+        return f"把话说死了（「{hit.group(0)}」）——她不会逼人表态"
+    return None
