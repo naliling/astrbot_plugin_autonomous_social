@@ -1189,7 +1189,6 @@ class TestNoScriptedContent(unittest.TestCase):
             },
             now, 1_700_000_000.0,
         )
-        self.assertIn("3 天没跟你说话", block)
         self.assertIn("我下周要面试", block)
         # 天气**不再**进素材块（v1.27.41）：它是唯一「永远有、永远具体」的素材，
         # 摆在这儿模型就会顺手拿去凑一句，线上真实记录是「天亮了/今早阴冷/天还阴着」
@@ -1198,9 +1197,49 @@ class TestNoScriptedContent(unittest.TestCase):
         self.assertNotIn("在下雨", block)
         self.assertEqual(block.count("改方案"), 1, "同一件事被列了两遍")
         self.assertIn("别编这里没有的事", block)
+        # v1.27.42：时间与「多久没说话」也移出素材块。跟天气同一个道理——它们是
+        # **背景**，永远有值、永远比别的事实更具体，摆在清单里就成了默认台词
+        # （「现在是 11 月 15 日 06:13」「距离上次说话过了 4.2 小时」）。
+        self.assertNotIn("现在是", block)
+        self.assertNotIn("没跟你说话", block, "间隔不该进素材清单")
+        self.assertNotIn("小时", block, "间隔不该进素材清单")
 
-    def test_material_block_prefers_core_last_interaction(self):
-        """「距离上次说话」以 Core 的 last_interaction 为准，不用社交层自己（偏旧）的 last_seen。"""
+    def test_material_block_keeps_peer_message_but_sanitized(self):
+        """素材块保留 TA 的原话，但把消息段占位符清掉。
+
+        线上真实记录里模型会收到 `TA最后说的是：「[图片][Image...」`，然后回一句
+        「你发的图片我看到了」——那不是像不像人的问题，是在复述系统输入。
+        """
+        gen = self._generator()
+        import datetime
+
+        now = datetime.datetime(2026, 3, 4, 15, 30)
+        block = gen._material_block(
+            {"last_message": "[图片][Image](x) 我下周要面试", "cue": ""},
+            {}, now, 1_700_000_000.0,
+        )
+        self.assertNotIn("[图片]", block)
+        self.assertNotIn("Image", block)
+        self.assertIn("我下周要面试", block)
+
+    def test_material_block_drops_pure_placeholder_message(self):
+        """整条都是占位符时当作「没有 TA 的原话」，不硬编一句。"""
+        gen = self._generator()
+        import datetime
+
+        block = gen._material_block(
+            {"last_message": "[图片]", "cue": ""}, {},
+            datetime.datetime(2026, 3, 4, 15, 30), 1_700_000_000.0,
+        )
+        self.assertNotIn("TA最后说的是", block)
+
+    def test_material_block_no_longer_carries_the_gap(self):
+        """「多远没说话」这条从 v1.27.42 起不再进素材块（改由 `_format_mind` 说）。
+
+        原来的用例钉的是「以 Core 的 last_interaction 为准，不看偏旧的 last_seen」。
+        现在这个量根本不进素材清单了，所以用例改成钉新契约：两种来源都**不出现**，
+        免得以后有人「顺手加回来」时把它又变成一句可抄的台词。
+        """
         gen = self._generator()
         import datetime
 
@@ -1208,17 +1247,16 @@ class TestNoScriptedContent(unittest.TestCase):
         ref = 1_700_000_000.0
         block = gen._material_block(
             {
-                # 社交层账本偏旧（以为 3 天没说话）；Core 记的是 1 小时前
                 "last_seen": ref - 3 * 86400,
                 "_last_interaction": ref - 3600,
             },
             {},
             now, ref,
         )
-        self.assertIn("1.0 小时", block)
+        self.assertNotIn("1.0 小时", block)
         self.assertNotIn("3 天没跟你说话", block)
 
-    def test_material_block_falls_back_without_core(self):
+    def test_material_block_without_core_still_has_no_gap(self):
         gen = self._generator()
         import datetime
 
@@ -1227,7 +1265,7 @@ class TestNoScriptedContent(unittest.TestCase):
         block = gen._material_block(
             {"last_seen": ref - 3 * 86400}, {}, now, ref,
         )
-        self.assertIn("3 天没跟你说话", block, "没接 Core 时该退回自己的 last_seen")
+        self.assertNotIn("3 天没跟你说话", block)
 
     def test_style_profile_only_outputs_features(self):
         from social.style_profile import build_style_profile
@@ -2209,24 +2247,36 @@ class TestPromptAsksForTopicNotSpeaking(unittest.TestCase):
         self.assertNotIn("你到底想不想说点什么", text)
 
     def test_asks_which_thing(self):
-        self.assertIn("这次你要跟 TA 说的是哪一件事", self._prompt())
+        # v1.27.51 去掉了「你只需要回答一件事…哪一件事」这句工单腔：它把主动消息写成
+        # 一道待办。话题仍然给定，靠上面那句「这次开口是因为下面这一件事（已经定了）」。
+        text = self._prompt()
+        self.assertNotIn("你只需要回答一件事", text)
+        self.assertIn("已经定了，你不用再去找话题", text)
 
     def test_anchor_is_given_as_a_fact(self):
         text = self._prompt()
         self.assertIn("已经定了，你不用再去找话题", text)
         self.assertIn("面试", text)
 
-    def test_hash_line_instruction_asks_for_a_noun_phrase(self):
+    def test_no_hash_title_line_is_requested(self):
+        """v1.27.42：不再要求「# 事件名」那行。
+
+        这一行是「念标题」的源头：模型经常不写 #、或者写完标题再另起一行写正文，
+        于是标题按正文发了出去。解析层为此叠了三层剥标题的补丁，每层都在猜。
+        现在**不要求它写**，也就在源头断了这件事——提示词必须明确禁止标题行。
+        """
         text = self._prompt()
-        self.assertIn("名词短语", text)
-        self.assertNotIn("写给自己看的，不会发出去", text,
-                         "还在教模型「这只是草稿」——它就会照抄")
+        self.assertNotIn("名词短语", text, "还在教模型写「几个字的名词短语」")
+        self.assertIn("不要标题", text)
+        self.assertNotIn("# 那行就是它", text, "正文里不该再引用一个不存在的标题行")
 
     def test_material_constraint_no_longer_squeezes(self):
         text = self._prompt()
         self.assertNotIn("只用上面列出来的", text,
                          "「只能用这些」会反向逼出复读（模型唯一能说的就只剩饿了）")
-        self.assertIn("别把「饿了、困了」当成唯一可说的事", text)
+        # v1.27.42：不再「从里面挑一件说」——那会把背景清单变成发言提纲。
+        self.assertNotIn("从里面挑一件说", text)
+        self.assertIn("只是别写错的依据，不是要念的清单", text)
 
 
 class TestHistoryBackfill(unittest.TestCase):
