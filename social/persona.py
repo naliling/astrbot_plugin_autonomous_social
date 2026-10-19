@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Optional, Tuple
 
 from astrbot.api import logger
@@ -126,5 +127,39 @@ async def resolve_persona(context: Any, umo: str) -> Tuple[str, str]:
         # 同样记一条，否则主人只看到“没取到人设”却不知道是没绑还是没配。
         logger.info(f"[autonomous_social] 会话 {umo} 没解析到生效人格（未绑人格/无默认/显式不用），主动消息退回默认口吻")
         return "", ""
+
+    # 平台名兜底：umo 前缀就是平台名（`露娜:GroupMessage:…`），而人格表里常常正好
+    # 有同名人格。线上三个 bot 的会话人格**全都没绑**，于是全都回落到全局默认
+    # （娜莉灵）——阿莉娜和露娜的主动消息都在用娜莉灵的口吻，用户一眼就看出串台。
+    #
+    # 只在「解析出来的是全局默认、且前缀有同名人格」时替换：手工绑过的会话不受影响。
+    persona = await _prefer_platform_persona(persona_mgr, umo, persona)
     # 人设存在但没名字时给中性占位；NO_PERSONA_MARKER 的含义是「不用人格」，不能拿来当名字显示
     return _persona_name(persona) or "（未命名人设）", _persona_prompt(persona)
+
+async def _prefer_platform_persona(persona_mgr: Any, umo: str, persona: Any) -> Any:
+    """会话人格没绑时，用 umo 前缀（平台名）的同名人格。
+
+    线上三个 bot（露娜/阿莉娜/娜莉灵）的会话人格全为空，AstrBot 于是全部回落到
+    全局默认「娜莉灵」——另外两个 bot 的主动消息都在用娜莉灵的口吻，用户一眼看出
+    串台。人格表里正好有同名人格，所以按前缀取一次就对了。
+
+    只在「解析结果与平台名不一致」时替换；拿不到同名人格就原样返回，绝不抛。
+    """
+    try:
+        platform_name = str(umo or "").split(":")[0].strip()
+        if not platform_name:
+            return persona
+        if _persona_name(persona) == platform_name:
+            return persona
+        cand = persona_mgr.get_persona(platform_name)
+        if inspect.isawaitable(cand):
+            cand = await cand
+        if not cand:
+            return persona
+        if not _persona_prompt(cand):
+            return persona
+        logger.info(f"[autonomous_social] 会话 {umo} 未绑人格，按平台名取用「{platform_name}」")
+        return cand
+    except Exception:
+        return persona
