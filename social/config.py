@@ -555,6 +555,9 @@ class SocialConfig:
     context_inject_count: int = CONTEXT_INJECT_DEFAULT
 
     # 时段加成
+    # 长期不回就永久删除这个会话（0 = 关）。私聊与群都适用。
+    purge_inactive_user_days: int = 0
+
     weekend_boost: bool = True
 
     # 能量阈值
@@ -757,7 +760,13 @@ class SocialConfig:
 
         Returns:
             SocialConfig 实例
+
+        已经是 `SocialConfig` 就**原样返回**。以前不管传什么都会走一遍 `c.get(...)`,
+        而 `SocialConfig` 没有 `.get()`，于是每个字段都取不到、悄悄退回默认值——
+        表现就是「面板上改了，运行时不生效」，而且不报错，最难查的那一类。
         """
+        if isinstance(c, cls):
+            return c
 
         def g(key: str, default: Any) -> Any:
             """安全获取配置值。"""
@@ -891,6 +900,9 @@ class SocialConfig:
             context_inject_count=max(
                 CONTEXT_INJECT_MIN,
                 min(CONTEXT_INJECT_MAX, gi("context_inject_count", CONTEXT_INJECT_DEFAULT)),
+            ),
+            purge_inactive_user_days=max(
+                0, min(3650, gi("purge_inactive_user_days", 0))
             ),
             weekend_boost=bool(g("weekend_boost", _d("weekend_boost",  True))),
             energy_threshold=max(
