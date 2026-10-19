@@ -25,6 +25,7 @@ from .threads import (
     PROMISE_SLOTS_MAX,
     PROMISE_MAX_CHARS,
     PROMISE_WAIT_SECONDS,
+    _promise_looks_sane,
     loop_entries,
     promise_entries,
 )
@@ -1477,10 +1478,21 @@ class SocialState:
 
         同一个诺不重复记；最多留 PROMISE_SLOTS_MAX 件，超了挤掉最老的一件。
         到点的兑现逻辑在 engine._promise_pick。
+
+        写进来之前先过一道**像不像一件事**的检查（`_promise_looks_sane`）：
+        这个字段会原样进下一轮的 prompt（`【你现在知道的】· 你们说好的：…`），
+        脏数据比多几条规则更伤——线上真实样本里出现过
+
+            · 你们说好的：了强烈的红光，你猛的惊喜回头望去发现这红光的指向点正是…
+            · ？：…
+
+        一条是从半句开始、括号都没闭合的正文碎片，一条是纯符号。它们会让模型
+        接着往下演一段根本不存在的剧情。
         """
-        text = str(promise or "").strip()[:PROMISE_MAX_CHARS]
-        if not text:
+        text = str(promise or "").strip()
+        if not text or not _promise_looks_sane(text):
             return
+        text = text[:PROMISE_MAX_CHARS]
         items = promise_entries(u)
         for item in items:
             if str(item.get("about", "")).strip() == text:
