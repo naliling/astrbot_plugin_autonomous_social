@@ -40,6 +40,7 @@ from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_an
 from .verify import (
     _bigrams,
     _check_cross_user,
+    _check_cross_user_action,
     _jaccard,
     strip_actions,
     verify_message,
@@ -165,6 +166,20 @@ CUE_MAX_TRIES = 3
 SEND_RETRY_COUNT = 1
 SEND_RETRY_DELAY = 3.0
 
+# 一轮里「试着说」的次数上限 = max_sends_per_round × 这个倍数。
+#
+# 为什么必须有：`budget` 只限制**发出去几条**，而发不出去时那条配额会被原样还回来
+# （`serve()` 里 `budget[bid] += 1`）。LLM 挂着的时候每个候选都会失败、都会归还配额，
+# 于是一轮心跳会把**全部候选**挨个试一遍——线上实测 550 个候选 = 550 次失败 =
+# 550 行 `→ LLM 不可用` 日志，每条还要等满 90 秒超时才放弃。这就是用户看到的刷屏。
+# 尝试次数不设上限，等于把「一轮最多发 3 条」这道护栏绕过去了。
+# 取 2 倍而不是 1 倍：模型否决（NO）也是「没发出去」，但它是一次成功的调用，不该
+# 因此让后面真有由头的人整轮没机会。
+ATTEMPT_PER_SEND = 2
+# 一轮里一次都没成功、且失败原因是基础设施（provider 取不到 / 超时 / 401…）时，
+# 剩下的候选不必再试：同一个 provider，下一个请求只会得到同样的结果。
+_INFRA_NOTES = ("LLM 不可用", "LLM 生成为空")
+
 # 没接 Core 时好感度的合成权重：在意程度（近期的热度）与熟络度（相处时长）。
 # 两个都留着，是因为只有在意程度时「最近回不回我」会把认识很久的人压成陌生人；
 # 两个都给足，是因为「聊得多」本身也不该把一个长期无视你的人写得很亲。
@@ -200,9 +215,17 @@ AGGR_NOTE_COOLDOWN = 3 * 86400.0
 SEND_FAIL_COOLDOWN_BASE = 1800.0     # 30 分钟起步
 SEND_FAIL_COOLDOWN_MAX = 28800.0     # 翻倍到 8 小时封顶
 
-# 平台侧问题（适配器未就绪、平台不支持主动消息）导致的发送失败：**不记在这个人头上**。
-# 只给一个短而固定的冷却，避免每轮心跳都白撞一次。
-SEND_FAIL_PLATFORM_COOLDOWN = 300.0
+# 平台侧问题（适配器未就绪、**umo 已失效**、平台不支持主动消息）导致的发送失败：
+# 不记在这个人的「关系账」上，但**按次数升档**，见 `_mark_send_failed`。
+#
+# 原来这是一档固定的 5 分钟。问题在「umo 已失效」这类失败**不会自愈**：被删好友、
+# 换了号、群散了，那个 umo 永远解析不出平台。5 分钟等于下一轮心跳又把这个人选回来、
+# 又花一次完整 LLM 生成、又失败一次。线上实测一轮 612 个候选里就有几十个这样的人，
+# 它们把每轮的「尝试配额」吃光，健康的人反而轮不到（一轮 25 次尝试只发出去 2 条）。
+# 现在 30 分钟起步、每次 ×4、12 小时封顶：同一个死人最多占掉几次尝试就自己退场，
+# 而对方真回来发消息时 `observe` 会清掉隔离（见 `_mark_send_failed` 的说明）。
+SEND_FAIL_PLATFORM_COOLDOWN = 1800.0
+SEND_FAIL_PLATFORM_MAX = 43200.0     # 12 小时封顶
 
 # 手动触发最多试几个候选：第一个发不出去就换下一个（回退）
 TRIGGER_CANDIDATE_LIMIT = 3
@@ -230,6 +253,59 @@ _PLATFORM_UNAVAILABLE_MARKERS = (
     "未找到匹配", "不支持主动", "qq_official", "adapter", "平台未就绪", "平台未连接",
     "connection refused", "session not found", "session expired", "会话已失效",
 )
+
+# 「这条 umo 废了」的标记（相对于「整个平台/适配器坏了」）。见 `_umo_problem`。
+_UMO_PROBLEM_MARKERS = (
+    "未找到匹配", "会话已失效", "session not found", "session expired",
+    "umo 可能已失效",
+)
+
+
+def _umo_problem(err: str) -> bool:
+    """这次失败是不是**这个 umo 本身**的问题（会话失效 / 平台解析不出）。
+
+    与 `_platform_problem` 的区别很重要：`_platform_problem` 还包含「adapter 没加载」
+    这类**全局**故障，那种才该熔断整个角色；而「未找到匹配的会话平台」在线上
+    99% 是这个人自己那条 umo 废了（被删好友、换号、群散了），拿它去熔断会让
+    **所有人**陪着停 15 分钟。
+
+    线上实测（`backend.log` 19:25~19:26）：三个这样的死人连着失败三次，
+    `[default] 连续 3 次发不出去，暂停生成 15 分钟` —— 于是每一轮都在「熔断中」
+    空转，健康的人一条也收不到。账本里 `发送熔断 66946` 就是这么来的。
+    """
+    low = str(err or "").lower()
+    return any(m.lower() in low for m in _UMO_PROBLEM_MARKERS)
+
+
+# 「平台收下了请求、但拒绝发给**这一个**目标」的标记：`ActionFailed` / `retcode=`。
+# 这类失败（被禁言、群被风控、retcode 1200）和「适配器没加载」不是一回事：
+# 同一次心跳里别的群/别人照常能发出去，拿它熔断整个角色纯属误伤。
+_TARGET_PROBLEM_MARKERS = ("actionfailed", "retcode=")
+
+
+def _target_problem(err: str) -> bool:
+    """平台明确拒绝把这句发给**这一个**目标（区别于整条链路坏了）。"""
+    low = str(err or "").lower()
+    return any(m in low for m in _TARGET_PROBLEM_MARKERS)
+
+
+# 「整条链路坏了」的标记：只有能**正面认出**这些，才允许熔断整个角色。
+#
+# 反过来默认（认不出就当全局故障）代价太大：线上 19:59 有一次 `ActionFailed` 的
+# 异常文本是空的，`str(e) == ""`，任何按子串分类都认不出来，于是被当成全局故障
+# 数进熔断，第三次就把整个角色停了 15 分钟 —— 而同一分钟别的群照常发得出去。
+# 熔断的作用是止损，止损判错了就是**主动断掉所有人的消息**，所以宁可漏判。
+_GLOBAL_PROBLEM_MARKERS = (
+    "发送超时", "timeout", "timed out", "connection refused", "connection reset",
+    "connection aborted", "broken pipe", "平台未就绪", "平台未连接", "adapter",
+    "eof occurred", "cannot connect",
+)
+
+
+def _global_problem(err: str) -> bool:
+    """这次失败是不是**整条链路**坏了（所有目标都会挂）。认不出来一律当不是。"""
+    low = str(err or "").lower()
+    return any(m in low for m in _GLOBAL_PROBLEM_MARKERS)
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -427,6 +503,17 @@ class SocialEngine:
         # 的熔断状态，看上去像刚启动就在停摆。
         # 每个角色最近一次 LLM 失败的样子，状态页逐角色显示
         self._last_llm_error: Dict[str, str] = {}
+        # 本轮「有由头但没发」的原因计数（按分类聚合，一轮一行日志）。
+        #
+        # 为什么不在闸门处逐人打日志：一个 412 人的角色，每轮有一两百人因为
+        # 「现在是安静时段」「她正在睡觉」被挡下，一天几十轮 —— 线上实测这两个原因
+        # 一天各 5606 / 4917 行，比 LLM 那条刷得还狠。而这些行**没有一个信息量**：
+        # 同一个原因在一轮里重复两百遍，结论仍然是「这轮大家都被安静时段挡了」。
+        self._round_skips: Dict[str, int] = {}
+        # 归不进已知分类的拦截原因原文 → 次数。轮末只打前三条，用于定位
+        # 「其它未发 N 条」到底是什么（v1.27.50：曾把闸门日志降到 debug，
+        # 于是 39 条失败一条原因都没有）。
+        self._round_skip_samples: Dict[str, int] = {}
         # ── 运行指标（只记数字与短原因，不含任何正文）────────────────────
         # 为什么要有：状态页原来只写「心跳：每 8~15 分钟一次」这种**静态说明**，
         # 于是「没触发」时根本分不清是没到时间、provider 取不到、用户被隔离、
@@ -634,6 +721,18 @@ class SocialEngine:
         """调试日志输出。"""
         if self.cfg.debug:
             logger.info(f"[autonomous_social] {message}")
+
+    @staticmethod
+    def _is_infra_note(result: str) -> bool:
+        """这条「没发出去」是不是因为 LLM 基础设施坏了（而不是模型说不想说）。
+
+        `_speak_inner` 在 provider 取不到 / 调用失败 / 生成结果为空时返回的说明只有
+        `_INFRA_NOTES` 里那两种开头；模型否决与验收拦截的文案不在这里面。
+        分辨它只为一件事：基础设施坏掉时，**同一轮剩下的候选不用再试**——同一个
+        provider，下一个请求只会得到同样的结果。
+        """
+        text = str(result or "")
+        return any(text.startswith(marker) or marker in text for marker in _INFRA_NOTES)
 
     # ─── 记忆联动（astrbot_plugin_memory_companion） ───────
 
@@ -1811,8 +1910,31 @@ class SocialEngine:
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
                 logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）破冰发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
-                self.log(f"群 {gid} 破冰发送失败：{err}")
+                # 非「发不了」的失败（被禁言、群被风控、ActionFailed 1200）原来**一点
+                # 退避都不记**，于是下一轮心跳又给这个群写一遍完整 LLM、又失败一次。
+                # 线上实测 19:43 两个群连续 retcode=1200，就这样把角色的熔断撞开了。
+                # 现在按群退避，逐次翻倍、封顶 8 小时；成功后清零。
+                g = self.state.group(bid, gid)
+                try:
+                    n = int(g.get("fail_count", 0) or 0) + 1
+                except (TypeError, ValueError):
+                    n = 1
+                g["fail_count"] = n
+                delay = min(
+                    SEND_FAIL_COOLDOWN_BASE * (2 ** min(n - 1, 6)),
+                    SEND_FAIL_COOLDOWN_MAX,
+                )
+                self.state.block_group(
+                    bid, gid, self._time() + delay, err or "发送失败"
+                )
+                self.log(
+                    f"群 {gid} 破冰发送失败，{int(delay / 60)} 分钟后再试：{err}"
+                )
             return False
+        try:
+            self.state.group(bid, gid)["fail_count"] = 0
+        except Exception:
+            pass
         sent_ts = self._time()
         day = self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
         if mode == "icebreak":
@@ -2016,7 +2138,7 @@ class SocialEngine:
                             affection = snap.get("affection")
                             self._sync_peer_said(u, snap.get("said"))
                     except Exception as e:
-                        self.log(f"加载用户 {uid} Core 快照失败: {e}")
+                        logger.debug(f"[autonomous_social] 加载用户 {uid} Core 快照失败: {e}")
 
                 target = desire.interest_level(
                     u, affection, weigh_reply_rate=self.cfg.adaptive_reply_rate
@@ -3158,6 +3280,17 @@ class SocialEngine:
         now = self._time()
         self._m["last_heartbeat"] = now
         self._m["rounds"] = int(self._m.get("rounds", 0)) + 1
+        # 每轮重置「有由头但没发」的分类计数（见 __init__ 里的说明）
+        # 每轮先把「她那座城市现在几点」问一次 Core。原来只有状态展示前才刷，
+        # 主循环里 _city_offset 一直是空的 → _moment_of 退回本机时区。
+        # 线上表现：她在泽列诺格拉茨克（UTC+2），北京 23:22 她那边才 17:22，
+        # 却被判成「安静时段」，一轮 156 个候选全挡住，生成的句子也会带错时段词。
+        try:
+            self._refresh_clocks()
+        except Exception:
+            pass
+        self._round_skips = {}
+        self._round_skip_samples = {}
         if not self.cfg.enabled:
             return
 
@@ -3247,7 +3380,10 @@ class SocialEngine:
                         last_talk=self._core_last_interaction(core_root, bid, uid),
                     )
                     if not picks:
-                        self.log(f"{uid} 念头到了但没由头，不找话说")
+                        # 逐人一行的话，一轮里有几十上百个人都走这条（念头够了但手上
+                        # 没有一件具体的事）。归到本轮汇总的「没由头」里。
+                        self._round_skips["没由头"] = self._round_skips.get("没由头", 0) + 1
+                        logger.debug(f"[autonomous_social] {uid} 念头到了但没由头，不找话说")
                         continue
                     for a in picks[:1]:
                         anchored.append((bid, uid, u, urge, a))
@@ -3342,6 +3478,20 @@ class SocialEngine:
         # 同一个人一轮里只服务一次：既到问候窗口、念头又攒满时，说一句早安就够
         served: Set[Tuple[str, str]] = set()
 
+        # 本轮「尝试」配额与基础设施熔断（见 ATTEMPT_PER_SEND）。
+        # 这两样与 `budget` 的区别：`budget` 管「发出去几条」，它们管「能试几次」。
+        # 混成一个数的话，模型否决（NO，一次成功的调用）会把发送配额吃掉；而完全不
+        # 管尝试次数时，一个坏掉的 provider 会让整轮 550 个候选全都跑一遍。
+        attempt_left: Dict[str, int] = {
+            bid: max(2, int(self.cfg.max_sends_per_round) * ATTEMPT_PER_SEND)
+            for bid in bots
+        }
+        skipped_no_attempt: Dict[str, int] = {}
+        infra_down: Dict[str, bool] = {"on": False}
+        round_stats: Dict[str, int] = {
+            "jobs": 0, "attempts": 0, "sent": 0, "vetoed": 0, "infra": 0, "other": 0,
+        }
+
         # 逐人生成、批量调度：下面各通道只**收集**候选成 job（收集阶段不 await 发送），
         # 全部攒齐后再统一交给 speak() 并发处理。job 带齐发送所需的一切，外加可选的
         # 「发送成功后的 post 动作」（念想写 miss_day、想要了写 intimacy_asked_at）。
@@ -3384,6 +3534,15 @@ class SocialEngine:
             note = job["note"]
             if budget.get(bid, 0) <= 0:
                 return False
+            # 基础设施已经明确坏了：同一个 provider 的下一个请求只会得到同样的结果，
+            # 剩下的候选一个都不用试。（`infra_down` 是一轮内的共享标志，并发下先
+            # 失败的那条把它立起来，后面排队的在进锁前就能直接退出。）
+            if infra_down["on"]:
+                return False
+            # 尝试配额：只花在「还有机会发出去」的候选上。见 ATTEMPT_PER_SEND。
+            if attempt_left.get(bid, 0) <= 0:
+                skipped_no_attempt[bid] = skipped_no_attempt.get(bid, 0) + 1
+                return False
             # 短临界区：只做「检查 + 占位 + 取 u」。`_speak` 里有两次 LLM 调用
             # （秒级~数十秒），锁跨过它们就会把 `observe` 堵在锁上（它是
             # EventMessageType.ALL 的入口，同一个人连发两条消息时第二条要等第一条
@@ -3394,9 +3553,12 @@ class SocialEngine:
             async with self._user_lock(bid, uid):
                 if budget.get(bid, 0) <= 0 or (bid, uid) in served:
                     return False
+                if infra_down["on"] or attempt_left.get(bid, 0) <= 0:
+                    return False
                 # 检查与占用之间不能有 await，否则并发进来的同角色 job 会挤进这个窗口。
                 served.add((bid, uid))
                 budget[bid] -= 1
+                attempt_left[bid] -= 1
                 # 拿到锁之后重新取一次 u：等锁期间 observe 可能已经改过它，
                 # 继续用等锁前那个引用就是在写一份过期的快照。
                 u = self.state.user(bid, uid)
@@ -3422,18 +3584,43 @@ class SocialEngine:
                     served.discard((bid, uid))
                     budget[bid] += 1
                 raise
+            round_stats["attempts"] += 1
             if not sent:
                 # 写回（重新取锁）：没发成就把占的位和名额都还回去，让后面的候选还有机会。
                 async with self._user_lock(bid, uid):
                     served.discard((bid, uid))
                     budget[bid] += 1
-            self.log(f"{note}{uid} → {result}")
+                if self._is_infra_note(result):
+                    # provider 已经坏了：剩下的人这一轮一个都不用试。这里不 return 之前
+                    # 已经把 pos/配额还清了，其它并发中的候选拿到结果后也会看到这个标志。
+                    infra_down["on"] = True
+                    round_stats["infra"] += 1
+                elif "不该说" in result or "不想说" in result:
+                    round_stats["vetoed"] += 1
+                else:
+                    round_stats["other"] += 1
+                try:
+                    _cat = self._block_category(result)
+                    self._round_skips[_cat] = self._round_skips.get(_cat, 0) + 1
+                    if _cat == "其它":
+                        _k = " ".join(str(result).split())[:46]
+                        self._round_skip_samples[_k] = (
+                            self._round_skip_samples.get(_k, 0) + 1
+                        )
+                except Exception:
+                    pass
+                # **逐人的结果只进 debug**。这行原来是 `self.log()`，而 `self.log()`
+                # 在 cfg.debug=true 时走 INFO——线上就是它把日志刷成 550 行一轮。
+                # 详细状态仍可从 /自主社交状态 的「最近决定」里看到，不必靠日志。
+                logger.debug(f"[autonomous_social] {note}{uid} → {result}")
             if not sent:
                 # 模型自己否决的另记在 veto_total；这里记的是「这一条最终没发出去」。
                 # 两者会重叠，但方向不同：一个说「她不想说」，一个说「没发成」。
                 self._count_block(result)
                 self._note_decision(uid, f"没发：{result}")
                 return False
+            round_stats["sent"] += 1
+            self.log(f"{note}{uid} → {result}")
             self._note_decision(uid, f"发了：{note}")
             post = job.get("post")
             if post is not None:
@@ -3571,7 +3758,11 @@ class SocialEngine:
             why = self.gate_reason(bid, uid, u, now, bodies.get(bid))
             if why:
                 self._count_block(why)
-                self.log(f"有由头但没说（{uid}）：{why}")
+                # 逐人一行会把日志刷成「两百行同一个原因」（见 __init__ 里
+                # `_round_skips` 的注释）。按分类聚到本轮汇总里。
+                _cat = self._block_category(why)
+                self._round_skips[_cat] = self._round_skips.get(_cat, 0) + 1
+                logger.debug(f"[autonomous_social] 有由头但没说（{uid}）：{why}")
                 continue
             jobs.append(job_of(
                 bid, uid, u, urge,
@@ -3645,6 +3836,26 @@ class SocialEngine:
 
         # 有界并发：收集完成后统一调度。`batch_send_concurrency == 1` 时逐条 await，
         # 与改造前的串行行为一致（连发送之间那几秒间隔也一样）。
+        #
+        # 调度前先看 provider 是不是正处在失败退避里：在的话，这一轮一条都不用试。
+        # 原来没有这道闸：每个候选都进 `_speak` → `_compose` 拿到 provider 再查退避
+        # → 查到了返回 None → 引擎记「LLM 不可用」。550 个候选就是 550 行日志，而
+        # 它们本来一秒就能判定出来「这个 provider 现在不能用」。
+        round_stats["jobs"] = len(jobs)
+        backoff_left = 0.0
+        try:
+            backoff_left = float(self.generator.llm_backoff_remaining())
+        except Exception:
+            backoff_left = 0.0
+        if backoff_left > 0:
+            infra_down["on"] = True
+            if throttle.allow("round.llm_backoff", window=600.0):
+                logger.warning(
+                    f"[autonomous_social] LLM 处于失败退避中（还剩 {int(backoff_left)} 秒），"
+                    f"本轮 {len(jobs)} 个候选全部跳过，不逐个重试"
+                    + throttle.summary("round.llm_backoff")
+                )
+
         limit = max(1, int(self.cfg.batch_send_concurrency))
         if limit == 1:
             # 串行分支也要隔离单个候选的异常：并发分支早就用 try/except 挡住了，
@@ -3666,6 +3877,41 @@ class SocialEngine:
                         self.log(f"发送任务异常（{job['uid']}）：{exc}")
 
             await asyncio.gather(*(_dispatch(job) for job in jobs))
+
+        # 一轮一行汇总。这是本轮「到底发生了什么」的唯一 INFO：候选几个、真的试了几次、
+        # 发了几条、被否决几条、被闸门挡下几条（按原因）。原来这些信息分散在几百行
+        # 逐人日志里，既看不出结论，又淹掉了真正该看的东西。
+        self._m["last_round"] = dict(round_stats)
+        self._m["last_round_skips"] = dict(self._round_skips)
+        _skip_text = ""
+        if self._round_skips:
+            _skip_text = "；闸门挡下 " + "、".join(
+                f"{name} {count}"
+                for name, count in sorted(
+                    self._round_skips.items(), key=lambda kv: -kv[1]
+                )[:4]
+            )
+        skipped = sum(skipped_no_attempt.values())
+        if round_stats["jobs"] or skipped or _skip_text:
+            logger.info(
+                f"[autonomous_social] 本轮候选 {round_stats['jobs']} 个，"
+                f"尝试 {round_stats['attempts']} 次，发出 {round_stats['sent']} 条，"
+                f"模型否决 {round_stats['vetoed']} 条，"
+                f"其它未发 {round_stats['other']} 条"
+                + (f"，尝试配额用完跳过 {skipped} 个" if skipped else "")
+                + _skip_text
+                + (
+                    "；这些被归进「其它」的原因："
+                    + "、".join(
+                        f"{k}（{v}）"
+                        for k, v in sorted(
+                            self._round_skip_samples.items(), key=lambda kv: -kv[1]
+                        )[:3]
+                    )
+                    if self._round_skip_samples
+                    else ""
+                )
+            )
 
         # 运行指标刷盘：容器侧不用开日志就能从 state.json 的 _runtime 段判断
         # 「她到底跑起来没、卡在哪一步」。只存数字与短标签。
@@ -3767,7 +4013,7 @@ class SocialEngine:
         # nan/inf 也走这条：一个坏字段不该让她一整天不开口。
         energy = _num((body or {}).get("energy"), 100.0)
         if energy < self.cfg.gate_energy_floor:
-            self.log(f"没发（{uid}）：她太累了（精力 {energy:.0f}）")
+            logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
 
         # 最小间隔：不管哪一种主动开口（问候/追问/回访/另起话题/收场），两条之间至少
@@ -3847,7 +4093,7 @@ class SocialEngine:
                 if user_core:
                     core_context = self.core.compact(user_core, include_weather=False)
         except Exception as e:
-            self.log(f"加载用户 {uid} Core 快照失败: {e}")
+            logger.debug(f"[autonomous_social] 加载用户 {uid} Core 快照失败: {e}")
 
         u_copy = dict(u)
         affection = user_core.get("affection") if user_core else None
@@ -3978,7 +4224,7 @@ class SocialEngine:
             except Exception as e:
                 if throttle.allow(f"speak.decide.{bid}"):
                     logger.warning(
-                        f"[autonomous_social] 判断该不该说时出错: {e}"
+                        f"[autonomous_social] LLM 调用失败（provider 取到了但请求挂了）: {type(e).__name__}: {e}"
                         + throttle.summary(f"speak.decide.{bid}")
                     )
             raw_generated = str(getattr(decision, "raw_text", "") or "")
@@ -3986,7 +4232,7 @@ class SocialEngine:
                 # LLM 不可用/退避中/超时：这是基础设施故障，不是「模型觉得不该说」。
                 # 两者走同一条 defer_cue 会把一个真实的由头（如「明天面试」）静默作废：
                 # 一次持续十几小时的 key 失效就够把 3 次重试预算全烧光。
-                note = "LLM 不可用（provider 取不到或调用失败），本轮未发送"
+                note = "LLM 不可用（provider 取不到），本轮未发送"
                 self._last_llm_error[bid] = note
                 return False, note
             if not decision.send:
@@ -4086,6 +4332,15 @@ class SocialEngine:
             self._note_cross_user_ratio(parts[0], others)
             if hit:
                 ok, why = False, hit
+            else:
+                # 上面那条比的是**正文**。动作标签是另一回事：正文可以完全不同，
+                # 括号里挂的却是同一套动作。线上 524 条里 15 个动作标签被用在了
+                # 多个人身上（「蜷在沙发」10 人、「伸个懒腰」9 人）——按人比对的
+                # `_check_action_repeat` 永远查不到，用户看到的就是「她跟谁都这样」。
+                # 窗口沿用同一个「跨人重复小时数」，不再新增一个开关。
+                hit2 = _check_cross_user_action(parts[0], others)
+                if hit2:
+                    ok, why = False, hit2
         if not ok:
             self._m["last_failure"] = f"[{bid}] 验收不过：{why}"
             self._m["last_rejected"] = (raw_generated or parts[0])[:200]
@@ -4173,7 +4428,7 @@ class SocialEngine:
             # 本身——所以推的是 retry_at，寿命 expire_at 不动。
             self._defer_cue_only(u, reason_meta)
             platform_side = self._platform_problem(err or "")
-            self._mark_send_failed(u, platform_side=platform_side)
+            self._mark_send_failed(u, platform_side=platform_side, reason=err or "")
             # 平台侧的问题（适配器没就绪/不支持主动消息/抖动）与「他」无关：
             # 无条件计 giveup 时，两次这样的失败就把**低档**用户写 `quiesced_at`，
             # 而它只由「对方先开口」解除 —— 平台恢复后她再也不主动找这个人。
@@ -4254,6 +4509,9 @@ class SocialEngine:
         # 发成功了，之前那次失败就不再约束他
         u["send_fail_count"] = 0
         u["send_fail_until"] = 0.0
+        u["platform_fail_count"] = 0
+        # 失败原因也跟着清：留着它会让状态页一直显示一条早就过去的故障
+        u["send_blocked_reason"] = ""
         # 发成了 → 不再是「连着发不出去」
         u["giveup_count"] = 0
         u["quiesced_at"] = 0.0
@@ -5117,9 +5375,25 @@ class SocialEngine:
         return max(0.0, float(self._breaker_slot(bid).get("until", 0.0)) - self._time())
 
     def _note_send_failure(self, bid: str, err: str, peer_unreachable: bool) -> None:
-        """连续发不出去就把生成也停下来：写好的消息送不出去，那次调用就是纯浪费。"""
+        """连续发不出去就把生成也停下来：写好的消息送不出去，那次调用就是纯浪费。
+
+        但**只在故障是全局的时候**才停：一个失效的 umo 失败三次，不该让整个角色
+        停 15 分钟（线上就是这样，每轮都在熔断里空转，健康的人一条也收不到）。
+        """
         if peer_unreachable:
             # 平台明说「这个人发不了」：是这一个用户的事，不该把所有人一起停掉
+            return
+        if _umo_problem(err):
+            # 这条 umo 自己废了：冷却已经按人记在 `_mark_send_failed` 里，
+            # 不该再拿它去熔断整个角色。
+            return
+        if _target_problem(err):
+            # 平台拒发给**这一个**目标（禁言/风控/retcode 1200）：同一次心跳里
+            # 别的目标照常能发出，按目标退避就够了，不熔断整个角色。
+            return
+        if not _global_problem(err):
+            # 认不出来是什么原因（线上真出现过异常文本为空：`str(e) == ""`）：
+            # 按目标级处理。熔断判错的代价是**所有人**收不到消息，宁可不熔断。
             return
         slot = self._breaker_slot(bid)
         slot["streak"] = int(slot.get("streak", 0)) + 1
@@ -5178,16 +5452,33 @@ class SocialEngine:
             u["quiesced_at"] = now
             self.log(f"{u.get('__uid', '')} 连着 {n} 次发不出去，先不主动找 TA 了（等 TA 先开口）")
 
-    def _mark_send_failed(self, u: Dict[str, Any], platform_side: bool = False) -> None:
+    def _mark_send_failed(
+        self, u: Dict[str, Any], platform_side: bool = False, reason: str = ""
+    ) -> None:
         """这个人的发送刚失败过：往后推一段，别下一轮心跳又给他写一遍。
 
         **平台侧的问题不记在这个人头上**：适配器没就绪、平台不支持主动消息这类失败
         与「他」无关，而原来一律走同一套指数退避（1800s 起、封顶 28800s）—— 一次平台
         抖动就让这个人在接下来最多 8 小时里彻底收不到消息，而且退避计数还挂在他身上
         继续累加（下一轮再失败就再翻倍）。平台侧只给一个短而固定的冷却。
+
+        `send_blocked_reason` 以前**从来没有被写过**（只有清理时置空），于是状态页那一
+        栏永远是空的：用户看到「这个人不发消息」却查不到为什么。现在把失败原文记在
+        这个人身上，下一轮成功时由 `_note_send_ok` 那条路清掉。
         """
         if platform_side:
-            u["send_fail_until"] = self._time() + SEND_FAIL_PLATFORM_COOLDOWN
+            # 升档而不是固定冷却：见 `SEND_FAIL_PLATFORM_COOLDOWN` 上面那段。
+            try:
+                n = int(_num(u.get("platform_fail_count", 0) or 0)) + 1
+            except (TypeError, ValueError):
+                n = 1
+            delay = min(
+                SEND_FAIL_PLATFORM_COOLDOWN * (4 ** min(n - 1, 6)),
+                SEND_FAIL_PLATFORM_MAX,
+            )
+            u["platform_fail_count"] = n
+            u["send_fail_until"] = self._time() + delay
+            u["send_blocked_reason"] = f"平台侧（与TA无关）：{(reason or '原因未知')[:80]}"
             self.state.mark_dirty()
             return
         try:
@@ -5199,6 +5490,8 @@ class SocialEngine:
         )
         u["send_fail_count"] = n
         u["send_fail_until"] = self._time() + delay
+        if reason:
+            u["send_blocked_reason"] = str(reason)[:80]
         self.state.mark_dirty()
 
     def _schedule_burst(self, bid: str, uid: str, rest: List[str],
@@ -5382,6 +5675,32 @@ class SocialEngine:
         if now - self._last_prune < PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = now
+        # 永久删除：很久不说话、她发过去也没人回的会话，连记录一起丢掉（私聊 + 群）。
+        # 放在历史清理**之前**：清完历史就分不清它当初到底有没有人回过。
+        try:
+            _days = float(getattr(self.cfg, "purge_inactive_user_days", 0) or 0)
+            if _days > 0:
+                _gone = 0
+                for _bid, _bot in (self.state.data.get("bots") or {}).items():
+                    _users = (_bot or {}).get("users") or {}
+                    for _uid in list(_users):
+                        if isinstance(_users.get(_uid), dict) and _silent_too_long(_users[_uid], now, _days):
+                            _users.pop(_uid, None)
+                            _gone += 1
+                    _groups = (_bot or {}).get("groups") or {}
+                    for _gid in list(_groups):
+                        if isinstance(_groups.get(_gid), dict) and _silent_too_long(_groups[_gid], now, _days):
+                            _groups.pop(_gid, None)
+                            _gone += 1
+                if _gone:
+                    self.state.mark_dirty()
+                    self._m["purged_sessions_total"] = int(self._m.get("purged_sessions_total", 0)) + _gone
+                    logger.info(
+                        f"[autonomous_social] 已永久删除 {_gone} 个长期不回（超过 {int(_days)} 天且无回复）的会话"
+                    )
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 永久删除长期不回的会话失败: {e}")
+
         try:
             pruned = self.state.prune_expired(self.cfg.user_retention_days, now)
         except Exception as e:
@@ -6134,3 +6453,22 @@ class SocialEngine:
         sections.append("【念头】\n" + self.urge_panel_text())
         sections.append("【最近联系】\n" + self.last_contact_text())
         return "\n\n".join(s for s in sections if s.strip())
+
+
+def _silent_too_long(record: Dict[str, Any], now: float, days: float) -> bool:
+    """这个人/这个群是不是「很久没说话、她发过去也没人回」。
+
+    只认两种证据，缺一不删：
+    * `last_seen` 超过 N 天（对方从没说过话时它可能是 0，靠 `last_said` 兜底）；
+    * 这段时间里没有任何回复记录（`replied_at`/`reply_gap_hours` 都指向很久以前）。
+    """
+    if days <= 0:
+        return False
+    span = days * 86400.0
+    seen = _num(record.get("last_seen", 0) or 0)
+    said = _num(record.get("last_said", 0) or 0)
+    anchor = max(seen, said)
+    if anchor <= 0 or now - anchor < span:
+        return False
+    replied = _num(record.get("replied_at", 0) or record.get("last_replied", 0) or 0)
+    return replied <= 0 or now - replied >= span
