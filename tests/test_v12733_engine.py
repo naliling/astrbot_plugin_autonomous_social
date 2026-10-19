@@ -189,25 +189,25 @@ class SendBreakerTest(unittest.TestCase):
     def test_two_failures_do_not_trip(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP - 1):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng.send_breaker_left("b1"), 0.0)
 
     def test_tripping_failure_opens_the_breaker_for_the_base_delay(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng.send_breaker_left("b1"), SEND_BREAKER_BASE_SECONDS)
 
     def test_each_extra_failure_doubles_the_delay(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP + 1):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng.send_breaker_left("b1"), SEND_BREAKER_BASE_SECONDS * 2)
 
     def test_delay_is_clamped_at_the_maximum(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP + 20):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng.send_breaker_left("b1"), SEND_BREAKER_MAX_SECONDS)
 
     def test_peer_unreachable_never_trips_the_breaker(self):
@@ -220,17 +220,17 @@ class SendBreakerTest(unittest.TestCase):
     def test_a_success_clears_the_streak(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         eng._note_send_ok("b1")
         self.assertEqual(eng.send_breaker_left("b1"), 0.0)
         # 清零之后要重新数满 3 次才会再熔断
-        eng._note_send_failure("b1", "boom", False)
+        eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng.send_breaker_left("b1"), 0.0)
 
     def test_breakers_are_isolated_per_bot(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertGreater(eng.send_breaker_left("b1"), 0.0)
         self.assertEqual(eng.send_breaker_left("b2"), 0.0)
 
@@ -243,14 +243,14 @@ class SendBreakerTest(unittest.TestCase):
         """
         eng = _engine()
         eng._breaker_slot("b1")["streak"] = 5000
-        eng._note_send_failure("b1", "boom", False)  # 修复前这里 OverflowError
+        eng._note_send_failure("b1", "adapter 没加载", False)  # 修复前这里 OverflowError
         self.assertEqual(eng.send_breaker_left("b1"), SEND_BREAKER_MAX_SECONDS)
 
     def test_streak_grows_without_a_ceiling_of_its_own(self):
         # streak 本身不封顶是刻意的（它记录真实失败次数），只是指数必须封顶
         eng = _engine()
         eng._breaker_slot("b1")["streak"] = 900
-        eng._note_send_failure("b1", "boom", False)
+        eng._note_send_failure("b1", "adapter 没加载", False)
         self.assertEqual(eng._breaker_slot("b1")["streak"], 901)
         self.assertEqual(eng.send_breaker_left("b1"), SEND_BREAKER_MAX_SECONDS)
 
@@ -322,7 +322,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
     async def test_success_clears_the_breaker(self):
         eng = _engine()
         for _ in range(SEND_BREAKER_TRIP):
-            eng._note_send_failure("b1", "boom", False)
+            eng._note_send_failure("b1", "adapter 没加载", False)
 
         async def _ok(target, text):
             return None
@@ -584,13 +584,21 @@ class GiveupTest(unittest.TestCase):
 
 
 class SendFailBackoffTest(unittest.TestCase):
-    def test_platform_side_uses_the_short_fixed_cooldown(self):
+    def test_platform_side_escalates_instead_of_a_flat_fixed_cooldown(self):
+        from social.engine import SEND_FAIL_PLATFORM_COOLDOWN, SEND_FAIL_PLATFORM_MAX
+
         eng = _engine()
         u = _user(eng)
-        for _ in range(5):
+        delays = []
+        for _ in range(9):
             eng._mark_send_failed(u, platform_side=True)
-        self.assertEqual(u["send_fail_until"], NOW + SEND_FAIL_PLATFORM_COOLDOWN)
-        self.assertNotIn("send_fail_count", u)
+            delays.append(u["send_fail_until"] - NOW)
+        # 第一次 30 分钟，之后 ×4 升档，12 小时封顶。原来是一档固定 5 分钟，
+        # 而「umo 废了」不会自愈：每个心跳都把这个人选回来、白烧一次 LLM。
+        self.assertEqual(delays[0], SEND_FAIL_PLATFORM_COOLDOWN)
+        self.assertGreater(delays[1], delays[0])
+        self.assertEqual(delays[-1], SEND_FAIL_PLATFORM_MAX)
+        self.assertNotIn("send_fail_count", u, "平台侧失败不该累加这个人的退避计数")
 
     def test_user_side_backoff_doubles_and_clamps(self):
         eng = _engine()
