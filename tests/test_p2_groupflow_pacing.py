@@ -355,6 +355,10 @@ class FlowContextTest(unittest.TestCase):
 
     线上数据：59 个群开过关注窗口，只接了 13 次话，其中 15 次被记成「插了没人理」。
     说明判定层太粗——它只问「这条消息有没有 @」，不问「这会儿是不是有人在对着说」。
+
+    v1.28.0 起语义变了：两人对聊 / 这句话在叫别人**不再硬拦**，改成把语境交给
+    模型判断（用户原话「能不能插嘴看模型」）。旧断言用 `interject_enabled=False`
+    保留——那一档就是旧语义（这种场合一律不插）。
     """
 
     def _group(self, **kw):
@@ -384,20 +388,37 @@ class FlowContextTest(unittest.TestCase):
         ok, why = self._gate(self._group())
         self.assertTrue(ok, why)
 
-    def test_named_address_without_at_is_not_interrupted(self):
-        """「小明你那个面试怎么样了」没有 @，但明显是冲着小明的。"""
-        ok, why = self._gate(self._group(), addressed_to_name="小明")
-        self.assertFalse(ok)
-        self.assertIn("小明", why)
+    def test_named_address_without_at_is_handed_to_the_model(self):
+        """「小明你那个面试怎么样了」没有 @，但明显是冲着小明的。
 
-    def test_two_person_exchange_is_not_interrupted(self):
-        ok, why = self._gate(self._group(), recent_speakers=["阿哲", "小鱼", "阿哲"])
-        self.assertFalse(ok)
-        self.assertIn("对聊", why)
+        v1.28.0：默认交给模型判断（它能看到语境块）；关掉插嘴则退回旧语义。
+        """
+        note = groupflow.flow_context_note([], "小明")
+        ok, why = self._gate(self._group(), context_note=note)
+        self.assertTrue(ok, why)
+        blocked, why = self._gate(
+            self._group(), context_note=note, interject_enabled=False
+        )
+        self.assertFalse(blocked)
+        self.assertIn("小明", note)
+        self.assertIn("按配置不插话", why)
+
+    def test_two_person_exchange_is_handed_to_the_model(self):
+        note = groupflow.flow_context_note(["阿哲", "小鱼", "阿哲"], "")
+        ok, why = self._gate(self._group(), context_note=note)
+        self.assertTrue(ok, why)
+        blocked, why = self._gate(
+            self._group(), context_note=note, interject_enabled=False
+        )
+        self.assertFalse(blocked)
+        self.assertIn("来回聊", note)
+        self.assertIn("按配置不插话", why)
 
     def test_three_speakers_is_still_fair_game(self):
         """三个人在说话就不算对聊——别把正常群聊也挡了。"""
-        ok, why = self._gate(self._group(), recent_speakers=["阿哲", "小鱼", "阿岚"])
+        note = groupflow.flow_context_note(["阿哲", "小鱼", "阿岚"], "")
+        self.assertEqual(note, "")
+        ok, why = self._gate(self._group(), context_note=note)
         self.assertTrue(ok, why)
 
     def test_two_speakers_without_alternation_is_not_a_duet(self):

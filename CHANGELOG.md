@@ -1,3 +1,91 @@
+## v1.28.0 — 群主动不再点名、素材回到她自己的生活、别人对聊交给模型判断
+
+### 为什么
+
+用户这一版的三句原话：
+
+1. 「主动消息发群时会叫别人，可是这不是特性；模型会引用别人的名字去问题」；
+2. 「有关于任何主动消息的都会只有天气，不会真的找话题；如果没有能说的就不发」；
+3. 「别人对话时就不会插嘴（不是必须），但是能不能插嘴看模型」。
+
+对到代码上是三个具体缺口：`group_mention_member` 默认开、且 `generator._group_boundary`
+对所有群模式都递「群里的人 + 可以点某个人的名字」；破冰/起话头的 `topic_hint` 只来自
+节日 + 天气，她自己的日程/梦/没做完的事完全没进群素材，而且破冰没有「这次不发」的出口；
+`groupflow.flow_should_consider` 里 `addressed_to` 与 `two_person_exchange` 是硬拦，
+模型根本没有判断机会。私聊侧另有两处同源问题：`day.doing`（此刻正在做）被写成
+「刚忙完{doing}」，`derive_extras` 的天气绕过了「变了 + 6 小时」的闸。
+
+### 做了什么
+
+**S1 群主动不点名**
+
+- `group_mention_member` 默认改为 `False`；`generator._group_boundary(..., mode=...)`
+  按模式分叉：起话头/破冰**一个名字都不给**并明说「别点名」；心流接话在允许点名时
+  只给**最新说话的那个人**一个名字，且只允许「接 TA 那句话时自然叫一句」，
+  不许用名字提问/点评/招呼别人；不允许点名时一个名字都不给；
+- `flow` 提示词里那条「要叫谁只在特别自然时才叫」同步改成新口径。
+
+**S2 群主动素材 = 她自己的生活，没话说就不发**
+
+- `groupflow.life_lines(body)`：从契约里抽刚做完（`day.done`，滤「才醒」与 vague）、
+  正在做（`day.doing`）、今天想去（`day.wants`）、没做完（`ongoing`）、梦到
+  （`day.dreams`），去重、每行 ≤40 字、最多 4 条；
+- `groupflow.topic_materials(life, holiday, weather)`：生活 > 节日 > 天气；
+  旧 `icebreak_topics` 保留为兼容包装；
+- `core_bridge._build_self_view` 映射 `day.dreams`（旧版 Core 缺字段/坏数据 → `[]`）；
+- `anchors` 新增 `KIND_DREAM`（TTL 3h、rank 2、理由「她昨晚做了个梦」、mode 走默认
+  share），派生 `梦到…`；修掉 doing 的「刚忙完」语义（改成「正在…」，doing 本身以
+  「在」开头时不再叠字）；新增「刚做完」由头（`day.done` 最多 2 条）；
+- 天气只留 `derive_extras` 一个入口，必须过 `weather_worth_telling`（变了 + 6 小时）
+  并 `mark_weather_told`；`_derive_from_state` 里那份重复入口删掉（原来同一场雨会挂
+  两条由头：一条「中雨…」、一条「外头中雨…」，后者还绕过闸）；
+- `engine._group_topic_hint` 返回 `(素材, 本次采用的天气)`：生活素材优先，天气过闸、
+  发送成功后记进**群状态**，同一个群 6 小时内不再说同一句天气；
+- 破冰/起话头 prompt 改成「她自己的生活 + 今天现成的事」，并加 SEND/NO 决策：
+  模型答 NO → `group_message` 返回 None，`_icebreak` 直接返回 False、**不消耗当天
+  额度**、不生成占位内容。
+
+**S3 别人对聊由模型决定**
+
+- 新增 `group_interject_others`（默认开）；`groupflow.flow_context_note` 把
+  「在叫 X」「A 和 B 在来回聊」写成一句语境；`flow_should_consider` 删掉两道硬拦，
+  改为：配置关闭 → 不插；刚插过话（`interject_gap_seconds=max(min_gap, 180)`）→
+  先缓一缓；其余窗口/配额/睡眠/安静时段等硬闸原样保留；
+- engine 两条心流路径都算语境并传进闸，生成前重校后把**最新**语境塞进
+  `group_ctx["context_note"]`；flow prompt 新增【现在的群聊语境】块，并把「两步判断」
+  的第一条从「大家在对着某个具体的人说事就别接」改成「先看语境块，接不上就 NO」。
+
+**其它**
+
+- 版本号 1.28.0；README 群聊段落与配置表同步；新增 `docs/REGRESSIONS.md`。
+
+### 没做什么（刻意的）
+
+- 没有改发送节奏与频率护栏：点名/插嘴的变化只改「说什么」和「要不要交给模型」，
+  不放松窗口、每小时上限、最小间隔、安静时段与睡眠闸；
+- 没有动私聊「念想」通道的由头种类限制：梦/刚做完只走正常主动那条路，念想仍然只说
+  关于 TA 的事；
+- 没有要求 Core 一定升级：`day.dreams`/`day.wants` 旧版 Core 没有，社交层一律容错成
+  空（照常工作，只是少一类素材）。
+
+### 旧测试的断言改动（语义被用户明确改变，不删测试）
+
+- `test_p2_groupflow_pacing.FlowContextTest`：两人对聊 / 叫别人从「必拒」改成
+  「默认交给模型」；旧断言改用 `interject_enabled=False` 保留（那一档就是旧语义）；
+- `test_v1273_review_fixes.GroupMemberNameTest`：边界块标题 `【群里的人】` 改成
+  `【正在接的那个人】`（v1.28.0 不再把整份名单递进 prompt），用例目的（昵称注入不
+  能伪造换行/块头）不变；
+- `test_autonomous_social.TestGroupOpenerPrompts.test_member_names_shown_when_enabled`：
+  从「名单里的人都出现」改成「只出现正在接的那个」，并加断言钉住另一个名字不在。
+
+### 验证
+
+- 新增 `tests/test_v1280_group_voice.py`（54 个用例）与
+  `tests/test_v1280_flow_interject.py`（23 个用例），覆盖设计文档 §2 列出的测试点；
+- 全量：**1193 passed, 478 subtests, 0 failed**（基线 1116 passed / 440 subtests，
+  0 failed）；新增用例在旧行为下会红（点名/素材顺序/天气闸/NO/对聊硬拦各自有断言）。
+
+
 # 更新日志
 
 ## v1.27.55 — 把「LLM 不可用」拆成两种可区分的原因

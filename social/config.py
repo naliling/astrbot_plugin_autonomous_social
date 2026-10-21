@@ -649,8 +649,15 @@ class SocialConfig:
     group_topic_enabled: bool = True
     group_topic_gap_hours: float = GROUP_TOPIC_GAP_HOURS_DEFAULT
     group_topic_daily_cap: int = GROUP_TOPIC_DAILY_CAP_DEFAULT
-    # G3：群内接话/起话头时，允许自然地点某个群友的名字。
-    group_mention_member: bool = True
+    # G3 → v1.28.0：群主动**默认不点名**。用户原话是「主动消息发群时会叫别人」
+    # ——模型只要拿到名字，就会拿别人的名字去提问/点评/招呼，而打招呼本来该对着
+    # 整个群说。打开后也只剩一种用法：心流接话时，可以叫**正在接的那一个人**一句；
+    # 起话头/破冰永远不点名（见 generator._group_boundary 的 mode 分叉）。
+    group_mention_member: bool = False
+    # v1.28.0：别人在群里对聊、或者这句话是在叫别人时，心流不再硬拦——用户原话
+    # 「不是必须，但是能不能插嘴看模型」。关掉退回旧语义：这两种场合一律不插。
+    # 频率/窗口/配额等护栏不受它影响，仍然全部生效。
+    group_interject_others: bool = True
     group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
@@ -1006,7 +1013,8 @@ class SocialConfig:
                 GROUP_TOPIC_DAILY_CAP_MIN,
                 min(GROUP_TOPIC_DAILY_CAP_MAX, gi("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)),
             ),
-            group_mention_member=bool(g("group_mention_member", _d("group_mention_member", True))),
+            group_mention_member=bool(g("group_mention_member", _d("group_mention_member", False))),
+            group_interject_others=bool(g("group_interject_others", _d("group_interject_others", True))),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, gi("group_stale_days", GROUP_STALE_DAYS_DEFAULT))
             ),

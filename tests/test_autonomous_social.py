@@ -3878,9 +3878,11 @@ class TestGroupOpenerPrompts(unittest.TestCase):
         self.assertIn("色情", p)
 
     def test_member_names_shown_when_enabled(self):
+        """v1.28.0：允许点名也只给「正在接的那个人」（members 最新在前），不是整份名单。"""
         p, _ = self._gen(group_mention_member=True)._compose_group(
             "flow", {"members": ["小明", "小红"]}, "人设", 40)
         self.assertIn("小明", p)
+        self.assertNotIn("小红", p, "把整个群名单递给模型了")
 
     def test_member_names_hidden_when_disabled(self):
         p, _ = self._gen(group_mention_member=False)._compose_group(

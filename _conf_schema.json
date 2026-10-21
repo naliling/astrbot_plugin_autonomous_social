@@ -652,8 +652,15 @@
   },
   "group_mention_member": {
     "type": "bool",
-    "description": "群内可以点名群友",
-    "hint": "接话/起话头时，允许她像熟人那样自然地点一下某个群友的名字。推荐开启。",
+    "description": "群内接话时点名群友",
+    "hint": "接话时允许叫正在接的那个人（起话头/破冰不会点名，默认关闭）",
+    "obvious_hint": true,
+    "default": false
+  },
+  "group_interject_others": {
+    "type": "bool",
+    "description": "别人对聊时可以插话",
+    "hint": "交给模型判断：接得上、不打断才插；关掉则两人对聊/叫别人时一律不插",
     "obvious_hint": true,
     "default": true
   },

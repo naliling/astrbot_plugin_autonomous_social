@@ -805,28 +805,53 @@ def _safe_member_name(raw: Any, limit: int = 16) -> str:
     return " ".join(text.split())[:limit]
 
 
-def _group_boundary(members: List[str], mention: bool) -> str:
-    """G1/G3：群聊边界 + 可点名的人。所有群聊模式共用。
+def _group_boundary(members: List[str], mention: bool, mode: str = "flow") -> str:
+    """G1/G3：群聊边界 + 这群人可以怎么称呼。所有群聊模式共用。
 
     群聊不是私聊：不论人设多开放，都不在群里主动挑起亲密/色情话题；有人这样起头就
     自然岔开。这是主人明确要的底线，且是**生成提示词**里的一句边界，不是往人设里
     塞规矩。
+
+    v1.28.0：点名规则按 mode 分叉（用户原话：「主动消息发群时会叫别人」）——
+    模型只要看到名字，就会拿别人的名字去提问、点评、招呼，而主动开口本来就该对着
+    整个群说。所以：
+      * 起话头 / 破冰：**一个名字都不给**，并明说别点名；
+      * 心流接话 + 允许点名：只给**最新说话的那个人**一个名字，且只允许「接 TA 那
+        句话时自然叫一句」，不许用名字提问/点评/招呼别人；
+      * 心流接话 + 不允许点名：一个名字都不给，明说不要点名。
     """
     lines = [
         "【这是群聊，不是私聊】不论她的人设多开放，都不在群里主动挑起亲密、暧昧、"
         "色情的话题；要是有人在群里这样起头，就自然地岔开、回到正常聊天，别顺着往下走。"
     ]
-    if mention and members:
-        # 昵称是用户自己能改的，先清洗再拼（见 `_safe_member_name`）。
-        names = "、".join(
-            name for name in (_safe_member_name(m) for m in members) if name
+    mode = str(mode or "flow").strip().lower()
+    if mode in ("icebreak", "topic"):
+        lines.append(
+            "【这是她主动起话头/破冰】这段话是说给群里**所有人**听的：别点名任何群友，"
+            "也别专门问某一个人的问题；直接对大家说一句就行。"
         )
-        if names:
-            lines.append(
-                "【群里的人】最近说过话的：" + names + "。"
-                "接话/起话头时如果自然，可以带上某一个人的名字（像熟人那样点一句），"
-                "但别每次都点、也别硬点。"
-            )
+        return "\n".join(lines)
+    if not mention:
+        lines.append(
+            "【不要点名】直接对群里说话，别叫任何群友的名字（也不用 @ 谁），"
+            "别对着某一个人提问。"
+        )
+        return "\n".join(lines)
+    # 昵称是用户自己能改的，先清洗再拼（见 `_safe_member_name`）。
+    # `members` 是「最近说过话的人、最新在前」（groupflow.member_names），
+    # 所以第一个就是这次要接的那个人——只给这一个，多给一个模型就会去喊别人。
+    latest = ""
+    for raw in members or []:
+        latest = _safe_member_name(raw)
+        if latest:
+            break
+    if latest:
+        lines.append(
+            "【正在接的那个人】" + latest + "。只有接 TA 那句话时可以自然叫一句，"
+            "别用名字去提问、点评或招呼别人；也别每次都叫。"
+        )
+    else:
+        lines.append("【不要点名】接话时别叫任何群友的名字，直接说话就行。")
     return "\n".join(lines)
 
 
@@ -1086,13 +1111,15 @@ class MessageGenerator:
         at: Optional[float] = None,
         clock_offset: Optional[int] = None,
     ) -> Optional[List[str]]:
-        """群聊心流/破冰的生成。mode="flow"（接话，可拒答）/ "icebreak"（破冰）。
+        """群聊心流/破冰/起话头的生成。mode="flow"（接话，可拒答）/ "icebreak" / "topic"。
 
         与 1:1 主动消息不同：这里没有单一「对方」，是对着一群人说话，参考库告诉模型
-        “这个群平时怎么说话”。flow 用 SEND/NO 协议——接不上就让它答 NO，不硬接。
+        “这个群平时怎么说话”。flow 用 SEND/NO 协议——接不上就让它答 NO，不硬接；
+        v1.28.0 起 icebreak/topic 也走 SEND/NO：没有一件真值得分享的事就这次不发。
 
         Returns:
-            消息段落列表；flow 选择不接、或 LLM 不可用/解析失败时返回 None。
+            消息段落列表；flow 选择不接、icebreak/topic 答 NO、或 LLM 不可用/解析失败
+            时返回 None。
         """
         provider = await self._get_provider(umo)
         if provider is None:
@@ -1123,9 +1150,14 @@ class MessageGenerator:
             if decision is None or not decision.send:
                 return None
             return decision.parts
-        # icebreak：直接当正文（也容错模型多写了 SEND 前缀，_split_parts 里的清洗会处理）
-        # 但动机行（`#想开个话头`）必须先剥：这条路径不经过 `_parse_decision`。
-        body, _promise = self._strip_intent(result_text)
+        # icebreak/topic：直接当正文，但先过一个「这次发不发」的出口（S2，v1.28.0）——
+        # 用户原话是「如果没有能说的就不发」。以前这里把整段当正文，模型只能硬编，
+        # 于是破冰/起话头翻来覆去都是天气。动机行（`#想开个话头`）仍要剥：这条路径
+        # 不经过 `_parse_decision`。
+        body = self._group_icebreak_body(result_text)
+        if body is None:
+            return None
+        body, _promise = self._strip_intent(body)
         return self._split_parts(body, max_len, self.cfg, allow_emoji)
 
     def _compose_group(
@@ -1143,10 +1175,10 @@ class MessageGenerator:
         blocks: List[str] = []
         if persona_prompt:
             blocks.append("【你是谁】\n" + persona_prompt.strip())
-        # G1/G3：群聊边界与可点名的人（所有群聊模式共用）
+        # G1/G3：群聊边界与可点名的人（所有群聊模式共用；点名规则按 mode 分叉）
         _members = [str(x).strip() for x in (group_ctx.get("members") or []) if str(x).strip()]
-        _mention = bool(getattr(self.cfg, "group_mention_member", True)) if self.cfg else True
-        blocks.append(_group_boundary(_members, _mention))
+        _mention = bool(getattr(self.cfg, "group_mention_member", False)) if self.cfg else False
+        blocks.append(_group_boundary(_members, _mention, mode))
         style_ref = str(group_ctx.get("style_ref", "") or "").strip()
         if style_ref:
             # 私聊路径一直有这层边界标注，群聊路径却没有。群聊里的样本文本与实时发言
@@ -1185,12 +1217,16 @@ class MessageGenerator:
                 head,
                 lead,
             ]
-            # K1：把节日/天气这类现成话头递进去（没有就不给，不硬编）。
+            # K1/S2：把「她自己的生活 + 今天现成的事」递进去（没有就不给，不硬编）。
+            # v1.28.0：素材以**她自己的生活**优先——刚做完/正在做/今天想去/还没
+            # 做完/昨晚梦到；节日、天气只是备选。用户原话：「只有天气，不会真的找
+            # 话题」「他就不会分享事物吗」。天气能进来还得先过 engine 那道
+            # 「变了 + 6 小时」的闸，所以这里不会天天摆着同一句天气。
             topic_hint = str(group_ctx.get("topic_hint", "") or "").strip()
             if topic_hint:
                 body.append(
-                    "【可以拿来当话头的现成事】（有就用，没有就自己想一个；"
-                    "不用硬扯上它）：\n" + topic_hint
+                    "【她自己的生活 + 今天现成的事】（有就挑一件真的分享，"
+                    "没有就别硬说）：\n" + topic_hint
                 )
             # 你自己最近在群里说过的话（含前几次破冰）：不列出的话，她每次破冰会
             # 说同一句（一天最多两次、连着几天就是逐字重复）——心流接话早就有这层
@@ -1205,13 +1241,23 @@ class MessageGenerator:
                 )
             body += [
                 "要求：",
+                "- 优先说她刚做完/正在做/今天想去/还没做完/昨晚梦到的一件具体小事；"
+                "节日、天气只是备选，天气只有真的变了才提，别把它当唯一话头；",
                 "- 像群里正常一员那样起个话头，短、口语，不需要谁必须回；",
                 "- 别像客服/播报，别用「有人在吗」这种查岗式开头；",
+                "- 别点名任何群友，也别专门问某一个人的问题；",
                 "- 一句就够，可以带一个轻松的小问题。",
             ]
             if shape:
                 body.append("- " + " ".join(shape))
-            body.append(f"长度不超过 {max_len} 字。直接写你要发到群里的那句话，不要写别的。")
+            body.append(f"长度不超过 {max_len} 字。")
+            # S2（v1.28.0）：没有值得分享的事就不发。以前破冰没有「不发」这个出口，
+            # 模型只能硬写，于是翻来覆去都是天气。与心流共用 SEND/NO（有兼容兜底，
+            # 只写正文也收，见 `_group_icebreak_body`）。
+            body.append(
+                "输出格式：想发就第一行写 SEND，第二行开始写要发到群里的那句话；"
+                "如果没有一件真值得分享/说的事，就只写一行 NO，这次不发。"
+            )
             blocks.append("\n".join(body))
             return "\n\n".join(b for b in blocks if b), allow_emoji
 
@@ -1267,6 +1313,16 @@ class MessageGenerator:
             time_line = ""
         if time_line:
             blocks.append(time_line)
+        # S3（v1.28.0）：别人对聊 / 这句话是在叫别人时，插件不再硬拦，而是把这个
+        # 事实写进语境——「能不能插嘴看模型」。只给事实，不替模型下结论；
+        # 频率/窗口等护栏仍在 engine 侧，模型看到这段话时已经过了那些闸。
+        context_note = str(group_ctx.get("context_note", "") or "").strip()
+        if context_note:
+            blocks.append(
+                "【现在的群聊语境】" + context_note + "。"
+                "他们会看到你在插话。你可以不插；只有接得上、不打断、能让聊天更热闹时"
+                "才插，否则 NO。插话时别叫正在聊的那几个人的名字。"
+            )
         instr = [
             "你刚才在这个群里说过话，现在群里有人继续在聊。你可以像群里熟人一样自然接一句，也可以不接。",
             (
@@ -1280,15 +1336,18 @@ class MessageGenerator:
             "判断：这话你接得上、接了不尴、能让聊天更热闹就接；接不上、没意思、或会打断别人就别接。",
             "要求：",
             "- 像群里正常一员那样说话，短、口语，可以自然地玩梗/接梗，但别硬玩、别复读别人的话；",
-            # G3：开了「群内可以点名群友」时，别再用一句「不要 @ 任何人」把它堵死。
+            # G3 → v1.28.0：允许点名也只允许叫**正在接的这一个人**；关掉就一个都不叫。
             (
-                "- 短、口语，别长篇大论；一般不用 @ 谁，直接说话就行；要叫谁只在特别自然时才叫；"
+                "- 短、口语，别长篇大论；一般不用 @ 谁，直接说话就行；"
+                "只有接最新那句话时可以自然叫一句正在说话的那个人，"
+                "别用名字去提问/点评/招呼别人；"
                 if _mention else
-                "- 短、口语，别长篇大论；不要 @ 任何人，除非特别自然；"
+                "- 短、口语，别长篇大论；不要点名任何群友，直接说话就行；"
             ),
             "- 不要每条都接，宁可不接也别尬聊。",
-            # F9（v1.27.8）：两步判断，都过了才接。
-            "两步判断（都过了才接）：① 这个话题你插进去自不自然，接不上、或大家在对着某个具体的人说事，就别接；"
+            # F9（v1.27.8）：两步判断，都过了才接。v1.28.0 把「有人在对着具体的人
+            # 说事」从硬拦改成了语境块：先看语境，接不上就 NO。
+            "两步判断（都过了才接）：① 先看【现在的群聊语境】：接不上、或会打断别人，就答 NO；"
             "② 群里最新这几句里有没有人在跟你（这个 bot）说话，有人点名找你那是主链路要回的，别抢着接。判不准就答 NO。",
             # 发出去的必须有一句给人看的话；也不许把刚说过的那句换个说法再说一遍。
             # **不教格式**（同 _SENTENCE_RULES）：只说不许整条都是描写。
@@ -2017,6 +2076,46 @@ class MessageGenerator:
         if not any(core in str(label) for label in labels if label):
             return text
         return rest
+
+    @staticmethod
+    def _group_icebreak_body(text: str) -> Optional[str]:
+        """破冰/起话头的输出解析：剥掉可选的 SEND 行；正文是 NO 就返回 None。
+
+        v1.28.0 起破冰/起话头也有「没话说就不发」的出口（用户原话：「如果没有能说
+        的就不发」）。协议与心流共用 SEND/NO，但**不要求** SEND：只写正文也收
+        （同 `_parse_decision` 的宽容路径），否则模型不肯写协议时整条破冰链全哑。
+
+        NO 只认「整行就是 NO」：允许 `NO。` / `NO！` / 前后空白；把理由接在后面
+        写成一行（`NO，今天没什么好说的`）也认——那是模型在表态，不是台词。
+        正文里出现 NO（如「NO 作死」）不会被误杀：只看**第一个非空行**。
+        """
+        raw = _THINK_BLOCK.sub("", str(text or ""))
+        raw = _THINK_OPEN.sub("", raw)
+        raw = _THINK_STRAY.sub("", raw).strip()
+        if not raw:
+            return None
+        lines = raw.splitlines()
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            return None
+        head = lines[idx].strip().strip("[]【】:： ").upper()
+        head = head.rstrip("。！!？?.…~ ")
+        if head == _DECISION_SEND:
+            rest = "\n".join(lines[idx + 1:]).strip()
+            if not rest:
+                return None
+            rest_head = rest.splitlines()[0].strip().strip("[]【】:： ").upper()
+            rest_head = rest_head.rstrip("。！!？?.…~ ")
+            if rest_head in _DECISION_NO_ALIASES:
+                return None
+            return rest
+        if head in _DECISION_NO_ALIASES or _NO_LEADING.match(raw):
+            return None
+        # 其余（含模型先铺垫一句再写正文）：整段交给 `_strip_intent` / 验收层，
+        # 与旧行为一致——协议只是可选的，不能因为没写 SEND 就把正常话头扔掉。
+        return raw
 
     @classmethod
     def _parse_decision(

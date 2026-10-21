@@ -1489,13 +1489,16 @@ class SocialEngine:
         self.state.forgive_stale_flow_ignored(bid, gid, now)
         # 语境：她要看这个群**现在在干什么**，而不是只盯着这一条消息。
         # 近几条真人发言（去掉她自己）用来判断「是不是两个人在对聊」；本条消息开头
-        # 如果叫了某个群友的名字，那它就是冲那个人说的，不插。
+        # 如果叫了某个群友的名字，那它就是在叫那个人。S3（v1.28.0）：这两件事不再
+        # 硬拦，而是写成 `context_note` 放进提示词交给模型判断——用户原话
+        # 「不是必须，但是能不能插嘴看模型」。
         speakers = [
             str(s.get("name", "") or "").strip()
             for s in (g.get("samples") or [])
             if not s.get("self") and str(s.get("name", "") or "").strip()
         ]
         addressed = groupflow.addressed_to(msg, speakers)
+        context_note = groupflow.flow_context_note(speakers, addressed)
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -1505,12 +1508,19 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
-            recent_speakers=speakers,
-            addressed_to_name=addressed,
+            interject_enabled=self.cfg.group_interject_others,
+            context_note=context_note,
+            # 别人对聊时，刚插过话就先缓一缓：至少是这个 Bot 自己的最小间隔，
+            # 并且不短于 3 分钟——上一句刚落就再扎进两个人的对话里最招人烦。
+            interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
             return
+        if context_note:
+            # 日志要能区分「两人对聊但交给模型判断」与「配置关闭不插话」——
+            # 后者在 `why` 那条日志里已经写明了。
+            self.log(f"群 {gid} 心流：{context_note}；交给模型判断要不要插")
         # 同一个群已有一条接话在生成中：先挣着。不然这条会抢在上一条落账前
         # 过闸（计数只在 note_flow_reply 里才 +1），两条同时发出就派了 min_gap。
         # 检查与标记都在同一个事件循环步里、create_task 前无 await → 原子。
@@ -1569,13 +1579,25 @@ class SocialEngine:
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
         self.state.forgive_stale_flow_ignored(bid, gid, now)
-        # 生成前重校也要看语境：生成要几秒，这几秒里群里可能已经变成两个人对聊了。
-        # 那时候她已经写好的话就不该再发出去——「在两个人中间插一句」是最招人烦的。
+        # 生成前重校也要看语境：生成要几秒，这几秒里群里可能已经变成两个人对聊、
+        # 或者有人开始叫别人了。S3（v1.28.0）起这两件事不再直接否掉，而是把**最新**
+        # 语境带进提示词——模型看到的是当下这个群，而不是几秒前的快照。
+        # 触发消息的原文不在这个函数里，只能从 samples 里取最新一条真人发言来判
+        # 「这句话是不是在叫谁」。
         speakers = [
             str(s.get("name", "") or "").strip()
             for s in (g.get("samples") or [])
             if not s.get("self") and str(s.get("name", "") or "").strip()
         ]
+        latest_human = ""
+        for sample in reversed(g.get("samples") or []):
+            if sample.get("self"):
+                continue
+            latest_human = str(sample.get("text", "") or "")
+            break
+        context_note = groupflow.flow_context_note(
+            speakers, groupflow.addressed_to(latest_human, speakers)
+        )
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -1585,13 +1607,18 @@ class SocialEngine:
             ignored_exit=self.cfg.flow_ignored_exit,
             is_quiet=is_quiet,
             asleep=asleep,
-            recent_speakers=speakers,
+            interject_enabled=self.cfg.group_interject_others,
+            context_note=context_note,
+            interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
         )
         if not ok:
             return
         group_ctx = self._build_group_ctx(bid, gid, g)
         group_ctx["now"] = now
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
+        group_ctx["context_note"] = context_note
+        if context_note:
+            self.log(f"群 {gid} 心流：{context_note}；交给模型判断要不要插")
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
         except Exception as e:
@@ -1726,19 +1753,48 @@ class SocialEngine:
             "members": groupflow.member_names(samples) if self.cfg.group_mention_member else [],
         }
 
-    def _group_topic_hint(self, bid: str) -> str:
-        """K1：破冰/起话头可用的现成素材（节日/天气）。拿不到 Core 就返回空串。"""
+    def _group_topic_hint(
+        self, bid: str, gid: str, g: Dict[str, Any], now: float
+    ) -> Tuple[str, str]:
+        """K1/S2：破冰/起话头可用的现成素材。返回 (素材文本, 本次采用的天气)。
+
+        素材以**她自己的生活**优先（`groupflow.life_lines`：刚做完/正在做/今天想去/
+        还没做完/昨晚梦到），节日其次，天气最后。天气必须过
+        `anchors.weather_worth_telling` 的「变了 + 6 小时未说过」闸——天气永远有，
+        不过闸就成了唯一话头（用户原话：「只有天气，不会真的找话题」）。
+
+        天气的去重存在**群状态** `g` 里（不是用户状态）：同一个群连着破冰不该反复
+        说同一句天气；发送成功后由 `_icebreak` 调 `mark_weather_told` 落账。
+        返回空天气表示这次没采用天气（或者压根没天气）。
+        """
         try:
             body = self.core.bot_self_state(bid) or {}
         except Exception:
             body = {}
+        if not isinstance(body, dict):
+            body = {}
+        life = groupflow.life_lines(body)
         holiday = str(body.get("holiday") or "").strip()
-        wx = body.get("weather")
-        if isinstance(wx, dict):
-            weather = str(wx.get("env") or wx.get("weather") or "").strip()
+        raw_weather = body.get("weather")
+        if isinstance(raw_weather, dict):
+            weather = str(raw_weather.get("env") or raw_weather.get("weather") or "").strip()
         else:
-            weather = str(wx or "").strip()
-        return groupflow.icebreak_topics(holiday, weather)
+            weather = str(raw_weather or "").strip()
+        weather_used = ""
+        if weather:
+            # 闸的返回非空 = 这次可以说；用**完整原句**而不是截断版当素材，
+            # 免得「外面下着很大的雷阵雨」被切成半句。
+            worth = anchors.weather_worth_telling(
+                g, {"weather": {"env": weather}}, now
+            )
+            if worth:
+                weather_used = weather
+        return (
+            groupflow.topic_materials(
+                life=life, holiday=holiday, weather=weather_used
+            ),
+            weather_used,
+        )
 
     async def _run_icebreaks(self, bots: List[str], now: float) -> None:
         """每个角色一轮最多给一个冷得最久的群破冰（别一口气把好几个群都点一遍）。
@@ -1855,8 +1911,10 @@ class SocialEngine:
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
         if mode == "icebreak":
             group_ctx["reason"] = groupflow.icebreak_reason()
-        # K1：把节日/天气这类现成话头递进去（没有就空着，不硬编）。
-        group_ctx["topic_hint"] = self._group_topic_hint(bid)
+        # K1/S2：把「她自己的生活 + 今天现成的事」递进去（没有就空着，不硬编）。
+        # 天气由 `_group_topic_hint` 过「变了 + 6 小时」的闸，并带回来这次采用的
+        # 那一句：发送成功后才记账（见下面 mark_weather_told）。
+        group_ctx["topic_hint"], weather_used = self._group_topic_hint(bid, gid, g, now)
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
         except Exception as e:
@@ -1875,6 +1933,13 @@ class SocialEngine:
                 )
             return False
         if not parts:
+            # 模型判断这次没有值得分享的事（S2：没话说就不发）。**不消耗今天的额度**
+            # ——用户要的是「没有能说的就不发」，不是「把额度用掉也不发」；
+            # 也不该生成一句占位内容。
+            self.log(
+                f"群 {gid} {'破冰' if mode == 'icebreak' else '起话头'}："
+                "模型决定这次不说，不占今天的次数"
+            )
             return False
         # ── 验收层（与私聊侧、心流同一套）──────────────────────
         # 破冰以前也是裸发：模型写出动机泄漏、括号截断、复读（连着几天同一句）
@@ -1941,6 +2006,10 @@ class SocialEngine:
             self.state.note_icebreak(bid, gid, sent_ts, day)
         else:
             self.state.note_group_topic(bid, gid, sent_ts, day)
+        if weather_used:
+            # 与私聊由头同口径：真发出去了才算「说过天气」，6 小时内不再拿天气当
+            # 话头。记在群状态上（`g` 随后会被 state.save() 落盘）。
+            anchors.mark_weather_told(g, {"weather": {"env": weather_used}}, sent_ts)
         # 开口也是“bot 在群里说了话”：开心流关注窗口，后面有人搭话就能接
         self.state.open_flow(bid, gid, sent_ts, self.cfg.flow_window_minutes * 60.0)
         # 把内容记进她的近期发言：下一次的 prompt 靠 `own_recent`

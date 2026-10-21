@@ -317,6 +317,28 @@ class CoreBridge:
         except (TypeError, ValueError, AttributeError):
             return 0
 
+    @staticmethod
+    def _text_list(value: Any) -> List[str]:
+        """把跨插件传来的列表字段读成 `[str]`：非列表 / 脏元素 / 空串一律跳过。
+
+        `day.dreams` 是 Core 2.28 才有的字段：旧版 Core 根本没有它（None），手改坏
+        时可能是字符串、`[None]`、或者夹着字典。缺字段必须容错成 []——「没有梦可
+        分享」不是错误；夹一个 `"None"` 进去更糟，社交层会把它当真事说出去。
+        """
+        if not isinstance(value, list):
+            return []
+        out: List[str] = []
+        for item in value:
+            if item is None or isinstance(item, (dict, list, tuple, set)):
+                continue
+            try:
+                text = str(item).strip()
+            except Exception:
+                continue
+            if text:
+                out.append(text)
+        return out
+
     def _build_self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
 
@@ -383,6 +405,9 @@ class CoreBridge:
             "next": [str(x) for x in (day.get("next") or []) if str(x).strip()],
             # 她自己想做的事：社交层拿它当由头（「她今天想去那家书店」）。
             "wants": [str(x) for x in (contract.get("wants") or []) if str(x).strip()],
+            # 她昨晚（或白天补觉时）梦到的事：Core 2.28 起给。群主动素材与私聊
+            # 由头都拿它当「她自己的生活」的一类；旧版 Core 没有这个字段 → []。
+            "dreams": self._text_list(day.get("dreams")),
         }
         # 她手上还没做完的事：社交层拿它当由头（「还在整理那份个案笔记」）。
         view["ongoing"] = [

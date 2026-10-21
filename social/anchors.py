@@ -76,6 +76,10 @@ KIND_MISS = "miss"         # 想念：好感够、又想了一阵子（不是有
 KIND_GREET = "greet"       # 问候：没事干，随口说一句看看你回不回
 KIND_HOLIDAY = "holiday"   # 节日：今天是个节，顺口提一句
 KIND_WEATHER = "weather"   # 天气：外头变了样（下雨/降温），一句观察
+# v1.28.0：梦。Core 2.28 起契约的 `day.dreams` 才给这个字段；旧版 Core 没有，
+# 派生时自然拿不到（不是错误，是「今天没梦可分享」）。用户原话：
+# 「白天/凌晨我觉得要加上梦境」——梦是她自己的生活里最像「分享」的一类。
+KIND_DREAM = "dream"
 
 # ── 一条用过的由头是**怎么结束的** ──────────────────────────────
 #
@@ -109,6 +113,7 @@ _KIND_TTL = {
     KIND_CUE: TTL_PEER_EVENT,
     KIND_HOLIDAY: TTL_DAY_PART,
     KIND_WEATHER: TTL_SELF_EVENT,
+    KIND_DREAM: TTL_DAY_PART,
 }
 
 # 表外的 kind 用的兜底寿命。
@@ -130,6 +135,8 @@ KIND_TTL_FALLBACK = TTL_SELF_EVENT
 # `live_anchors` 里 `KIND_RANK.get(kind, 9)` 的默认 9 是给表外的 kind 的兜底。
 KIND_RANK = {
     KIND_CUE: 1,
+    # 梦排在第二档：刚醒那阵子最想说的就是它，比「今天想去」更具体、更有画面。
+    KIND_DREAM: 2,
     KIND_HOLIDAY: 3,
     KIND_MISS: 4,
     KIND_GREET: 5,
@@ -567,18 +574,25 @@ def _clause(text: Any, n: int) -> str:
 def _derive_from_state(
     body: Dict[str, Any], u: Dict[str, Any], now: float, taken: set,
     *, last_talk: Optional[float] = None,
+    kinds: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """从她自己的真实状态里，派生出「一件具体的事」。
 
-    只认插件**确实知道**的事实：Core 契约里的日程/天气/体感、她与对方的沉默时长。
+    只认插件**确实知道**的事实：Core 契约里的日程（刚做完/正在做/接下来/想做的/
+    梦到的）、没做完的事、体感、她与对方的沉默时长。天气不在这里——它归
+    `derive_extras`（KIND_WEATHER，变了 + 6 小时闸），见下面那段说明。
     没有新的事实就返回空列表——那正是「没什么可说的」的正确表达。
+
+    `kinds` 是给调用方的可选回填表：返回值是**文本**（派生本身不关心 kind），
+    但 `prepare_round_anchors` 挂池子时要知道「这条是梦」——梦有自己的档位和理由句
+    （`KIND_DREAM`），不能一律记成 `KIND_DERIVED`。不传就保持旧行为。
     """
     out: List[str] = []
     body = body if isinstance(body, dict) else {}
     activity = body.get("activity") if isinstance(body.get("activity"), dict) else {}
     day = body.get("day") if isinstance(body.get("day"), dict) else {}
 
-    def offer(text: str) -> None:
+    def offer(text: str, kind: str = KIND_DERIVED) -> None:
         # 上限与 `add_anchor` 的存储上限是同一个数：碎片各自量好尺寸再拼，模板
         # （引号、「后来呢」）永远不会被这一层切掉。原来这里统一 `_short(text, 14)`，
         # 于是**每一条**派生由头都被从尾巴上剁掉一截——不是零星几条，是所有。
@@ -587,13 +601,55 @@ def _derive_from_state(
             return
         taken.add(text)
         out.append(text)
+        if kinds is not None:
+            kinds[text] = kind
+
+    # ①-dream 她刚醒时还记得的梦（v1.28.0，Core 2.28 起 `day.dreams`）。
+    #
+    # 用户原话：「白天/凌晨我觉得要加上梦境」。梦是她自己的生活里最像「分享」的
+    # 一类：具体、有画面、不需要对方接。只取 1 条（多条的梦读起来像在报梦单）；
+    # 同一段梦文本的重复由由头冷却与「已用过」挡掉。旧版 Core 没有这个字段，
+    # `day.get("dreams")` 不是列表就什么都不做——不编。
+    #
+    # **为什么排在最前面派生**：梦的档位（`KIND_DREAM`，rank 2）比所有派生类都高，
+    # 而且它有时效——只有刚醒那阵子说才自然。而 `prepare_round_anchors` 的候选顺序
+    # 就是这里的产出顺序，池子满 3 条时排在后面的候选根本进不去（引擎取的是
+    # `picks[:1]`）。放在末尾等于永远轮不到它。
+    dreams = day.get("dreams")
+    if isinstance(dreams, list):
+        for item in dreams[:1]:
+            if item is None or isinstance(item, (dict, list, tuple, set)):
+                continue                      # 脏数据（契约是外部输入）
+            text = _s(item).strip()
+            if not text:
+                continue
+            offer(f"梦到{_short(text, 16)}", KIND_DREAM)
+            break
 
     doing = _short(day.get("doing") or activity.get("schedule_event"), 12)
-    # 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「刚忙完忙手里的活」等于没说，
+    # 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「正在忙手里的活」等于没说，
     # 而模型拿到这种由头只会顺着编一句更空的。真实记录里这类由头出现过 11 次
     # （「刚忙完忙自己的事」×5、「刚忙完醒神」×6）。
+    #
+    # v1.28.0：`day.doing` 是**此刻正在做**，不是「刚做完」——原来拼「刚忙完{doing}」
+    # 会产出「刚忙完在厨房煮饭」这种自相矛盾的话（用户反馈的语义错误）。改成「正在」。
+    # doing 有时本身就以「在」开头（Core 的 event 名常写成「在厨房煮饭」），
+    # 再补一个「正在」会得到「正在在厨房煮饭」，与 Core `_with_at` 的叠字判据一致处理。
     if doing and not is_vague_doing(doing):
-        offer(f"刚忙完{doing}")
+        offer(f"正在{doing}" if not doing.startswith("在") else doing)
+
+    # 「刚做完」：`day.done` 本身已经带「下午/傍晚」这类时间词，直接说就是一件具体
+    # 的事，不用再套模板（套了反而会得到「刚忙完下午在门诊接待」）。最多取 2 条；
+    # 「才醒」是说状态不是做事，和 vague doing 一样滤掉。
+    done = day.get("done")
+    if isinstance(done, list):
+        for item in done[:2]:
+            if item is None or isinstance(item, (dict, list, tuple, set)):
+                continue                      # 脏数据（契约是外部输入）
+            text = _s(item).strip()
+            if not text or "才醒" in text or is_vague_doing(text):
+                continue
+            offer(text)
 
     nxt = day.get("next")
     if isinstance(nxt, list) and nxt:
@@ -601,15 +657,13 @@ def _derive_from_state(
         if first and not is_vague_doing(first):
             offer(f"接下来是{first}")
 
-    # 天气（v1.27.41 起加闸）：只在**变了**、且距上次说天气够久时才当由头。
-    # 原来这里是「有天气就给」——而天气永远有，于是它成了最稳定的一条由头；
-    # 用户那边的真实记录就是「不是天气就是天气」。
-    weather = weather_worth_telling(u, body, now)
-    if weather:
-        before = len(out)
-        offer(weather)
-        if len(out) > before:  # 真进了池子才算「说过」
-            mark_weather_told(u, body, now)
+    # 天气**不在这里**（v1.28.0）。
+    #
+    # v1.27.41 在这里加了「变了 + 6 小时」的闸，但 `derive_extras` 同时还在用
+    # `_notable_weather` 直接往池子里塞一条天气——同一场雨会挂出两条由头
+    # （一条「中雨…」、一条「外头中雨…」），而且后一条绕过了闸。现在天气只剩
+    # `derive_extras` 一个入口、一套闸（也是 `KIND_WEATHER` 该在的地方），
+    # 生活类由头因此天然排在它前面（prepare_round_anchors 先派生生活、再补 extras）。
 
     # 沉默时长是一句真实的话，但**不能按天数逐天变**。写成 f"快{N}天没说话了" 的话，
     # 每天都是一句新的话：既不会被「已用过」挡掉（于是每天都能重新派生），
@@ -739,9 +793,18 @@ def derive_extras(
     holiday = _short(body.get("holiday"), 12)
     if holiday:
         offer(KIND_HOLIDAY, f"今天是{holiday}")
-    wx = _notable_weather(body)
-    if wx:
-        offer(KIND_WEATHER, wx)
+    # v1.28.0：天气必须与 `_derive_from_state` 走**同一道闸**（变了 + 6 小时未说过，
+    # 进池后调用 `mark_weather_told`），不能再用 `_notable_weather` 直接进池子——
+    # 那一路绕过了闸，于是「节日/天气 extras」成了天气的侧门，天气又变成默认台词
+    # （用户原话：主动消息「只有天气，不会真的找话题」）。`_notable_weather` 只留作
+    # 「这场天气值不值得当话头」的第一道筛选（多云/20℃ 不算），不是闸的替代品。
+    if _notable_weather(body):
+        earned = weather_worth_telling(u, body, now)
+        if earned:
+            before = len(out)
+            offer(KIND_WEATHER, earned)
+            if len(out) > before:  # 真进了池子才算「说过」
+                mark_weather_told(u, body, now)
     return out
 
 
@@ -928,6 +991,9 @@ def prepare_round_anchors(
     for a in picked:
         used.add(_s(a.get("about")))
 
+    # `kinds` 回填：梦这条要挂成 `KIND_DREAM`（它有自己的档位与理由句），其余派生
+    # 仍记 `KIND_DERIVED`。派生函数只返回文本，kind 由这一层决定。
+    candidate_kinds: Dict[str, str] = {}
     if relational:
         candidates = derive_relations(
             u, affection, now, used, last_talk=last_talk, missing_floor=missing_floor
@@ -944,11 +1010,14 @@ def prepare_round_anchors(
                 # 原来直接 `return gap_candidates` 就是这个后果。
                 return list(picked) + list(gap_candidates)
     else:
-        candidates = _derive_from_state(body, u, now, used, last_talk=last_talk)
+        candidates = _derive_from_state(
+            body, u, now, used, last_talk=last_talk, kinds=candidate_kinds
+        )
         kind = KIND_DERIVED
 
     for text in candidates:
-        item = add_anchor(u, kind, text, now=now)
+        text_kind = kind if relational else candidate_kinds.get(text, kind)
+        item = add_anchor(u, text_kind, text, now=now)
         if item is not None:
             # ⚠️ 这里**不**立刻标 used_at。真正消费发生在消息发出去的那一刻
             # （engine._speak 调 anchors.consume）。一上来就消费的话，模型这次写砸了
@@ -1222,6 +1291,7 @@ _REASON_BY_KIND = {
     KIND_MISS: "你最近一直在想TA",
     KIND_GREET: "你们有一阵子没说话了",
     KIND_DERIVED: "你自己这边刚发生的事",
+    KIND_DREAM: "她昨晚做了个梦",
     KIND_HOLIDAY: "今天是个节日",
     KIND_WEATHER: "外头的天气变了样",
 }

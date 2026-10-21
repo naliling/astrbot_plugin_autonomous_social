@@ -22,6 +22,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from .emoji import EMOJI as _EMOJI
 # 「外头」前缀的判据同样只有一份（Core 的 weather.env 往往已是整句）。
 from .textutil import outside_lead
+# 「忙手里的活 / 休着」这种空话的判据也只有一份：群素材里「她自己的生活」
+# 和私聊由头是同一批事实，不能一边过滤一边不过滤（否则群破冰会说出
+# 「正在忙自己的事」这种等于没说的话）。`anchors` 不 import 本模块，无环。
+from .anchors import is_vague_doing
+
+# S2（v1.28.0）：群破冰/起话头时「她自己的生活」最多给几条、每行多长。
+# 与 `anchors.ANCHOR_TEXT_MAX` 不是同一个用途：那边是私聊由头的存储上限；
+# 这里是给提示词的一行素材，太长会把「生活」写成流水账。
+LIFE_MAX_LINES = 4
+LIFE_LINE_MAX_CHARS = 40
 
 
 def _f(x: Any) -> float:
@@ -149,6 +159,34 @@ def two_person_exchange(speakers: List[str], *, lookback: int = 4) -> bool:
     return all(recent[i] != recent[i + 1] for i in range(len(recent) - 1))
 
 
+def flow_context_note(recent_speakers: List[str], addressed_name: str) -> str:
+    """把「这个群现在在干什么」写成一句给模型看的语境（S3，v1.28.0）。
+
+    以前这两件事是**硬拦**：两人对聊、或者这句话在叫别人，心流一律不插。用户明确
+    说「不是必须，但是能不能插嘴看模型」——插件只把语境给出来，插不插由模型判断；
+    频率/窗口等护栏仍在外层。返回空串 = 没什么要提醒的（正常群聊）。
+    """
+    name = str(addressed_name or "").strip()
+    recent = [
+        str(s or "").strip() for s in (recent_speakers or []) if str(s or "").strip()
+    ]
+    duet = ""
+    if two_person_exchange(recent):
+        names: List[str] = []
+        for item in recent:
+            if item not in names:
+                names.append(item)
+        if len(names) == 2:
+            duet = f"群里现在是 {names[0]} 和 {names[1]} 在来回聊"
+    if name and duet:
+        return f"{duet}；这一句是在叫「{name}」，不是跟你说"
+    if duet:
+        return duet
+    if name:
+        return f"群里这句话是在叫「{name}」，不是跟你说"
+    return ""
+
+
 def flow_should_consider(
     group: Dict[str, Any],
     now: float,
@@ -160,8 +198,9 @@ def flow_should_consider(
     ignored_exit: int,
     is_quiet: bool = False,
     asleep: bool = False,
-    recent_speakers: Optional[List[str]] = None,
-    addressed_to_name: str = "",
+    interject_enabled: bool = True,
+    context_note: str = "",
+    interject_gap_seconds: float = 0.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -174,8 +213,10 @@ def flow_should_consider(
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
     - 连续插话没人接，已经到退出阈值；
-    - **语境**（v1.27.36）：这句话开头在叫某个群友（没 @ 也算），或者群里就是
-      两个人在来回对聊——都不是「可以插一句」的场合。
+    - **语境**（v1.28.0）：两人对聊、或这句话在叫某个群友时，**不再硬拦**——用户
+      明确说「能不能插嘴看模型」。这里只保留两道护栏：`interject_enabled=False`
+      退回旧语义（这种场合一律不插）；刚插过话时别人还在对聊就先缓一缓，别在她
+      上一句刚落、语境已过时的时候又扎进去。
     """
     if asleep:
         return False, "她正在睡觉"
@@ -197,12 +238,18 @@ def flow_should_consider(
     if gap < max(0.0, min_gap_seconds):
         return False, "距上一句插话太近"
     # 语境：她要看这个群**现在在干什么**，而不只是「这一条消息过不过关」。
-    # 放在配额检查之后：配额是「她还能不能开口」，这两条是「这会儿该不该开口」，
+    # 放在配额检查之后：配额是「她还能不能开口」，语境是「这会儿该不该开口」，
     # 前者更该出现在日志里（调参看的是它）。
-    if str(addressed_to_name or "").strip():
-        return False, f"这句话是冲着「{str(addressed_to_name).strip()}」说的"
-    if two_person_exchange(recent_speakers or []):
-        return False, "两个人正在对聊，先不插"
+    note = str(context_note or "").strip()
+    if note:
+        if not interject_enabled:
+            return False, "别人正在对聊/在叫别人，按配置不插话"
+        try:
+            need_gap = float(interject_gap_seconds or 0.0)
+        except (TypeError, ValueError):
+            need_gap = 0.0
+        if need_gap > 0 and gap < need_gap:
+            return False, "刚插过话，别人对聊时先缓一缓"
     return True, ""
 
 
@@ -284,20 +331,133 @@ def icebreak_reason() -> str:
     return ""
 
 
-def icebreak_topics(holiday: str, weather: str) -> str:
-    """K1：破冰/起话头可用的现成素材（节日 / 天气）。只给事实，不给台词。
+def _as_text_list(value: Any) -> List[str]:
+    """把契约里的列表字段读成 `[str]`：非列表 / 脏元素 / 空串一律跳过。
 
-    破冰动机句早就删了（由模型自己产生），但模型手里没有「今天是什么日子」这类
-    客观事实，只能拿平庸话题凑。这里把节日/天气递进去当话头的种子，说什么仍由她定。
+    `day.done` / `day.dreams` / `ongoing` 都是跨插件来的值：旧版 Core 没有新字段，
+    手改坏时还可能是字符串或 `[None]`。破冰这条链抛一次就是整轮心跳丢一个角色，
+    所以这里只认列表，其余当「没有这件事」。
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        if item is None or isinstance(item, (dict, list, tuple, set)):
+            continue
+        try:
+            text = str(item).strip()
+        except Exception:
+            continue
+        if text:
+            out.append(text)
+    return out
+
+
+def _life_line(text: Any) -> str:
+    """一行生活素材：压成单行、截到 `LIFE_LINE_MAX_CHARS`。"""
+    return " ".join(str(text or "").split())[:LIFE_LINE_MAX_CHARS]
+
+
+def _want_line(text: Any) -> str:
+    """把「今天想做的事」写成一句顺口的话，别拼出「今天想去去那家书店」。"""
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    if body.startswith(("想", "要", "去", "来", "拐去", "拐到", "过去")):
+        return f"今天{body}"
+    return f"今天想去{body}"
+
+
+def life_lines(body: Dict[str, Any]) -> List[str]:
+    """S2：她自己的生活里**可以分享的具体小事**（群破冰/起话头的素材）。
+
+    用户原话是「他就不会分享事物吗」——天气不是生活，刚做完 / 正在做 / 今天想去 /
+    还没做完 / 昨晚梦到才是。顺序即优先级（先挑最像「我这边有件事想说」的），
+    去重、每行 ≤ `LIFE_LINE_MAX_CHARS` 字、最多 `LIFE_MAX_LINES` 条。
+
+    `body` 是 Core 契约（或 `core_bridge` 的 self view）：旧版 Core 没有
+    `day.dreams` / `day.wants`，缺字段与脏数据一律当「没有这件事」，绝不抛。
+    """
+    body = body if isinstance(body, dict) else {}
+    day = body.get("day") if isinstance(body.get("day"), dict) else {}
+    out: List[str] = []
+    seen: set = set()
+
+    def add(line: Any) -> None:
+        line = _life_line(line)
+        if not line or line in seen:
+            return
+        seen.add(line)
+        out.append(line)
+
+    # ① 刚做完的：`day.done` 本身已经带「下午/傍晚」这类时间词，直接说就是一件具体
+    # 的事。「才醒」不算做了件事（那是状态），vague doing 也是空话——两条都滤掉。
+    for text in _as_text_list(day.get("done"))[:2]:
+        if "才醒" in text or is_vague_doing(text):
+            continue
+        add(text)
+
+    # ② 正在做的。`day.doing` 是「此刻正在做」，不是「刚做完」——群素材只按现在说。
+    # 与私聊由头同一条口径：doing 本身以「在」开头时不再补「正在」（避免「正在在…」）。
+    doing = str(day.get("doing") or "").strip()
+    if doing and not is_vague_doing(doing):
+        add(f"正在{doing}" if not doing.startswith("在") else doing)
+
+    # ③ 今天想做的（Core 2.28 才有；没有这个字段就是空的）。
+    for text in _as_text_list(day.get("wants"))[:2]:
+        add(_want_line(text))
+
+    # ④ 还没做完的（Core 跨天跟着的那件事）。
+    for task in _as_text_list(body.get("ongoing"))[:1]:
+        if not is_vague_doing(task):
+            add(f"还在{task}")
+
+    # ⑤ 昨晚/白天补觉时梦到的（Core 2.28 才有）。梦是最像「分享」的一类：
+    # 具体、有画面、不需要对方接。
+    for dream in _as_text_list(day.get("dreams"))[:1]:
+        add(f"梦到{dream[:16]}")
+
+    return out[:LIFE_MAX_LINES]
+
+
+def topic_materials(
+    *,
+    life: Optional[List[str]] = None,
+    holiday: str = "",
+    weather: str = "",
+) -> str:
+    """K1/S2：破冰/起话头可用的现成素材。**她自己的生活优先**，节日其次，天气最后。
+
+    用户原话：「为啥只在破冰是总发天气的，他就不会分享事物吗？」——所以生活素材
+    排在最前面。天气只是备选：它是唯一「永远有、永远具体」的素材，摆在前面就会
+    变成唯一话头（调用方还得先过「变了 + 6 小时」的闸，见 engine）。
     """
     lines: List[str] = []
+    seen: set = set()
+    for item in list(life or [])[:LIFE_MAX_LINES]:
+        text = _life_line(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        lines.append(f"- {text}")
     holiday = str(holiday or "").strip()
-    weather = str(weather or "").strip()
     if holiday:
-        lines.append(f"今天是{holiday}")
+        lines.append(f"- 今天是{holiday}")
+    weather = str(weather or "").strip()
     if weather:
-        lines.append(outside_lead(weather))
-    return "\n".join(f"- {x}" for x in lines)
+        lines.append(f"- {outside_lead(weather)}")
+    return "\n".join(lines)
+
+
+def icebreak_topics(holiday: str, weather: str) -> str:
+    """K1：破冰/起话头可用的现成素材（节日 / 天气）。保留为兼容包装。
+
+    v1.28.0 起真正的素材组装在 `topic_materials`（多了「她自己的生活」并且排在最
+    前）；这个入口的调用方与测试仍在用，所以名字与「节日在前、天气在后」的旧语义
+    都保留，只是转调新函数。
+    """
+    return topic_materials(holiday=holiday, weather=weather)
+
 
 
 def member_names(samples: List[Dict[str, Any]], limit: int = 6) -> List[str]:
