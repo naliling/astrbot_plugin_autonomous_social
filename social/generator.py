@@ -450,6 +450,10 @@ def estimate_tokens(text: str) -> int:
 # 超预算时按这个顺序丢块：先丢装饰性的示例，最后才动背景与内心。
 # persona 排最后：人设在 persona.py 里已经截到 800 字，但生成器不该信任调用方，
 # 再卡一道才保证预算与谁传进来无关。
+# `history` 之后才轮到 `unanswered`：
+# 「上一条主动消息没人接」是**上下文**，不是装饰。它跟 `history` 同性质——
+# 少了它模型就退回「不知道自己在说哪一句」（v1.28.1 修的就是这个）。
+# 所以它排在 `out_block`（别重复句式，纯装饰）之后、`mind`/`persona` 之前。
 SHED_ORDER = (
     "bad_examples",
     "good_examples",
@@ -458,8 +462,9 @@ SHED_ORDER = (
     "out_block",
     "burst",
     "core_context",
-    "mind",
     "history",
+    "unanswered",
+    "mind",
     "persona",
 )
 
@@ -1632,6 +1637,23 @@ class MessageGenerator:
             if intimate:
                 # 亲密氛围：不抹露骨正文，只给一句氛围提示，让她顺着当下的亲昵感接下去
                 ref_lines.append("你们刚才聊得很亲密黏糊，氛围还暖着，顺着这个感觉自然说一句就好。")
+                # 「那句话有没有人接」在亲密分支里也要给（v1.28.1 补）。
+                #
+                # 原来这条只写在 else 分支里，于是**所有走亲密路的用户都拿不到这个事实**——
+                # 而他们恰恰是最容易被连发几条没人回的人（露骨内容对方常常不知道怎么接）。
+                # 实测真实数据里 67 个待回复用户有 7 个落在这条路上，提示词里一个字的上下文都没有，
+                # 模型只能把问过的事再问一遍。
+                #
+                # 只给事实不给指令（同 else 分支的理由）。
+                if target.get("_proactive_unanswered") and "unanswered" not in dropped:
+                    try:
+                        _hours = float(target.get("_proactive_unanswered_hours") or 0.0)
+                    except (TypeError, ValueError):
+                        _hours = 0.0
+                    if _hours >= 1.0:
+                        ref_lines.append(f"这句话发出去已经 {_hours:.0f} 小时了，对方没有接话")
+                    else:
+                        ref_lines.append("这句话刚发出去不久，对方还没有接话")
             else:
                 last_msg = _peer_text(target.get("last_message"), 120)
                 if last_msg:
@@ -1640,6 +1662,23 @@ class MessageGenerator:
                 if spoken and "out_block" not in dropped:
                     # 不记这一笔，她下一句接不上自己刚才说的话，看起来就像换了个人
                     ref_lines.append(f"你自己上一句对TA说的是：{spoken[:120]}")
+                # **那句话有没有人接**（v1.28.1）。
+                #
+                # 用户原话：「不知道说过啥就只会一个劲的问」。只写「你上一句说的是 X」
+                # 而不写「X 没人回」，模型就照常往下写——它看到的是一段没有结局的对话，
+                # 于是把问过的事再问一遍。补一句事实，让「已经问过、还没回」成为可知的。
+                #
+                # 只给事实不给指令：不说「别重复问」，那会压出「那算了」这种敷衍收场；
+                # 也不说「再问一次」——要不要开口由她自己定。
+                if target.get("_proactive_unanswered") and "unanswered" not in dropped:
+                    try:
+                        _hours = float(target.get("_proactive_unanswered_hours") or 0.0)
+                    except (TypeError, ValueError):
+                        _hours = 0.0
+                    if _hours >= 1.0:
+                        ref_lines.append(f"这句话发出去已经 {_hours:.0f} 小时了，对方没有接话")
+                    else:
+                        ref_lines.append("这句话刚发出去不久，对方还没有接话")
                 if topics_text and "topics" not in dropped:
                     ref_lines.append(f"之前聊到的话题：{topics_text}")
                 # Core 记着的对方原话。这是**她说过的**，不是给她的台词，

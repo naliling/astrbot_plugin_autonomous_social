@@ -336,6 +336,11 @@ class SocialState:
             "flow_open_until": 0.0,  # 心流关注窗口到期
             "flow_replies": 0,       # 当前窗口已主动接几条
             "flow_last_reply_at": 0.0,
+            # 最近一次**发起过**心流生成的时刻（不论发没发出去）。
+            # 与 flow_last_reply_at 分开：后者只在成功发送时更新，
+            # 于是「模型选择不接」完全不消耗任何配额——活跃群里每条消息
+            # 都会重新走一遍闸门 + 一次 LLM（实测 1 分钟 14 次）。
+            "flow_last_attempt_at": 0.0,
             "flow_ignored": 0,       # 连续插话没人接的计数
             "flow_hour_bucket": 0,   # 小时级插话计数的时间桶（epoch 小时）
             "flow_hour_count": 0,
@@ -474,8 +479,24 @@ class SocialState:
             g["flow_hold_until"] = until
             self.mark_dirty()
 
-    def note_flow_reply(
-        self,
+    def note_flow_attempt(self, bid: str, gid: str, now: float) -> None:
+        """记一次心流**尝试**（不论成没成）。
+
+        为什么需要它：`note_flow_reply` 只在**成功发送**时调用，于是「模型选择不接」
+        这条路完全不碰任何配额——活跃群里每来一条群消息就重新走一遍闸门 + 一次 LLM。
+        线上实测：某个群 1 分钟内 14 次「模型选择不接或生成为空」，每次都真打了模型。
+
+        这个时间戳只用于**节流**（别把 LLM 当免费的打），不计入：
+        · `flow_replies`（窗口配额——那个数的是「真正接了几句话」）
+        · `flow_ignored`（连续插话没人理——那个数的是「发出去没人接」）
+        · `flow_hour_count`（每小时插话上限）
+        三者都保持「只算真正发出去的」，语义不混。
+        """
+        g = self.group(bid, gid)
+        g["flow_last_attempt_at"] = now
+        self.mark_dirty()
+
+    def note_flow_reply(        self,
         bid: str,
         gid: str,
         now: float,

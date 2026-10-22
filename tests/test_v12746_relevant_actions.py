@@ -83,8 +83,11 @@ class WiderRepeatWindowTest(unittest.TestCase):
         self.assertTrue(ok, why)
 
     def test_a_different_action_is_fine(self) -> None:
+        # 样本原来用的是「(把手机扣在桌上)」——那正是 v1.28.1 要拦的第四面墙
+        # （她活在对话里，不活在设备里）。换成中性动作，这条测的是
+        # 「动作标签不同就不算复读」，不该被别的要求连带弄红。
         ok, why = verify_message(
-            "(把手机扣在桌上) 你刚才那句我没听清。", recent=self._recent(12, "放下手中的活")
+            "(放下手中的笔) 你刚才那句我没听清。", recent=self._recent(12, "推开面前的杯子")
         )
         self.assertTrue(ok, why)
 

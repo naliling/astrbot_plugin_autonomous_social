@@ -98,6 +98,86 @@ _COMMAND_NAMES = (
 )
 
 
+def _strip_ts(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """去掉只为排序用的 ts，返回 prompt 侧要的 {dir,text} 列表。
+
+    ts 是 `_generation_conversation` 合并两个来源时的排序键，不属于对话内容；
+    留着它会让下游（`_format_conversation`、风格统计、`_recent_proactive` 去重）
+    多一个无关字段，也让测试断言变噪。
+    """
+    return [{"dir": str(m.get("dir", "") or ""), "text": str(m.get("text", "") or "")}
+            for m in conv if isinstance(m, dict)]
+
+
+def _splice_ledger_into_session(
+    session_history: List[Dict[str, Any]],
+    ledger: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """把账本里会话库没有的条目，按 ts 插回会话库主干的正确位置。
+
+    AstrBot 的会话库只存 role/content，**没有时间戳**；而插件自己的账本每条都带 ts。
+    直接「会话库 + 账本剩下的」会把主动消息排到用户所有回复之后（见调用处注释）。
+
+    这里反过来：会话库是主干（它反映真实发生顺序，只是缺了主动消息那几条），
+    账本里缺的条目各带 ts，按「落在哪两条之间」插进去。
+
+    锚点：账本与会话库**同文同向**的条目就是同一句话，用它的 ts 当主干上那个位置的
+    时刻。一条缺条目插在「第一个比它新的锚点」之前；比所有锚点都旧就插在开头，
+    比所有锚点都新就插在末尾。
+
+    同 ts 的缺条目（连发的后续几条）必须**保持账本里的相对顺序**：insert 的 pos
+    用 `>` 严格大于来算，等于时不越过，后一条因此落在前一条之后。
+    """
+    anchor_ts: Dict[Tuple[str, str], float] = {}
+    for item in ledger:
+        key = (item["dir"], item["text"])
+        # 账本可能因 store_text 关掉而过期，取不到 ts 时按 0（最旧）
+        ts = _num(item.get("ts", 0.0) or 0.0)
+        if key not in anchor_ts or ts > anchor_ts[key]:
+            anchor_ts[key] = ts
+
+    # 主干：会话库原样搬过来。**不去重**——用户连着说两句一样的「早」是真实发生的，
+    # 原来（按来源拼接那版）也保留；这里不能顺手改掉这个既有行为。
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for s in session_history:
+        if not isinstance(s, dict):
+            continue
+        text = str(s.get("text", "") or "").strip()
+        if not text:
+            continue
+        key = (str(s.get("dir", "") or ""), text)
+        seen.add(key)
+        out.append({"dir": key[0], "text": text})
+
+    # 主干上每个位置的时刻。找不到锚点的位置（会话库有、账本没有：历史导入或手改过库）
+    # 记 +inf —— 不知道它何时发生，就不拿它去挡任何缺条目，缺条目因此都排在它后面，
+    # 而不会因为一个未知时刻被错误地顶到用户刚说的话前面。
+    slot_ts = [anchor_ts.get((m["dir"], m["text"]), float("inf")) for m in out]
+
+    missing = [
+        item for item in ledger
+        if (item["dir"], item["text"]) not in seen
+    ]
+    # 稳定排序：同 ts 保持账本顺序（连发的 p1、p2 不会颠倒）
+    missing.sort(key=lambda m: _num(m.get("ts", 0.0) or 0.0))
+
+    for item in missing:
+        ts = _num(item.get("ts", 0.0) or 0.0)
+        pos = len(out)
+        for i, t in enumerate(slot_ts):
+            if t > ts:
+                pos = i
+                break
+        out.insert(pos, {"dir": item["dir"], "text": item["text"]})
+        slot_ts.insert(pos, ts)
+
+    if limit > 0:
+        out = out[-limit:]
+    return out
+
+
 def _looks_like_command(event: Any, raw: str, msg: str) -> bool:
     """F1：这条消息是不是一次真的要执行的指令（含被框架剪掉 `/` 的情况）。
 
@@ -1067,6 +1147,7 @@ class SocialEngine:
         if limit <= 0:
             return []
 
+        # 账本里带 ts（`_splice_ledger_into_session` 按它插位）；会话库不带。
         ledger: List[Dict[str, Any]] = []
         for item in user.get("conversation") or []:
             if not isinstance(item, dict):
@@ -1078,24 +1159,31 @@ class SocialEngine:
                 {
                     "dir": "out" if item.get("dir") == "out" else "in",
                     "text": text[:300],
+                    "ts": _num(item.get("ts", 0.0) or 0.0),
                 }
             )
         if not session_history:
-            return ledger[-limit:]
+            return _strip_ts(ledger)[-limit:]
 
-        merged = list(session_history)
-        seen = {
-            (str(item.get("dir", "") or ""), str(item.get("text", "") or ""))
-            for item in merged
-            if isinstance(item, dict)
-        }
-        for item in ledger:
-            key = (item["dir"], item["text"])
-            if key in seen:
-                continue
-            merged.append(item)
-            seen.add(key)
-        return merged[-limit:]
+        # **按时间排序，不按来源拼接**（v1.28.1）。
+        #
+        # 原来是「会话库在前，账本里没有的追加到末尾」。两个来源的条目交替出现时
+        # （她昨晚主动发了一句 → 用户今天回 → 她主链路回 → 用户再回），那句**主动消息
+        # 会被排到用户所有回复之后**，模型看到的历史变成：
+        #   对方：我也才忙完 / 我：那正好一起摸鱼 / 对方：哈哈行 / 我：刚下班今天累死了
+        # 她以为「刚下班」是自己**刚说完**的话，于是接着这句往下接。用户看到的就是
+        # 「她根本不知道自己在说哪一句，只会一个劲地问」。
+        #
+        # 去重本身没错，错的是去重之后没有恢复时间顺序。会话库的条目不带 ts
+        # （AstrBot 的 history 只存 role/content），所以**不能**给它们编一个占位 ts
+        # 再整体排序：整段会被一起推到账本最老一条之前或之后，顺序反而更乱。
+        #
+        # 做法：会话库保持原样当主干，只把账本里**它没有的**条目按 ts 插回正确位置。
+        # 账本比会话库全（主动消息只在账本里），缺的正是这些；而主动消息全都带 ts，
+        # 插得准。
+        return _strip_ts(
+            _splice_ledger_into_session(session_history, ledger, limit)
+        )
 
     async def _load_session_history(self, umo: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """只读 AstrBot 会话库，取最近几轮用户与正常聊天记录。
@@ -1513,6 +1601,8 @@ class SocialEngine:
             # 别人对聊时，刚插过话就先缓一缓：至少是这个 Bot 自己的最小间隔，
             # 并且不短于 3 分钟——上一句刚落就再扎进两个人的对话里最招人烦。
             interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
+            # 同上：尝试也要节流，别让每条群消息都重打一次 LLM。
+            attempt_gap_seconds=self._flow_attempt_gap(),
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -1533,6 +1623,21 @@ class SocialEngine:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    def _flow_attempt_gap(self) -> float:
+        """心流两次**尝试**之间至少隔多久（秒）。
+
+        与 `flow_min_gap_seconds`（两句真正发出去的话之间）分开：那个数的是
+        「说出去的话别太密」，这个数的是「别把 LLM 当免费的打」。
+
+        取 `flow_min_gap_seconds` 与一个下限的较大者：下限 60 秒——再短的话
+        活跃群里两条消息就能打一次模型，限流期间尤其浪费。
+        没有单独配置项：复用现有那个即可，主人要调节奏时改的还是同一个数。
+        """
+        try:
+            base = float(getattr(self.cfg, "flow_min_gap_seconds", 120) or 120)
+        except (TypeError, ValueError):
+            base = 120.0
+        return max(base, 60.0)
     async def _flow_reply(self, bid: str, gid: str, trigger_ts: float) -> None:
         """包一层 in-flight 释放：无论生成/发送成不成功、中途抛不抛，都把
         该群的在途标记拿掉，让后续消息能重新触发（此时计数/min_gap 已落账）。"""
@@ -1610,6 +1715,8 @@ class SocialEngine:
             interject_enabled=self.cfg.group_interject_others,
             context_note=context_note,
             interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
+            # 「模型选择不接」也要占一次尝试：不然活跃群里每条消息都重打一次 LLM。
+            attempt_gap_seconds=self._flow_attempt_gap(),
         )
         if not ok:
             return
@@ -1624,6 +1731,9 @@ class SocialEngine:
         except Exception as e:
             self.log(f"群 {gid} 解析人格失败: {e}")
             persona_prompt = ""
+        # 记一次尝试：无论模型答不答应，这一轮都算试过。
+        # 少了它，「模型选择不接」就不占任何配额，活跃群里会一条消息一次 LLM。
+        self.state.note_flow_attempt(bid, gid, now)
         try:
             parts = await self.generator.group_message(
                 umo, "flow", group_ctx, persona_prompt,
@@ -4229,6 +4339,30 @@ class SocialEngine:
             if str(e.get("text", "") or "").strip()
         ]
 
+        # **上一条主动消息有没有被接住**（v1.28.1）。
+        #
+        # 用户原话：「模型在下一次主动消息会把上一次的主动消息参考用户最晚的消息
+        # 直接跨天问 结果就是没有上下文回复的很假！不知道说过啥就只会一个劲的问」。
+        #
+        # 根因有两半，这一半是「没有告诉模型对方压根没回」：
+        # `last_spoken_text` 一直是她自己那句主动消息，而 `last_message` 是空的
+        # （对方从那天起就没再开口）。生成侧只看到「你上一句说的是 X」，看不到
+        # 「这句话没人接」，于是它照常写下一句——用户看到的就是「她明明问过了，
+        # 又当没问过一样再问一遍」。
+        #
+        # `last_proactive_replied` 是 state 里早有的字段（回复窗口内对方开口就置 True），
+        # 只是从来没有任何一处把它读进 prompt。这里补上，并同时给出「悬了多久」，
+        # 因为「昨晚问的没人回」和「三分钟前问的还没回」是两件事。
+        u_copy["_proactive_unanswered"] = bool(
+            _num(u.get("last_proactive_sent", 0) or 0) > 0
+            and not u.get("last_proactive_replied", True)
+        )
+        u_copy["_proactive_unanswered_hours"] = (
+            round(max(0.0, now - _num(u.get("last_proactive_sent", 0) or 0)) / 3600.0, 1)
+            if u_copy["_proactive_unanswered"]
+            else 0.0
+        )
+
         if preset is not None:
             reason, reason_meta = preset
         else:
@@ -5127,6 +5261,16 @@ class SocialEngine:
                 for e in recent_pro
                 if str(e.get("text", "") or "").strip()
             ]
+            # 预览路径同样要告诉模型「上一条主动消息没人接」（见 _speak_inner 处长注释）。
+            u_copy["_proactive_unanswered"] = bool(
+                _num(u.get("last_proactive_sent", 0) or 0) > 0
+                and not u.get("last_proactive_replied", True)
+            )
+            u_copy["_proactive_unanswered_hours"] = (
+                round(max(0.0, now - _num(u.get("last_proactive_sent", 0) or 0)) / 3600.0, 1)
+                if u_copy["_proactive_unanswered"]
+                else 0.0
+            )
             reason, reason_meta = generate_reason(
                 u_copy, now, self._moment_of(bid, now).hour
             )
@@ -5406,9 +5550,15 @@ class SocialEngine:
                 last_err = str(e)
                 peer_unreachable = peer_unreachable or e.peer_unreachable
                 if e.unknown:
+                    # 异常消息可能是空的（框架把异常 repr 吞了的时候），那时只打
+                    # 「结果未知: 」后面什么都没有，排查时等于没有信息。补上异常类型，
+                    # 至少能分清是 ApiNotAvailable（没连上）还是别的东西。
+                    _detail = str(e).strip()
+                    if not _detail:
+                        _detail = f"{type(e).__name__}（无消息，通常是适配器未就绪或连接抖动）"
                     if throttle.allow(f"send.unknown.{bid or '-'}"):
                         logger.warning(
-                            f"[autonomous_social] 发送结果未知（不重试，避免重复投递）: {e}"
+                            f"[autonomous_social] 发送结果未知（不重试，避免重复投递）: {_detail}"
                             + throttle.summary(f"send.unknown.{bid or '-'}")
                         )
                     self._note_send_failure(bid, last_err, peer_unreachable)

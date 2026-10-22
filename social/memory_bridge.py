@@ -29,12 +29,11 @@ from typing import Any, Dict, Optional, Tuple
 
 from .throttle import LogThrottle
 
-try:  # 插件外（脚本/测试）导入时退化为标准库，别让日志变成硬依赖
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger("autonomous_social")
+# 上架硬规则：logger 必须且只能 `from astrbot.api import logger`，严禁内置 logging 模块。
+# v1.28.1 被自动安全审核退回，唯一必改项就是这个——social/config.py 与 social/memory_bridge.py
+# 各有一处 `except: import logging` 兜底。本插件只在 AstrBot 内运行，该分支永远走不到，
+# 删掉它与 Core v2.27.29 删 generator.py/persona.py 同类兜底是同一个理由。
+from astrbot.api import logger
 
 MEMORY_PLUGIN_ID = "astrbot_plugin_memory_companion"
 # 宿主注册表里可能出现这些身份（name / display_name / 目录名）。

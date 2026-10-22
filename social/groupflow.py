@@ -201,6 +201,7 @@ def flow_should_consider(
     interject_enabled: bool = True,
     context_note: str = "",
     interject_gap_seconds: float = 0.0,
+    attempt_gap_seconds: float = 0.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -237,6 +238,18 @@ def flow_should_consider(
     gap = now - _f(group.get("flow_last_reply_at", 0))
     if gap < max(0.0, min_gap_seconds):
         return False, "距上一句插话太近"
+    # **尝试节流**（v1.28.1）。
+    #
+    # 上面的 flow_last_reply_at 只在**成功发送**时更新，于是「模型选择不接」这条路
+    # 完全不碰任何配额：活跃群里每来一条群消息就重新走一遍闸门 + 一次 LLM。
+    # 线上实测某个群 1 分钟内 14 次「模型选择不接或生成为空」，每次都真打了模型——
+    # 既烧额度又刷屏。
+    #
+    # 用独立的 flow_last_attempt_at：只节流「多久试一次」，不改上面那几个配额的语义
+    # （flow_replies / flow_ignored / flow_hour_count 仍然只数真正发出去的）。
+    try_gap = now - _f(group.get("flow_last_attempt_at", 0))
+    if try_gap < max(0.0, attempt_gap_seconds):
+        return False, f"心流刚试过（{int(try_gap)} 秒前），先歇会儿"
     # 语境：她要看这个群**现在在干什么**，而不只是「这一条消息过不过关」。
     # 放在配额检查之后：配额是「她还能不能开口」，语境是「这会儿该不该开口」，
     # 前者更该出现在日志里（调参看的是它）。
