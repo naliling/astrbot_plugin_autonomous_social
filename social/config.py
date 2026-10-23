@@ -194,7 +194,10 @@ HEARTBEAT_MINUTES_MAX = 60
 # 心跳上限的上限（与 schema 的 heartbeat_max_minutes.max=120 对齐）
 HEARTBEAT_MAX_MINUTES_MAX = 120
 HEARTBEAT_MIN_DEFAULT = 8
-HEARTBEAT_MAX_DEFAULT = 15
+# v1.28.2：15 → 30。原值下一天约 96 轮，而每轮最多 `max_sends_per_round × 2`
+# 次 LLM 尝试——上游一限流（429 恢复窗口按小时计），这些请求全部白烧。
+# 30 分钟仍在她「想起来看一眼手机」的尺度内，轮次与请求量直接减半。
+HEARTBEAT_MAX_DEFAULT = 30
 
 RECENT_TALK_MIN = 5
 RECENT_TALK_MAX = 720
@@ -288,7 +291,10 @@ GREETING_NIGHT_END_DEFAULT = 24   # 24 视作 0（午夜）
 # 这条只是别在一轮里全发出去的护栏。
 MAX_SENDS_PER_ROUND_MIN = 1
 MAX_SENDS_PER_ROUND_MAX = 10
-MAX_SENDS_PER_ROUND_DEFAULT = 3
+# v1.28.2：3 → 2。每轮 LLM 尝试次数 = 这个数 × ATTEMPT_PER_SEND(2)，所以它就是
+# 「一轮最多打几次模型」。降到 2 之后一轮最多 4 次尝试（原 6 次）。
+# 发送成功率并没有变差：线上 998 轮只发出去 582 条，瓶颈从来不在尝试次数上。
+MAX_SENDS_PER_ROUND_DEFAULT = 2
 
 # ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，

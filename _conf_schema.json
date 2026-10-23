@@ -78,7 +78,7 @@
     "description": "心跳间隔上限（分钟）",
     "hint": "实际间隔在上下界之间随机取，避免节奏精确得像闹钟。不会小于下限。",
     "obvious_hint": true,
-    "default": 15,
+    "default": 30,
     "min": 1,
     "max": 120,
     "slider": {
@@ -339,9 +339,9 @@
   "max_sends_per_round": {
     "type": "int",
     "description": "每轮最多联系几人",
-    "hint": "一轮心跳（8-15分钟）最多主动联系几个不同的人。推荐3-3个。",
+    "hint": "一轮心跳最多主动联系几个不同的人。每轮尝试次数 = 这个数 × 2（ATTEMPT_PER_SEND），所以它同时决定了一轮最多打几次 LLM。推荐2-3个。",
     "obvious_hint": true,
-    "default": 3,
+    "default": 2,
     "min": 1,
     "max": 10,
     "slider": {

@@ -54,14 +54,20 @@ LLM_TIMEOUT_SECONDS = 90
 # 连续失败多少次开始退避，以及退避的基数与上限（指数）
 LLM_FAIL_STREAK_BEFORE_BACKOFF = 3
 # 鉴权/额度/模型不存在这类「再等一分钟也是同样的错」的失败，一次就退避。
-# 起步 30 分钟而不是几十秒：心跳本身就要 8~15 分钟一次，退避比心跳短等于没退——
+# 起步 30 分钟而不是几十秒：心跳本身 8~30 分钟一次，退避比心跳短等于没退——
 # key 挂着不动时仍然是每个心跳白打一次请求（实测 5 天 81 次）。失败次数不提供
 # 新信息，所以后面只是拉长窗口，封顶 6 小时（一天 4 次而不是 70 次）。
-LLM_FATAL_BACKOFF_BASE_SECONDS = 1800.0
+# v1.28.2：心跳上限从 15 提到 30 分钟，这一档的起步值跟着抬到 45 分钟，
+# 否则正好等于一个最长心跳，`test_backoff_outlives_a_heartbeat` 的
+# 「退避必须严格长于心跳」就不再成立。
+LLM_FATAL_BACKOFF_BASE_SECONDS = 2700.0
 LLM_FATAL_BACKOFF_MAX_SECONDS = 21600.0
 # 限流（429 / too many requests）：不是配置坏了，等一会儿就自己好。
 # 退避要短于「鉴权失败」那一档，否则一次上游抖动就被当成 key 挂了停半天。
-LLM_RATE_BACKOFF_BASE_SECONDS = 300.0
+# v1.28.2：起步 5 → 10 分钟。原来 5 分钟短于心跳下限 8 分钟，等于「永远等不到
+# 下一个心跳」——跨轮熔断立起来之前，每一轮都还在撞。10 分钟起、指数到 30 分钟封顶，
+# 与 429 常见的分钟级配额窗口（线上是 2h48m）之间仍然靠跨轮熔断兜底。
+LLM_RATE_BACKOFF_BASE_SECONDS = 600.0
 LLM_RATE_BACKOFF_MAX_SECONDS = 1800.0
 # 瞬时故障（超时、连接中断、5xx）的退避：起步 1 分钟，**封顶 15 分钟**。
 #
@@ -1017,6 +1023,20 @@ class MessageGenerator:
         self._llm_skip_until: Dict[str, float] = {}
         # 上次成功返回文本的调用方式。稳态下只走它，一次生成 = 一次网络请求。
         self._prefer: Dict[str, str] = {}
+        # ── 跨轮熔断（v1.28.2）─────────────────────────────────
+        # `_llm_skip_until` 只在本实例里活着，而它本身就是「按 scope 记着上次失败」。
+        # 问题是**没有人跨轮读它**：`try_once` 每轮开头会拿 `llm_backoff_remaining()`
+        # 问一次，但那只是把本轮的候选全跳过，**退避本身会在本轮的候选跑完之后继续
+        # 计时**——一次 429 换来的是「这一轮不试」+「下一轮照试」。而上游是按分钟级
+        # 配额计的（线上是 20 次/限流周期），心跳 8~15 分钟一轮，于是每个心跳仍然
+        # 白打一次注定失败的请求。
+        #
+        # 这里补的是「失败状态本身也要能被外面看到」：引擎据此在 `try_once` 开头就
+        # 结束整轮（连候选都不收集），而不是等 `speak` 里逐个去撞。
+        self._llm_down_since: Dict[str, float] = {}
+        self._llm_down_kind: Dict[str, str] = {}
+        # 熔断期间每轮最多提醒一次（ throttle 的窗口由调用方给）
+        self._llm_down_rounds: Dict[str, int] = {}
         # 形状对不上的调用方式（签名不对、返回的不是文本）：对这个 provider 而言
         # 它根本不是正确的用法，试过一次就永久排除，否则每轮都在它上面白打一次。
         # 按 provider 存是关键：签名是否匹配是 per-provider-class 的属性，
@@ -2613,6 +2633,11 @@ class MessageGenerator:
     def _note_llm_ok(self, scope: str) -> None:
         self._llm_fail_streak[scope] = 0
         self._llm_skip_until[scope] = 0.0
+        # v1.28.2：成功了就撤熔断。不撤的话一次 429 之后哪怕上游早就恢复了，
+        # `llm_circuit_open()` 还会按 `since` 一直返回 True，插件永久停摆。
+        self._llm_down_since.pop(scope, None)
+        self._llm_down_kind.pop(scope, None)
+        self._llm_down_rounds.pop(scope, None)
         # 恢复正常后清掉节流计数：故障已经结束，下一次再坏时应该立刻能打出第一条。
         # 只清自己这一格：以前是全局清，B 的一次成功就把 A 刚建立的日志窗口拆掉了。
         for key in ("llm.failed", "llm.exception", "llm.timeout", "llm.backoff"):
@@ -2638,6 +2663,13 @@ class MessageGenerator:
         }.get(kind, (LLM_BACKOFF_BASE_SECONDS, LLM_BACKOFF_MAX_SECONDS))
         delay = min(base * (2 ** (streak - threshold)), cap)
         self._llm_skip_until[scope] = self._now() + delay
+        # v1.28.2：把「这一路现在整体是坏的」记下来，让引擎能在轮次开头就看见。
+        # 只在第一次立（`since` 不刷新）：刷新的话 `since` 永远等于最近一次失败，
+        # 「坏了多久」这个数字就没有意义了，也没法据此升级退避。
+        if scope not in self._llm_down_since:
+            self._llm_down_since[scope] = self._now()
+            self._llm_down_kind[scope] = kind
+            self._llm_down_rounds[scope] = 0
         if throttle.allow(f"llm.backoff.{scope}", window=120.0):
             hint = {
                 "fatal": "（改好 key/额度后会自己继续；先在面板里查模型配置）",
@@ -2657,6 +2689,38 @@ class MessageGenerator:
         if not self._llm_skip_until:
             return 0.0
         return max(0.0, max(self._llm_skip_until.values()) - now)
+
+    def llm_circuit_state(self) -> Dict[str, Dict[str, Any]]:
+        """v1.28.2：现在有哪些 scope 处于熔断中，各坏了多久、什么档位。
+
+        引擎用它做**跨轮**熔断：`try_once` 开头若发现这一路是坏的，整轮直接收工，
+        不去收集候选、不让 `speak` 逐个去撞。返回的 dict 以 scope 为键。
+        """
+        now = self._now()
+        out: Dict[str, Dict[str, Any]] = {}
+        for scope, since in self._llm_down_since.items():
+            if self._llm_skip_until.get(scope, 0.0) <= now:
+                # 退避已过但没撤：只可能是还没轮到一次成功调用。仍算坏着，
+                # 否则退避一过就又整轮重试，等于熔断只挡了一轮。
+                pass
+            out[scope] = {
+                "kind": self._llm_down_kind.get(scope, "transient"),
+                "since": float(since),
+                "down_for": max(0.0, now - float(since)),
+                "streak": int(self._llm_fail_streak.get(scope, 0)),
+                "backoff_left": max(0.0, self._llm_skip_until.get(scope, 0.0) - now),
+            }
+        return out
+
+    def llm_circuit_note_round(self, scope: str) -> int:
+        """v1.28.2：记「这一路又空转了一轮」，返回这是连续第几轮。
+
+        引擎每轮调用一次，用于把日志从「每轮一条」压成「按轮数指数降频」——
+        否则跨轮熔断会把一种刷屏换成另一种刷屏。
+        """
+        n = int(self._llm_down_rounds.get(scope, 0)) + 1
+        self._llm_down_rounds[scope] = n
+        return n
 
     @staticmethod
     def _format_conversation(

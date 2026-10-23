@@ -618,6 +618,7 @@ class SocialEngine:
             "sent_total": 0,            # 累计主动消息
             "settle_user_errors": 0,    # 累计被跳过的坏用户数（见 settle_minds 的逐用户兜底）
             "blocked_reasons": {},      # 各闸门各拦下多少（近 N 轮滚动）
+            "llm_circuit_scopes": [],  # v1.28.2：当前熔断中的 LLM scope（仅状态展示）
         }
         # 累计类指标从上次落盘的地方接上。`last_*` 那几个不接——它们本来就该是
         # 「最近一次」，接了会让人以为这一轮刚跑过。
@@ -3491,6 +3492,42 @@ class SocialEngine:
             if ((x if isinstance(x, dict) else {}).get("users") or {})
         ]
         if not bots:
+            return
+
+        # ── 跨轮熔断（v1.28.2）────────────────────────────────
+        # 上面那段 `infra_down` 是**一轮内**的：同一轮里第一个候选撞见 provider 坏了，
+        # 剩下的候选就不再试。但它管不到下一轮——`infra_down` 每轮新建、每轮清零，
+        # 于是上游持续限流时，每个心跳仍然会收集全部候选、再逐个去撞一次墙。
+        #
+        # 真实代价（本机日志，v1.28.1）：一天 998 轮、404 次 Gemini 重试，
+        # 只发出去 582 条，绝大部分请求最终被「她在睡」「发送熔断」挡下——
+        # 也就是配额烧在了根本发不出去的候选上，而 429 的恢复窗口是 2h48m。
+        #
+        # 现在从生成器把「这一路整体是坏的」读出来，直接结束整轮：
+        # 不收集候选、不进 settle、不刷日志洪水。恢复由 `_note_llm_ok` 撤熔断，
+        # 所以上游一好，下一个心跳（8~15 分钟）就能重新说话。
+        try:
+            circuit = self.generator.llm_circuit_state()
+        except Exception:
+            circuit = {}
+        if circuit:
+            self._m["last_failure"] = (
+                f"LLM 熔断中（{'; '.join(sorted(circuit))}），本轮未尝试"
+            )
+            self._m["llm_circuit_scopes"] = sorted(circuit)
+            for scope, info in circuit.items():
+                n = self.generator.llm_circuit_note_round(scope)
+                kind = info.get("kind", "transient")
+                mins = int(info.get("down_for", 0.0) // 60)
+                # 降频：第 1、2 轮各一条，之后按 2/4/8/16… 轮一条，封顶 128 轮。
+                # 不降的话熔断只是把「每轮 550 行 provider 报错」换成「每轮 1 行熔断」。
+                if n <= 2 or (n & (n - 1)) == 0 or n % 128 == 0:
+                    logger.warning(
+                        f"[autonomous_social][{scope}] LLM 仍处于熔断中"
+                        f"（已连续 {mins} 分钟，连续失败 {info.get('streak', 0)} 次，"
+                        f"档位={kind}），本轮 {len(bots)} 个角色的候选全部不尝试。"
+                        f"这是连续第 {n} 个空转轮。"
+                    )
             return
 
         # 每个角色只读一次 Core 状态
