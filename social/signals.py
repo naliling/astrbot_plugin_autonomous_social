@@ -34,6 +34,15 @@ v1.27.31（schema 1 → 2）：
   （旧 Core 忽略多出来的字段，新 Core 在字段缺失时按「没有开着的事」处理）。
 - 这条通道的方向是单向的：`open_items` 由社交层算好发出去，Core **不许**把它当成
   「她最近做过什么」再喂回来——那会形成闭环（见 `core_bridge` 里 `life_log` 只认 `did`）。
+
+v1.28.4：
+- 多写一件事：`last_proactive_text` —— 最近一次主动开口的**原文**。
+  为什么需要它：主动消息走 `context.send_message`，不经过 AstrBot 的 respond 阶段，
+  Core 侧收不到任何事件（`after_message_sent` 只在 respond 阶段触发，接不到它）。
+  Core v2.28.4 起按这个字段把「她刚主动说了什么」补记进 `mood.spoke_log`，
+  并推进这个人的 `last_interaction`。
+- 只加不改：旧 Core 忽略这个字段；旧社交插件没有它时 Core 按「只知道她开过口」
+  降级，不会拿占位文本污染 `spoke_log`。
 """
 
 from __future__ import annotations
@@ -56,6 +65,9 @@ _IGNORED_BY_MAX = 500
 MAX_OPEN_ITEMS = 4
 # 单条字数上限。Core 侧还会再截，这里先截是为了别把这个每轮全量重写的文件写大。
 OPEN_ITEM_TEXT_MAX = 40
+# 主动消息原文的上限。Core 的 `mood.note_spoke()` 本来就只留 200 字，这里再大没有意义；
+# 这个文件每轮心跳全量重写，一条主动消息的原文不该让它持续变大。
+PROACTIVE_TEXT_MAX = 200
 # 允许的 kind。写死白名单而不是原样透传：Core 按 kind 分类渲染，一个拼错的 kind 会落进
 # 「不认识」的分支，症状是那条事项静默消失，而这边看起来一切正常。
 _OPEN_ITEM_KINDS = ("loop", "promise")
@@ -73,6 +85,8 @@ class SignalsWriter:
             "schema": 2,
             "last_proactive_at": 0.0,
             "last_target_uid": "",
+            # 主动消息的原文（v1.28.4）：Core 靠它把这句话补记进情绪账本。
+            "last_proactive_text": "",
             "ignored_streak": 0,
             # 她手上还开着的事（见 note_open_items）。默认写空列表而不是省略这个键：
             # 「没有开着的事」是一个**有意义的结论**，Core 靠它判断「这件事结了没有」。
@@ -128,6 +142,7 @@ class SignalsWriter:
             return {}
         slot = {"last_proactive_at": 0.0,
                 "last_target_uid": "",
+                "last_proactive_text": "",
                 "ignored_streak": 0,
                 "open_items": []}
         by_bid[key] = slot
@@ -146,6 +161,7 @@ class SignalsWriter:
         if self._roles > 1 and was <= 1:
             for key, empty in (("last_proactive_at", 0.0),
                                ("last_target_uid", ""),
+                               ("last_proactive_text", ""),
                                ("ignored_streak", 0),
                                ("open_items", [])):
                 if self._payload.get(key) != empty:
@@ -153,20 +169,31 @@ class SignalsWriter:
         self._dirty = True
 
     def note_proactive(self, target_uid: str, at: float | None = None,
-                       bid: str = "") -> None:
-        """一条主动消息真的发出去了。"""
+                       bid: str = "", text: str = "") -> None:
+        """一条主动消息真的发出去了。
+
+        `text` 是**真的发出去的那句原文**（v1.28.4）。Core 收不到任何主动消息事件，
+        只能靠这里把话带过去；缺了它，Core 只知道「她开过口」，不知道说了什么，
+        `spoke_log` 就补不上。
+
+        原文截到 `PROACTIVE_TEXT_MAX`：Core 那边 `note_spoke()` 也只留 200 字，
+        而这个信号文件每轮心跳全量重写，留着长文只会让每次心跳多写几 KB。
+        """
         try:
             when = float(self._time() if at is None else at)
         except (TypeError, ValueError):
             # at 是调用方传进来的值，坏值不该让「刚替她开过口」这件事整个丢掉
             when = float(self._time())
+        body = str(text or "")[:PROACTIVE_TEXT_MAX]
         slot = self._slot(bid)
         slot["last_proactive_at"] = when
         slot["last_target_uid"] = str(target_uid or "")
+        slot["last_proactive_text"] = body
         if getattr(self, "_roles", 1) <= 1:
             # 单 Bot：Core 只会把这一个角色的消息认成自己的，照旧写顶层
             self._payload["last_proactive_at"] = when
             self._payload["last_target_uid"] = str(target_uid or "")
+            self._payload["last_proactive_text"] = body
         self._dirty = True
         self.flush()
 

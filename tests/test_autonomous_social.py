@@ -3957,5 +3957,72 @@ class TestMemoryBridge(unittest.TestCase):
         self.assertIsNone(SocialEngine._memory_bridge(_E()))
 
 
+class SignalsProactiveTextTest(unittest.TestCase):
+    """v1.28.3：主动消息的原文也要发给 Core。
+
+    Core 的 `after_message_sent` 只在 respond 阶段触发，看不到
+    `context.send_message`；原文只能走这条信号桥。缺了它，Core 只知道她开过口，
+    不知道说了什么，`mood.spoke_log` 就补不上。
+    """
+
+    def _writer(self, tmp):
+        return SignalsWriter(os.path.join(tmp, "s.json"),
+                             time_source=lambda: 1_700_000_000.0)
+
+    def _read(self, tmp):
+        with open(os.path.join(tmp, "s.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_text_is_written_per_bot(self):
+        tmp = tempfile.mkdtemp()
+        w = self._writer(tmp)
+        w.set_role_count(2)
+        w.note_proactive("u1", 1_700_000_000.0, "A", text="刚下班，今天累死了")
+        data = self._read(tmp)
+        self.assertEqual(data["by_bid"]["A"]["last_proactive_text"],
+                         "刚下班，今天累死了")
+        self.assertEqual(data["last_proactive_text"], "",
+                         "多 Bot 时顶层不许写，否则每个角色都读到同一句话")
+
+    def test_single_bot_writes_toplevel(self):
+        tmp = tempfile.mkdtemp()
+        w = self._writer(tmp)
+        w.set_role_count(1)
+        w.note_proactive("u1", 1_700_000_000.0, "A", text="晚安")
+        data = self._read(tmp)
+        self.assertEqual(data["last_proactive_at"], 1_700_000_000.0)
+        self.assertEqual(data["last_target_uid"], "u1")
+        self.assertEqual(data["last_proactive_text"], "晚安")
+
+    def test_text_is_capped(self):
+        """原文不能把这个每轮心跳全量重写的文件撑大。"""
+        tmp = tempfile.mkdtemp()
+        w = self._writer(tmp)
+        w.note_proactive("u1", 1_700_000_000.0, "A", text="啊" * 500)
+        data = self._read(tmp)
+        self.assertLessEqual(len(data["by_bid"]["A"]["last_proactive_text"]), 200)
+
+    def test_missing_text_is_empty_not_stale(self):
+        """没传原文时写空串，不能把上一条的原文留在文件里。"""
+        tmp = tempfile.mkdtemp()
+        w = self._writer(tmp)
+        w.note_proactive("u1", 1_700_000_000.0, "A", text="上一句")
+        w.note_proactive("u1", 1_700_000_100.0, "A")
+        data = self._read(tmp)
+        self.assertEqual(data["by_bid"]["A"]["last_proactive_text"], "")
+
+    def test_role_count_change_clears_toplevel_text(self):
+        tmp = tempfile.mkdtemp()
+        w = self._writer(tmp)
+        w.set_role_count(1)
+        w.note_proactive("u1", 1_700_000_000.0, "A", text="单 Bot 时的原文")
+        w.set_role_count(2)
+        # `set_role_count` 只清内存并标脏，真正落盘要等下一轮心跳（`beat()` 强制重写）。
+        w.beat()
+        data = self._read(tmp)
+        self.assertEqual(data["last_proactive_text"], "",
+                         "切成多 Bot 后顶层旧原文还在，B 会读到 A 的话")
+
+
 if __name__ == "__main__":
     unittest.main()

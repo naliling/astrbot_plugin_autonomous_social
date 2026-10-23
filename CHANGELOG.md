@@ -1,5 +1,31 @@
 # 更新日志
 
+## v1.28.4 — 主动消息的原文，Core 终于看得到了
+
+配套 humanoid_core v2.28.4。用户原话：「那两个包里没用的功能都删掉 但是两个都要升级X.28.4」。
+
+Core 那版检查发现：2.28.1 用 `after_message_sent` 钩子接主动消息是**接错了**——那个钩子
+只在 AstrBot 的 respond 阶段末尾触发（`core/pipeline/respond/stage.py`），而主动消息走
+`context.send_message` → `platform.send_by_session`，根本不经过 respond 阶段。
+于是「Core 知道她主动说了什么」实际从未发生过。Core v2.28.4 已把那个钩子整块删除，
+主动消息改走这条信号桥。
+
+**修法（只加不改）**：`humanoid_signals.json` 多写一个 `last_proactive_text`。
+
+- `SignalsWriter.note_proactive(..., text=...)` 新增可选参数，取真正发出去的
+  `segments[0]`（`social/engine.py` 的发送成功路径）；
+- 按 `by_bid` 分片写；单 Bot 才写顶层（与 `last_proactive_at` / `last_target_uid`
+  同一口径，多 Bot 不串台）；
+- 原文截到 200 字：Core 的 `note_spoke()` 本来就只留 200 字，而这个文件每轮心跳
+  全量重写，留长文只会让每次心跳多写几 KB；
+- 没传原文时写空串，**不能**把上一条的原文留在文件里；
+- `set_role_count(1→2)` 时连同顶层原文一起清掉（否则 B 会读到 A 的话）；
+- schema 仍是 2：旧 Core 忽略这个字段；旧社交插件没有它时，Core 按「只知道她开过口、
+  不知道说了什么」降级。
+
+新增 `tests/test_autonomous_social.py::SignalsProactiveTextTest`（5 条：按 Bot 写、
+单 Bot 写顶层、截断、缺省清空、切多 Bot 清顶层）。
+
 ## v1.28.2 — LLM 熔断终于跨轮生效了
 
 用户原话：「帮我看一下我的 astrbot 是啥东西在循环调用 gemini」。

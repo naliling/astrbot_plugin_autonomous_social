@@ -4797,7 +4797,7 @@ class SocialEngine:
         bot = self.state.bot(bid)
         bot["last_global_send"] = sent_ts
         self.state.save()
-        self.signals.note_proactive(uid, sent_ts, bid)
+        self.signals.note_proactive(uid, sent_ts, bid, text=segments[0])
         if len(segments) > 1:
             self._schedule_burst(bid, uid, segments[1:], waits, sent_ts)
             veto_note = f"\n（按这个 Bot 的分段设置，稍后还会补 {len(segments) - 1} 条）"
