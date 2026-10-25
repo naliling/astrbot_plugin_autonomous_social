@@ -2413,6 +2413,26 @@ class MessageGenerator:
         Returns:
             provider 对象，失败返回 None
         """
+        # 专供模型（v1.28.5）：配了就走它，按顺序试到第一个能用的即止。
+        # **故意不退会话默认**：配了却拿不到，本轮就不发，等下一轮。
+        # 退回去等于「指定的就要管它」白写——弱模型写出来的主动消息比不发更糟。
+        # 也不重试：一次限流拖成整轮心跳卡住，更糟。
+        #
+        # 例外：这个 AstrBot 版本压根不支持按 ID 取 provider 时，
+        # `_get_designated_provider` 自己放过一条 warning 并返回 None——那时继续
+        # 按「配了但取不到」处理会让主动消息**全停**，而用户看不出为什么。
+        # 所以那种情况放行到下面的旧路径（跟着会话走）。
+        provider = await self._get_designated_provider()
+        if provider is not None:
+            return provider
+        if self._designated_configured() and self._can_resolve_by_id():
+            # 配了专供模型却一个都没拿到：本轮不发（见上面）。不打 warning——
+            # 心跳 15~120 分钟一轮，限流时每秒刷一行日志会把真问题埋掉。
+            logger.debug(
+                "[autonomous_social] 配了主动专用模型但一个都没取到，本轮不主动开口"
+            )
+            return None
+
         # 方式1: get_using_provider_async（常见 API）
         if hasattr(self.context, "get_using_provider_async"):
             try:
@@ -2451,6 +2471,68 @@ class MessageGenerator:
                 logger.warning(f"[autonomous_social] 取默认 LLM provider 失败: {e}")
                 return None
 
+        return None
+
+    def _designated_configured(self) -> bool:
+        """面板上配没配主动专用模型。"""
+        try:
+            return bool(getattr(self.cfg, "proactive_provider_ids", ()) or ())
+        except Exception:
+            return False
+
+    def _can_resolve_by_id(self) -> bool:
+        """这个 AstrBot 版本支不支持按 ID 取 provider。
+
+        不支持时不该按「配了但取不到」处理（那会让主动消息全停），
+        而是放行到旧路径——至少还能说话。warning 由
+        `_get_designated_provider` 出，这里只做判断。
+        """
+        if callable(getattr(self.context, "get_provider_by_id", None)):
+            return True
+        manager = getattr(self.context, "provider_manager", None)
+        return isinstance(getattr(manager, "inst_map", None), dict)
+
+    async def _get_designated_provider(self) -> Optional[Any]:
+        """按面板配的顺序取第一个能用的专供 provider。没配返回 None。
+
+        与 `_get_provider` 的三路回退分开：这里只认 `get_provider_by_id`
+        （按 ID 取，最直接）。那个方法在这个 AstrBot 版本上不存在时，
+        试 `provider_manager.inst_map`。
+
+        **两个能力都没有时返回 None 并留一条 warning**：那不是「配错了 ID」，
+        是这个 AstrBot 版本压根不支持按 ID 取 provider——继续按「配了但取不到」
+        处理会让主动消息**全停**，而用户从日志里看不出为什么。退回旧路径
+        （跟着会话走）至少还能说话。
+        """
+        if not self._designated_configured():
+            return None
+        getter = getattr(self.context, "get_provider_by_id", None)
+        inst_map = None
+        if not callable(getter):
+            manager = getattr(self.context, "provider_manager", None)
+            inst_map = getattr(manager, "inst_map", None) if manager is not None else None
+            if not isinstance(inst_map, dict):
+                logger.warning(
+                    "[autonomous_social] 这个 AstrBot 版本没有 get_provider_by_id / "
+                    "provider_manager.inst_map，无法按 ID 取主动专用模型；"
+                    "已退回跟着当前会话的模型走。要启用专用模型请升级 AstrBot。"
+                )
+                return None
+
+        for pid in getattr(self.cfg, "proactive_provider_ids", ()) or ():
+            try:
+                if callable(getter):
+                    provider = getter(pid)
+                else:
+                    provider = inst_map.get(pid)
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 取专供模型 {pid!r} 失败: {exc}")
+                continue
+            if provider is not None:
+                return provider
+            # 找不到不刷 warning：心跳一轮刷 N 行没有新信息，`_get_provider`
+            # 的调用方已经有「本轮不发」的日志了。真要看配没配对，
+            # `/自主社交状态` 会列出来（见 facade_status_text 旁边那条）。
         return None
 
     async def _call_llm(self, provider: Any, prompt: str) -> Optional[str]:

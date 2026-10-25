@@ -38,7 +38,23 @@ from .textutil import OUTSIDE_WORDS as _OUTSIDE_WORDS, outside_lead as _outside_
 from .textutil import is_quotable
 
 # 一个人身上同时挂着几条「还没用过的事」
-ANCHOR_MAX = 5
+#
+# v1.28.7：5 → `ANCHOR_MAX`（8）。
+#
+# 为什么必须抬：派生侧的产能早就超过它了。`_derive_from_state` + `derive_extras`
+# 现在能产出 **15 类以上**（dreams/recent/wake/doing/done×4/next×2/wants×2/
+# ongoing×5/said×2/feelings×2/body×2/节日/天气，v1.28.7 又加了 topics），
+# 而 `prepare_round_anchors` 里 `limit = min(limit, ANCHOR_MAX)`、`add_anchor`
+# 的池子也只装这么多——于是**第 6 条起当场被挤掉**，用户看到的就是
+# 「每次都是同样那几个话题」：不是没素材，是漏斗只容得下 5 条。
+#
+# 代价：`u["anchors"]` 数组变长（未用的最多 8 条 + 已用的避重记录）。
+# 一条记录约 120 字节，8 条 ≈ 1 KB/人；180 人规模下 state.json 多不到 200 KB，
+# 而它本来就已经按人存着 conversation/topics 这些重字段。
+#
+# **这不等于一轮发 8 条**：漏斗放宽只让「手上有什么」更完整，一轮说几件仍由
+# `ANCHOR_ROUND_PER_USER`（引擎侧，默认 2）与关系档最小间隔管着。
+ANCHOR_MAX = 8
 # 一条由头文本最多多长。**拼装与存储必须用同一个上限**：拼装处若把上限卡得比它小，
 # 句子末尾的模板（右引号、「后来呢」）会被切掉，产出一个未闭合的「引号
 # （`你上次说的「明天面试`）。所以片段各自量好自己的尺寸，模板拼完不再二次截断。
@@ -80,6 +96,25 @@ KIND_WEATHER = "weather"   # 天气：外头变了样（下雨/降温），一�
 # 派生时自然拿不到（不是错误，是「今天没梦可分享」）。用户原话：
 # 「白天/凌晨我觉得要加上梦境」——梦是她自己的生活里最像「分享」的一类。
 KIND_DREAM = "dream"
+# v1.28.5：刚刚发生的事够重。Core 2.29 起契约的 `event` 才给这个字段；旧版 Core 没有，
+# 派生时自然拿不到（不是错误，是「这会儿没有这样一件事」）。
+# 与梦同级（rank 2）：它和梦一样有时效——Core 那边保鲜期只有 30 分钟，
+# 被骂了一句却隔半天再说，那已经不是「刚刚」了。
+KIND_RECENT = "recent"
+# v1.28.6：她刚醒。Core 2.28 起契约的 `wake` 块给 `asleep/wake_at/inertia_minutes_left/
+# last_sleep_hours`。醒来那几分钟是真人最会发一句的时候（「刚醒」「睡到现在」），
+# 而原来派生全看「在做什么」，于是她刚睁眼却说「正在厨房煮饭」。
+# rank 与梦同级：它和梦一样只在那几分钟里成立。
+KIND_WAKE = "wake"
+# v1.28.6：体感。Core 契约的 body 轴一直在给 sleep_pressure/hunger/discomfort/
+# arousal/last_sleep_hours，而**从来没有一条由头用过它们**。真人主动开口里
+# 「困死了」「饿到胃疼」是很常见的一类，只要它是真的（跨过阈值才说）。
+KIND_BODY = "body"
+# v1.28.6：她正在做的下一件事。`day.next` 原来只取第一条拼「接下来是X」，
+# 而 Core 给的是**列表**（最多两条）。真人说「等下要去」比「接下来是要去」自然。
+# 单独一类而不是并进 KIND_DERIVED：它有时效（那件事开始之前），且措辞要避开
+# 「接下来是」这种报幕腔。
+KIND_PLAN = "plan"
 
 # ── 一条用过的由头是**怎么结束的** ──────────────────────────────
 #
@@ -105,6 +140,9 @@ RETIRED_CROSS = "cross_user"   # 这件事刚发给过别人，主动让位（dr
 TTL_SELF_EVENT = 2 * 3600.0
 TTL_DAY_PART = 3 * 3600.0
 TTL_PEER_EVENT = 24 * 3600.0
+# 最短的一档：**只在那几分钟里成立**的事（她刚醒）。见 KIND_WAKE。
+# 也是表外 kind 的兜底寿命（见 KIND_TTL_FALLBACK）。
+TTL_JUST_NOW = 1 * 3600.0
 
 _KIND_TTL = {
     KIND_DERIVED: TTL_SELF_EVENT,
@@ -114,6 +152,17 @@ _KIND_TTL = {
     KIND_HOLIDAY: TTL_DAY_PART,
     KIND_WEATHER: TTL_SELF_EVENT,
     KIND_DREAM: TTL_DAY_PART,
+    # 刚刚发生的事：比派生类短一档。Core 那边保鲜期只有 30 分钟，
+    # 而由头池自己还会再放一会儿（等一个合适的开口时机）——
+    # 但不该放到「明天再说」。2 小时和 KIND_DERIVED 同级。
+    KIND_RECENT: TTL_SELF_EVENT,
+    # 刚醒：只在那几分钟里成立。Core 的睡眠惯性默认几分钟，
+    # 给它 1 小时是「睡醒后那一阵子」，再长就是拿陈事当新事说。
+    KIND_WAKE: TTL_JUST_NOW,
+    # 体感：饿/困是会变的，但跨过阈值之后那几分钟里它是稳定的。
+    KIND_BODY: TTL_SELF_EVENT,
+    # 「等下要做X」：那件事开始之前有效。时段类同级。
+    KIND_PLAN: TTL_DAY_PART,
 }
 
 # 表外的 kind 用的兜底寿命。
@@ -122,10 +171,29 @@ _KIND_TTL = {
 # kind 在 `_KIND_TTL` 里全都有各自的值，它一次都不会生效——一个永不生效的数字比没有
 # 更误导人（照着它调参、照着它排障，都调不到、也排不出）。
 #
-# 取**最短**的那一档（她这边刚发生的事，2h）：忘了登记的 kind 不该悄悄多活 24 小时、
-# 白占着 ANCHOR_MAX 个位置。用例 `test_11_every_known_kind_has_a_ttl` 盯着「有无遗漏」，
+# 取**最短**的那一档（她这边刚发生的事，2h；她刚醒更短，1h）：忘了登记的 kind
+# 不该悄悄多活 24 小时、白占着 ANCHOR_MAX 个位置。用例
+# `test_11_every_known_kind_has_a_ttl` 盯着「有无遗漏」，
+# `test_11_fallback_is_the_shortest_bucket` 盯着「兜底不高于任何已知档」，
 # 这个兜底只是双保险。
-KIND_TTL_FALLBACK = TTL_SELF_EVENT
+KIND_TTL_FALLBACK = TTL_JUST_NOW
+
+# 「这个布尔字段算真吗」的词表。与 `desire.truthy` / Core 的 `_as_bool` 同一套口径：
+# Core 的布尔字段可能是字符串（配置面板、手改 state.json、老版本迁移都能写出来），
+# 而 `bool("false")` 是 True。这里不 import desire（那边 import 本模块，会成环），
+# 所以留一份**同样的**词表；改词表时两处一起改。
+_TRUTHY_WORDS = frozenset({
+    "1", "true", "yes", "y", "on", "t", "是", "真", "开", "开着的", "睡", "睡着",
+})
+
+# 「刚醒」这条由头认为 `wake_at` 还算新的窗口。Core 的 `wake_at` 是 epoch、
+# 跨天不清（回退到 `last_wake_at`，后者可能是很久以前那次醒），所以必须判新鲜度——
+# 否则三天前醒的觉也能派生出「刚睡醒」，一句假话。
+# 2 小时而不是 1 小时：与 KIND_WAKE 的 TTL 对齐，窗口内她随时可能找到开口的时机。
+WAKE_FRESH_SECONDS = 2 * 3600.0
+# `wake_at` 比 now 还大多少算「时钟不一致」而不是「还没醒」。两边跑在同一台机器上，
+# 但 state.json 可能被手改、也可能 Core 换了时区。容忍 10 分钟，超过就当读不出来。
+WAKE_CLOCK_SKEW_SECONDS = 600.0
 
 # 每一个已知 kind 都必须在这里有一档。漏了的话 `live_anchors` 的
 # `KIND_RANK.get(kind, 9)` 会把它当成最低优先级——`KIND_GREET` 就漏过一次，
@@ -137,10 +205,19 @@ KIND_RANK = {
     KIND_CUE: 1,
     # 梦排在第二档：刚醒那阵子最想说的就是它，比「今天想去」更具体、更有画面。
     KIND_DREAM: 2,
+    # 刚刚发生的事与梦同级：它和梦一样有时效，而且是她心里正过着一件事。
+    KIND_RECENT: 2,
+    # 刚醒与梦同级：醒来头几分钟最想说话，而且只在那几分钟里成立。
+    KIND_WAKE: 2,
     KIND_HOLIDAY: 3,
     KIND_MISS: 4,
     KIND_GREET: 5,
     KIND_DERIVED: 6,
+    # 体感排在派生类之后、天气之前：它是真的（跨阈值才说），但
+    # 「困死了」比「我刚从健身房回来」更像随口一句，不该抢在那类前面。
+    KIND_BODY: 6,
+    # 「等下要做X」与派生类同级：都是她自己的生活，只是时间朝向不同。
+    KIND_PLAN: 6,
     KIND_WEATHER: 7,
 }
 
@@ -234,7 +311,10 @@ TIER_MIN_GAP_MINUTES = {TIER_HIGH: 20, TIER_MID: 60, TIER_LOW: 720}
 # `picked.append` 到 12，而每加一条都可能把池子里最不急的那条挤掉，于是 `picked`
 # 里留下**池子里已经没有的**悬空记录，`consume` / `mark_failed` 全都找不到它。
 # 现在三档都在池子容量之内，高的那档就等于满池。
-TIER_POOL_MAX = {TIER_HIGH: 5, TIER_MID: 4, TIER_LOW: 3}
+#
+# v1.28.7：跟着 ANCHOR_MAX 5→8 一起抬（8/6/4）。**高档拿满**：她常聊的那个人
+# 本来就该有最多的事可讲。比例仍是 2:1.5:1，没有变得更陡。
+TIER_POOL_MAX = {TIER_HIGH: 8, TIER_MID: 6, TIER_LOW: 4}
 
 # 涨幅：关系从起点长出来多少才算「真的在升温」
 # 绝对好感低于这个值，且没涨过 → 封在中档以下
@@ -381,7 +461,6 @@ def prune_anchors(u: Dict[str, Any], now: float) -> None:
 # 淘汰都让避重整体失效，同一件事又能被重新派生一遍（「23 条沙发追剧」的成因）。
 _ANCHOR_USED_KEY = "anchor_used"
 _ANCHOR_USED_KEEP = 64
-
 
 def _used_log(u: Dict[str, Any]) -> List[Dict[str, Any]]:
     log = u.get(_ANCHOR_USED_KEY)
@@ -626,6 +705,33 @@ def _derive_from_state(
             offer(f"梦到{_short(text, 16)}", KIND_DREAM)
             break
 
+    # ①-recent 刚刚发生的事够重（v1.28.5，Core 2.29 起契约的 `event`）。
+    #
+    # 她被夸了/被骂了/被敷衍了——这是唯一一种「她自己心里正过着一件事」的由头。
+    # 原来的派生全看她**在做什么**（梦、doing、done、next、wants、ongoing），
+    # 于是她被骂了一句之后主动找你，说的还是天气和节日。
+    #
+    # 排在梦之后、doing 之前：它和梦一样有时效（Core 那边保鲜期 30 分钟），
+    # 池子满 3 条时排在后面的候选根本进不去。
+    #
+    # **不当成「她做了什么」说**：由头是给模型的开场素材，这里只递那句话本身，
+    # 要不要提、怎么提由它定。旧版 Core 没有这个字段 → 空 dict，什么都不做。
+    event = body.get("event")
+    if isinstance(event, dict):
+        phrase = _short(event.get("phrase"), ANCHOR_TEXT_MAX)
+        if phrase:
+            offer(phrase, KIND_RECENT)
+
+    # ①-recent-wake 她刚醒（v1.28.6，Core 2.28 起契约的 `wake` 块）。
+    #
+    # 原来派生只看「在做什么」，于是她刚睁眼说的还是「正在厨房煮饭」——日程
+    # 还没翻到那一段。醒来头几分钟是真人最会发一句的时候，而 `wake` 块
+    # 从 2.28 起就在契约里，从没人读过。
+    # 排在 recent 之后、doing 之前：它和梦一样只在那几分钟里成立。
+    _wake = _wake_cue(body, now)
+    if _wake:
+        offer(_wake, KIND_WAKE)
+
     doing = _short(day.get("doing") or activity.get("schedule_event"), 12)
     # 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「正在忙手里的活」等于没说，
     # 而模型拿到这种由头只会顺着编一句更空的。真实记录里这类由头出现过 11 次
@@ -639,23 +745,31 @@ def _derive_from_state(
         offer(f"正在{doing}" if not doing.startswith("在") else doing)
 
     # 「刚做完」：`day.done` 本身已经带「下午/傍晚」这类时间词，直接说就是一件具体
-    # 的事，不用再套模板（套了反而会得到「刚忙完下午在门诊接待」）。最多取 2 条；
+    # 的事，不用再套模板（套了反而会得到「刚忙完下午在门诊接待」）。
+    #
+    # v1.28.7：2 → `DONE_MAX`（4）条。Core 的 `day_phrases(past_limit=3)` 给的是
+    # **最近 210 分钟内**刚做完的三件，我们原来只取前两条——第三件白丢。
+    # 取 4 是为了给旧状态/别的写方留一条余量（它们可能给得更多），
+    # 真正起作用的仍是 Core 那三件。这不是放宽口径，是把已经拿到的事实用上。
     # 「才醒」是说状态不是做事，和 vague doing 一样滤掉。
     done = day.get("done")
     if isinstance(done, list):
-        for item in done[:2]:
-            if item is None or isinstance(item, (dict, list, tuple, set)):
+        for item in done[:DONE_MAX]:
+            # **只认字符串**。契约是外部输入：`3`、`True`、`3.5` 这些非字符串
+            # 会被 `_s` 翻成 "3" / "True" / "3.5"，变成一条由头——
+            # 而「她刚做完 3」不是人话。None / dict / list 由下面那道 isinstance 挡，
+            # 数字与布尔走这里。
+            if not isinstance(item, str):
                 continue                      # 脏数据（契约是外部输入）
-            text = _s(item).strip()
+            text = item.strip()
             if not text or "才醒" in text or is_vague_doing(text):
                 continue
             offer(text)
 
-    nxt = day.get("next")
-    if isinstance(nxt, list) and nxt:
-        first = _short(nxt[0], 12)
-        if first and not is_vague_doing(first):
-            offer(f"接下来是{first}")
+    # 「接下来」：`day.next` 是**列表**（Core 给最多两条），原来只用第一条，
+    # 白丢了一条。v1.28.6 起两条都给，各自一条由头（KIND_PLAN）。
+    for item in _plan_cues(body):
+        offer(f"接下来是{item}", KIND_PLAN)
 
     # 天气**不在这里**（v1.28.0）。
     #
@@ -727,6 +841,25 @@ def _derive_from_state(
     # 空列表 —— 整条由头派生路径静默死掉（实测 222 次调用 0 产出）。
     if _is_idle(body):
         offer("今天挺空的")
+
+    # ④ 此刻的体感（v1.28.6）：饿 / 困 / 不舒服 / 欠觉。
+    #
+    # Core 契约的 body 轴从 v1 起就在给 sleep_pressure / hunger / discomfort /
+    # sleep_debt，而**从来没有一条由头用过它们**。真人主动开口里「困死了」
+    # 「饿到胃疼」是很常见的一类，只要它是真的。
+    # 阈值见 `_body_cue`：低于阈值不提，否则就是拿读数当台词。
+    for text in _body_cue(body):
+        offer(text, KIND_BODY)
+
+    # ⑤ 她此刻正想着的那件事（Core 的 feelings 里已经排过显著度）。
+    #
+    # 契约的 `feelings` 是 `[str]`（`link.build_contract` 按显著度取前三条），
+    # 正是「她这会儿心里最响的三句话」。原来只有 `_is_idle` 读它、而且只为了
+    # 判「今天挺空的」——其余两句（「今天到这会」「手上正在做」这类）被丢掉。
+    # 这里把**不是**活动描述、也不空话的那几条当由头：它们比天气具体，
+    # 且是 Core 自己挑出来的，不是我们编的。
+    for text in _feeling_cues(body):
+        offer(text, KIND_DERIVED)
 
     seen = _talk_ts(u, last_talk)
     if seen and now > seen:
@@ -918,6 +1051,11 @@ def _ongoing_tasks(body: Dict[str, Any]) -> List[str]:
 
     接不到就返回空——那是没装 Core 或者她今天确实没有跨天的事，
     两种都不该编一个出来。
+
+    v1.28.7：3 → `ONGOING_MAX`（5）条。Core 契约的 `ongoing` 是自己截到 3 的
+    （`link.build_contract` 里 `[:3]`），所以这里多取两条在**当前** Core 下是
+    空转；但它是**写方可能给更多**的那类字段（`ongoing_tasks` 是另一个键名，
+    形状也不同），上限放宽不改变当前行为，只为对面的升级留出空间。
     """
     out: List[str] = []
     for holder in (body or {}).get("ongoing"), (body or {}).get("ongoing_tasks"):
@@ -927,7 +1065,183 @@ def _ongoing_tasks(body: Dict[str, Any]) -> List[str]:
                           (item or {}).get("what", "") if isinstance(item, dict) else "").strip()
                 if text:
                     out.append(text)
-    return out[:3]
+    return out[:ONGOING_MAX]
+
+
+# v1.28.7：两条来源的取用上限。**都不是放宽口径**，是把已经拿到的事实用上：
+# * `DONE_MAX`：Core 的 `day_phrases(past_limit=3)` 本来就按「最近 210 分钟内」
+#   给三件，我们原来只取前两条；取 4 是给别的写方留一条余量。
+# * `ONGOING_MAX`：Core 契约自己截到 3（`link.build_contract` 的 `[:3]`），
+#   这里放宽在当前 Core 下是空转，只为对面升级留空间。
+DONE_MAX = 4
+ONGOING_MAX = 5
+
+
+# ── 刚醒 / 体感 / 待办（v1.28.6）────────────────────────────────
+#
+# 三类新的由头来源，全部读 Core 契约里**早就给了**、却从来没人当由头用的字段：
+#
+# * `wake`（2.28 起）：醒来状态。原来派生只看「在做什么」，于是她刚睁眼
+#   说的还是「正在厨房煮饭」——日程还没翻页。
+# * `body` 轴（sleep_pressure / hunger / discomfort / arousal / last_sleep_hours，
+#   v1 契约起就有）：真人主动开口里「困死了」「饿到胃疼」是很常见的一类。
+# * `day.next`（v1 契约起就是列表）：原来只取第一条，白丢了一条。
+#
+# **每一条都必须跨阈值**才说，否则就是拿读数当台词——那是「状态播报」，
+# 不是「想说什么」。阈值写在各自的注释里。
+
+
+def _wake_block_of(body: Dict[str, Any]) -> Dict[str, Any]:
+    """从身体视图里取 `wake` 块。
+
+    `core_bridge._build_self_view` 把它放在 `day.wake`（与 dreams/event 同级的
+    「今天」块），而契约原文里它在**顶层**（与 ongoing/wants 同级）。两处都认：
+    上层调用点传过来的可能是桥接后的视图、也可能是契约原文。
+    """
+    body = body if isinstance(body, dict) else {}
+    top = body.get("wake")
+    if isinstance(top, dict):
+        return top
+    day = body.get("day")
+    if isinstance(day, dict):
+        inner = day.get("wake")
+        if isinstance(inner, dict):
+            return inner
+    return {}
+
+
+def _wake_cue(body: Dict[str, Any], now: Optional[float] = None) -> str:
+    """她刚醒：一句关于「睡醒」的由头。没醒/不新鲜就空串。
+
+    只认 Core 2.28 起的 `wake` 块（`asleep` 为假且 `wake_at` 有值）。
+    拿不到（旧 Core）返回空——不编。
+
+    **`wake_at` 必须够新**：它是 epoch，Core 那边跨天不清（`wake_at` 回退到
+    `last_wake_at`，而后者可以是很久以前那次醒）。不看新鲜度的话，她三天前醒的
+    觉也能派生出「刚睡醒」——一句假话。窗口取 `WAKE_FRESH_SECONDS`。
+
+    `asleep` 用**解析**而不是真值判断：Core 的布尔字段可能是字符串
+    （配置面板/手改 state.json），而 `bool("false")` 是 True——那会把她
+    正在睡当成醒着，反过来多出一条由头。词表与 `desire.truthy` 同一套
+    （这里不 import desire：那边会 import 本模块，成环）。
+    """
+    wake = _wake_block_of(body)
+    if not wake:
+        return ""
+    if _s(wake.get("asleep")).strip().lower() in _TRUTHY_WORDS:
+        return ""
+    wake_at = _finite(wake.get("wake_at"))
+    if wake_at is None or wake_at <= 0:
+        return ""
+    if now is not None:
+        # 拿不到 now 时不判新鲜度（调用方明确说「只问形状」），由 KIND_WAKE 的
+        # 1 小时 TTL 兜着。
+        age = float(now) - wake_at
+        if age < -WAKE_CLOCK_SKEW_SECONDS or age > WAKE_FRESH_SECONDS:
+            return ""
+    hours = _finite(wake.get("last_sleep_hours"))
+    # 睡够了才值得说「睡到自然醒」；没睡够那句是抱怨，归体感那条。
+    if hours is not None and hours >= 7.0:
+        return "刚睡醒，睡了挺久"
+    if hours is not None and hours > 0:
+        return f"刚醒，才睡{int(hours)}小时"
+    return "刚醒"
+
+
+def _body_cue(body: Dict[str, Any]) -> List[str]:
+    """此刻的体感：饿 / 困 / 不舒服。跨阈值才给，最多两条。
+
+    阈值取 Core 自己的量纲（0~100）：
+    * hunger ≥ 70   —— Core 的 soma 里 70 以上才会驱动「去找吃的」；
+    * sleep_pressure ≥ 75 —— 与 `CHANGE_TRIGGER_SLEEP_PRESSURE` 同档；
+    * discomfort ≥ 60 —— 明显不适（Core 的不适项也在 60 以上才显著）。
+    低于阈值的一律不提：拿「有点饿」当主动消息的开场，读起来像状态播报。
+    """
+    out: List[str] = []
+
+    def offer(text: str) -> None:
+        if text and text not in out:
+            out.append(text)
+
+    def val(key: str) -> Optional[float]:
+        return _finite((body or {}).get(key))
+
+    hunger = val("hunger")
+    if hunger is not None and hunger >= 70.0:
+        offer("饿得有点受不了")
+    pressure = val("sleep_pressure")
+    if pressure is not None and pressure >= 75.0:
+        offer("困得睁不开眼")
+    discomfort = val("discomfort")
+    if discomfort is not None and discomfort >= 60.0:
+        offer("身上不太得劲")
+    # 睡得太少也是一个具体的事实（Core 一直在算 sleep_debt / last_sleep_hours）
+    debt = val("sleep_debt")
+    if debt is not None and debt >= 6.0:
+        offer("欠了一屁股觉")
+    return out[:2]
+
+
+def _plan_cues(body: Dict[str, Any]) -> List[str]:
+    """接下来要做的事：`day.next` 是列表（Core 给最多两条），原来只用第一条。
+
+    **扫过的窗口比取回的多一倍**（`[:4]` 里挑 `[:2]`）：Core 的 `day_phrases`
+    未来向只给 2 条，但它写进来的可能是「才醒」这类状态词、或「忙自己的事」
+    这种空话——前两条全是废话时，不该就此没有待办可说。
+    """
+    day = (body or {}).get("day") if isinstance((body or {}).get("day"), dict) else {}
+    nxt = day.get("next")
+    if not isinstance(nxt, list):
+        return []
+    out: List[str] = []
+    for item in nxt[:4]:
+        text = _s(item).strip()
+        if not text or "才醒" in text or is_vague_doing(text):
+            continue
+        out.append(_short(text, 12))
+        if len(out) >= 2:
+            break
+    return out
+
+
+# feelings 里**不能**当由头的那类：它们跟「正在做什么」说的是同一件事，
+# 再由一次就是「正在在厨房煮饭」这种重复；以及 Core 的措辞里那些
+# 不带信息的语气（「还行」「就那样」）。
+_FEELING_SKIP = ("手上正在做", "今天到这会", "等下", "接下来", "待会")
+
+
+def _feeling_cues(body: Dict[str, Any]) -> List[str]:
+    """Core 自己挑出来的「她这会儿心里最响的几句话」里，能当由头的那几句。
+
+    契约的 `feelings` 是 `[str]`（`link.build_contract` 按显著度排序取前三条）。
+    形状有三种（见 `_is_idle` 的说明），这里都认。
+
+    **只取与 doing/done/next 不重复的**：那三处已经各有一条由头了，
+    再从 feelings 拿一句「手上正在做X」是同一件事说两遍。
+    """
+    feelings = (body or {}).get("feelings")
+    raw: List[str] = []
+    if isinstance(feelings, list):
+        for item in feelings:
+            if isinstance(item, str):
+                raw.append(item)
+            elif isinstance(item, dict):
+                raw.append(str(item.get("text", "") or ""))
+    out: List[str] = []
+    for text in raw:
+        t = _s(text).strip()
+        if not t or len(t) > 16:
+            continue
+        if any(s in t for s in _FEELING_SKIP):
+            continue
+        # feelings 是**体感/念头**，不是要做的事：「想去书店」那类归 wants，
+        # 别在这儿再说一遍。
+        if t.startswith(("想去", "要去", "打算去")):
+            continue
+        out.append(t)
+        if len(out) >= 2:
+            break
+    return out
 
 
 # 「她做过的事」当由头的那条派生**已删除**（v1.27.39）：Core 的账本没有 `kind`
@@ -999,6 +1313,22 @@ def prepare_round_anchors(
             u, affection, now, used, last_talk=last_talk, missing_floor=missing_floor
         )
         kind = KIND_MISS
+        # v1.28.7：关系向里再补一类——「TA 上次说的那个X，后来呢」。素材是
+        # `u["topics"]`（每人一套，天然不撞车），比「有点想你了」具体得多。
+        #
+        # **它有自己的额度**（`TOPIC_QUOTA`），不是「剩几个补几个」：
+        # `derive_relations` 常常正好返回两条（想念 + 搭话），按剩余额度算的话
+        # 话题由头一次都排不上——而它恰恰是最具体的那一类。所以只要关系向
+        # 没占满整个池子，就按额度补；补满额度或池子满即停。
+        #
+        # 顺序在关系向之后：牵挂/续聊/想念是更近的事，话题由头是「翻旧账」。
+        if len(candidates) < limit:
+            for line in derive_topic_relations(
+                u, now, used, limit=TOPIC_QUOTA, last_talk=last_talk
+            ):
+                if len(candidates) >= limit:
+                    break
+                candidates.append(line)
         # 手上真没有新事发生 —— 真人这时候会随口说一句，不至于硬找个话题。
         # 「你有多久没理我了」本身就是理由。
         if not candidates:
@@ -1154,6 +1484,103 @@ def _quotable(seg: str) -> bool:
     return is_quotable(seg)
 
 
+# 话题由头（v1.28.7）：TA 聊过的、还值得回头问一句的具体事。
+#
+# ## 为什么是 `u["topics"]` 而不是接着挖 `conversation`
+#
+# `derive_relations` 的「续聊」只扫 `conversation[-8:]`——最近八条。八条以前聊过的
+# 事（养了三个月的花、在追的那部剧、报了名的考试）就再也够不着了。而 `topics`
+# 是**每条消息都在攒**的关键词表（每人 8 个，见 `state._extract_topics`），
+# 且它**每人一套**——Core 的日程是角色级的，同一句「刚忙完个案笔记」发给 12 个人
+# 要靠跨用户护栏去拦；「你上次说的那个塞尔达」对每个人都是独一份，天然不撞车。
+#
+# 这是由头里唯一一个「加法」来源：别的都在做减法（太像就不发），它在做加法。
+#
+# ## 三道闸，缺一不可
+#
+# 1. **`is_quotable`**：`topics` 里混过「好的」「哈哈」和框架注入块
+#    （`〔她的身体与生活 v10〕`，见 `state._sanitize_once`）。捧一句
+#    「你上次说的「好的」后来呢」回去，是整条消息里最假的地方。
+# 2. **够新**：`topics` 本身不带时间戳（它是关键词表，不是事件流），所以拿
+#    **这条话题最后一次出现的时间**当新旧的代理——由 `_TOPIC_FRESH_SECONDS`
+#    （21 天）卡。**没有时间戳的旧状态一律当过期**：升级后头几天话题由头会少
+#    一些，下一条消息带过时间戳就有了。宁可少几天，不要把陈年话题当新事问。
+# 3. **不与已问过的重复**：`used`（`_remembered` + 本轮 picked）已经挡掉大多数，
+#    这里再按「最后一次出现」排一次序，让最新的先说。
+_TOPIC_FRESH_SECONDS = 21 * 86400.0
+# 关系向由头里，话题类最多占几条。
+#
+# 为什么是额度而不是「剩几个补几个」：`derive_relations` 常常正好返回两条
+# （想念 + 搭话），按剩余额度算的话话题由头一次都排不上——而它恰恰是
+# 最具体的那类（「你上次说的那个塞尔达」比「有点想你了」信息量大得多）。
+# 给 2 而不是更多：话题由头是「翻旧账」，一轮里翻两本就够了。
+TOPIC_QUOTA = 2
+
+
+def _topic_candidates(u: Dict[str, Any], now: float) -> List[str]:
+    """TA 聊过的具体话题，按「最后一次出现」从新到旧。
+
+    **超过 `_TOPIC_FRESH_SECONDS` 没再提起的话题直接丢掉**：那是旧账，
+    拿它问「后来呢」像在翻三个月的聊天记录。没有时间戳的（旧状态）当 0，
+    于是也被这道闸挡掉——宁可少一条，不要把陈年话题当新事问。
+    """
+    topics = u.get("topics") if isinstance(u, dict) else None
+    if not isinstance(topics, list):
+        return []
+    seen = u.get("topic_seen_at") if isinstance(u.get("topic_seen_at"), dict) else {}
+    out: List[Tuple[float, str]] = []
+    for raw in topics:
+        text = _s(raw).strip()
+        if not text or not is_quotable(text):
+            continue
+        try:
+            at = _finite(seen.get(text)) or 0.0
+        except (TypeError, ValueError, AttributeError):
+            at = 0.0
+        if at <= 0 or now - at > _TOPIC_FRESH_SECONDS:
+            continue
+        out.append((at, text))
+    out.sort(key=lambda item: -item[0])
+    return [text for _at, text in out]
+
+
+def derive_topic_relations(
+    u: Dict[str, Any],
+    now: float,
+    taken: set,
+    *,
+    limit: int = 2,
+    last_talk: Optional[float] = None,
+) -> List[str]:
+    """派「TA 上次说的那个X」——素材是 `u["topics"]`（v1.28.7）。"""
+    out: List[str] = []
+    seen = _talk_ts(u, last_talk)
+    # **没有来往记录就不派**：`_talk_ts` 读不到时返回 0，而 `now - 0` 是个巨大的
+    # 正数——看着像「好久没理你了」，其实是「这个人压根没聊过」。拿它当由头
+    # 等于对一个从没说过话的人翻旧账。播种名单上那些人正是这个形状。
+    if seen <= 0:
+        return []
+    since = now - seen
+    # 刚聊过不提：上一句还在说这件事，立刻回头问「后来呢」是打断不是惦记。
+    if since < 2 * 3600.0:
+        return []
+    # `limit <= 0` 表示调用方这次一条都不要（例如关系向已经占满整个池子）。
+    # 这里必须先判再取：原来写在 append 之后的 break 会先塞一条再停，
+    # 于是 limit=0 也返回一条。
+    want = int(limit)
+    if want <= 0:
+        return []
+    for text in _topic_candidates(u, now)[:4]:
+        line = f"你上次说的「{_short(text, 12)}」后来呢"
+        if line in taken:
+            continue
+        taken.add(line)
+        out.append(line)
+        if len(out) >= want:
+            break
+    return out
+
+
 def derive_relations(
     u: Dict[str, Any],
     affection: Optional[float],
@@ -1247,11 +1674,70 @@ def derive_relations(
 # 真人「没事干问候一句，看你回不回」是常态：他不需要一个由头，**安静本身**就是理由。
 # 以前问候硬绑早/午/晚三个日历窗口，一天最多三次，还必须从固定句池抽一句——
 # 池子不消耗，于是某一晚连着 23 条全是同一件事。
+#
+# v1.28.7：三档 → 七档，且**按关系档位换措辞**。
+#
+# 原来只有 6h/3h/90min 三档，每档一辈子只说一次（用完进 7 天冷却）。三档用完
+# 之后，这个人当天、这周就再也没有「没事干」的开口理由了——用户看到的
+# 「私聊发送没看到几个」有一部分就是这个：不是不想说，是无话可说。
+#
+# 加档不等于多说话：门槛由 `_min_gap_left`（高档 20 分钟 / 中档 1 小时 / 低档
+# 12 小时）与 `miss_daily_cap` 管着，这里只是**把已经等了那么久这件事变成一句
+# 可说出口的话**。七档各自的措辞见 `_NAG_BY_GAP`。
 _NAG_BY_GAP = (
+    (7 * 86400.0, "都好几天没你的消息了"),
+    (24 * 3600.0, "昨天之后就没顾上跟你说话"),
+    (12 * 3600.0, "大半天没动静了"),
     (6 * 3600.0, "你好久没理我了"),
     (3 * 3600.0, "好半天没动静了，你还在吗"),
-    (90 * 60.0, "刚才怎么没声了"),
+    (60 * 60.0, "有个把小时没跟你说话了"),
+    (25 * 60.0, "刚才怎么没声了"),
 )
+
+# 按关系档位换措辞：对熟人可以说「想你了」，对半生不熟的人说这句很怪。
+#
+# **三张表各自独立，互不共用句子**：共用的话分组就白做了——`tier` 传空串时
+# 走通用档，共用句子意味着「算不出档位」和「算出是熟人」会说出同一句，
+# 而这两件事本该给出不同的观感。
+# 长档（好几天）三种关系都成立，所以三张表都覆盖到 7 天；低档只有两档，
+# 因为 `TIER_MIN_GAP_MINUTES[LOW] = 720` 分钟——它压根等不到 6 小时以下。
+#
+# 分组的作用是把「同一句话发给所有人」拆开——与跨用户撞车护栏是两个方向：
+# 护栏是发之后拦，这是发之前就不生成同一句。
+_NAG_BY_TIER = {
+    TIER_HIGH: (
+        (7 * 86400.0, "好几天没跟你好好说话了"),
+        (24 * 3600.0, "一天没跟你说话了，有点想找你"),
+        (12 * 3600.0, "大半天没你消息，怪不习惯"),
+        (6 * 3600.0, "好几个小时没你消息，想你了"),
+        (3 * 3600.0, "隔了会儿没说话，忽然想找你"),
+        (60 * 60.0, "有个把小时没找你说话了"),
+        (25 * 60.0, "怎么忽然没声了"),
+    ),
+    TIER_MID: (
+        (7 * 86400.0, "都好几天没你的消息了"),
+        (24 * 3600.0, "昨天之后就没顾上跟你说话"),
+        (12 * 3600.0, "大半天没动静了，你还忙吗"),
+        (6 * 3600.0, "一整个下午没你消息"),
+        (3 * 3600.0, "几小时没说话，还顺利吗"),
+        (60 * 60.0, "有一个钟头没说话了"),
+        (25 * 60.0, "刚那会儿怎么没声了"),
+    ),
+    TIER_LOW: (
+        (7 * 86400.0, "好久不见，你最近怎么样"),
+        (24 * 3600.0, "一天没消息了，近来可好"),
+    ),
+}
+
+# 通用档与三张分档表**刻意共用长档那几句**（7 天 / 24 小时）。理由：
+# 那两句对三种关系都成立，分组是为了把「想你了」这类亲昵话拆开，
+# 不是为了把每一句都改写一遍——硬改写只会得到「好久没你的音讯了」
+# 这种不像人话的句子。
+#
+# 所以唯一性检查只覆盖**中短档**（24 小时以下）：那才是关系差异真正显出来
+# 的地方。共用的清单写在这里，测试按它断言——不写的话，下次有人给
+# 通用档加一句短档措辞，分组就悄悄失效了。
+_NAG_SHARED_LONG_TIERS = ("都好几天没你的消息了", "昨天之后就没顾上跟你说话")
 
 # 「没事也想搭一句话」的开场白。与 `_NAG_BY_GAP` 的区别：那些是抱怨（你不理我），
 # 这些是**中性搭话**（在干嘛呢）。用过的会进由头冷却，不会天天同一句。
@@ -1264,13 +1750,19 @@ _CASUAL_OPENERS = (
 
 def derive_nag(u: Dict[str, Any], now: float, taken: set, *, tier: str = "",
                last_talk: Optional[float] = None) -> List[str]:
-    """安静了一阵子 → 随口问一句。分档只是为了换措辞。"""
+    """安静了一阵子 → 随口问一句。
+
+    v1.28.7：按关系档位取措辞（`_NAG_BY_TIER`），取不到才退回通用档
+    （`_NAG_BY_GAP`）。tier 传空串（调用方算不出档位）时直接走通用档——
+    那是「不知道她跟这个人多熟」，用最中性的一句最安全。
+    """
     seen = _talk_ts(u, last_talk)
     if seen <= 0:
         return []
     gap = max(0.0, now - seen)
     out: List[str] = []
-    for need, text in _NAG_BY_GAP:
+    rows = _NAG_BY_TIER.get(str(tier or "")) or _NAG_BY_GAP
+    for need, text in rows:
         if gap >= need and text not in taken:
             taken.add(text)
             out.append(text)
@@ -1294,6 +1786,10 @@ _REASON_BY_KIND = {
     KIND_DREAM: "她昨晚做了个梦",
     KIND_HOLIDAY: "今天是个节日",
     KIND_WEATHER: "外头的天气变了样",
+    KIND_RECENT: "你刚刚经历了这件事",
+    KIND_WAKE: "你刚醒过来",
+    KIND_BODY: "你此刻的身体感觉",
+    KIND_PLAN: "你接下来要做的事",
 }
 
 # 「这条由头是怎么结束的」给人看的话。原来是三种去向三种记法（`used_at`、

@@ -299,6 +299,12 @@ class SocialState:
             "reply_samples": 0,
             # v2: 提取的话题
             "topics": [],
+            # v1.28.7: 每个话题最后一次被提到的时刻。`topics` 从这一版起还是
+            # **由头来源**（`anchors.derive_topic_relations` 拿它问「你上次说的
+            # 那个X，后来呢」），由头有时效而关键词表本身不带时间戳——
+            # 没有这个字段就分不清「上周聊的」和「去年聊的」。
+            # 旧状态没有这个键：由头派生按「不知道多久前」处理，不丢由头。
+            "topic_seen_at": {},
             # v2: 最近消息类型（反重复）
             "recent_msg_types": [],
             # 主动消息 7 天日志：只记自己主动发出的那几条（{ts, text, cat}），
@@ -803,6 +809,21 @@ class SocialState:
                     if item not in a:
                         a.append(item)
                 target[f] = a
+        # `topic_seen_at`（话题 → 最后一次出现）：合并取**较晚**的那个。
+        # 取并集的话，同一个话题会留两份时间戳，而它回答的是「最后一次」——
+        # 取早的那个等于把重新聊过的话题判成旧的。与 `no_reply_streak` 取小、
+        # `urge` 取高是同一条原则：合并要按这个字段**自己的语义**取边。
+        seen_a, seen_b = target.get("topic_seen_at"), other.get("topic_seen_at")
+        if isinstance(seen_a, dict) or isinstance(seen_b, dict):
+            merged = dict(seen_a) if isinstance(seen_a, dict) else {}
+            if isinstance(seen_b, dict):
+                for key, val in seen_b.items():
+                    try:
+                        if float(val or 0) > float(merged.get(key, 0) or 0):
+                            merged[key] = val
+                    except (TypeError, ValueError):
+                        merged[key] = val
+            target["topic_seen_at"] = merged
         # conversation / proactive_log 合并后要按时间重排：`threads` / `recent_exchange`
         # 靠 `reversed(conversation)` 取「最近一句」，不重排会取到更早的那条。
         for f in ("conversation", "proactive_log"):
@@ -1379,7 +1400,7 @@ class SocialState:
 
         # 提取话题（store_text 关闭时不提取，避免落盘派生关键词）
         if store_text:
-            self._extract_topics(u, text, max_topics)
+            self._extract_topics(u, text, max_topics, now=ts)
             self._note_cue(u, cue, cue_due, ts)
             self._note_loop(u, loop, loop_due, ts)
 
@@ -1809,7 +1830,8 @@ class SocialState:
     # ─── 话题提取 ───────────────────────────────────────
 
     @staticmethod
-    def _extract_topics(u: Dict[str, Any], text: str, max_topics: int = 8) -> None:
+    def _extract_topics(u: Dict[str, Any], text: str, max_topics: int = 8,
+                        now: float = 0.0) -> None:
         """从用户消息中提取话题关键词。
 
         策略：
@@ -1817,9 +1839,25 @@ class SocialState:
         - 长度 2~TOPIC_MAX_CHARS 的整段作为候选（过滤停用词）
         - 长度超过 TOPIC_MAX_CHARS 的短语跳过，不做切尾
           （避免"我最近在玩塞尔达传说"被切出"尔达传说"这类垃圾）
-        - 英文单词单独提取（3+ 字母）
+        - 英文单词单独提取（3+字母）
+
+        v1.28.7：同时记 `topic_seen_at[话题] = now`（这个话题最后一次出现）。
+
+        为什么：`topics` 从这一版起还是**由头来源**（`anchors.derive_topic_relations`
+        拿它问「你上次说的那个X，后来呢」）。由头有时效，而关键词表本身不带时间戳
+        ——没有这个字段就分不清「上周聊的塞尔达」和「去年聊的塞尔达」，
+         只能一律当新事问。记**最后一次出现**：话题被重新提起就是它又新鲜了。
+
+        上限与 `topics` 对齐（`max_topics`）：这是每用户每轮心跳都会碰的字段，
+        不能跟着消息数无界增长。`topic_seen_at` 留一倍余量，被 `topics` 挤出去的
+        话题时间戳由末尾那段一起收。
         """
         topics = u.setdefault("topics", [])
+        seen = u.get("topic_seen_at")
+        if not isinstance(seen, dict):
+            seen = {}
+            u["topic_seen_at"] = seen
+        stamp = round(float(now or 0.0), 1)
         segments = re.split(_CHINESE_PUNCT_PATTERN, text)
 
         for seg in segments:
@@ -1832,6 +1870,11 @@ class SocialState:
                 # 避免重复（检查原词和小写）
                 if w_lower not in [t.lower() for t in topics] and w not in topics:
                     topics.insert(0, w)
+                # **已经在表里也要刷新时间戳**：`topic_seen_at` 记的是「最后一次
+                # 出现」，由头那边按它判 21 天新鲜度。只在 insert 时记的话，
+                # 一个天天聊的话题会在第 21 天被判成旧账——而它昨天还在聊。
+                if w in topics:
+                    seen[w] = stamp
 
             # 提取中文部分
             chinese = re.sub(_NON_CHINESE_PATTERN, "", seg)
@@ -1841,9 +1884,17 @@ class SocialState:
                 continue
             if chinese not in topics:
                 topics.insert(0, chinese)
+            if chinese in topics:
+                seen[chinese] = stamp
 
         # 限制数量
         del topics[max_topics:]
+        # `topic_seen_at` 跟着 `topics` 一起收：被挤出上限的话题，时间戳也该走。
+        # 不然这个 dict 按「曾经见过的所有话题」单调增长。
+        if len(seen) > max_topics * 2:
+            live = set(topics)
+            for key in [k for k in seen if k not in live]:
+                seen.pop(key, None)
 
     # ─── 统计 ───────────────────────────────────────────
 

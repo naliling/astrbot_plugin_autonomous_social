@@ -268,7 +268,15 @@ class EngineRoundSkipTest(unittest.TestCase):
 
 
 class ThrottleDefaultsTest(unittest.TestCase):
-    """B：默认值必须真的降下来了（否则老用户升级后请求量一点没变）。"""
+    """B：默认值必须真的降下来了（否则老用户升级后请求量一点没变）。
+
+    v1.28.6 注：`max_sends_per_round` 从 2 调回 3。这不是把 v1.28.2 的结论推翻——
+    那一版的账是拿「LLM 挂着」算的（每轮 6 次尝试、上游限流时全白烧），而真实瓶颈
+    是**候选根本进不了发送段**：由头只取第一条、每小时 12 条封顶、一个人一天两句
+    想念。用户反馈「事件少 每次只有那几个」「私聊发送没看到几个」。
+    3 条 × 2 = 6 次尝试，与 v1.28.2 之前同级，不是新量级；而跨轮熔断
+    （`llm_circuit_state`）已经在管「上游坏了就别试」那一头。
+    """
 
     def test_schema_defaults(self) -> None:
         import json
@@ -277,7 +285,7 @@ class ThrottleDefaultsTest(unittest.TestCase):
             (PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         )
         self.assertEqual(schema["heartbeat_max_minutes"]["default"], 30)
-        self.assertEqual(schema["max_sends_per_round"]["default"], 2)
+        self.assertEqual(schema["max_sends_per_round"]["default"], 3)
 
     def test_config_fallback_defaults_match_schema(self) -> None:
         from social.config import (
@@ -286,18 +294,22 @@ class ThrottleDefaultsTest(unittest.TestCase):
         )
 
         self.assertEqual(HEARTBEAT_MAX_DEFAULT, 30)
-        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 2)
+        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 3)
 
     def test_attempts_per_round_is_bounded(self) -> None:
-        """一轮 LLM 尝试次数 = max_sends × ATTEMPT_PER_SEND，必须 ≤ 4。"""
+        """一轮 LLM 尝试次数 = max_sends × ATTEMPT_PER_SEND，必须 ≤ 6。
+
+        上限从 4 抬到 6：再往上就是「一轮里把所有候选挨个试一遍」，那正是 v1.28.2
+        要防的事（550 个候选 = 550 次失败）。6 次与 v1.28.2 之前同级。
+        """
         from social.config import SocialConfig
         from social.engine import ATTEMPT_PER_SEND
 
         cfg = SocialConfig.from_astrbot({})
         self.assertLessEqual(
             cfg.max_sends_per_round * ATTEMPT_PER_SEND,
-            4,
-            "一轮尝试次数又涨回 6 次以上了，限流下这些都是白烧的请求",
+            6,
+            "一轮尝试次数又涨回 8 次以上了，限流下这些都是白烧的请求",
         )
 
 

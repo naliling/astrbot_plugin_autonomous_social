@@ -913,7 +913,15 @@ class SpeakLockScopeTest(unittest.TestCase):
                 ):
                     continue
                 text = ast_mod.unparse(handler)
-                if "served.discard" in text and "budget" in text:
+                # v1.28.6 起 `served` 是计数而不是集合（一个人一轮里可以服务多次），
+                # 所以「退还」从 `served.discard(...)` 变成 `served[bid, uid] = ... - 1`
+                # （`ast.unparse` 会把下标里的元组括号去掉）。判据改成「把 served 那次
+                # 占用退回去 + 退还 budget」——两条都在，不管用哪种记法都算数。
+                refunds_served = (
+                    "served.discard" in text
+                    or ("served[bid, uid]" in text and "budget[bid] += 1" in text)
+                )
+                if refunds_served and "budget" in text:
                     found = True
         self.assertTrue(
             found,

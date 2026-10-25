@@ -238,11 +238,11 @@ class TierPoolCapIsReal(unittest.TestCase):
                            anchors.TIER_POOL_MAX[anchors.TIER_LOW])
 
     def test_10_tier_really_bounds_the_pick(self):
-        """前后对比：旧值 high/mid/low = 12/8/4（而池子只装 5 条），现在 5/4/3。"""
+        """前后对比：旧值 high/mid/low = 12/8/4（而池子只装 5 条），v1.28.7 起 8/6/4。"""
         want = {
-            anchors.TIER_HIGH: 5,
-            anchors.TIER_MID: 4,
-            anchors.TIER_LOW: 3,
+            anchors.TIER_HIGH: 8,
+            anchors.TIER_MID: 6,
+            anchors.TIER_LOW: 4,
         }
         for tier, n in want.items():
             picks = anchors.prepare_round_anchors({}, dict(RICH_BODY), NOW,

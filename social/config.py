@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 上架硬规则：logger 必须且只能 `from astrbot.api import logger`，严禁内置 logging 模块。
@@ -144,6 +145,75 @@ VALID_MODES = {"auto", "standalone"}
 #   off  —— 完全不碰门面（逃生门：与 1.27.38 逐字一致）
 VALID_FACADE_MODES = {"auto", "on", "off"}
 
+# 主动消息专用模型的 provider ID 上限。留一个上限是为了防手滑：
+# 粘一大串进去时，每一轮心跳都要按顺序试到能用为止，那会把主动消息全堵死。
+PROACTIVE_PROVIDER_MAX = 8
+
+# 默认的主动消息模型链。**「只要是这个插件就用专模型」**——所以默认就写死，
+# 装上即生效，不需要装完再去面板选一次。写成空等于这个功能装上是关的，
+# 那句话白说。
+#
+# 三条的顺序与取舍：
+#   · gpt-6.1-sol 打头——手上最强的，主动消息是她**自己想起来**要说什么，
+#     最该用好模型（用户原话：「描述才要给到强一点的模型用于生成」）；
+#   · gpt-6-sol 兜第二——同族次新，6.1 限流时顶上，说话风格不会跳；
+#   · gemini-3.5-flash 收尾——换厂商，前两个同时限流时还有活路。
+# 不进来：luna / 5.6 / grok / deepseek / agnes / 所有 lite 与 preview。
+# 这条链是「强模型用于生成」，不是「能跑就行」。
+#
+# 面板上改它照旧生效；清空 = 关掉这个功能，回旧行为跟着会话走。
+DEFAULT_PROACTIVE_PROVIDERS: tuple = (
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-sol",
+    "gemini/gemini-3.5-flash",
+)
+
+
+def _provider_id_list(raw: Any) -> list:
+    """把 provider ID 列表归一成 list。
+
+    面板里这一项是 ``list``，但有人会粘一段文本（逗号/分号/换行分隔）——
+    三种写法都认。非字符串元素（数字、None、字典）一律跳过：provider ID
+    只可能是字符串，硬 ``str()`` 会把 ``None`` 变成 ``"None"`` 然后每轮都
+    试着去解析一个不存在的 provider。
+
+    去重且保序：同一个 ID 写三遍没有意义，还会让「按顺序回退」的日志难读。
+
+    返回 `list` 而不是 `tuple`：dataclass 默认值是 `[]`，而测试
+    `test_every_documented_default_is_the_schema_default` 逐项比相等。
+    """
+    if raw is None:
+        # 键不存在（老配置里本来就没有这一项）→ 兜到默认链。
+        # 「只要是这个插件就用专模型」——缺省不能等于关掉。
+        return list(DEFAULT_PROACTIVE_PROVIDERS)
+    if isinstance(raw, str):
+        parts = re.split(r"[,，;；\n\r]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        parts = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            # 列表里混进来的非字符串直接丢，不 str()——见上面
+    elif raw:
+        # 非 None、非字符串、非列表：类型就不对（数字、字典、布尔）。
+        # 那是意外而不是「用户清空了」——兜回默认链，不静默关掉功能。
+        return list(DEFAULT_PROACTIVE_PROVIDERS)
+    else:
+        # 显式的空值（`[]` / `""` / `0` / `False`）：用户主动清空 = 关掉这个功能，
+        # 回旧行为跟着会话走。与上面的 None 区别对待：一个是缺省，一个是选择。
+        return []
+
+    out: list = []
+    for part in parts:
+        text = str(part).strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= PROACTIVE_PROVIDER_MAX:
+            break
+    # 给了列表但一条都没解析出来（`[""]`、`["   "]`、`"  "`）：
+    # 那也是「清空」，不是「缺省」。与上面的显式空值同一口径。
+    return out
+
 # 配置范围常量
 ACTIVITY_MIN = 10
 ACTIVITY_MAX = 90
@@ -169,7 +239,7 @@ URGE_REFILL_DEFAULT = 4
 # 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
 CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
 CROSS_USER_REPEAT_HOURS_DEFAULT = 2.0
-HOURLY_SENDS_CAP_DEFAULT = 12
+HOURLY_SENDS_CAP_DEFAULT = 24
 HOURLY_SENDS_CAP_MAX = 200
 GREETING_MIDDAY_START_DEFAULT = 12
 GREETING_MIDDAY_END_DEFAULT = 14
@@ -181,7 +251,9 @@ MISS_AFFECTION_MIN_DEFAULT = 42
 # 「念想」（没有正事、就是想找你）每人每天的条数上限。
 # 1 → 2：反馈是「每一次发言都有事情，感觉不像想跟他聊天」——一天一条且门槛高，
 # 「就是想你了」几乎从来没发生过；两句日常聊天里的黏糊话该是正常频率。
-MISS_DAILY_CAP_DEFAULT = 2
+# 2 → 3（v1.28.6）：用户反馈「私聊发送没看到几个」。好感高的人本该是最容易
+# 被主动联系的那批，而这条专程为他们开的通道一天只给两句。
+MISS_DAILY_CAP_DEFAULT = 3
 # 两条主动消息的最小间隔（分钟）默认值与范围；
 MIN_GAP_MINUTES_DEFAULT = 60
 MIN_GAP_MAX = 720
@@ -294,7 +366,13 @@ MAX_SENDS_PER_ROUND_MAX = 10
 # v1.28.2：3 → 2。每轮 LLM 尝试次数 = 这个数 × ATTEMPT_PER_SEND(2)，所以它就是
 # 「一轮最多打几次模型」。降到 2 之后一轮最多 4 次尝试（原 6 次）。
 # 发送成功率并没有变差：线上 998 轮只发出去 582 条，瓶颈从来不在尝试次数上。
-MAX_SENDS_PER_ROUND_DEFAULT = 2
+#
+# v1.28.6：2 → 3。用户反馈「事件少 每次只有那几个」「私聊发送没看到几个」。
+# 那一轮 4 次尝试的账是拿「LLM 挂着」算的，而真实瓶颈是**候选根本进不了发送段**：
+# 由头来源扩了（wake/体感/feelings/next）、一个人一轮能说两件事之后，
+# 3 条名额 + 每小时 24 条的上限才配得上「她一天发生几次变化就有几次机会」。
+# 3 条 × 2 = 6 次尝试，与 v1.28.2 之前同级，不是新量级。
+MAX_SENDS_PER_ROUND_DEFAULT = 3
 
 # ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
@@ -543,6 +621,31 @@ class SocialConfig:
     #   on        ——只走门面，找不到就不读 Core（用来验证门面确实在工作）；
     #   off       ——完全不碰门面，与 1.27.38 逐字一致（出问题时的逃生门）。
     use_core_facade: str = "auto"
+
+    # ── 主动消息专用模型（v1.28.5）─────────────────────────────
+    #
+    # 以前这个插件的每一次模型调用都跟着**当前会话的** provider 走
+    # （`get_using_provider(umo)`）——群里换个模型，她主动找你说话的质量也跟着变，
+    # 而主动消息恰恰是最不该省的那一次：那是她**自己想起来**要说什么。
+    #
+    # 这里给一个 provider ID 列表，本插件所有模型调用（1:1 主动、群聊心流、
+    # 破冰、起话头）都按顺序试，第一个能用的即止。
+    #
+    # **「只要是这个插件就用专模型」**：所以默认就带值（见
+    # `DEFAULT_PROACTIVE_PROVIDERS`），装上即生效，不需要装完再去面板选一次。
+    # 默认是三个**会思考的**模型——用户原话「描述才要给到强一点的模型用于生成」，
+    # 面板上那一栏的标题也写着「脑子/思考好的」。
+    #
+    # **故意不退会话默认**：配了专供模型却拿不到，本轮就不发，等下一轮
+    # （心跳 15~120 分钟，用户配的）。理由很直接——退回去等于「指定的就要管它」
+    # 这句话白写，弱模型写出来的主动消息比不发更糟。也不重试：重试只会把
+    # 一次限流拖成整轮心跳卡住。
+    #
+    # 清空 = 关掉这个功能，回旧行为跟着会话走。默认值必须是 `list` 而不是
+    # `tuple`：schema 里写的是 `[]`，而测试
+    # `test_every_documented_default_is_the_schema_default` 逐项比
+    # `getattr(cfg, key) != spec["default"]`——两者必须字面相等。
+    proactive_provider_ids: list = field(default_factory=lambda: list(DEFAULT_PROACTIVE_PROVIDERS))
 
     # 时段设置
     quiet_start: int = QUIET_START_DEFAULT
@@ -827,6 +930,12 @@ class SocialConfig:
         if facade_mode not in VALID_FACADE_MODES:
             facade_mode = "auto"
 
+        # 主动消息专用模型：provider ID 列表。三种写法都认（面板里是 list，
+        # 有人会粘一段逗号/分号/换行分隔的文本）。
+        # 默认值传 **None** 而不是 `()`：`_provider_id_list` 靠它区分
+        # 「键不存在（缺省 → 兜到默认链）」与「用户显式清空（→ 关掉功能）」。
+        proactive_providers = _provider_id_list(g("proactive_provider_ids", None))
+
         # 跟进窗口必须比「多久算没声」长，否则永远落在空区间里一条也发不出
         followup_after = max(
             FOLLOWUP_AFTER_MIN,
@@ -1082,6 +1191,7 @@ class SocialConfig:
             track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
             use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
             use_core_facade=facade_mode,
+            proactive_provider_ids=proactive_providers,
             owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
             trigger_group_requires_at=bool(g("trigger_group_requires_at", _d("trigger_group_requires_at",  True))),
         )

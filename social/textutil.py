@@ -26,6 +26,26 @@ SEGMENT_PLACEHOLDER = re.compile(
     r"Poke|Face|Node|Record)[^\]\n]{0,80}\]?"
 )
 
+#: 框架注入块的左右定界符：Humanoid Core 的身体事实块用「〔…〕」，
+#: `<system_reminder>` 用尖括号。它们不是人说的话，却会因为「汉字够多」
+#: 通过 `is_quotable` 的条数检查——线上真实由头里出现过
+#: 「你上次说的「〔她的身体与生活 v10」后来呢」。
+#: 判据用**成对出现**（左右都有）而不是单边：正文里出现单个「〔」很可能是
+#: 正常书写，只有整段被这对符号包住才是注入块。
+_FRAMEWORK_WRAPPERS = (
+    ("〔", "〕"), ("【", "】"), ("<system_reminder>", "</system_reminder>"),
+    ("<", ">"), ("[", "]"),
+)
+
+
+def _is_framework_wrapped(text: str) -> bool:
+    """整段被框架注入块的定界符包着吗。"""
+    body = text.strip()
+    for left, right in _FRAMEWORK_WRAPPERS:
+        if body.startswith(left) and body.endswith(right) and len(body) > len(left) + len(right):
+            return True
+    return False
+
 #: 纯应答词：任何语境下都不构成「那件事」，不能被当成由头引回去。
 QUOTE_FILLERS = frozenset({
     "yep", "yes", "no", "ok", "okay", "嗯", "嗯嗯", "哦", "哦哦", "啊", "哈", "哈哈",
@@ -58,6 +78,11 @@ def is_quotable(text: Any) -> bool:
     """
     raw = str(text or "").strip()
     if not raw or SEGMENT_PLACEHOLDER.search(raw):
+        return False
+    # 框架注入块（Core 的身体事实块、<system_reminder>）：它们汉字够多、
+    # 也不是应答词，光靠前两条拦不住——线上真实由头里出现过
+    # 「你上次说的「〔她的身体与生活 v10」后来呢」。
+    if _is_framework_wrapped(raw):
         return False
     core = raw.strip(_PUNCT)
     if not core or core.lower() in QUOTE_FILLERS:

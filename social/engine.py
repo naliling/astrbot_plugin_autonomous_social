@@ -256,6 +256,16 @@ SEND_RETRY_DELAY = 3.0
 # 取 2 倍而不是 1 倍：模型否决（NO）也是「没发出去」，但它是一次成功的调用，不该
 # 因此让后面真有由头的人整轮没机会。
 ATTEMPT_PER_SEND = 2
+# 一个人一轮里最多因为「由头」被找几次（v1.28.6）。
+#
+# 原来是 1：`_anchor_pick` 返回的 picks 只取第一条，于是派生出来的第二、第三条
+# 当晚就过期作废，下一轮重新派生、又只发第一条——用户看到的就是
+# 「每次都是同样那几个话题」。由头来源扩了之后（wake / 体感 / feelings / next），
+# 一个人手上常常同时挂着两三件具体的事，只发一件是浪费。
+#
+# 给 2 而不是更多：一轮里对同一个人连说三件不同的事，观感是「她在报日程」。
+# 真人一天里对同一个人主动开口，多数也就两三回。
+ANCHOR_ROUND_PER_USER = 2
 # 一轮里一次都没成功、且失败原因是基础设施（provider 取不到 / 超时 / 401…）时，
 # 剩下的候选不必再试：同一个 provider，下一个请求只会得到同样的结果。
 _INFRA_NOTES = ("LLM 不可用", "LLM 生成为空")
@@ -322,11 +332,46 @@ GIVEEUP_TRIES = 2
 # 适配器未就绪、传输层报错）不在此列：那是平台与配置的问题，隔离用户只会让一个
 # 健康的人凭空消失一整天，表现为「几百小时才发一条」。
 # 匹配范围必须很窄：风控、限流、网络抖动的临时失败里也可能含这些字样。
+# 好友侧那一半与 `_PERMANENT_DEAD_MARKERS` 重叠（同一批字样，两种处置）——
+# 「永久」那一档才是用户要的（见下面），这里保留是为了非好友侧的
+# 其它不可达（对方已注销等）仍按 24h 隔离走。
+#
+# **群侧的字样也必须在这里**：群心流/破冰/连发三条路的隔离分支都是
+# `if peer_unreachable:` 才进，「你已被移除群聊」这种 OneBot 通常包在
+# `ActionFailed retcode=` 里抛出来，`_is_unreachable_error` 认不出它的话
+# 连 24h 隔离都进不去——每轮照样给这个群写一遍 LLM。
 _PEER_UNREACHABLE_MARKERS = (
     "请添加对方为好友", "添加对方为好友", "不是好友", "非好友", "对方不在你的好友列表",
     "好友关系不存在", "对方不是你的好友", "not friend", "add friend", "unfriend",
     "friendship", "已被删除", "已删除好友", "删除好友", "拉黑", "已拉黑",
     "对方已注销", "账号已注销",
+    # 群侧（与 `_PERMANENT_DEAD_MARKERS` 同一批词）：认出来才进得了隔离分支
+    "你已被移除群聊", "已被移除群聊", "被移出群聊", "移出群聊", "已移出群聊",
+    "not in group", "notingroup", "群聊不存在", "群不存在",
+    "群已解散", "已退出群聊", "退出了群聊", "不在群聊中", "不在该群",
+)
+# 「这个目标已经不存在了，别再试」的标记：平台明确说不是好友 / 已被移出群聊。
+# 这些错**不会自愈**——好友删了就加不回来（对方不通过）、群散了就真散了。
+# 用户原话：「关于报错 出现 请添加对方为好友/你已被移除群聊的报错就该对目标永久丢弃」。
+#
+# 与 `_PEER_UNREACHABLE_MARKERS` 的分工：那一档只判「这条消息发不到这个人」，
+# 用 24h 隔离；这里判的是「这个目标本身没了」——**永久隔离**（`block_send` 传一个
+# 远超当前时刻的 until，且 `is_send_blocked` 的语义不变：`until > now` 即隔离中）。
+#
+# 永久隔离**不等于删掉状态**：对方哪天回来发消息，`observe` 会清掉隔离
+# （见 `_mark_send_failed` 那段「对方又发消息了」），关系账本一点不丢。
+# 删掉状态才是真的丢——那会让「认识多久、聊过多少」从头开始算。
+_PERMANENT_DEAD_MARKERS = (
+    # 好友侧：QQ/NapCat/OneBot 的原话
+    "请添加对方为好友", "添加对方为好友", "不是好友", "非好友",
+    "对方不在你的好友列表", "好友关系不存在", "对方不是你的好友",
+    "not friend", "not friends", "add friend", "unfriend", "friendship",
+    "已被删除", "已删除好友", "删除好友", "拉黑", "已拉黑",
+    "对方已注销", "账号已注销",
+    # 群侧：被移出群聊（用户原话里的第二种报错）
+    "你已被移除群聊", "已被移除群聊", "被移出群聊", "移出群聊", "已移出群聊",
+    "not in group", "notingroup", "kicked", "群聊不存在", "群不存在",
+    "群已解散", "已退出群聊", "退出了群聊", "不在群聊中", "不在该群",
 )
 # 平台级原因：只用来把错误说清楚，不用来隔离用户
 _PLATFORM_UNAVAILABLE_MARKERS = (
@@ -386,6 +431,32 @@ def _global_problem(err: str) -> bool:
     """这次失败是不是**整条链路**坏了（所有目标都会挂）。认不出来一律当不是。"""
     low = str(err or "").lower()
     return any(m in low for m in _GLOBAL_PROBLEM_MARKERS)
+
+
+# 永久隔离的到期时刻。用「现在 + 100 年」而不是 float("inf")：
+# 这个值会写进 state.json 的 `send_blocked_until`，而 json 不认 inf/nan
+# （`json.dump` 默认 allow_nan=True 会写出 `Infinity`，再读回来虽能过，
+# 但任何别的 json 解析器都会拒收整个文件）。100 年同时躲开了 32 位时间戳溢出。
+_PERMANENT_DEAD_SECONDS = 100 * 365 * 86400.0
+
+
+def _permanent_dead(err: str) -> bool:
+    """平台是不是明说「这个目标已经不存在了」：不是好友 / 已被移出群聊。
+
+    这两种报错**不会自愈**：好友删了就是删了，群散了就是散了。用户原话：
+    「关于报错 出现 请添加对方为好友/你已被移除群聊的报错就该对目标永久丢弃」。
+    原来它们只走 24 小时隔离，到期后下一轮心跳又把这个人选回来、又写一遍
+    完整 LLM、又撞同一面墙——每轮都烧一次生成，而且占掉「尝试配额」，
+    健康的人反而轮不到（一轮 25 次尝试只发出去 2 条就是这么来的）。
+
+    与 `_is_unreachable_error` 的区别：那个返回 True 时**这里也返回 True**
+    （永久是 24h 的加强），但反过来不成立——`_PERMANENT_DEAD_MARKERS`
+    里的群侧字样不在 `_PEER_UNREACHABLE_MARKERS` 里。
+    """
+    low = str(err or "").lower()
+    if not low:
+        return False
+    return any(m.lower() in low for m in _PERMANENT_DEAD_MARKERS)
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -457,6 +528,9 @@ class _SendFailed(Exception):
     unknown=True：投递结果未知（超时/连接中断），消息可能已经送达，
     再发一次就是给同一个人发两条一样的。
     peer_unreachable=True：平台明确说这个目标发不了（非好友/已注销），才值得隔离该用户。
+    permanent=True：平台明说这个目标**已经不存在了**（不是好友 / 已被移出群聊）。
+        这类错不会自愈，处置是永久隔离，而不是 24 小时后放回来再撞一次墙。
+        它是 `peer_unreachable` 的加强版，所以两者会同时为真。
     """
 
     def __init__(
@@ -465,10 +539,17 @@ class _SendFailed(Exception):
         *,
         unknown: bool = False,
         peer_unreachable: bool = False,
+        permanent: bool = False,
     ) -> None:
         super().__init__(message)
         self.unknown = unknown
         self.peer_unreachable = peer_unreachable
+        # 永久档必须同时算「这个人发不了」：下游有几处只读 peer_unreachable
+        # （`_send_with_retry` 的 early return、群心流的隔离分支），漏了它
+        # 那些路就只会给 24h 隔离。
+        self.permanent = bool(permanent)
+        if self.permanent:
+            self.peer_unreachable = True
 
 # 回访那件事之前，这场话至少凉下来多久：还在你来我往时问「后来呢」太急
 LOOP_QUIET_GAP_SECONDS = 1800.0
@@ -1789,8 +1870,20 @@ class SocialEngine:
         ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
             if peer_unreachable:
-                self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
-                logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
+                # 「你已被移除群聊」/「群已解散」这类报错不会自愈：24h 隔离只是
+                # 让下一轮再撞一次同一面墙。永久隔离，直到有人在群里重新说话
+                # （`observe` 会清掉隔离）。
+                if self._is_permanent_dead_error(err):
+                    self.state.block_group(
+                        bid, gid, self._time() + _PERMANENT_DEAD_SECONDS, err
+                    )
+                    logger.warning(
+                        f"[autonomous_social] 群 {gid}（bid={bid}）平台报告已不在群/群不存在，"
+                        f"永久隔离（群里有人说话才恢复）：{err}"
+                    )
+                else:
+                    self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
+                    logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
                 self.log(f"群 {gid} 心流发送失败：{err}")
             return
@@ -1884,7 +1977,7 @@ class SocialEngine:
             body = {}
         if not isinstance(body, dict):
             body = {}
-        life = groupflow.life_lines(body)
+        life = groupflow.life_lines(body, now)
         holiday = str(body.get("holiday") or "").strip()
         raw_weather = body.get("weather")
         if isinstance(raw_weather, dict):
@@ -2083,6 +2176,16 @@ class SocialEngine:
         ok_send, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not ok_send:
             if peer_unreachable:
+                # 与心流那条同口径：被移出群聊/群已解散不会自愈 → 永久隔离。
+                if self._is_permanent_dead_error(err):
+                    self.state.block_group(
+                        bid, gid, self._time() + _PERMANENT_DEAD_SECONDS, err
+                    )
+                    logger.warning(
+                        f"[autonomous_social] 群 {gid}（bid={bid}）平台报告已不在群/群不存在，"
+                        f"破冰/话头永久隔离（群里有人说话才恢复）：{err}"
+                    )
+                    return False
                 self.state.block_group(bid, gid, self._time() + SEND_BLOCK_HOURS * 3600.0, err)
                 logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）破冰发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
@@ -2541,6 +2644,19 @@ class SocialEngine:
         """
         low = str(err or "").lower()
         return any(m.lower() in low for m in _PEER_UNREACHABLE_MARKERS)
+
+    @staticmethod
+    def _is_permanent_dead_error(err: str) -> bool:
+        """平台是不是明说「这个目标已经不存在了」（不是好友 / 已被移出群聊）。
+
+        与 `_is_unreachable_error` 的区别在**处置**：那个给 24 小时隔离，
+        这个给永久隔离。判据本身 superset 了它——好友侧的字样两边都收。
+        见 `_PERMANENT_DEAD_MARKERS` 的注释。
+
+        静态方法、且转调模块级函数：调用点有的只装配了部分依赖
+        （测试桩只塞 `_is_unreachable_error`），缺了它也不该让分类整条抛穿。
+        """
+        return _permanent_dead(err)
 
     # 拦截理由 → 稳定分类。
     #
@@ -3095,6 +3211,12 @@ class SocialEngine:
         存量不够时**当场从她的真实状态派生**一件，派生即消费——同一件事一辈子只出现
         一次。真实记录里某一个晚上 23 条全是「窝在沙发追剧…困了…晚安」，就是因为
         问候的由头是固定句池、每天抽一句、池子不消耗。
+
+        v1.28.6：**默认给 2 条而不是 1 条**。用户原话「事件少 每次只有那几个」——
+        由头来源扩了之后（wake / 体感 / feelings / next 四条新来源），一个人手上
+        常常同时挂着两三件具体的事，而原来只取第一条：于是派生出来的第二条、第三条
+        当晚就过期作废，下一轮重新派生、又只发第一条。给 2 条，同一个人可以在一轮里
+        说两件不同的事（预算允许时），而**同一条由头一辈子只说一次**的性质不变。
         """
         try:
             picks = prepare_round_anchors(
@@ -3107,7 +3229,7 @@ class SocialEngine:
         if not picks:
             return []
         # 第一个记成「用掉了」，但要等真发出去才真正消费（见 _speak）
-        return list(picks[:1])
+        return list(picks[:max(1, int(limit))])
 
     def _promise_pick(
         self,
@@ -3194,7 +3316,7 @@ class SocialEngine:
             try:
                 picks = anchors.prepare_round_anchors(
                     u, {}, now, limit=3, affection=aff, relational=True,
-                    missing_floor=floor,
+                    missing_floor=floor, tier=tier,
                 )
             except Exception as exc:
                 # 这里**不能只 log 就算完**：之前这一段把一个 NameError 静默吞了，
@@ -3601,7 +3723,12 @@ class SocialEngine:
                         self._round_skips["没由头"] = self._round_skips.get("没由头", 0) + 1
                         logger.debug(f"[autonomous_social] {uid} 念头到了但没由头，不找话说")
                         continue
-                    for a in picks[:1]:
+                    # **每条由头各占一个候选位**（v1.28.6）。原来是 `picks[:1]`：
+                    # 派生出来的第二、第三条当晚就过期作废，下一轮重新派生、又只发
+                    # 第一条——用户看到的就是「每次都是同样那几个话题」。同一个人
+                    # 一轮里最多说 ANCHOR_ROUND_PER_USER 件不同的事，且同一件由头
+                    # 一辈子只说一次（`consume` 在真发出去时才消费）。
+                    for a in picks[:ANCHOR_ROUND_PER_USER]:
                         anchored.append((bid, uid, u, urge, a))
                 picked = self._thread_pick(bid, now, bot_state)
                 if picked:
@@ -3691,8 +3818,17 @@ class SocialEngine:
         budget: Dict[str, int] = {
             bid: max(1, self.cfg.max_sends_per_round) for bid in bots
         }
-        # 同一个人一轮里只服务一次：既到问候窗口、念头又攒满时，说一句早安就够
-        served: Set[Tuple[str, str]] = set()
+        # 同一个人一轮里默认只服务一次：既到问候窗口、念头又攒满时，说一句早安就够。
+        #
+        # v1.28.6 起它是**计数**而不是集合：「由头」通道允许同一个人一轮里说两件
+        # 不同的事（ANCHOR_ROUND_PER_USER），别的通道（问候/追问/回访/收场/承诺/
+        # 念想/想要了）仍然只一次。用计数而不是两套集合：通道是六条、散在三处，
+        # 两套集合意味着每条通道都要记住自己该查哪套。
+        served: Dict[Tuple[str, str], int] = {}
+
+        def _served_once(bid: str, uid: str, limit: int = 1) -> bool:
+            """这个人这一轮还能不能再被服务一次（limit=1 是除「由头」外的通道）。"""
+            return served.get((bid, uid), 0) >= limit
 
         # 本轮「尝试」配额与基础设施熔断（见 ATTEMPT_PER_SEND）。
         # 这两样与 `budget` 的区别：`budget` 管「发出去几条」，它们管「能试几次」。
@@ -3720,6 +3856,7 @@ class SocialEngine:
             note: str,
             require_about_peer: bool = False,
             post: Optional[Any] = None,
+            once: int = 1,
         ) -> Dict[str, Any]:
             # 不再把 `u` 塞进 job：`speak` 拿到锁之后会自己重新取一次
             # （`self.state.user(bid, uid)`），job 里那个引用是等锁前的旧快照。
@@ -3731,6 +3868,9 @@ class SocialEngine:
                 "note": note,
                 "require_about_peer": require_about_peer,
                 "post": post,
+                # 这个人本轮最多被服务几次：1 = 除「由头」外的所有通道；
+                # ANCHOR_ROUND_PER_USER = 由头通道（同一个人一轮说几件不同的事）。
+                "once": max(1, int(once)),
             }
 
         jobs: List[Dict[str, Any]] = []
@@ -3739,15 +3879,19 @@ class SocialEngine:
             """发一条、记账、记账后稍隔几秒。发不出（被否决/失败）不耗配额。
 
             「检查 + 占用」在拿到 per-(bot,uid) 锁之后、下一个 await 之前一次做完：
-            `served.add` 占住这个人，`budget[bid] -= 1` 占住这个角色的名额（失败再还
-            回去）。两件事都必须在锁内、中间不夹 await——同一角色下不同人的 job 并发
-            时各自的锁互不阻塞，若把占用留到 `await self._speak` 之后再做，它们会一起
-            读到同一个 budget 值，把 max_sends_per_round 冲破。
+            `served[...] += 1` 占住这个人一次，`budget[bid] -= 1` 占住这个角色的名额
+            （失败再还回去）。两件事都必须在锁内、中间不夹 await——同一角色下不同人的
+            job 并发时各自的锁互不阻塞，若把占用留到 `await self._speak` 之后再做，
+            它们会一起读到同一个 budget 值，把 max_sends_per_round 冲破。
+
+            `once` 是这条 job 允许的**本轮服务次数上限**：除「由头」通道外都传 1
+            （见 `job_of`），由头通道传 ANCHOR_ROUND_PER_USER。
             """
             bid = job["bid"]
             uid = job["uid"]
             preset = job["preset"]
             note = job["note"]
+            once = int(job.get("once", 1) or 1)
             if budget.get(bid, 0) <= 0:
                 return False
             # 基础设施已经明确坏了：同一个 provider 的下一个请求只会得到同样的结果，
@@ -3767,12 +3911,12 @@ class SocialEngine:
             # 所以生成/发送放锁外，写回（退还/记账）时再取一次锁（读改写分离）。
             # 锁是 per-(bot,uid) 的，所以发 A 的时候不会把发 B 一起堵住。
             async with self._user_lock(bid, uid):
-                if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+                if budget.get(bid, 0) <= 0 or _served_once(bid, uid, once):
                     return False
                 if infra_down["on"] or attempt_left.get(bid, 0) <= 0:
                     return False
                 # 检查与占用之间不能有 await，否则并发进来的同角色 job 会挤进这个窗口。
-                served.add((bid, uid))
+                served[(bid, uid)] = served.get((bid, uid), 0) + 1
                 budget[bid] -= 1
                 attempt_left[bid] -= 1
                 # 拿到锁之后重新取一次 u：等锁期间 observe 可能已经改过它，
@@ -3797,14 +3941,14 @@ class SocialEngine:
                 # 「发送任务异常」，没人归还的话这一轮这个人和这个角色都被占死，
                 # 后面的候选跟着少发。退还之后再抛，别把异常吞掉。
                 async with self._user_lock(bid, uid):
-                    served.discard((bid, uid))
+                    served[(bid, uid)] = max(0, served.get((bid, uid), 1) - 1)
                     budget[bid] += 1
                 raise
             round_stats["attempts"] += 1
             if not sent:
                 # 写回（重新取锁）：没发成就把占的位和名额都还回去，让后面的候选还有机会。
                 async with self._user_lock(bid, uid):
-                    served.discard((bid, uid))
+                    served[(bid, uid)] = max(0, served.get((bid, uid), 1) - 1)
                     budget[bid] += 1
                 if self._is_infra_note(result):
                     # provider 已经坏了：剩下的人这一轮一个都不用试。这里不 return 之前
@@ -3892,7 +4036,7 @@ class SocialEngine:
         # **距上次说上话多久了**。所以这里纯静音时长驱动，隔了够久就能说，一天说几次
         # 由关系档和这句话当下的分量决定。
         for bid, uid, u, kind, _reason in greets:
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served or not pre_take(bid):
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid) or not pre_take(bid):
                 continue
             tier, aff, warmth = self._tier_of(bid, uid, u, core_root, now)
             picks = self._anchor_pick(
@@ -3969,7 +4113,9 @@ class SocialEngine:
         ))
         # 走「另起话题」之前，前三条通道已经按 pre_cap 让出了名额（见上）。
         for bid, uid, u, urge, a in anchored:
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+            # 由头通道允许一个人一轮里说几件不同的事（ANCHOR_ROUND_PER_USER）。
+            # 同一条由头一辈子只说一次由 `consume` 保证，跟这里的计数无关。
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid, ANCHOR_ROUND_PER_USER):
                 continue
             why = self.gate_reason(bid, uid, u, now, bodies.get(bid))
             if why:
@@ -3984,11 +4130,12 @@ class SocialEngine:
                 bid, uid, u, urge,
                 (anchor_sentence(a), anchor_meta(a)),
                 f"因为{a.get('about')} urge={urge:.2f} ",
+                once=ANCHOR_ROUND_PER_USER,
             ))
 
         # 兑现承诺排在「另起话题」之后：她是自己答应过这件事的，理由比随口找个话题足。
         for bid, uid, u, about in promises:
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid):
                 continue
             jobs.append(job_of(
                 bid, uid, u, 0.0, (f"该兑现「{about}」了", promise_meta(about)),
@@ -4007,7 +4154,7 @@ class SocialEngine:
             self.state.mark_dirty()
 
         for bid, uid, u, a in misses:
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid):
                 continue
             jobs.append(job_of(
                 bid, uid, u, 0.0,
@@ -4023,7 +4170,7 @@ class SocialEngine:
             self.state.mark_dirty()
 
         for bid, uid, u in intimacies:
-            if budget.get(bid, 0) <= 0 or (bid, uid) in served:
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid):
                 continue
             jobs.append(job_of(
                 bid, uid, u, 0.0,
@@ -4667,19 +4814,50 @@ class SocialEngine:
             # 发送失败是可以重试的（换一轮心跳、换个时间再来），但不该拿掉这件事
             # 本身——所以推的是 retry_at，寿命 expire_at 不动。
             self._defer_cue_only(u, reason_meta)
+            # 「目标已经不存在了」（非好友 / 已被移出群聊）：这不是「他不回话」，
+            # 是**他压根收不到**。所以既不记 giveup（那账只由「对方先开口」解除，
+            # 而这个人永远不会先开口），也不记发送失败退避（那只会让健康的人在
+            # 下一次心跳前多等一会儿）——直接永久隔离，见下面。
+            permanent_dead = peer_unreachable and self._is_permanent_dead_error(err)
             platform_side = self._platform_problem(err or "")
-            self._mark_send_failed(u, platform_side=platform_side, reason=err or "")
+            if not (permanent_dead or platform_side):
+                self._mark_send_failed(u, platform_side=platform_side, reason=err or "")
             # 平台侧的问题（适配器没就绪/不支持主动消息/抖动）与「他」无关：
             # 无条件计 giveup 时，两次这样的失败就把**低档**用户写 `quiesced_at`，
             # 而它只由「对方先开口」解除 —— 平台恢复后她再也不主动找这个人。
-            if not platform_side:
+            # 永久死目标同理不计：下面会把 giveup/quiesced 一并清掉。
+            if not (permanent_dead or platform_side):
                 self._note_giveup(u, bid, self._time())
             self._m["last_failed"] = self._time()
             self._m["last_failure"] = f"[{bid}] 发送失败：{(err or '原因未知')[:70]}"
             # 只在平台明确说「这个人发不了」（非好友/已注销）时才隔离。平台没就绪、
             # 不支持主动消息、结果未知这些都不是他的错，隔离只会让一个健康的人
-            # 凭空消失 24 小时，而且被当成「TA 不想理我」写进关系账本
+            # 凭空消失 24 小时，而且被当成「TA 不想理我」写进关系账本。
+            #
+            # 「请添加对方为好友」是**永久**的：好友删了不会自己回来，24h 隔离
+            # 只是让下一轮心跳再写一遍完整 LLM、再撞一次同一面墙（线上就是这样
+            # 把每轮的「尝试配额」吃光的）。用户原话：
+            # 「关于报错 出现 请添加对方为好友/你已被移除群聊的报错就该对目标永久丢弃」。
+            # 永久隔离**不删状态**——对方哪天回来发消息，`observe` 会清掉它，
+            # 认识多久、聊过多少一分不丢。
             if peer_unreachable:
+                if permanent_dead:
+                    self.state.block_send(
+                        bid, uid, self._time() + _PERMANENT_DEAD_SECONDS, err
+                    )
+                    if throttle.allow(f"send.dead.{bid}.{uid}"):
+                        logger.warning(
+                            f"[autonomous_social] {uid}（bid={bid}, umo={umo}）平台报告"
+                            f"目标已不存在（非好友/已被移出群聊），**永久丢弃**"
+                            f"（对方先说话才恢复）：{err}"
+                            + throttle.summary(f"send.dead.{bid}.{uid}")
+                        )
+                    # 永久目标不进「连着发不出去」的 giveup 账：那账是给
+                    # 「一直不回话的人」的，而这个人压根收不到。
+                    u["giveup_count"] = 0
+                    u["quiesced_at"] = 0.0
+                    self.state.mark_dirty()
+                    return False, f"目标已不存在（非好友/已被移出群聊），已永久丢弃：{err}"
                 self.state.block_send(
                     bid, uid, self._time() + SEND_BLOCK_HOURS * 3600.0, err
                 )
@@ -5494,9 +5672,15 @@ class SocialEngine:
                     if self._is_unreachable_error(_err_text):
                         # 平台明确说「这个人发不了」（不是好友 / 会话已失效）：
                         # 消息**确定没送达**，可以据此隔离该用户，也不存在重复投递。
+                        # `permanent`：不是好友 / 已被移出群聊时是**永久**隔离
+                        # （见 `_PERMANENT_DEAD_MARKERS`）——这两种错不会自愈，
+                        # 24h 隔离只是让下一轮再撞一次同一面墙。
+                        # 用模块级函数而不是 `self.`：这个方法的调用点有的只装配了
+                        # 部分依赖（测试桩只塞 `_is_unreachable_error`）。
                         raise _SendFailed(
                             f"context.send_message 调用失败: {_err_text}",
                             peer_unreachable=True,
+                            permanent=_permanent_dead(_err_text),
                         ) from e
                     # 其余异常来自发送本身（平台侧风控/限流/序列化之后才炸）：
                     # **结果未知，绝不能回退重发** —— 那时消息可能已经送达，
@@ -5525,9 +5709,11 @@ class SocialEngine:
                 # 与 MessageChain 路径同构：这里异常发生在**调用之后**（回执处理/
                 # 序列化阶段才炸），消息可能已经送达 —— 标 `unknown=True`，
                 # `_send_with_retry` 就不会再发一遍（否则用户收到两条一样的话）。
+                _err = str(e)
                 raise _SendFailed(
-                    f"context.send_message 调用失败（结果未知，不重发）: {e}",
-                    peer_unreachable=self._is_unreachable_error(str(e)),
+                    f"context.send_message 调用失败（结果未知，不重发）: {_err}",
+                    peer_unreachable=self._is_unreachable_error(_err),
+                    permanent=_permanent_dead(_err),
                     unknown=True,
                 ) from e
 
@@ -5554,6 +5740,7 @@ class SocialEngine:
                     raise _SendFailed(
                         f"platform.send_message 调用失败: {_err_text}",
                         peer_unreachable=True,
+                        permanent=_permanent_dead(_err_text),
                     ) from e
                 # 其余异常来自发送本身：结果未知，不重发（否则用户收到两条一样的）。
                 raise _SendFailed(
@@ -5574,6 +5761,9 @@ class SocialEngine:
 
         「结果未知」的失败不重试：可能已经送到了，再发一次就是给同一个人发两条一样的。
 
+        **「目标已经不存在」也不重试**：好友删了/群散了不会因为重试就好，
+        重试只是把同一面墙再撞一次（还多等一个重试间隔）。
+
         无论成败都会更新熔断计数：连续发不出去时，下一轮就不再先写一遍消息再失败了。
         """
         last_err = ""
@@ -5586,6 +5776,12 @@ class SocialEngine:
             except _SendFailed as e:
                 last_err = str(e)
                 peer_unreachable = peer_unreachable or e.peer_unreachable
+                # 平台明说这个目标没了：立刻收手。`_send_message` 已经把
+                # permanent 置上（它同时带着 peer_unreachable），这里只需要
+                # 认出「这次失败是永久档」就不再进重试循环。
+                if _permanent_dead(last_err):
+                    self._note_send_failure(bid, last_err, True)
+                    return False, last_err, True
                 if e.unknown:
                     # 异常消息可能是空的（框架把异常 repr 吞了的时候），那时只打
                     # 「结果未知: 」后面什么都没有，排查时等于没有信息。补上异常类型，
@@ -5784,8 +5980,18 @@ class SocialEngine:
                 umo = str(u.get("umo", "") or "")
                 if not umo:
                     return
-                ok, _, _ = await self._send_with_retry(umo, text, bid)
+                ok, err, _peer = await self._send_with_retry(umo, text, bid)
                 if not ok:
+                    # 补发这一条时才发现「目标已经不在了」：立刻永久隔离，
+                    # 别让后面的补发一条条去撞同一面墙。
+                    if self._is_permanent_dead_error(err):
+                        self.state.block_send(
+                            bid, uid, self._time() + _PERMANENT_DEAD_SECONDS, err
+                        )
+                        logger.warning(
+                            f"[autonomous_social] {uid}（bid={bid}）连发补发时平台报告"
+                            f"目标已不存在，永久丢弃：{err}"
+                        )
                     return
                 self.state.record_outgoing(
                     bid, uid, text, count_proactive=False,
@@ -5837,8 +6043,18 @@ class SocialEngine:
                 if _num(g.get("last_human_at", 0) or 0) > sent_ts:
                     self.log(f"群 {gid} 有新群友发言，取消连发补充")
                     return
-                ok, _, _ = await self._send_with_retry(umo, text, bid)
+                ok, err, _peer = await self._send_with_retry(umo, text, bid)
                 if not ok:
+                    # 同私聊侧：补发时才发现已被移出群聊 → 永久隔离，
+                    # 别让剩下的补发一条条去撞同一面墙。
+                    if self._is_permanent_dead_error(err):
+                        self.state.block_group(
+                            bid, gid, self._time() + _PERMANENT_DEAD_SECONDS, err
+                        )
+                        logger.warning(
+                            f"[autonomous_social] 群 {gid}（bid={bid}）心流连发补发时平台报告"
+                            f"已不在群，永久隔离：{err}"
+                        )
                     return
                 self.state.record_group_self_text(
                     bid, gid, text, now,
@@ -6119,6 +6335,17 @@ class SocialEngine:
         if mode == "on":
             return f"❌ 门面：未连接（{reason}）；use_core_facade=on，所以不读 state.json"
         return f"⚠️ 门面：未连接（{reason}）；已退回读 state.json"
+
+    def _provider_status_text(self) -> str:
+        """主动消息用哪个模型。配了专供却一个都取不到时，这里必须说出来。
+
+        不说的后果很具体：那一行会是「跟会话走」，而实际行为是「本轮不开口」——
+        用户以为模型选错了，实际是 ID 打错了、而插件按设计静默不发。
+        """
+        ids = list(getattr(self.cfg, "proactive_provider_ids", []) or [])
+        if not ids:
+            return "模型：未指定专用模型，跟着当前会话的 provider 走"
+        return "模型：主动消息专用 → " + " → ".join(ids) + "（取不到就本轮不发，不退默认）"
 
     def _per_bot_status_text(self) -> str:
         """按角色分行：念头、冷却、发送、熔断、退避各自一格。
@@ -6630,7 +6857,8 @@ class SocialEngine:
             f"- Core：{self._core_status_text()}\n"
             f"- {self._facade_status_text()}\n"
             f"- 写回：{self._signals_status_text()}\n"
-            f"- 模型：{self._llm_status_text()}\n"
+            f"- {self._llm_status_text()}\n"
+            f"- {self._provider_status_text()}\n"
             f"- 发送：{self._send_status_text()}"
         )
         sections.append("【运行指标】\n" + self._metrics_text())

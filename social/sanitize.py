@@ -213,6 +213,16 @@ def sanitize_user_record(u: Dict[str, Any]) -> bool:
         if cleaned_topics != topics:
             u["topics"] = cleaned_topics
             changed = True
+        # `topic_seen_at`（v1.28.7）跟着清：不清的话，被洗掉的话题在这里留一个
+        # 孤儿时间戳，而由头派生只从 `topics` 取话题——孤儿永远用不上，
+        # 却让这个 dict 按「曾经见过的所有话题」增长。
+        seen = u.get("topic_seen_at")
+        if isinstance(seen, dict) and seen:
+            live = {t for t in cleaned_topics if isinstance(t, str)}
+            kept = {k: v for k, v in seen.items() if k in live}
+            if kept != seen:
+                u["topic_seen_at"] = kept
+                changed = True
 
     return changed
 

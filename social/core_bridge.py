@@ -14,6 +14,7 @@ v1.6.1：
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -339,6 +340,62 @@ class CoreBridge:
                 out.append(text)
         return out
 
+    @staticmethod
+    def _wake_block(value: Any) -> Dict[str, Any]:
+        """把契约的 `wake` 块读成干净的 dict；拿不到就是空 dict。
+
+        Core 2.28 起给，六个键：`asleep` / `wake_at` / `inertia_until` /
+        `inertia_minutes_left` / `disturbed` / `last_sleep_hours`。
+        社交层（anchors._wake_cue）只用 `asleep` / `wake_at` / `last_sleep_hours`，
+        但**整块照抄**：这是跨插件契约，缺字段就是缺信息，而不是「把它变成
+        我们要的形状」。与 `_event_block` 的分工：那个只留 phrase（Core 故意
+        不给会变的秒数），这个块的值本身稳定，抄下来就够。
+
+        类型必须逐键洗：契约是外部输入，手改坏时可能是字符串/None。
+        `_num_or_none` 把读不出来的归 None，由头派生据此当「没有这个信息」，
+        而不是抛穿 `_build_self_view` → `load_snapshot` 两层。
+        """
+        if not isinstance(value, dict):
+            return {}
+
+        def _num_or_none(raw: Any) -> Optional[float]:
+            try:
+                out = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return out if math.isfinite(out) else None
+
+        wake_at = _num_or_none(value.get("wake_at"))
+        inertia = _num_or_none(value.get("inertia_until"))
+        hours = _num_or_none(value.get("last_sleep_hours"))
+        left = _num_or_none(value.get("inertia_minutes_left"))
+        return {
+            "asleep": bool(value.get("asleep")),
+            "wake_at": wake_at,
+            "inertia_until": inertia,
+            "inertia_minutes_left": int(left) if left is not None else None,
+            "disturbed": bool(value.get("disturbed")),
+            "last_sleep_hours": hours,
+        }
+
+    def _event_block(self, value: Any) -> Dict[str, Any]:
+        """把契约的 `event` 块读成干净的单键 dict；拿不到就是空 dict。
+
+        契约是跨插件来的：旧版 Core 没有这个字段（None）、手改坏时可能是字符串
+        或列表。**缺字段与脏数据一律当「这会儿没有这样一件事」**——社交层不该
+        因为 Core 升级就凭空多出一件没发生过的事。
+
+        只保留 `phrase`：Core 故意不在契约里给 `age_seconds`（它每秒都在变，
+        会让那半小时里每分钟重写一遍全量 state.json）。由头有时效，
+        那是 anchors 的 TTL 在管，不是这里的活。
+        """
+        if not isinstance(value, dict):
+            return {}
+        phrase = str(value.get("phrase") or "").strip()
+        if not phrase:
+            return {}
+        return {"phrase": phrase}
+
     def _build_self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
 
@@ -360,6 +417,9 @@ class CoreBridge:
             "day": {},
             # 她手上还没做完的事（Core 跨天跟着的 ongoing）：社交层拿它当由头
             "ongoing": [],
+            # 醒来状态（Core 2.28 起）。旧版 Core / 读不到契约时是空 dict，
+            # 由头派生按「这会儿没刚醒」处理。契约里它在顶层，视图照抄。
+            "wake": {},
             "persona": "",
             "holiday": "",
         }
@@ -408,7 +468,27 @@ class CoreBridge:
             # 她昨晚（或白天补觉时）梦到的事：Core 2.28 起给。群主动素材与私聊
             # 由头都拿它当「她自己的生活」的一类；旧版 Core 没有这个字段 → []。
             "dreams": self._text_list(day.get("dreams")),
+            # 刚刚发生的事够重（被夸/被骂/被敷衍）：Core 2.29 起给，在契约
+            # **顶层**（与 ongoing/wants 同级，不在 day 里）。旧版 Core 没有
+            # 这个字段 → {}，由头派生按「这会儿没有这样一件事」处理。
+            "event": {},
         }
+        # 醒来状态（Core 2.28 起给，v1.28.6 起当由头）：睡没睡够、醒来多久。
+        # 旧版 Core 没有这个字段 → {}，由头派生按「这会儿没刚醒」处理。
+        # 契约里它在**顶层**（与 ongoing/wants/day 同级），视图照抄同一处；
+        # `day` 里再放一份同一个对象，两处共用（与 `event` 同一套做法）——
+        # `anchors._wake_cue` 与 `groupflow.life_lines` 读的是不同入口。
+        # 与 `event` 不同：这个块的键是数值/布尔，不能走 `_event_block`
+        # （那个只留 `phrase`），所以单独一个读取器。
+        _wake = self._wake_block(contract.get("wake"))
+        view["wake"] = _wake
+        view["day"]["wake"] = _wake
+        # 事件从契约顶层读一次，两处共用同一个 dict：`anchors._derive_from_state`
+        # 读顶层 `body["event"]`（与 ongoing 同级），`groupflow` 读 `day["event"]`
+        # （与 wants/dreams 同级）。给同一个对象，不会出现两份不一致。
+        _event = self._event_block(contract.get("event"))
+        view["event"] = _event
+        view["day"]["event"] = _event
         # 她手上还没做完的事：社交层拿它当由头（「还在整理那份个案笔记」）。
         view["ongoing"] = [
             str(x) for x in (contract.get("ongoing") or []) if str(x).strip()

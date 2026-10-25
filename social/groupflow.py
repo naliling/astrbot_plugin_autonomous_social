@@ -25,7 +25,7 @@ from .textutil import outside_lead
 # 「忙手里的活 / 休着」这种空话的判据也只有一份：群素材里「她自己的生活」
 # 和私聊由头是同一批事实，不能一边过滤一边不过滤（否则群破冰会说出
 # 「正在忙自己的事」这种等于没说的话）。`anchors` 不 import 本模块，无环。
-from .anchors import is_vague_doing
+from .anchors import _wake_cue, is_vague_doing
 
 # S2（v1.28.0）：群破冰/起话头时「她自己的生活」最多给几条、每行多长。
 # 与 `anchors.ANCHOR_TEXT_MAX` 不是同一个用途：那边是私聊由头的存储上限；
@@ -381,7 +381,7 @@ def _want_line(text: Any) -> str:
     return f"今天想去{body}"
 
 
-def life_lines(body: Dict[str, Any]) -> List[str]:
+def life_lines(body: Dict[str, Any], now: Optional[float] = None) -> List[str]:
     """S2：她自己的生活里**可以分享的具体小事**（群破冰/起话头的素材）。
 
     用户原话是「他就不会分享事物吗」——天气不是生活，刚做完 / 正在做 / 今天想去 /
@@ -390,6 +390,9 @@ def life_lines(body: Dict[str, Any]) -> List[str]:
 
     `body` 是 Core 契约（或 `core_bridge` 的 self view）：旧版 Core 没有
     `day.dreams` / `day.wants`，缺字段与脏数据一律当「没有这件事」，绝不抛。
+
+    `now` 给「刚醒」那一条判新鲜度用（`anchors._wake_cue`）：不传就只问形状，
+    由引擎侧的 TTL 兜着。
     """
     body = body if isinstance(body, dict) else {}
     day = body.get("day") if isinstance(body.get("day"), dict) else {}
@@ -410,11 +413,26 @@ def life_lines(body: Dict[str, Any]) -> List[str]:
             continue
         add(text)
 
+    # ①-bis 她刚醒（v1.28.6，Core 2.28 起契约的 `wake`）。群里也会有人搭一句
+    # 「你起好晚」——跟私聊由头是同一批事实（同一个 `anchors._wake_cue`），
+    # 不能一边读一边不读。排在 done 之后、doing 之前：醒来头几分钟最想说话。
+    wake = _wake_line(body, now)
+    if wake:
+        add(wake)
+
     # ② 正在做的。`day.doing` 是「此刻正在做」，不是「刚做完」——群素材只按现在说。
     # 与私聊由头同一条口径：doing 本身以「在」开头时不再补「正在」（避免「正在在…」）。
     doing = str(day.get("doing") or "").strip()
     if doing and not is_vague_doing(doing):
         add(f"正在{doing}" if not doing.startswith("在") else doing)
+
+    # ②-bis 接下来要做的（v1.28.6）。`day.next` 是**列表**（Core 给最多两条），
+    # 原来只用第一条，白丢一条。排在 doing 之后、wants 之前：时间线是
+    # 刚做完 → 刚醒 → 正在做 → 接下来 → 今天想去。
+    for text in _as_text_list(day.get("next"))[:2]:
+        if "才醒" in text or is_vague_doing(text):
+            continue
+        add(f"接下来{text[:LIFE_LINE_MAX_CHARS - 3]}")
 
     # ③ 今天想做的（Core 2.28 才有；没有这个字段就是空的）。
     for text in _as_text_list(day.get("wants"))[:2]:
@@ -431,6 +449,19 @@ def life_lines(body: Dict[str, Any]) -> List[str]:
         add(f"梦到{dream[:16]}")
 
     return out[:LIFE_MAX_LINES]
+
+
+def _wake_line(body: Dict[str, Any], now: Optional[float] = None) -> str:
+    """她刚醒：一行群素材。没醒/不新鲜就空串。
+
+    判据与私聊由头**同一个函数**（`anchors._wake_cue`）：两处各写一份的话，
+    㑹私聊说「刚睡醒」而群里说三天前那次醒。这里只把它转成群素材的一行。
+    """
+    try:
+        cue = _wake_cue(body, now)
+    except Exception:
+        return ""
+    return cue or ""
 
 
 def topic_materials(

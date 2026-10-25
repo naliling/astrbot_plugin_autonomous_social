@@ -647,7 +647,8 @@ class BehaviourSwitchOptionTest(unittest.TestCase):
     def test_miss_daily_cap_clamped(self):
         self.assertEqual(_cfg(miss_daily_cap=-1).miss_daily_cap, 0)
         self.assertEqual(_cfg(miss_daily_cap=999).miss_daily_cap, 10)
-        self.assertEqual(_cfg().miss_daily_cap, 2)
+        # v1.28.6：2 → 3（用户反馈「私聊发送没看到几个」）
+        self.assertEqual(_cfg().miss_daily_cap, 3)
 
     def test_miss_affection_min_clamped(self):
         self.assertEqual(_cfg(miss_affection_min=-1).miss_affection_min, 0)
