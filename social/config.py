@@ -291,6 +291,35 @@ FOLLOWUP_COOLDOWN_MIN = 5
 FOLLOWUP_COOLDOWN_MAX = 720
 FOLLOWUP_COOLDOWN_DEFAULT = 30
 
+# ─── 接话（continue）：她回完、对方就没声了 ──────────────────────
+#
+# 上面那条 followup 的判据是「**对方**那句还悬着」，而主链路一回复，最后一条永远是
+# 她的——于是「她说完之后对方消失」永远落不进任何一条未完话题：`thread_reason` 在
+# 「spoken >= seen 且沉默超过 presence_after」处直接 return ""，再往上又被
+# followup_max（默认 70 分钟）截一刀。用户原话是「这种情况应当判断要不要接话/问
+# 对方干啥去了，而不是被回避逻辑挡住」。所以单开一条：起点比追问晚（她刚回完就
+# 追问像催），窗口比追问长（隔几小时问一句「你人呢」才自然）。
+CONTINUE_AFTER_MIN = 10
+CONTINUE_AFTER_MAX = 720
+CONTINUE_AFTER_DEFAULT = 90
+CONTINUE_WINDOW_HOURS_MIN = 1
+CONTINUE_WINDOW_HOURS_MAX = 24
+CONTINUE_WINDOW_HOURS_DEFAULT = 8
+
+# ─── 真回避（silent giveup）────────────────────────────────────
+#
+# 对方连续这么多天没开口、而这期间她一直在主动发 → 全面停发（问候也算），等对方
+# 先开口才恢复。0 = 关闭。
+#
+# 为什么需要它：问候走 `expect_reply=False`，不进 pending / `no_reply_streak`，
+# 而 `COLD_SILENCE_SENT` 只挡非 greet 类——于是「一句不回的人每天照样收早安」。
+# 线上真实记录：某人最后一次开口是 10-18 15:33，之后 10-19/21/22/23/25 各收到一条
+# cat=greeting 的主动消息（silent_sent=5、proactive_sent=0、no_reply_streak=0，
+# 现有九道闸没有任何一道看得见这件事）。
+SILENT_GIVEUP_DAYS_MIN = 0
+SILENT_GIVEUP_DAYS_MAX = 30
+SILENT_GIVEUP_DAYS_DEFAULT = 3
+
 # 隔一阵回访那件事：对方提了个没说完结果的事，过几小时问「后来呢」
 LOOP_MIN_HOURS_FLOOR = 1.0
 LOOP_MIN_HOURS_CEIL = 24.0
@@ -601,6 +630,16 @@ class SocialConfig:
     probe_after_minutes: int = PROBE_AFTER_DEFAULT
     followup_max_minutes: int = FOLLOWUP_MAX_DEFAULT
     followup_cooldown_minutes: int = FOLLOWUP_COOLDOWN_DEFAULT
+
+    # 接话：她回完、对方就没声了 → 隔一阵接一句/问一句人去哪了。
+    # 关掉（或窗口算成 0）= 回旧行为：这条路永远不成立，她说完之后对方消失就是消失。
+    continue_enabled: bool = True
+    continue_after_minutes: int = CONTINUE_AFTER_DEFAULT
+    continue_window_hours: int = CONTINUE_WINDOW_HOURS_DEFAULT
+
+    # 对方连续这么多天没开口就全面停发主动消息（问候也算），等 TA 先开口才恢复。
+    # 0 = 关闭（回旧行为：只剩 COLD_SILENCE_SENT 挡非 greet 类）。
+    silent_giveup_days: int = SILENT_GIVEUP_DAYS_DEFAULT
 
     # 隔一阵回访对方提过的那件事（面试、复查、搬家…没说结果）
     loop_enabled: bool = True
@@ -949,6 +988,21 @@ class SocialConfig:
             followup_after + 5,
             max(FOLLOWUP_MAX_MIN, min(FOLLOWUP_MAX_MAX, gi("followup_max_minutes", FOLLOWUP_MAX_DEFAULT))),
         )
+        # 接话窗口：起点必须在范围内，窗口必须**严格长于**起点。窗口 = 起点时区间是空的，
+        # 接话一次都不会发生，而面板上两个数看着都正常——与 followup_max 必须大于
+        # followup_after 同一条教训（那边是 +5 分钟，这边按整点小时抬）。
+        continue_after = max(
+            CONTINUE_AFTER_MIN,
+            min(CONTINUE_AFTER_MAX, gi("continue_after_minutes", CONTINUE_AFTER_DEFAULT)),
+        )
+        continue_window_hours = max(
+            CONTINUE_WINDOW_HOURS_MIN,
+            min(
+                CONTINUE_WINDOW_HOURS_MAX,
+                gi("continue_window_hours", CONTINUE_WINDOW_HOURS_DEFAULT),
+            ),
+        )
+        continue_window_hours = max(continue_window_hours, continue_after // 60 + 1)
         try:
             loop_min = max(LOOP_MIN_HOURS_FLOOR, min(LOOP_MIN_HOURS_CEIL, gf("loop_min_hours", LOOP_MIN_HOURS_DEFAULT)))
         except (TypeError, ValueError):
@@ -1179,6 +1233,18 @@ class SocialConfig:
             followup_cooldown_minutes=max(
                 FOLLOWUP_COOLDOWN_MIN,
                 min(FOLLOWUP_COOLDOWN_MAX, gi("followup_cooldown_minutes", FOLLOWUP_COOLDOWN_DEFAULT)),
+            ),
+            continue_enabled=bool(
+                g("continue_enabled", _d("continue_enabled", True))
+            ),
+            continue_after_minutes=continue_after,
+            continue_window_hours=continue_window_hours,
+            silent_giveup_days=max(
+                SILENT_GIVEUP_DAYS_MIN,
+                min(
+                    SILENT_GIVEUP_DAYS_MAX,
+                    gi("silent_giveup_days", SILENT_GIVEUP_DAYS_DEFAULT),
+                ),
             ),
             loop_enabled=bool(g("loop_enabled", _d("loop_enabled",  True))),
             loop_min_hours=loop_min,

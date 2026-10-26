@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Optional, Tuple
 
 try:
@@ -106,10 +107,30 @@ except ImportError:
 
 from .social import __version__
 from .social.config import migrate_legacy_defaults
-from .social.engine import SocialEngine
+from .social.engine import SocialEngine, _ago_text, _num
 
 # 插件数据子目录
 DATA_SUBDIR = ("plugin_data", "astrbot_plugin_autonomous_social")
+
+
+def _selfcheck_settle_text(settled: object, prev_settled: object, now: float) -> str:
+    """`/社交自检` 里的「上次结算」：一律从时间戳算，不再写死「刚刚」。
+
+    自检本身也会结算一次（`dry_run` 把 `last_settled` 改写成「现在」），所以只报
+    `last_settled` 的话这一行永远是「刚刚」——等于什么也没说。真实信息在
+    `prev_settled`：自检覆盖之前，上一次心跳是什么时候结算的。两个都给，而且都按
+    真实相对时间显示：写死的时间比不写更糟，它看着像证据。
+    """
+    settled_v = _num(settled or 0.0)
+    prev_v = _num(prev_settled or 0.0)
+    if settled_v <= 0:
+        return "还没跑过"
+    text = f"{_ago_text(settled_v, now)}（这次自检刚结算完）"
+    if prev_v > 0:
+        text += f"；自检前那次心跳结算：{_ago_text(prev_v, now)}"
+    else:
+        text += "；自检前这次启动还没跑过心跳结算"
+    return text
 
 
 class AutonomousSocial(Star):
@@ -327,7 +348,17 @@ class AutonomousSocial(Star):
             yield event.plain_result("这个指令只有机器人的主人能用。")
             return
         try:
-            text = await self._engine.status_text()
+            # 私聊里把「当前对话者」的 ID 传下去，【亲密】段才能显示与这个人的
+            # 场景/亲近欲；群里不传（群聊里不该出现任何人的私密数字）。拿不到
+            # ID 时保持空串，引擎会退回只报能力/配置。
+            bid = uid = ""
+            if not self._is_group(event):
+                try:
+                    bid = self._engine._get_bot_id(event)
+                    uid = self._engine._get_sender_id(event)
+                except Exception:
+                    bid = uid = ""
+            text = await self._engine.status_text(bid=bid, uid=uid)
         except Exception as e:
             logger.error(f"[autonomous_social] 获取状态失败: {e}")
             yield event.plain_result(f"获取状态失败: {e}")
@@ -357,11 +388,15 @@ class AutonomousSocial(Star):
             yield event.plain_result(f"自检失败: {e}")
             return
         settled = m.get("last_settled") or 0
+        try:
+            now = self._engine._time()
+        except Exception:
+            now = time.time()
         yield event.plain_result(
             "自检完成（没有发送任何消息，也没有调用模型）：\n"
             f"  已认识的人：{m.get('last_settled_users', 0)}\n"
             f"  念头已攒够、闸门也放行的：{m.get('last_ready', 0)}\n"
-            f"  上次结算：{'还没跑过' if not settled else '刚刚'}\n"
+            f"  上次结算：{_selfcheck_settle_text(settled, m.get('prev_settled'), now)}\n"
             f"  说明：{m.get('last_failure') or '链路正常，等下一个心跳就会尝试主动联系'}"
         )
 

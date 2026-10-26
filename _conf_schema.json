@@ -198,6 +198,55 @@
             "step": 10
         }
     },
+    "continue_enabled": {
+        "type": "bool",
+        "description": "她说完、对方就没声了，隔一阵接一句",
+        "hint": "对话刚结束、对方一句话没回就消失了——真人会过一会儿接一句，或问一句「你干啥去了」。关掉就只在「话说到一半」时追问。",
+        "obvious_hint": true,
+        "default": true
+    },
+    "continue_after_minutes": {
+        "type": "int",
+        "description": "接话前至少等多久（分钟）",
+        "hint": "她上一条说完之后，隔这么久才允许接话。太短像盯着人看，太长这场话就凉了。",
+        "obvious_hint": true,
+        "default": 90,
+        "min": 10,
+        "max": 720,
+        "slider": {
+            "min": 10,
+            "max": 720,
+            "step": 10
+        }
+    },
+    "continue_window_hours": {
+        "type": "int",
+        "description": "接话窗口最长（小时）",
+        "hint": "超过这么久就当这场话已经过去了，不再接。窗口必须比「至少等多久」长，配得太短会自相矛盾（代码会自动抬到比它长）。",
+        "obvious_hint": true,
+        "default": 8,
+        "min": 1,
+        "max": 24,
+        "slider": {
+            "min": 1,
+            "max": 24,
+            "step": 1
+        }
+    },
+    "silent_giveup_days": {
+        "type": "int",
+        "description": "对方几天不开口就全面停发（天）",
+        "hint": "对方连续这么多天一句话没说、她这期间主动发过、也一直没人回，就停下来等对方先开口（早安晚安也算）。0=关闭。真人不会一直追一个不回话的人。",
+        "obvious_hint": true,
+        "default": 3,
+        "min": 0,
+        "max": 30,
+        "slider": {
+            "min": 0,
+            "max": 30,
+            "step": 1
+        }
+    },
     "followup_cooldown_minutes": {
         "type": "int",
         "description": "追话冷却（分钟）",

@@ -33,7 +33,7 @@ from . import memory_bridge
 from . import pacing
 from .clock import city_now
 from .config import SocialConfig
-from .core_bridge import CoreBridge
+from .core_bridge import CORE_SAID_MAX, CoreBridge
 from .input_state import InputStateNotifier
 from .sanitize import sanitize_incoming
 from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_anchors
@@ -482,6 +482,98 @@ def _num(value: Any, default: float = 0.0) -> float:
     return out if math.isfinite(out) else default
 
 
+def _brief_text(value: Any) -> str:
+    """门面 `brief()` 里的单行文本：只收 str / 数字，容器与布尔一律当空。
+
+    口径与 `core_bridge._clean_text` 一致：这些值会被拼进提示词当称呼/标签，
+    `str({})`、`str(True)` 那种「把脏数据变成名字/标签念出去」的路径不能有。
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value).strip()
+    return ""
+
+
+def _brief_float(value: Any) -> Optional[float]:
+    """门面 `brief()` 里的数值：读不出来 / nan / inf 一律 None（=「它没给」）。
+
+    不能用 0 兜底：「好感 0」和「没给好感」是两件事，前者会把她对所有人的语气都
+    压成陌生，后者应该退回文件里的值。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _brief_said(value: Any, limit: int = CORE_SAID_MAX) -> List[Dict[str, Any]]:
+    """门面 `user.said`（`[{"text", "at"}]`）→ 生成侧认的老形状（`[{"said", "at"}]`）。
+
+    为什么必须转：`generator._compose` 读的是 `x.get("said")`（Core 契约与
+    `core_bridge.load_snapshot` 都是这个键）。门面把同一件事叫 `text`，不转的话
+    门面值虽然进了 target，那句「你记得TA说过这些」却永远是空的——等于没接。
+    """
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value[:limit]:
+        if isinstance(item, dict):
+            text = _brief_text(item.get("text")) or _brief_text(item.get("said"))
+            if text:
+                out.append({"said": text, "at": item.get("at")})
+        else:
+            text = _brief_text(item)
+            if text:
+                out.append({"said": text, "at": 0.0})
+    return out
+
+
+def _ago_text(ts: Any, now: float) -> str:
+    """「多久以前」的相对时间。0 / 读不出来 → 空串（表示「没有这件事」）。
+
+    为什么单独抽出来：面板上到处是「X 分钟前」，以前有几处是写死的文案
+    （`/社交自检` 的「上次结算：刚刚」不看时间戳，只要 settled 非 0 就永远是刚刚）。
+    写死的时间比不写更糟——它看着像证据，实际什么也没说。统一走这一个函数，
+    「显示出来的每个时间都是真从时间戳算的」这件事才有唯一入口。
+    """
+    value = _num(ts or 0.0)
+    if value <= 0:
+        return ""
+    delta = max(0.0, now - value)
+    if delta < 60:
+        return f"{int(delta)} 秒前"
+    if delta < 3600:
+        return f"{int(delta / 60)} 分钟前"
+    if delta < 86400:
+        return f"{int(delta / 3600)} 小时前"
+    return f"{int(delta / 86400)} 天前"
+
+
+def _ccb_present(data: Any) -> bool:
+    """这份用户数据里有没有 Humanoid Core 的 ccb 字段（场景 / 次数 / 余韵）。
+
+    为什么用它当「要不要显示亲密段」的总开关：AS 读不到 Core 的配置文件，
+    分不清「ccb 关着」和「ccb 开着但从没进过场景」——这两种情况下 state.json
+    里都没有 ccb 键。于是只认**已经有数据**这一种证据：有就显示，没有就整段不出。
+    这样才能兑现「ccb 关闭 / 老版本 Core 时面板与以前逐字等价」。
+    """
+    if not isinstance(data, dict):
+        return False
+    for key in (
+        "ccb_stage", "ccb_satisfy", "ccb_last_at", "ccb_turns",
+        "ccb_done_count", "ccb_aftercare_until",
+    ):
+        if data.get(key) is not None:
+            return True
+    return False
+
+
 def _body_asleep(body: Any) -> bool:
     """Core 契约里「她现在在睡吗」。
 
@@ -687,18 +779,32 @@ class SocialEngine:
         # 现在是 `_speak_inner` 的局部变量，验收失败时记下来，下次能分辨
         # 「模型自己漏写了括号」还是「清洗/截断弄坏的」。
         self._m: Dict[str, Any] = {
-            "last_heartbeat": 0.0,      # 最后一次心跳进来的时刻
-            "last_settled": 0.0,        # 最后一次真正结算了念头
+            # 本次进程的启动时刻。面板上的「本次运行 X 分钟」要有参照物——否则重启后
+            # 面对从 state.json 接回来的累计数字，根本分不清哪些是这一轮、哪些像上辈子。
+            "boot_at": self._time(),
+            "last_heartbeat": 0.0,      # 最后一次心跳进来的时刻（本次运行）
+            "last_settled": 0.0,        # 最后一次真正结算了念头（本次运行）
             "last_settled_users": 0,    # 那次结算了多少个人
             "last_ready": 0,            # 多少人念头够了
             "last_candidate": 0,         # 多少个候选进了闸门
-            "last_sent": 0,             # 最后一次真的发出去了
+            "last_sent": 0,             # 最后一次真的发出去了（本次运行）
             "last_failed": 0.0,          # 最后一次失败
             "last_failure": "",         # 失败在哪一步（短标签）
-            "rounds": 0,                # 累计心跳轮数
-            "sent_total": 0,            # 累计主动消息
+            "rounds": 0,                # 历史累计心跳轮数（跨重启，从 _runtime 接回）
+            "sent_total": 0,            # 历史累计主动消息（跨重启）
             "settle_user_errors": 0,    # 累计被跳过的坏用户数（见 settle_minds 的逐用户兜底）
-            "blocked_reasons": {},      # 各闸门各拦下多少（近 N 轮滚动）
+            # 各闸门各拦下多少。**历史累计**：从 state.json 的 `_runtime` 接回、
+            # 跨重启只增不减（`test_counters_survive_a_restart` 钉的就是这个语义）。
+            # 以前注释写「近 N 轮滚动」、面板也照着累计念，于是「拦下 900 次」里
+            # 有多少是今天发生的完全看不出来——这是用户说的「以前的计数不会变」。
+            "blocked_reasons": {},
+            # 本次运行的那份。同结构、启动清零，只回答「这台机器这次起来之后发生了什么」。
+            # 两份都留：累计回答「一路下来哪道闸最常拦」，本次运行回答「现在卡在哪」。
+            "blocked_reasons_run": {},
+            # 本进程真的发出去几条 / 跑了几轮。`sent_total`/`rounds` 是累计，
+            # 重启后它们会像「这台机器刚发了 900 条」一样骗人，必须有本次运行的对照。
+            "sent_run": 0,
+            "rounds_run": 0,
             "llm_circuit_scopes": [],  # v1.28.2：当前熔断中的 LLM scope（仅状态展示）
         }
         # 累计类指标从上次落盘的地方接上。`last_*` 那几个不接——它们本来就该是
@@ -2266,6 +2372,169 @@ class SocialEngine:
             self._facade = None
         return self._facade
 
+    def _core_brief(
+        self,
+        bid: str,
+        uid: str,
+        *,
+        char_name: str = "",
+        user_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """问 Core 门面要一份「主动消息用」的结构化情境；拿不到返回 None。
+
+        `core_facade.brief()` 这个封装从 v1.27.40 起就存在，却只有 clock/status 在用
+        ——门面直给的结构化情境（她自己的身份/穿搭、天气/节日/作息，以及**称呼与好感**）
+        因此从来没进过主动消息的 prompt，那条路只能读落盘的 state.json（慢一拍、
+        而且大多数用户压根没有 Core 认定的 nickname）。v1.28.9 把这条死路接上。
+
+        失败安全是硬要求：没门面（没装 / `use_core_facade=off` / 版本太旧）、门面报错、
+        返回非 dict，一律 None——调用方退回 `core_bridge` 的旧行为，绝不能因为一条
+        **可选**上下文把主动消息弄得发不出去。
+        """
+        try:
+            facade = self._core_facade()
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取 Core 门面失败（退回 state.json）: {exc}")
+            return None
+        if facade is None:
+            return None
+        try:
+            return core_facade.brief(
+                facade,
+                bid,
+                uid,
+                task="proactive",
+                char_name=str(char_name or ""),
+                user_name=str(user_name or ""),
+            )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 门面 brief 失败（退回 state.json）: {exc}")
+            return None
+
+    @staticmethod
+    def _apply_core_brief(
+        u_copy: Dict[str, Any],
+        brief: Optional[Dict[str, Any]],
+        user_core: Optional[Dict[str, Any]],
+        u: Dict[str, Any],
+    ) -> None:
+        """把门面 brief 的用户块合并进生成目标：**门面优先，state.json / 本地账本兜底**。
+
+        只写 `_` 开头的生成侧字段，不动状态账本（`u_copy` 是副本）；任何字段读坏都只
+        跳过那一个，不抛——这条路径是加分项，坏掉时必须退回 v1.28.8 的旧行为。
+        `_nickname` 保持旧语义：只放 **Core 认定** 的称呼（生成侧据此区分措辞），
+        可用的称呼统一放 `_call_name`，来源放 `_name_source`。
+        """
+        snap = user_core if isinstance(user_core, dict) else {}
+        local = u if isinstance(u, dict) else {}
+        block = brief.get("user") if isinstance(brief, dict) else {}
+        if not isinstance(block, dict):
+            block = {}
+        if isinstance(brief, dict):
+            # 整份 brief 留给生成侧（身份/穿搭等以后直接用，不必再问一次门面）
+            u_copy["_brief"] = brief
+
+        # ── 称呼：门面 > state.json（nickname→display_name）> 本地账本名片名 ──
+        # 门面给了空 nickname 时以门面为准：它现算，文件里的可能是几小时前的旧值。
+        if "nickname" in block:
+            u_copy["_nickname"] = _brief_text(block.get("nickname"))
+        elif "nickname" in snap:
+            u_copy["_nickname"] = _brief_text(snap.get("nickname"))
+        nickname = _brief_text(u_copy.get("_nickname"))
+
+        display_name = _brief_text(block.get("display_name"))
+        if not display_name:
+            display_name = _brief_text(snap.get("display_name"))
+        if display_name:
+            u_copy["_display_name"] = display_name
+
+        brief_call = _brief_text(block.get("call_name"))
+        snap_call = _brief_text(snap.get("call_name"))
+        local_name = _brief_text(local.get("name"))
+        if brief_call:
+            call_name = brief_call
+            name_source = _brief_text(block.get("name_source"))
+        elif snap_call:
+            call_name = snap_call
+            name_source = _brief_text(snap.get("name_source"))
+        elif local_name:
+            call_name = local_name
+            name_source = "local"
+        else:
+            call_name, name_source = "", ""
+        # 门面/文件没带 name_source 时按已知的两级反推，反推不到就按名片名处理
+        # （措辞上「偶尔这么叫」比「你一直叫」安全：叫错来源不会让模型以为在复读旧称呼）。
+        if call_name and not name_source:
+            if nickname and nickname == call_name:
+                name_source = "nickname"
+            elif display_name:
+                name_source = "display_name"
+            else:
+                name_source = "local"
+        if call_name:
+            u_copy["_call_name"] = call_name
+            u_copy["_name_source"] = name_source
+
+        # ── 好感：门面现算，文件里的可能是几小时前落盘的 ──
+        affection = _brief_float(block.get("affection"))
+        if affection is not None:
+            u_copy["_affection"] = affection
+        base_affection = _brief_float(block.get("base_affection"))
+        if base_affection is not None:
+            u_copy["_affection_base"] = base_affection
+        # 她对 TA 的情绪标签（Core 情绪分析出的短标签）：拿不到就不出这一句
+        if "label" in block:
+            label = _brief_text(block.get("label"))
+            if label:
+                u_copy["_label"] = label
+            else:
+                u_copy.pop("_label", None)
+
+        if "mood_tag" in block:
+            u_copy["_mood_tag"] = _brief_text(block.get("mood_tag"))
+        elif "mood_tag" in snap:
+            u_copy["_mood_tag"] = _brief_text(snap.get("mood_tag"))
+
+        # 在意程度：老字段 `_attention` 是 care 那一个数（生成侧按 float 读），
+        # 门面给的是整块 {care, focus, spare}——单值照旧写 `_attention`，整块另存。
+        attention = block.get("attention")
+        if isinstance(attention, dict):
+            care = _brief_float(attention.get("care"))
+            if care is not None:
+                u_copy["_attention"] = care
+            u_copy["_attention_block"] = dict(attention)
+        else:
+            care = _brief_float(attention)
+            if care is not None:
+                u_copy["_attention"] = care
+
+        # 她记着对方说过的话：形状转回生成侧认的 [{"said", "at"}]
+        if "said" in block:
+            u_copy["_said"] = _brief_said(block.get("said"))
+        elif "said" in snap:
+            u_copy["_said"] = list(snap.get("said") or [])
+
+        # 她自己的名字：优先门面 her.char_name，旧 Core 则从契约 identity 块兜底。
+        her = brief.get("her") if isinstance(brief, dict) else {}
+        her_name = _brief_text(her.get("char_name")) if isinstance(her, dict) else ""
+        if not her_name:
+            identity = snap.get("identity")
+            if isinstance(identity, dict):
+                her_name = _brief_text(identity.get("char_name"))
+        if her_name:
+            u_copy["_her_name"] = her_name
+
+        # 简单字段：有就给，没有就保持旧逻辑算出来的值
+        known_days = _brief_float(block.get("known_days"))
+        if known_days is not None:
+            u_copy["_known_days"] = known_days
+        last_interaction = _brief_float(block.get("last_interaction"))
+        if last_interaction is not None:
+            u_copy["_last_interaction"] = last_interaction
+        libido = _brief_float(block.get("libido"))
+        if libido is not None:
+            u_copy["_libido"] = libido
+
     def _remember_clock(self, bid: str, body: Optional[Dict[str, Any]]) -> None:
         """从 Core 记下她所在城市的时区偏移。
 
@@ -2685,6 +2954,9 @@ class SocialEngine:
         ("没有可用的会话来源", "投不出"),
         ("发送侧熔断", "发送熔断"),
         ("没有由头", "没由头"),
+        # v1.28.9 的真回避：对方连着几天没开口，她全面停发。单列一类，否则它会落进
+        # 「其它」——而这条恰恰是主人最想知道的那种「她为什么突然不说话了」。
+        ("没开口", "TA没开口"),
     )
 
     @classmethod
@@ -2734,6 +3006,10 @@ class SocialEngine:
         # 这次把它填上，不再另起一个名字。
         table = self._m.setdefault("blocked_reasons", {})
         table[cat] = int(table.get(cat, 0) or 0) + 1
+        # 同一个原因再记一份「本次运行」的。两份的口径不同，面板上必须分开念：
+        # 只有累计那份的话，重启后「安静时段 900 次」会一直挂在那儿，看着像今天。
+        run = self._m.setdefault("blocked_reasons_run", {})
+        run[cat] = int(run.get(cat, 0) or 0) + 1
 
     def _note_decision(self, uid: str, text: str) -> None:
         """C2：把一次决策（发了 / 没发）记进最近 24h 时间线，面板上看得到她都在想什么。"""
@@ -2807,6 +3083,12 @@ class SocialEngine:
         # 作息与安静时段同样的教训：这类东西做成权重会漏，必须是闸。
         if _body_asleep(body):
             return "她正在睡觉"
+        # 对方连着几天没开口、她这期间还在主动发 → 全面停发，等对方先开口。
+        # 与下面「刚聊上 / 不久前才说过话」是两回事：那些是节奏护栏（别打断），
+        # 这一条是「人家压根不理你」——再发就是追着一个不回话的人。
+        _avoid = SocialEngine._avoidance_note(self, u, now)
+        if _avoid:
+            return _avoid
         # C5/D4：Core 那边的情绪也参与——她正在冷静期就不找这个人；
         # 对这个人的气还没消（攻击性远高于基线）也不找。
         try:
@@ -2863,18 +3145,28 @@ class SocialEngine:
         u: Dict[str, Any],
         now: float,
         body: Optional[Dict[str, Any]] = None,
+        kind: str = "",
     ) -> str:
         """接话的闸门。与 gate_reason 的区别只有一处：不管 recent_talk。
 
         真人追问恰恰发生在「刚聊完」之后，拿「不久前才说过话」去挡它，等于把
         这条路径永远堵死。同理不查对方作息：TA 几分钟前还在说话，这个点肯定醒着。
+
+        `kind` 只有 continue 一个特例：**它也不查 recent_talk**。理由不是「追问特殊」，
+        而是 continue 的定义就是「她回完、对方消失」——它本来就发生在一次对话之后；
+        而 recent_talk 的上限能配到 12 小时（RECENT_TALK_MAX=720），拿它挡 continue
+        等于让这条路径在那种配置下永远不成立（默认 30 分钟配 continue 起点 90 分钟，
+        平时碰不到，但不能靠默认值活着）。
         """
         if _body_asleep(body):
             return "她正在睡觉"
+        _avoid = SocialEngine._avoidance_note(self, u, now)
+        if _avoid:
+            return _avoid
         # 「刚聊过」也要拦。追问与「在吗」都是**接续型**——对方刚说完话就追一句
         # 是打断。对方一小时一条「在吗」，她每两小时（最小间隔一过）追问一次，
         # 7 天 44 次。
-        if now - _num(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
+        if kind != "continue" and now - _num(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
             return "刚聊过，不追"
         last_said = self._last_said(u)
         if last_said > 0 and _num(u.get("thread_for", 0) or 0) == last_said:
@@ -2890,17 +3182,34 @@ class SocialEngine:
         """这一段对话里最后一个人说话的时刻。沉默从这一刻算起。"""
         return max(_num(u.get("last_seen", 0) or 0), _num(u.get("last_spoken", 0) or 0))
 
-    def _thread_windows(self) -> Tuple[float, float, float, float]:
-        """四个时间窗：多久算能追问 / 多久算能问在吗 / 最长追到多久 / 之前多久内得有过话。
+    def _thread_windows(self) -> Tuple[float, float, float, float, float, float]:
+        """六个时间窗：(能追问, 能问在吗, 最长追到多久, 之前多久内得有过话,
+        接话起点, 接话窗口)。
 
         「得先聊起来」这一条以前取 presence 的三倍（默认 18 分钟）：两个人你一句我一句
         但每句隔半小时，就被判成「没在聊」，追问永远不成立。它该跟「最长追到多久」同量级
         ——要的是「刚才确实在来往」，不是「聊得密」。
+
+        后两个是 v1.28.9 的接话窗口：`continue_enabled` 关掉时都给 0（= 关闭），
+        `thread_reason` 拿到 0 就走老路径，与 v1.28.9 逐字一致。
         """
         presence = self.cfg.followup_after_minutes * 60
         probe = min(presence, self.cfg.probe_after_minutes * 60)
         ceiling = self.cfg.followup_max_minutes * 60
-        return probe, presence, ceiling, max(1800.0, ceiling)
+        context = max(1800.0, ceiling)
+        # `getattr` 兜底：轻量测试桩的 cfg 可能是 SimpleNamespace（没有这两个新键），
+        # 缺键时按「关闭」处理，老路径照常跑。
+        continue_on = bool(getattr(self.cfg, "continue_enabled", False))
+        if continue_on:
+            continue_after = max(
+                0.0, float(getattr(self.cfg, "continue_after_minutes", 0) or 0) * 60.0
+            )
+            continue_max = max(
+                0.0, float(getattr(self.cfg, "continue_window_hours", 0) or 0) * 3600.0
+            )
+        else:
+            continue_after = continue_max = 0.0
+        return probe, presence, ceiling, context, continue_after, continue_max
 
     def _thread_pick(
         self,
@@ -2911,10 +3220,14 @@ class SocialEngine:
         """这个角色名下，谁的那场对话正说断了。返回 (uid, u, 种类, 动机, 沉默秒)。
 
         挑刚断的那一个：离得越近越像同一场话，隔了两小时再问「在吗」就不成立了。
+
+        `continue_enabled` 是**独立开关**：followup 关掉只是不再追问/问在不在，
+        不该把「她回完、对方消失」这条也一起关掉（那是另一件事，用户可能只想关前者）。
         """
-        if not self.cfg.followup_enabled:
+        continue_on = bool(getattr(self.cfg, "continue_enabled", False))
+        if not self.cfg.followup_enabled and not continue_on:
             return None
-        probe, presence, ceiling, context = self._thread_windows()
+        probe, presence, ceiling, context, continue_after, continue_max = self._thread_windows()
         best: Optional[Tuple[float, str, Dict[str, Any], str, str]] = None
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo"):
@@ -2929,10 +3242,16 @@ class SocialEngine:
                 max_seconds=ceiling,
                 context_seconds=context,
                 presence_floor_seconds=presence,
+                continue_after_seconds=continue_after,
+                continue_max_seconds=continue_max,
             )
             if not kind:
                 continue
-            if self.thread_gate(bid, uid, u, now, body):
+            # followup 关掉时只留 continue：上面虽然放行了这一轮，但 `thread_reason`
+            # 仍会算 probe/presence（窗口值照旧给着），不过滤就等于把追问开关又打开了。
+            if not self.cfg.followup_enabled and kind != "continue":
+                continue
+            if self.thread_gate(bid, uid, u, now, body, kind=kind):
                 continue
             gap = now - self._last_said(u)
             if best is None or gap < best[0]:
@@ -2959,9 +3278,16 @@ class SocialEngine:
         但会查「TA 说过要去睡」：以前这条只有另起话题查，于是 22:50 对方说「困了先睡了」，
         22:52 就收到一句「晚安，今天过得怎么样呀」。晚安本身豁免——对方要睡了，回一句
         晚安是合理的。
+
+        还会查「对方是不是连着几天没开口」：问候是唯一**绕过** pending / 冷落计数 /
+        `COLD_SILENCE_SENT` 的路径，所以它必须自己认这一条——否则「一句不回的人每天
+        照样收早安」，而面板上还写着「回避：开」。
         """
         if _body_asleep(body):
             return "她正在睡觉"
+        _avoid = SocialEngine._avoidance_note(self, u, now)
+        if _avoid:
+            return _avoid
         if kind != "night" and sleep_signal(u, now):
             return "TA 说过要去睡了，这时发过去不合适"
         if self._quiet_now(bid, self._moment_of(bid, now).hour):
@@ -3151,6 +3477,54 @@ class SocialEngine:
         except (TypeError, ValueError):
             return False
         return stopped > 0 and seen <= stopped
+
+    def silent_giveup_days(self, u: Dict[str, Any], now: float) -> float:
+        """对方连续这么多天没开口、她这期间还在主动发 → 返回天数；否则 0。
+
+        这是「真回避」的**唯一**判据，`gate_reason` / `greet_gate` / `thread_gate`
+        与 `_speak_inner` 的唯一收口全都调它，绝不各写一份——同一条判断散在几处，
+        改一处忘一处，表现就是「面板说在回避，消息照样发」。
+
+        为什么必须单独有这一条：问候走 `expect_reply=False`，不进 pending /
+        `no_reply_streak`；`COLD_SILENCE_SENT` 又只挡非 greet 类。于是「一句不回的
+        人每天照样收早安」——线上真实记录：某人最后一次开口 10-18，之后 10-19/21/22/
+        23/25 各收到一条问候，而现有九道闸没有一道看得见（silent_sent=5、
+        proactive_sent=0、no_reply_streak=0）。
+
+        两个「留一次机会」的兜底：
+        * `last_seen <= 0`：从没记录过对方开口（播种进来/老数据），不据此判死；
+        * `silent_sent <= 0`：她这期间**一条都没发过**，那还谈不上「追着一个不回的人」，
+          先让她正常开口一次。
+        """
+        # `getattr` 兜底：`_speak_inner` 会被只挂少数依赖的轻量引擎桩直接调用
+        # （桩上的 cfg 是 SimpleNamespace，没有这一项）。缺键时按「关闭」处理——
+        # 新增的闸不该让一条老路径崩掉。
+        try:
+            limit = float(getattr(self.cfg, "silent_giveup_days", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if limit <= 0:
+            return 0.0
+        seen = _num(u.get("last_seen", 0) or 0)
+        if seen <= 0:
+            return 0.0
+        silent_sent = int(_num(u.get("silent_sent", 0) or 0))
+        if silent_sent <= 0:
+            return 0.0
+        days = max(0.0, now - seen) / 86400.0
+        return days if days >= limit else 0.0
+
+    def _avoidance_note(self, u: Dict[str, Any], now: float) -> str:
+        """回避中的统一说法（闸门与 `_speak_inner` 共用，文案只写一份）。
+
+        显式写成 `SocialEngine.silent_giveup_days(self, ...)`：几个闸门方法会被只挂了
+        少数依赖的轻量引擎桩直接调用（`gate_reason = SocialEngine.gate_reason`），
+        桩上并没有这个新方法。
+        """
+        days = SocialEngine.silent_giveup_days(self, u, now)
+        if not days:
+            return ""
+        return f"TA 已经 {int(days)} 天没开口，先不主动了（等 TA 先开口）"
 
     def loop_gate(
         self,
@@ -3526,6 +3900,10 @@ class SocialEngine:
                         ready += 1
             except Exception as exc:
                 logger.warning(f"[autonomous_social][{bid}] dry-run 结算出错: {exc}")
+        # 自检自己也会「结算」一次，但它不代表心跳真的跑过。原来直接覆盖
+        # `last_settled`，于是 `/社交自检` 里永远只能说「刚刚」，上一次真实心跳
+        # 是什么时候被永久抹掉了——面板于是没法回答「这链路是刚跑过还是三天前」。
+        self._m["prev_settled"] = self._m.get("last_settled") or 0.0
         self._m["last_settled"] = now
         self._m["last_settled_users"] = total
         self._m["last_ready"] = ready
@@ -3560,9 +3938,18 @@ class SocialEngine:
 
     def _persist_metrics(self) -> None:
         """运行指标落盘。容器侧靠它判断「跑没跑、卡在哪」，所以写完就 flush，
-        不等那个 30 秒的周期——否则刚装上时去读文件会扑空。"""
+        不等那个 30 秒的周期——否则刚装上时去读文件会扑空。
+
+        「本次运行」那几项**不落盘**：落下去它们会比进程活得久，下次启动、
+        第一次刷盘之前，容器侧或手点开 state.json 的人就会把上一个进程的
+        「本进程发送 2 条」读成现在的事实——那正是这轮要修的病。
+        """
         try:
-            self.state.set_runtime_metrics(self._m)
+            _persist = {
+                k: v for k, v in self._m.items()
+                if k not in ("boot_at", "blocked_reasons_run", "sent_run", "rounds_run")
+            }
+            self.state.set_runtime_metrics(_persist)
             self.state.flush()
         except Exception as exc:
             self.log(f"写运行指标失败: {exc}")
@@ -3582,6 +3969,7 @@ class SocialEngine:
         now = self._time()
         self._m["last_heartbeat"] = now
         self._m["rounds"] = int(self._m.get("rounds", 0)) + 1
+        self._m["rounds_run"] = int(self._m.get("rounds_run", 0)) + 1
         # 每轮重置「有由头但没发」的分类计数（见 __init__ 里的说明）
         # 每轮先把「她那座城市现在几点」问一次 Core。原来只有状态展示前才刷，
         # 主循环里 _city_offset 一直是空的 → _moment_of 退回本机时区。
@@ -4078,6 +4466,8 @@ class SocialEngine:
                 kind,
                 about=str(u.get("last_message", "") or ""),
                 asked=str(u.get("last_spoken_text", "") or ""),
+                # continue 用得到：沉默 20 分钟和沉默 5 小时是两种说法（接话 vs 问人去哪了）
+                silence_minutes=gap / 60.0,
             )
             jobs.append(job_of(bid, uid, u, 0.0, (reason, meta), f"{kind}（沉默 {gap / 60:.0f} 分钟）"))
 
@@ -4399,6 +4789,17 @@ class SocialEngine:
         if self._quiesced(u):
             return False, "已经决定不再主动找 TA 了（等 TA 先开口）"
 
+        # 真回避：对方连着几天没开口、她这期间还在主动发 → **全面**停发，等对方先开口。
+        #
+        # 为什么必须放在这个唯一收口上：问候走 `expect_reply=False`，不进 pending /
+        # `no_reply_streak`，而 `COLD_SILENCE_SENT` 只挡非 greet 类——于是「一句不回的人
+        # 每天照样收早安」（线上真实记录：某人 10-18 后没再开口，10-19/21/22/23/25 各收到
+        # 一条问候）。每一条主动消息都要经过这里，所以闸落在这儿，对所有 category 生效，
+        # 包括 greet / cue / closer。
+        _avoid = SocialEngine._avoidance_note(self, u, now)
+        if _avoid:
+            return False, _avoid
+
         # 上一条主动消息还悬着（发出去了、还没回）：别追着说。
         #
         # 这道闸以前只在 `gate_reason`（另起话题）与 `loop_gate`（回访）里查，
@@ -4508,6 +4909,17 @@ class SocialEngine:
             u_copy["_said"] = list(user_core.get("said") or [])
             u_copy["_mood_tag"] = str(user_core.get("mood_tag") or "")
             u_copy["_attention"] = user_core.get("attention")
+        # 门面 brief（v1.28.9 起真正接上）：主动消息的上下文不再只有落盘的 state.json。
+        # 没门面 / 门面报错 / 老 Core 时 `brief` 为 None，下面只做 state.json 兜底，
+        # 行为与 v1.28.8 一致；拿到时门面值优先（现算的），文件值兜底。
+        #
+        # 显式写成 `SocialEngine._core_brief(self, ...)`：本方法会被只挂了少数依赖的
+        # 轻量引擎桩直接调用（测试里的 SimpleNamespace），桩上没有这个新方法；
+        # `_core_brief` 自己会把「没有 `_core_facade`」当失败吞掉并返回 None。
+        brief = SocialEngine._core_brief(
+            self, bid, uid, user_name=_brief_text(u.get("name"))
+        )
+        SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
 
         # 会话库只提供用户与正常聊天历史；主动消息留在插件账本里，合并后
         # 一起作为本次主动消息生成的上下文，避免 bot 自己的话被覆盖掉。
@@ -4887,6 +5299,9 @@ class SocialEngine:
         # 配额已经在发送前占掉了（见上面的 `_hourly_reserve`），这里不再记一次。
         self._m["last_sent"] = sent_ts
         self._m["sent_total"] = int(self._m.get("sent_total", 0)) + 1
+        # 本次运行单独记一条：`sent_total` 跨重启累计，面板上光看它分不清
+        # 「这台机器刚发了 900 条」和「历史上发过 900 条、今天一条没发」。
+        self._m["sent_run"] = int(self._m.get("sent_run", 0)) + 1
         msg_type = reason_meta.get("msg_type") if reason_meta else None
         category = str((reason_meta or {}).get("category") or "")
         # 她在这条里又许了新诺？记下来，到点她会自己兑现
@@ -4933,7 +5348,7 @@ class SocialEngine:
         # 发成了 → 不再是「连着发不出去」
         u["giveup_count"] = 0
         u["quiesced_at"] = 0.0
-        if category in ("probe", "presence"):
+        if category in ("probe", "presence", "continue"):
             # 记的是「这次追问发出去的时刻」。thread_reason 用它判断：
             # **追过一次之后对方有没有说过新话**——说过就是新断点，可以说；
             # 没说就还是那个断点，不再追第二遍。
@@ -4941,6 +5356,8 @@ class SocialEngine:
             # 以前记的是断点时间戳并拿它跟 last_said 比相等，而 last_said 每次都
             # 会被她自己这条消息推进，等式第二次就必然不成立，守卫等于没有。
             # 真实表现：一个每小时回一句的用户，7 天被追问 44 次。
+            #
+            # continue 走同一笔账：一段沉默只接一次话，接完等对方开口才算新的一段。
             u["thread_asked_at"] = sent_ts
             u["thread_for"] = thread_anchor
             u["thread_at"] = sent_ts
@@ -5055,6 +5472,13 @@ class SocialEngine:
             bits.append(f"{kind.get(mode, '问候')}窗口")
         elif category in ("probe", "presence"):
             bits.append("话说到一半断了")
+        elif category == "continue":
+            # 与上一条不同：这次不是「对方那句悬着」，而是**她说完之后**对方消失。
+            # 带上沉默时长，主人一眼能看出这是接话而不是又在追问同一件事。
+            _mins = int(_num((reason_meta or {}).get("silence_minutes", 0) or 0))
+            bits.append(
+                f"她说完之后 TA {_mins} 分钟没声了" if _mins else "她说完之后 TA 就没声了"
+            )
         elif u.get("last_ignored_at"):
             bits.append("之前被冷落过，这次主动一点")
         if not bits and str(reason or "").strip():
@@ -5468,6 +5892,14 @@ class SocialEngine:
                 u_copy["_said"] = list(user_core.get("said") or [])
                 u_copy["_mood_tag"] = str(user_core.get("mood_tag") or "")
                 u_copy["_attention"] = user_core.get("attention")
+            # 预览必须和真实发送走同一份上下文（门面 brief 也接在这里），
+            # 否则预览看到的名字/好感与真发时不一致，等于白预览。
+            # 与 `_speak_inner` 同一原因显式走类调用：预览路径同样会被只挂了少数
+            # 依赖的轻量引擎桩调用（没有 `_core_brief` / `_core_facade`）。
+            brief = SocialEngine._core_brief(
+                self, bid, uid, user_name=_brief_text(u.get("name"))
+            )
+            SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
             session_history = await self._load_session_history(umo)
             u_copy["conversation"] = self._generation_conversation(u, session_history)
             recent_pro = self.state.recent_proactive(bid, uid, now)
@@ -6326,10 +6758,17 @@ class SocialEngine:
             return "门面：已关闭（use_core_facade=off，与 1.27.38 行为一致）"
         info = core_facade.status()
         if info.get("connected"):
-            caps = "、".join(info.get("capabilities") or []) or "（无）"
+            caps_list = list(info.get("capabilities") or [])
+            caps = "、".join(caps_list) or "（无）"
+            # `user` 是 Core 2.29 起新增的子能力：有它，称呼/好感/说过的话（以及她
+            # 自己的名字 identity）才是门面直给的；没有就仍然读 state.json。
+            # 主动消息能不能叫出名字，第一眼就能在这里看出来。
+            caller = "；主动消息的上下文改由 Core 直接给"
+            if "user" in caps_list:
+                caller += "（含称呼/好感/说过的话）"
             return (
                 f"✅ 门面：已连接（Core API v{info.get('api_version')}；能力：{caps}）"
-                "；主动消息的上下文改由 Core 直接给"
+                + caller
             )
         reason = str(info.get("reason") or "还没查过")
         if mode == "on":
@@ -6419,33 +6858,64 @@ class SocialEngine:
         分不清是没到时间、provider 取不到、用户被隔离、模型否决、平台失败，
         还是后台循环压根没跑。这里把上一次心跳的时间与每一步的人数写出来，
         一眼就能定位到是哪一步之后就不再往下走。
+
+        口径纪律（v1.28.8）：凡是从 state.json 的 `_runtime` 接回来的累计量都写
+        「历史累计」，凡只活在本进程的都写「本次运行」。「最后心跳」这种 `last_*`
+        不从盘上接，所以它一定属于本次运行——标出来是为了让它旁边的累计数字
+        不再被误读。
         """
         m = self._m
         now = self._time()
         # dry-run 也算「跑过了」：启动后 3 秒那次就是给部署验证用的，
         # 那时候主循环还在睡第一个心跳间隔，不该显示成「还没跑过」
-        last_run = m.get("last_heartbeat") or m.get("dry_run_at") or 0.0
+        hb_at = _num(m.get("last_heartbeat") or 0.0)
+        dry_at = _num(m.get("dry_run_at") or 0.0)
+        last_run = hb_at or dry_at
         if not last_run:
             return "⏳ 后台循环还没跑过第一轮（启动后会先等一个心跳间隔）"
         since_hb = now - _num(last_run)
         stale = since_hb > (self.cfg.heartbeat_max_minutes * 60 * 2)
-        hb = f"{int(since_hb / 60)} 分钟前" if since_hb < 3600 else f"{since_hb / 3600:.1f} 小时前"
-        settled = m.get("last_settled") or 0.0
-        since_set = now - settled if settled else -1
-        settle_txt = "还没结算过" if settled <= 0 else (
-            f"{int(since_set / 60)} 分钟前，{m.get('last_settled_users', 0)} 人"
+        hb = _ago_text(last_run, now)
+        # 标「本次运行」不是啰嗦：`last_*` 不从 state.json 接回（见 __init__），
+        # 所以它只可能是这次进程的。可它旁边紧挨着的是跨重启的累计数字，
+        # 不标清楚就会被读成「这台机器一直在跑」。
+        if hb_at:
+            hb_line = f"最后心跳（本次运行）：{hb}"
+        else:
+            hb_line = f"最后心跳：本次运行还没跑过心跳，只跑过启动自检（{hb}）"
+        if stale:
+            hb_line += "（⚠️ 超过两个心跳间隔还没跑，后台循环可能卡住了）"
+        settled = _num(m.get("last_settled") or 0.0)
+        settle_txt = (
+            f"{_ago_text(settled, now)}，{m.get('last_settled_users', 0)} 人"
+            if settled > 0 else "还没结算过"
         )
-        last_sent = m.get("last_sent") or 0.0
-        sent_txt = "还没发出去过" if last_sent <= 0 else (
-            datetime.fromtimestamp(last_sent).strftime("%m-%d %H:%M")
+        # 自检会把 `last_settled` 改写成「刚刚」，于是「上一次真实心跳什么时候结算的」
+        # 只能从 `prev_settled`（dry_run 覆盖前存下来的那一刻）看。没有就不写。
+        prev_settled = _num(m.get("prev_settled") or 0.0)
+        prev_txt = (
+            f"；自检前那次心跳结算：{_ago_text(prev_settled, now)}"
+            if prev_settled > 0 else ""
         )
+        last_sent = _num(m.get("last_sent") or 0.0)
+        sent_txt = "本次运行还没发出去过" if last_sent <= 0 else (
+            f"{_ago_text(last_sent, now)}"
+            f"（{datetime.fromtimestamp(last_sent).strftime('%m-%d %H:%M')}）"
+        )
+        sent_run = int(_num(m.get("sent_run", 0) or 0))
+        total_sent = int(_num(m.get("sent_total", 0) or 0))
+        rounds_run = int(_num(m.get("rounds_run", 0) or 0))
+        rounds_total = int(_num(m.get("rounds", 0) or 0))
         nxt = int(max(0, (self.cfg.heartbeat_min_minutes * 60) - since_hb) / 60)
         lines = [
-            f"最后心跳：{hb}{'（⚠️ 超过两个心跳间隔还没跑，后台循环可能卡住了）' if stale else ''}",
-            f"最后结算：{settle_txt}｜念头够了 {m.get('last_ready', 0)} 人"
+            hb_line,
+            f"最后结算：{settle_txt}{prev_txt}｜念头够了 {m.get('last_ready', 0)} 人"
             f"｜候选 {m.get('last_candidate', 0)} 个",
-            f"最后发送：{sent_txt}（累计 {m.get('sent_total', 0)} 条）"
-            f"｜累计跑了 {m.get('rounds', 0)} 轮心跳",
+            f"最后发送：{sent_txt}",
+            # 这一行是用户要的：「这次起来到底发了几条」。`sent_total` 是跨重启累计，
+            # 光看它分不清「刚发了 900 条」和「上辈子发过 900 条、今天一条没有」。
+            f"本进程发送：{sent_run} 条（只算这次启动之后；历史累计 {total_sent} 条）",
+            f"心跳轮数：本进程 {rounds_run} 轮｜历史累计 {rounds_total} 轮（含重启前）",
         ]
         fail = str(m.get("last_failure") or "")
         if fail:
@@ -6454,13 +6924,13 @@ class SocialEngine:
         vetoed = int(_num(m.get("veto_total", 0) or 0))
         if vetoed:
             lines.append(
-                f"模型否决：累计 {vetoed} 次（她说此刻不该找这个人——由头留着，"
+                f"模型否决：历史累计 {vetoed} 次（她说此刻不该找这个人——由头留着，"
                 f"下轮状态变了还可以说）"
             )
         rejected = int(_num(m.get("rejected_total", 0) or 0))
         if rejected:
             lines.append(
-                f"验收拦下：累计 {rejected} 条（这由头她驾驭不了，已消耗；"
+                f"验收拦下：历史累计 {rejected} 条（这由头她驾驭不了，已消耗；"
                 f"念头保留，下轮还能再试）"
             )
             last_rej = str(m.get("last_rejected") or "")
@@ -6468,12 +6938,30 @@ class SocialEngine:
                 lines.append(f"  最近一条被拦的是：{last_rej[:60]}")
         # 没发出去的都去了哪：按理由分组。这是唯一能回答「这一轮为什么一条都没发」
         # 的地方——以前只知道总数，调阈值全凭感觉。
-        blocked = m.get("blocked_reasons") or {}
-        if isinstance(blocked, dict) and blocked:
-            total_blocked = sum(int(_num(v or 0)) for v in blocked.values())
-            lines.append(f"没发出去的去向（累计 {total_blocked} 次）：")
-            for cat, cnt in sorted(blocked.items(), key=lambda kv: -int(_num(kv[1] or 0)))[:8]:
-                lines.append(f"  {cat}：{int(_num(cnt))} 次")
+        #
+        # 口径必须分开：`blocked_reasons` 从 state.json 的 `_runtime` 接回、跨重启
+        # 只增不减，`blocked_reasons_run` 随启动清零。以前把累计那张表当「近 N 轮」
+        # 展示，于是重启十次之后「安静时段 900 次」还挂在那里，看着像刚刚发生。
+        run_blocked = m.get("blocked_reasons_run") or {}
+        hist_blocked = m.get("blocked_reasons") or {}
+        has_run_block = isinstance(run_blocked, dict) and bool(run_blocked)
+        has_hist_block = isinstance(hist_blocked, dict) and bool(hist_blocked)
+        if has_run_block or has_hist_block:
+            lines.append("没发出去的去向（两个口径分开看，别混）：")
+            if has_run_block:
+                total_run = sum(int(_num(v or 0)) for v in run_blocked.values())
+                lines.append(f"  本次运行 {total_run} 次（这次启动以来）：")
+                for cat, cnt in sorted(
+                    run_blocked.items(), key=lambda kv: -_num(kv[1] or 0)
+                )[:6]:
+                    lines.append(f"    {cat}：{int(_num(cnt))} 次")
+            if has_hist_block:
+                total_blocked = sum(int(_num(v or 0)) for v in hist_blocked.values())
+                lines.append(f"  历史累计 {total_blocked} 次（含重启前，不是「近 N 轮」）：")
+                for cat, cnt in sorted(
+                    hist_blocked.items(), key=lambda kv: -_num(kv[1] or 0)
+                )[:8]:
+                    lines.append(f"    {cat}：{int(_num(cnt))} 次")
         # 关系档位与「多久没回」
         tier_rows = []
         for bid in sorted(self.state.data.get("bots", {})):
@@ -6496,6 +6984,213 @@ class SocialEngine:
         if nxt > 0:
             lines.append(f"预计下一轮：约 {nxt} 分钟后")
         return "\n".join(lines)
+
+    def _boot_text(self) -> str:
+        """「本次运行多久了」——面板顶上的时间参照物。
+
+        重启后 state.json 里还躺着上一轮的 `last_*` 与累计计数。没有起点的话，
+        「最后心跳 3 分钟前」可能是上一个进程留下的，读起来像刚跑过。
+        """
+        boot = _num(self._m.get("boot_at") or 0.0)
+        if boot <= 0:
+            return ""
+        uptime = max(0.0, self._time() - boot)
+        if uptime < 60:
+            span = "不到 1 分钟"
+        elif uptime < 3600:
+            span = f"{int(uptime / 60)} 分钟"
+        elif uptime < 86400:
+            span = f"{uptime / 3600:.1f} 小时"
+        else:
+            span = f"{uptime / 86400:.1f} 天"
+        return f"{span}（{datetime.fromtimestamp(boot).strftime('%m-%d %H:%M')} 启动）"
+
+    def _core_intimacy_capability(self) -> str:
+        """Core 门面有没有 `intimacy` 能力——这是「ccb 兼容性」唯一的硬证据。
+
+        不拿版本号猜：门面没连上时「旧版 Core」和「Core 没起来」在用户眼里是
+        同一种症状，都只能让面板去看 state.json 的静态字段。
+        """
+        try:
+            facade = self._core_facade()
+        except Exception:
+            facade = None
+        if facade is None:
+            return "Core 门面未连接，只能读 state.json（落盘后就不再更新的静态字段）"
+        # `capabilities()` 是门面唯一的版本谈判方式（API_VERSION 只加不改），
+        # 统一走 `core_facade.has_capability`，别在调用点各写一份 `in list`。
+        if core_facade.has_capability(facade, "intimacy"):
+            return "Core 门面具备 intimacy 能力（能按需读到场景 / 亲近欲）"
+        return "Core 门面没有 intimacy 能力（Core < 2.28.6），只能读 state.json 的静态字段"
+
+    def _probe_ccb_proactive(self, bid: str, uid: str) -> str:
+        """能确认才说：门面的 `intimacy()` 只有 `ccb_proactive` 开着才会给「想不想」那句。
+
+        空串代表「它没给我」——可能是关着，也可能是她这会儿没那个心思，分不清，
+        所以只报确认到的那一种。没有具体 uid 时不问（门面 API 是按人取的）。
+        """
+        if not bid or not uid:
+            return ""
+        try:
+            facade = self._core_facade()
+        except Exception:
+            facade = None
+        if facade is None:
+            return ""
+        fn = getattr(facade, "intimacy", None)
+        if not callable(fn):
+            return ""
+        try:
+            data = fn(str(bid), str(uid))
+        except Exception:
+            return ""
+        if isinstance(data, dict) and str(data.get("want_line") or "").strip():
+            return "- ccb_proactive：开着（Humanoid Core 门面给出了「她这会儿想不想」那句）"
+        return ""
+
+    def _intimacy_capability_line(self) -> str:
+        """能力/配置侧的一行：本插件「想要了」通道的门槛 + 门面兼容性。"""
+        aff = getattr(self.cfg, "intimacy_affection_min", 70)
+        rise = getattr(self.cfg, "intimacy_libido_rise", 6.0)
+        cool = getattr(self.cfg, "intimacy_cooldown_hours", 48)
+        return (
+            f"- 能力：想要了通道＝好感≥{aff}、亲近欲比基线涨≥{rise:g}、"
+            f"同一人 {cool} 小时内只问一次（够不够由 Core 的 ccb 判定，这里只报门槛）；"
+            f"{self._core_intimacy_capability()}"
+        )
+
+    @staticmethod
+    def _any_ccb_user(root: Dict[str, Any], bid: str) -> bool:
+        """这套部署的 state.json 里有没有任何人带 ccb 字段。
+
+        只用来决定「要不要显示能力段」：读不到具体对话者时，至少确认 Core 在记
+        这条线。扫描有上限——状态页是给人看的，不该为它把上千用户全走一遍。
+        """
+        roles = root.get("roles") if isinstance(root, dict) else None
+        if not isinstance(roles, dict):
+            return False
+        role_ids = [bid] if bid and bid in roles else []
+        if not role_ids:
+            role_ids = list(roles)[:8]
+        for rid in role_ids:
+            role = roles.get(rid)
+            if not isinstance(role, dict):
+                continue
+            users = role.get("users")
+            if not isinstance(users, dict):
+                continue
+            for user in list(users.values())[:800]:
+                if _ccb_present(user):
+                    return True
+        return False
+
+    def _intimacy_person_text(self, snap: Dict[str, Any], bid: str = "",
+                              uid: str = "") -> str:
+        """带具体对话者的【亲密】段：场景、亲近欲、历史、余韵。"""
+        now = self._time()
+        lines = [
+            "【亲密】她这会儿的亲密状态（读自 Humanoid Core 落盘的 state.json；"
+            "Core 不写盘时这里会是上一次落盘的样子）"
+        ]
+        stage = int(_num(snap.get("ccb_stage", 0) or 0))
+        satisfy = _num(snap.get("ccb_satisfy", 0) or 0)
+        turns_raw = snap.get("ccb_turns")
+        has_turns = turns_raw is not None
+        turns = int(_num(turns_raw or 0))
+        if stage > 0:
+            scene = f"进行中 · 阶段 {stage} · 满足 {satisfy:g}/100"
+            if has_turns:
+                scene += f" · 今日 {turns} 次"
+        else:
+            scene = "这会儿不在场景里"
+            if has_turns and turns > 0:
+                scene += f"（今日 {turns} 次）"
+        lines.append(f"- 场景：{scene}")
+        libido = snap.get("libido")
+        if libido is not None:
+            lib = _num(libido)
+            line = f"- 亲近欲：{lib:g}/50"
+            base_libido = snap.get("base_libido")
+            if base_libido is not None:
+                base = _num(base_libido)
+                diff = lib - base
+                if abs(diff) >= 0.5:
+                    line += (
+                        f"（基线 {base:g}，比平时{'高' if diff > 0 else '低'} "
+                        f"{abs(diff):g}）"
+                    )
+                else:
+                    line += f"（基线 {base:g}，跟平时差不多）"
+            else:
+                line += "（Core 没给基线）"
+            lines.append(line)
+        last_at = _num(snap.get("ccb_last_at") or 0.0)
+        done = int(_num(snap.get("ccb_done_count") or 0))
+        bits: List[str] = []
+        if last_at > 0:
+            bits.append(f"上次 {_ago_text(last_at, now)}")
+        if done > 0:
+            bits.append(f"一共 {done} 次")
+        if bits:
+            lines.append("- 历史：" + " · ".join(bits))
+        until = _num(snap.get("ccb_aftercare_until") or 0.0)
+        if until > now:
+            lines.append(
+                f"- 余韵：还剩 {max(0, int((until - now) / 60))} 分钟（刚收场，"
+                f"这会儿人还是软的）"
+            )
+        probed = self._probe_ccb_proactive(bid, uid)
+        if probed:
+            lines.append(probed)
+        lines.append(self._intimacy_capability_line())
+        return "\n".join(lines)
+
+    def _intimacy_capability_text(self, bid: str = "", uid: str = "") -> str:
+        """拿不到具体对话者的 ccb 数据时，只给能力/配置侧——不拿别人的数字充数。"""
+        lines = [
+            "【亲密】（没有具体对话者：只报能力与配置，不显示任何人的数字）",
+            self._intimacy_capability_line(),
+        ]
+        probed = self._probe_ccb_proactive(bid, uid)
+        if probed:
+            lines.append(probed)
+        lines.append(
+            "- ccb_proactive：是 Humanoid Core 侧的总开关，本插件读不到它的配置；"
+            "关着时 Core 不会把「想不想」外传，本插件也就不会据此主动问"
+        )
+        lines.append("- 想看具体状态：在私聊里发本指令（拿得到对话者 ID 时才带场景/亲近欲）")
+        return "\n".join(lines)
+
+    def _intimacy_text(self, bid: str = "", uid: str = "") -> str:
+        """【亲密】段的入口：有 ccb 数据才出，没有就整段不出。
+
+        三条纪律：
+        1. 只读 Humanoid Core 写进 state.json 的用户级字段（ccb_* 与
+           mood.libido/base_libido），本插件不推算、不编数字；
+        2. `ccb 关闭` / 没装 Core / 老版本 Core 时**一个字都不加**——面板与以前
+           逐字等价。这三件事在 state.json 里长得一样（都没有 ccb 键），所以只认
+           「已经有数据」这一种证据；
+        3. 有具体 uid 就报那个人的状态；没有就退回能力/配置，绝不拿别人顶替。
+        """
+        try:
+            root = self.core.read_root()
+        except Exception:
+            root = None
+        if not root:
+            return ""
+        bid = str(bid or "")
+        uid = str(uid or "")
+        snap = None
+        if bid and uid:
+            try:
+                snap = self.core.load_snapshot(bid, uid, root=root)
+            except Exception:
+                snap = None
+        if isinstance(snap, dict) and _ccb_present(snap):
+            return self._intimacy_person_text(snap, bid=bid, uid=uid)
+        if self._any_ccb_user(root, bid):
+            return self._intimacy_capability_text(bid, uid)
+        return ""
 
     def _signals_status_text(self) -> str:
         """写回 Core 的信号。写不进去要说出来——原来静默，表现是两边像没装。"""
@@ -6629,18 +7324,24 @@ class SocialEngine:
         return "\n".join(lines)
 
     def _thread_mark(self, bid: str, uid: str, now: float) -> str:
-        """状态面板上标出「话正断着 / 还挂着哪件没回访的事」。
+        """状态面板上标出「话正断着 / 还挂着哪件没回访的事 / 正在回避」。
 
         沉默与几个窗口一律用同一套来源算：以前这里自己算一份、选人那里算另一份，
         两边单位还不一样（分钟 vs 秒），面板那列会静默永远空白。
         """
         u = self.state.user(bid, uid)
         bits: List[str] = []
+        # 真回避：面板上必须看得见，否则主人只会看到「她好几天没动静」而查不出原因。
+        _avoid_days = SocialEngine.silent_giveup_days(self, u, now)
+        if _avoid_days:
+            bits.append(f"｜回避中（{int(_avoid_days)} 天没开口）")
         last_said = self._last_said(u)
-        if self.cfg.followup_enabled and last_said > 0:
-            probe, presence, ceiling, context = self._thread_windows()
+        probe, presence, ceiling, context, continue_after, continue_max = self._thread_windows()
+        if (self.cfg.followup_enabled or continue_max > 0) and last_said > 0:
             silence = now - last_said          # 秒
-            if min(probe, presence) <= silence <= ceiling:
+            # 上界取两者较大的：接话窗口（默认 8 小时）比追问窗口（默认 70 分钟）长得多，
+            # 只按追问上界算的话，「她回完、对方消失」这一段在面板上永远不显示。
+            if min(probe, presence) <= silence <= max(ceiling, continue_max):
                 kind, _ = thread_reason(
                     u,
                     now,
@@ -6649,12 +7350,18 @@ class SocialEngine:
                     max_seconds=ceiling,
                     context_seconds=context,
                     presence_floor_seconds=presence,
+                    continue_after_seconds=continue_after,
+                    continue_max_seconds=continue_max,
                 )
+                # followup 关掉时只标接话：与 `_thread_pick` 同一口径，否则面板会说
+                # 「话断了（追问）」而那条路其实已经关掉了。
+                if not self.cfg.followup_enabled and kind != "continue":
+                    kind = ""
                 if _num(u.get("thread_for", 0) or 0) == last_said:
                     bits.append(f"｜话断了 {silence / 60:.0f} 分钟（已接过一回）")
                 elif kind:
-                    why = self.thread_gate(bid, uid, u, now)
-                    label = "追问" if kind == "probe" else "问在不在"
+                    why = self.thread_gate(bid, uid, u, now, kind=kind)
+                    label = {"probe": "追问", "continue": "接话"}.get(kind, "问在不在")
                     bits.append(
                         f"｜话断了 {silence / 60:.0f} 分钟（{label if not why else f'不接：{why}'}）"
                     )
@@ -6803,8 +7510,41 @@ class SocialEngine:
             parts.append(note)
         return "识别：" + "，".join(parts)
 
-    async def status_text(self) -> str:
-        """获取插件状态文本。"""
+    def _continue_status_text(self) -> str:
+        """面板【触发与节奏】里的「接话」一行。
+
+        单独一个方法而不是塞进 `status_text` 的长表达式：那段已经是一串 `+` 拼出来的
+        条件表达式，再塞一行进去就没人看得懂哪一行对应哪个开关了（同 `_send_status_text`
+        等几个既有小方法的分工）。
+        """
+        if not bool(getattr(self.cfg, "continue_enabled", False)):
+            return "- 接话：关（她回完、对方消失也不接，只在话说到一半时追问）"
+        after = int(getattr(self.cfg, "continue_after_minutes", 0) or 0)
+        window = int(getattr(self.cfg, "continue_window_hours", 0) or 0)
+        return (
+            f"- 接话：开（她回完、对方 {after} 分钟~{window} 小时没声，"
+            "接一句或问一句人去哪了；一段沉默只接一次）"
+        )
+
+    def _avoidance_status_text(self) -> str:
+        """面板【触发与节奏】里的「回避」一行。
+
+        0 = 关闭；>0 时把天数念出来——主人看到「她好几天没动静」时，这一行是唯一
+        能直接对上「因为对方一直没开口」的地方。
+        """
+        days = int(getattr(self.cfg, "silent_giveup_days", 0) or 0)
+        if days <= 0:
+            return "- 回避：关"
+        return f"- 回避：开（对方连续 {days} 天没开口就全面停发，等 TA 再开口）"
+
+    async def status_text(self, *, bid: str = "", uid: str = "") -> str:
+        """获取插件状态文本。
+
+        `bid`/`uid` 是**发起本次查看的会话**（main.py 只在私聊里传）。有它们时
+        【亲密】段会给「与这个对话者」的状态；没有就只给能力/配置——绝不拿
+        别人的数字来冒充。两个参数都带默认值：任何老的 `status_text()` 调用
+        行为不变。
+        """
         bots = self.state.data.get("bots", {})
         # 面板是排障第一入口：一个 null/非 dict 的 bot 条目不该让它整体报错。
         users = sum(
@@ -6840,6 +7580,7 @@ class SocialEngine:
         # 分段拼排：每段一个主题，行首统一符号，行内用全角空格断句。
         # 此前是一把 30+ 行的流水，排查时要逐行读；重排后按「你想知道什么」找段就行。
         sections: List[str] = []
+        boot_line = self._boot_text()
         sections.append(
             f"自主拟人社交 v{__version__}\n"
             f"- 状态：{'🟢 启用' if self.cfg.enabled else '⏸ 停用'}"
@@ -6848,6 +7589,7 @@ class SocialEngine:
             f"- 当前时段：{slot_names.get(slot, '未知')} {dt.strftime('%H:%M')}"
             f"{'（安静时段，念头长得极慢）' if self._quiet_now(ref_bid, dt.hour) else ''}"
             f"　{'按她所在城市' if self._city_offset.get(ref_bid) is not None else '按本机时钟'}"
+            + (f"\n- 本次运行：{boot_line}" if boot_line else "")
         )
         sections.append(
             "【人格】按会话解析，各角色互不影响\n" + persona_text
@@ -6861,6 +7603,11 @@ class SocialEngine:
             f"- {self._provider_status_text()}\n"
             f"- 发送：{self._send_status_text()}"
         )
+        # 【亲密】只在 Humanoid Core 真的给了 ccb 数据时出现；没装 / 老版本 /
+        # ccb 关闭时整段不进 sections，面板与以前逐字等价。
+        _intimacy = self._intimacy_text(bid=bid, uid=uid)
+        if _intimacy:
+            sections.append(_intimacy)
         sections.append("【运行指标】\n" + self._metrics_text())
         sections.append(
             "【触发与节奏】\n"
@@ -6901,6 +7648,10 @@ class SocialEngine:
                 else "- 看得见她说过的话：关（未完话题的判定会明显变弱）"
             )
             + "\n"
+            + self._continue_status_text()
+            + "\n"
+            + self._avoidance_status_text()
+            + "\n"
             + (
                 f"- 早晚问候：开（早安 {self.cfg.greeting_morning_start}~{self.cfg.greeting_morning_end} 点、"
                 f"晚安 {self.cfg.greeting_night_start}~{self.cfg.greeting_night_end % 24} 点，"
@@ -6928,7 +7679,10 @@ class SocialEngine:
             f"- 播种：历史导入{'开' if self.cfg.history_ingest else '关'}"
             f"　名单 {len(history_ingest.normalize_seed_entries(self.cfg.seed_users, self.cfg.seed_platform))} 人（没聊过也能找）\n"
             f"- 记录 bot：{len(bots)}（{bot_list}）　候选用户：{users}\n"
-            f"- 发送/回复：{reply_rate}　回复窗口：{self.cfg.reply_window_hours} 小时\n"
+            f"- 发送/回复：{reply_rate}（只统计「等回复」的主动消息："
+            f"一条都没标记等回复时它永远是 0/0，不代表没发过；"
+            f"全部发送量看【运行指标】的「本进程发送」与「历史累计」）"
+            f"　回复窗口：{self.cfg.reply_window_hours} 小时\n"
             f"- 连发：{'开' if self.cfg.allow_burst else '关'}（拆法跟 AstrBot 的分段回复设置）"
             f"　括号动作/emoji：看她自己的说话习惯\n"
             f"- 输入状态：{'开' if self.cfg.input_state_enabled else '关'}（仅 NapCat 私聊）"

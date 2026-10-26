@@ -13,8 +13,11 @@
    完。当时不适合追（人家在忙），过几小时再问「后来呢」才对。到点即发，不看 urge。
 3. **没人回也不空着（closer）**：她主动找的话对方一直没回。旧版从此把这个人压住不再
    开口，真人却是过一阵自己冒一句把尴尬揭过去。一次 pending 只收一次场。
+4. **她说完之后对方就没声了（continue）**：对方回了、她也回了，然后对面消失。这条
+   以前被「她回过话就收尾」那条早退挡死，永远接不上话——而真人这时会说一句
+   「人呢」或者接着上一句往下说。窗口比追问宽（默认 90 分钟 ~ 8 小时）。
 
-三条都不进 urge 模型：攒十几小时才开口那是「另起一个新话题」该有的样子，而话说到一半
+四条都不进 urge 模型：攒十几小时才开口那是「另起一个新话题」该有的样子，而话说到一半
 的事，真人以分钟和小时计。
 """
 
@@ -103,14 +106,20 @@ def thread_reason(
     max_seconds: float,
     context_seconds: float,
     presence_floor_seconds: Optional[float] = None,
+    continue_after_seconds: float = 0.0,
+    continue_max_seconds: float = 0.0,
 ) -> Tuple[str, str]:
-    """这一场话是不是说断了。返回 (种类, 动机)，种类为 probe / presence / ""。
+    """这一场话是不是说断了。返回 (种类, 动机)，种类为 probe / presence / continue / ""。
 
     沉默从**最后一个人说话**算起，不要求那句是对方说的：主链路一说话，最后一条永远是
     她的，按旧规则判这条就永远不成立——那正是「用户随便发几句，模型不回来追问」的成因。
 
     两种说法的耐心不一样：追问那件事是有由头的，两三分钟就成立；光问「在吗」得再等会儿，
     不然像在催人。
+
+    `continue_*` 两个参数默认 0 = 关闭，老调用（老测试、老行为）逐字不变。打开时多出
+    第三种情况：**她说完之后对方就没声了**——这不是「对方那句悬着」，所以上面那条
+    「她回过话就收尾」的早退会把它挡死，得单独判。
     """
     # 「在吗」的门槛取 max(配置值, 两个最小间隔)。对方每小时都在说话的话，
     # 沉默最长也就一小时，永远够不到这个门槛——**每小时都在聊的人不需要被问
@@ -123,6 +132,29 @@ def thread_reason(
     last_said = max(seen, spoken)
     if last_said <= 0 or seen <= 0:
         return "", ""
+    last_msg = str(user.get("last_message", "") or "")
+    # ─── 接话：她回完、对方就没声了 ────────────────────────────────
+    #
+    # 这一段必须放在下面两句「沉默超过 max_seconds 就算了」**之前**：continue 的窗口
+    # （默认 90 分钟 ~ 8 小时）比追问窗口（默认 70 分钟）长得多，放后面会被那两句先
+    # 挡死——而这条路本来就是为「她说完之后对方消失，永远接不上话」开的。
+    #
+    # 判据里没有「最近还在聊」那一道：`spoken >= seen` 意味着最后一句是她说的，而
+    # 「对方还在连着说话」会让 `seen > spoken`，两种条件本来就互斥。
+    if continue_max_seconds > 0:
+        asked_at = _num(user.get("thread_asked_at", 0))
+        since_spoken = now - spoken
+        if (
+            spoken >= seen                                  # 最后一句是她说的
+            and continue_after_seconds <= since_spoken <= continue_max_seconds
+            and now - seen <= continue_max_seconds          # 对方也没消失太久
+            and str(user.get("pending_result", "") or "") != "waiting"
+            and not (asked_at > 0 and seen <= asked_at)     # 这段沉默只接一次
+            and not (
+                is_leaving(last_msg) or sleep_signal(user, now) or busy_signal(user, now)
+            )
+        ):
+            return "continue", ""
     # 断点必须是**对方**那句还热着的时候。只看 max(seen, spoken) 的话，她在群里或跟
     # 别人说过话就会把沉默计时重置，于是隔了半天还在追问人家早上那句——真人不会这样。
     if now - seen > max_seconds:
@@ -144,12 +176,14 @@ def thread_reason(
     # 她**已经回过**、之后双方都没再说话 → 这段已经收尾了，不是新断点。
     # 以前用 max(seen, spoken) 判断点，把「她刚回完」也算成「对方的话还悬着」，
     # 于是每一轮主链路回复都会造出一个新断点。
+    #
+    # 注意这一条**只**管 probe/presence：上面 continue 分支已经把「她回完、对方消失」
+    # 接走了，这里再早退一次就等于没接。
     if spoken >= seen and (now - spoken) > presence_after_seconds:
         return "", ""
     if str(user.get("pending_result", "") or "") == "waiting":
         # 她上一条主动发的话还悬着：这时候再补一句就是追着人要回复
         return "", ""
-    last_msg = str(user.get("last_message", "") or "")
     # T1：对方最近在忙（不一定是最后一句）就别追问——真忙与敷衍要分开，
     # 「在忙」之后回一个「嗯」不是敷衍，是在忙。
     if is_leaving(last_msg) or sleep_signal(user, now) or busy_signal(user, now):
@@ -199,12 +233,40 @@ def thread_reason(
     return "", ""
 
 
-def thread_meta(kind: str, about: str = "", asked: str = "") -> Dict[str, Any]:
+def thread_meta(
+    kind: str,
+    about: str = "",
+    asked: str = "",
+    silence_minutes: float = 0.0,
+) -> Dict[str, Any]:
     """把「说什么」交给生成器时的类型信息。
 
     `about` 是对方最后说的那句、`asked` 是她上一句问的那件——带着这两样才写得出
     一句接着话头的话，而不是干巴巴的「在吗」。
+
+    `silence_minutes` 只有 continue 用：同一句「你人呢」在沉默 20 分钟和 5 小时后
+    是两种说法，得让生成侧知道到底隔了多久。
     """
+    if kind == "continue":
+        # 与 probe/presence 的区别：那两条是**对方那句悬着**，这条是**她说完之后
+        # 对方消失**。所以说法也要换：短沉默接着上一个话题往下说，长沉默问一句人去哪了；
+        # 两种都不许查岗、不许提「你怎么不回」——那是催，不是接话。
+        minutes = int(silence_minutes or 0)
+        away = f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
+        return {
+            "category": "continue",
+            "intent": "followup",
+            "mode": "continue",
+            "msg_type": "continue_topic",
+            "msg_type_desc": f"接着刚才那半句话往下说（TA 已经 {away}没声了）",
+            "style_hint": (
+                "短沉默就顺着上一个话题往下说；长沉默就问一句人怎么突然没了。"
+                "别查岗、别问「你怎么不回」、别连着问两句"
+            ),
+            "about": about,
+            "asked": asked,
+            "silence_minutes": minutes,
+        }
     if kind == "probe":
         return {
             "category": "probe",

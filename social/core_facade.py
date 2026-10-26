@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
 
@@ -66,11 +66,40 @@ def status() -> Dict[str, Any]:
     return {
         "connected": facade is not None,
         "api_version": _safe_int(getattr(facade, "api_version", None)),
-        "capabilities": list(getattr(facade, "capabilities", lambda: [])() or [])
-        if facade is not None else [],
+        "capabilities": capabilities(facade),
         "reason": str(_CACHE.get("reason") or ""),
         "resolved": bool(_CACHE.get("resolved")),
     }
+
+
+def capabilities(facade: Any) -> List[str]:
+    """门面声明的能力列表；拿不到 / 形状不对一律 []（绝不抛）。
+
+    `capabilities()` 是门面**唯一**的版本谈判方式：API_VERSION 只加不改，
+    所以「有没有子能力」不能看版本号猜，只能问它。主动消息这边用它判断
+    `user`（称呼/好感/说过的话）与 `identity`（她自己的名字）是否直给。
+    """
+    if facade is None:
+        return []
+    try:
+        raw = facade.capabilities()
+    except Exception as exc:
+        logger.debug(f"[autonomous_social] 门面 capabilities 失败: {exc}")
+        return []
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: List[str] = []
+    for item in raw:
+        text = _text_of(item)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def has_capability(facade: Any, name: str) -> bool:
+    """门面有没有某项子能力（见 `capabilities()`）。拿不到就当没有。"""
+    want = _text_of(name)
+    return bool(want) and want in capabilities(facade)
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -224,17 +253,38 @@ def clock(facade: Any, role_id: str) -> Dict[str, Any]:
 
 def brief(facade: Any, role_id: str, user_id: str = "", *, task: str = "chat",
           text: str = "", char_name: str = "", user_name: str = "") -> Optional[Dict[str, Any]]:
+    """门面 `brief()` 的容错封装：拿不到返回 `None`，调用方退回读 state.json。
+
+    契约只加不改，但 `brief()` 的**签名**长过好几次（`task` → `text` →
+    `char_name`/`user_name`）。一次调用失败时逐级退到更小的调用，而不是让一个
+    稍旧的 Core 把整条门面路径判死——主动消息的上下文比那几个可选参数值钱。
+    """
     if facade is None:
         return None
-    try:
-        out = facade.brief(
-            str(role_id), str(user_id or ""), task=task, text=text,
-            char_name=char_name, user_name=user_name,
-        )
-        return out if isinstance(out, dict) else None
-    except Exception as exc:
-        logger.debug(f"[autonomous_social] 门面 brief 失败: {exc}")
+    fn = getattr(facade, "brief", None)
+    if not callable(fn):
         return None
+    attempts = (
+        {"task": task, "text": text, "char_name": char_name, "user_name": user_name},
+        {"task": task, "text": text},
+        {"task": task},
+        {},
+    )
+    last_exc: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            out = fn(str(role_id), str(user_id or ""), **kwargs)
+        except TypeError as exc:
+            # 只可能是「这个旧门面不认某个关键字参数」：退一级再试。
+            last_exc = exc
+            continue
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 门面 brief 失败: {exc}")
+            return None
+        return out if isinstance(out, dict) else None
+    if last_exc is not None:
+        logger.debug(f"[autonomous_social] 门面 brief 签名不兼容（已逐级降级）: {last_exc}")
+    return None
 
 
 def fingerprint(facade: Any, role_id: str) -> str:

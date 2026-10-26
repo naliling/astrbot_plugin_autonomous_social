@@ -396,6 +396,54 @@ class CoreBridge:
             return {}
         return {"phrase": phrase}
 
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        """跨插件来的**单行文本**字段：缺字段 / 脏容器 / 布尔一律空串，绝不抛。
+
+        `nickname` / `display_name` / `char_name` 这类值会被拼进提示词给模型照着叫，
+        所以只收 str 与数字（数字名如「123」也确实是有的），容器（手改坏时的 `{}`、
+        `[]`）直接当「没有」——`str({})` 会变成「{}」然后被当成名字念出去。
+        """
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, bool) or value is None:
+            return ""
+        if isinstance(value, (int, float)):
+            return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _identity_block(value: Any) -> Dict[str, Any]:
+        """契约的 `identity` 块（Core 2.29 起给）：她的名字 / 人设标签。
+
+        缺字段（老 Core）、脏数据（字符串/列表）一律空 dict——这一层只是**加分项**，
+        不该因为另一个插件升级或手改坏就把整轮心跳弄挂。
+        """
+        if not isinstance(value, dict):
+            return {}
+        identity = {
+            "char_name": CoreBridge._clean_text(value.get("char_name")),
+            "persona_label": CoreBridge._clean_text(value.get("persona_label")),
+        }
+        return identity if (identity["char_name"] or identity["persona_label"]) else {}
+
+    @staticmethod
+    def _outfit_block(value: Any) -> Dict[str, Any]:
+        """契约的 `outfit` 块（Core 2.29 起给）：她今天穿什么。
+
+        形状 `{enabled, text, source}`；缺字段 / 脏数据一律空 dict（理由同
+        `_identity_block`）。`enabled=False` 本身是有效信息（穿搭关闭），只要块不是空的
+        就照抄，由消费方自己决定用不用。
+        """
+        if not isinstance(value, dict):
+            return {}
+        outfit = {
+            "enabled": bool(value.get("enabled")),
+            "text": CoreBridge._clean_text(value.get("text")),
+            "source": CoreBridge._clean_text(value.get("source")),
+        }
+        return outfit if (outfit["enabled"] or outfit["text"] or outfit["source"]) else {}
+
     def _build_self_view(self, selfs: Dict[str, Any], bot_id: str) -> Dict[str, Any]:
         """把 Core 的角色自身状态整理成社交层要的视图。
 
@@ -422,6 +470,11 @@ class CoreBridge:
             "wake": {},
             "persona": "",
             "holiday": "",
+            # 她自己的身份/穿搭（Core 2.29 起给：契约 identity / outfit 块）。
+            # 旧版 Core 没有这两个键 → 空 dict，消费方按「不知道」处理；
+            # 这两个块**不进 compact()**（名字是称呼，不是状态摘要）。
+            "identity": {},
+            "outfit": {},
         }
         contract = selfs.get("contract")
         # 版本号必须容错：契约里的 v 是跨插件来的值，非数字时裸 int() 会抛穿
@@ -495,6 +548,10 @@ class CoreBridge:
         ]
         view["persona"] = str(contract.get("persona") or "")
         view["holiday"] = str(contract.get("holiday") or "").strip()
+        # 她自己的名字 / 人设标签、她今天穿什么（Core 2.29 起给）。
+        # 旧版 Core 没有这两个键 → 空 dict（与加这个字段之前逐字等价：compact 不读它们）。
+        view["identity"] = self._identity_block(contract.get("identity"))
+        view["outfit"] = self._outfit_block(contract.get("outfit"))
         # 契约里的 weather 是**故意的**空串（说明书/过期/未配置都导成空）。
         # 不能因为空就退回 `_cached_weather_obj`——那是从不清的旧缓存，
         # 停机几天后仍会拿几天前的天气派生由头（Core 那边正是要避免这个）。
@@ -607,6 +664,22 @@ class CoreBridge:
             first_met = float(user.get("first_met") or 0) or None
         except (TypeError, ValueError):
             first_met = None
+        # 称呼三级回退（老 Core 只有 nickname；2.29 起才有 display_name）：
+        #   1. `nickname`  —— Core「认定」过的称呼（auto_nickname 校验很严，多数人是空）
+        #   2. `display_name` —— 名片名，已清洗（Core 2.29 起给）
+        #   3. `name` —— 最后兜底：Core 用户档里若有原始名就用它（老数据也可能没有）
+        # 三级都空时 `call_name` 就是空串：宁可明确「不知道叫什么」，也不自己编。
+        nickname = self._clean_text(user.get("nickname"))
+        display_name = self._clean_text(user.get("display_name"))
+        local_name = self._clean_text(user.get("name"))
+        if nickname:
+            call_name, name_source = nickname, "nickname"
+        elif display_name:
+            call_name, name_source = display_name, "display_name"
+        elif local_name:
+            call_name, name_source = local_name, "local"
+        else:
+            call_name, name_source = "", ""
         return {
             **self._self_view(selfs, str(bot_id)),
             "mood": mood_data,
@@ -620,9 +693,35 @@ class CoreBridge:
             "ccb_done_count": user.get("ccb_done_count"),
             "ccb_last_at": user.get("ccb_last_at"),
             "ccb_satisfy": user.get("ccb_satisfy"),
+            # 场景态（Core 2.28.7 起把这几根键写全）：在不在场景里、到哪个阶段、
+            # 今天几次、余韵窗口到什么时候。老版本 Core 根本没有这些键 → None，
+            # 调用方按「不知道」处理；不能拿 0 当「没发生过」，否则老 Core 会被
+            # 面板说成「不在场景里」（其实只是它没说过）。
+            "ccb_stage": self._float_or_none(user.get("ccb_stage")),
+            "ccb_turns": self._float_or_none(user.get("ccb_turns")),
+            "ccb_aftercare_until": self._float_or_none(
+                user.get("ccb_aftercare_until")
+            ),
+            # 亲近欲与基线（mood 档案里的两个轴）：面板与主动消息上下文都想知道
+            # 「她这会儿有多想」。base_libido 真的可能是 0（她从没什么欲望），
+            # 所以只能用 None 当「没给」——`base or libido` 会把 0 悄悄吃掉。
+            "libido": self._float_or_none(
+                mood_data.get("libido") if isinstance(mood_data, dict) else None
+            ),
+            "base_libido": self._float_or_none(
+                mood_data.get("base_libido") if isinstance(mood_data, dict) else None
+            ),
             # 她该怎么称呼这个人（Core 从 TA 自报的昵称里认定，改口会跟着变）
-            "nickname": str(user.get("nickname", "") or "").strip(),
+            "nickname": nickname,
             "nickname_src": str(user.get("nickname_src", "") or "").strip(),
+            # 名片名（Core 2.29 起给：已清洗、≤24 字）。Core 的 `auto_nickname` 校验很严，
+            # 带数字/emoji/装饰的名片一律不认，所以大多数用户 `nickname` 是空——名片名是
+            # 主动消息**唯一**能叫得出名字的来源，不能只躺在 state.json 里。
+            "display_name": display_name,
+            # 她开口时该怎么叫 TA：Core 认定的称呼 → 名片名 → 本地记下的名片名 → 空。
+            # `name_source` 让生成侧决定措辞（「你一直叫TA」 vs 「TA 的名片名是」）。
+            "call_name": call_name,
+            "name_source": name_source,
             # 她自己记着对方说过什么（原话、最新在前）
             "said": said,
             # 对方此刻的状态标签（Core 情绪分析出的短标签）
@@ -721,14 +820,75 @@ class CoreBridge:
         if affection is not None and affection != "":
             parts.append(f"好感度: {affection}")
 
+        # 亲密状态单独一行：模型要看得出「她这会儿在不在状态」，而不是只看到一个
+        # 裸的亲近欲数字。只在 Core 真的给了 ccb 字段时才出——老版本 Core / ccb
+        # 关闭时，这条主动消息的上下文必须与以前逐字一致。
+        intimacy = self._intimacy_line(s)
+        # 亲近欲只在「情绪」行里出现一次：新行已经给了「x/50（基线 y）」，再在
+        # 情绪行重复一遍同一个数只烧 token，还会让模型以为是两个不同的量。
+        show_libido_in_mood = "亲近欲" not in intimacy
+
         mood = s.get("mood")
         if isinstance(mood, dict) and mood:
             dims = []
             for k, label in (("libido", "亲近欲"), ("aggression", "攻击性")):
+                if k == "libido" and not show_libido_in_mood:
+                    continue
                 v = mood.get(k)
                 if v is not None:
                     dims.append(f"{label}{v}")
             if dims:
                 parts.append(f"情绪: {' / '.join(dims)}")
 
+        if intimacy:
+            parts.append(intimacy)
+
         return "\n".join(parts) if parts else "Humanoid Core 当前没有可用的简要状态。"
+
+    @staticmethod
+    def _intimacy_line(s: Dict[str, Any]) -> str:
+        """把 ccb 场景与亲近欲拼成 prompt 里的一行；拿不到就回空串。
+
+        两件事分开说：**在不在场景里**（行为层面的状态，决定她说话的分寸）与
+        **亲近欲到哪了**（身体层面的量）。只有亲近欲没有场景时也照样报——那正是
+        「有点想但还没到」的状态，模型以前完全看不见。
+        """
+        if not isinstance(s, dict):
+            return ""
+        mood = s.get("mood") if isinstance(s.get("mood"), dict) else {}
+        stage = CoreBridge._float_or_none(s.get("ccb_stage"))
+        satisfy = CoreBridge._float_or_none(s.get("ccb_satisfy"))
+        if stage is None:
+            # 场景字段缺失，但只要有历史/次数，就说明 Core 在记这条线，别整行吞掉。
+            has_history = any(
+                s.get(k) is not None
+                for k in ("ccb_turns", "ccb_last_at", "ccb_done_count",
+                          "ccb_aftercare_until", "ccb_satisfy")
+            )
+            if not has_history:
+                return ""
+        libido = CoreBridge._float_or_none(s.get("libido"))
+        if libido is None:
+            libido = CoreBridge._float_or_none(mood.get("libido"))
+        base_libido = CoreBridge._float_or_none(s.get("base_libido"))
+        if base_libido is None:
+            base_libido = CoreBridge._float_or_none(mood.get("base_libido"))
+        bits: List[str] = []
+        if stage is not None:
+            if stage > 0:
+                bits.append(f"在场景里·阶段{int(stage)}")
+                if satisfy is not None:
+                    bits.append(f"满足{int(round(satisfy))}/100")
+            else:
+                bits.append("未在场景")
+        if libido is not None:
+            text = f"亲近欲 {libido:g}/50"
+            if base_libido is not None:
+                text += f"（基线 {base_libido:g}）"
+            bits.append(text)
+        until = CoreBridge._float_or_none(s.get("ccb_aftercare_until"))
+        if until is not None and until > time.time():
+            bits.append(f"余韵还剩 {max(0, int((until - time.time()) / 60))} 分钟")
+        if not bits:
+            return ""
+        return "亲密: " + " · ".join(bits)

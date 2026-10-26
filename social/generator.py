@@ -511,6 +511,12 @@ _MODE_NOTES = {
         "- 不许提「你怎么没回」「在吗」，那会变成催；\n"
         "- 也别道歉、别解释你上次为什么发那句。"
     ),
+    "continue": (
+        "你们刚才在聊，你回完那句之后 TA 就没声了。你想接一句，或者问一句人去哪了。\n"
+        "- 沉默还短：接着上一个话题往下说，别重新起头；\n"
+        "- 沉默久了：就问一句 TA 去哪了 / 怎么突然没声了；\n"
+        "- 不许查岗，也不许提「你怎么不回」——那是催，不是接话；一两句说完就停。"
+    ),
     "greet_morning": (
         "现在是早上，你想跟TA道个早安。\n"
         "- 别只发「早安」两个字；有真事就带一句，没有就只问这一句，别拿天气和「刚睡醒」凑；\n"
@@ -550,6 +556,9 @@ _MODE_ASK = {
     # 判成「占位符没值」直接丢弃：收场每次都是一句没有上下文的空话。
     "closer": "你上次发出去没人接的那句是：「{about}」。",
     "presence": "你自己上一句说的是：「{asked}」。",
+    # 接话要引**她自己上一句**：那是她回完就断掉的那半句话，接着它往下说才像同一场话
+    # （引对方那句会把「她说完之后对方消失」讲成「对方的话悬着」，那是 probe/presence）。
+    "continue": "你自己上一句说的是：「{asked}」。",
 }
 
 
@@ -589,6 +598,10 @@ _DECIDE_NOTES = {
     "presence": (
         "但这一次不是另起话题：你们刚才一直在聊，TA 那边突然没声了。"
         "这种情况问一句在不在，是正常人也会做的事。"
+    ),
+    "continue": (
+        "但这一次不是没话找话：你回完那句之后 TA 就没声了。"
+        "接一句、或者问一句人去哪了，是正常人也会做的事。"
     ),
     "loop": (
         "但这一次不是没话找话：TA 之前提过一件事没说结果，你到今天才想起来问。"
@@ -930,19 +943,58 @@ def _low_state_day(body: Dict[str, Any]) -> bool:
     return hits >= 2
 
 
+def _name_text(value: Any) -> str:
+    """称呼/标签这类单行文本：只收 str / 数字，容器与布尔一律当空。
+
+    这些值来自另一个插件（门面 brief）或本地账本，手改坏/跨版本时可能是 dict/list。
+    `str({"坏": 1})` 会变成「{'坏': 1}」被当成名字念出去（实测提示词已能拼出这种句子），
+    所以宁可当「没有名字」。
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value).strip()
+    return ""
+
+
 def _bond_line(target: Dict[str, Any]) -> str:
-    """Core 替她记着的东西：她该怎么叫这个人、这个人此刻什么状态、她有多在意。
+    """Core（或本地账本）替她记着的对方信息：怎么称呼、此刻什么状态、她有多在意。
 
     这些以前只躺在 Core 的状态文件里，主动消息一条也没用上——她主动找上门时既不按
     自己记住的称呼开口，也不知道对方这阵子是什么状态，联动看着就是假的。
+
+    名字有三级来源（引擎合并后写进 target，见 `SocialEngine._apply_core_brief`）：
+
+    * `_nickname`  —— Core「认定」过的称呼（`auto_nickname` 校验很严，含数字/emoji/
+      装饰的名片一律不认，所以大多数用户没有）；
+    * `_call_name` —— 真正能叫出口的称呼（Core 认定 → Core 名片名 → 本地账本名片名）；
+    * `_name_source` —— `nickname` / `display_name` / `local`，决定这里给哪种措辞。
+
+    没有名字时**明说别编**：以前整句不出，模型就自己给 TA 起个名字，或者干脆不叫
+    ——用户原话就是「主动消息从 core 那拿不到名称，以至于根本不会叫人」。
     """
     bits: List[str] = []
-    nick = str(target.get("_nickname") or "").strip()
-    if nick:
-        # 这条是「她平时怎么叫这个人」，模型会照抄。挂全名它就会一句一句念出来
-        # （线上：`忙着吃饭，爱筝挽起·冲击波冠军，想你`），所以只给前一段。
-        bits.append(f"你一直叫TA「{short_call_name(nick)}」")
-    tag = str(target.get("_mood_tag") or "").strip()
+    nickname = _name_text(target.get("_nickname"))
+    raw_name = _name_text(target.get("_call_name")) or nickname
+    source = _name_text(target.get("_name_source"))
+    # 长名片只叫前一段（线上真实记录：「爱筝挽起·冲击波冠军」被整段念出来）。
+    call_name = short_call_name(raw_name)
+    if call_name:
+        if nickname or source == "nickname":
+            bits.append(f"你一直叫TA「{call_name}」")
+        else:
+            bits.append(f"TA 的名片名是「{call_name}」，你可以偶尔这么叫")
+        # 追一句使用纪律：名字是**称呼**，不是每条的起手模板。不写这句的话，
+        # 模型拿到名字就会每条都喊、而且固定放在开头（「小明，…」）。
+        bits.append(
+            "叫名字要偶尔、自然（比如打招呼、催一句、说到一半提一下），"
+            "别每条都叫，别每句开头都是名字"
+        )
+    else:
+        bits.append("你还不知道TA叫什么，别自己给TA编名字")
+    tag = _name_text(target.get("_mood_tag"))
     if tag:
         bits.append(f"TA这会儿的状态是{tag}")
     try:
@@ -951,6 +1003,12 @@ def _bond_line(target: Dict[str, Any]) -> str:
         attention = None
     if attention is not None and attention >= 60:
         bits.append("你挺在意这个人")
+    # 她对 TA 的情绪标签（门面 brief 的 user.label）：翻成一句人话，拿不到就不出。
+    # 与关系档位（`_relationship_line`）刻意分开：那个按涨幅/互动算行为倾向，
+    # 这个是 Core 情绪分析给她的当下感受。
+    label = _name_text(target.get("_label"))
+    if label:
+        bits.append(f"你心里对TA的感觉是{label}")
     if not bits:
         return ""
     return "【你记得的·自然地用上，别当成设定复述出来】" + "；".join(bits) + "。"
@@ -1435,7 +1493,8 @@ class MessageGenerator:
         slot = time_slot(now.hour)
         # 未完话题那几条与「另起一个话题」要的东西相反：它们就是要问一句
         mode = str((reason_meta or {}).get("mode") or "")
-        is_followup = mode in ("probe", "presence", "loop")
+        # continue 也算未完话题：它要的是「接着刚才那半句说」，不是另起话题。
+        is_followup = mode in ("probe", "presence", "loop", "continue")
         is_closer = mode == "closer"
         # 「分享」和「求回应」是两种不同的主动：真人发「这面包超难吃」不需要你回，
         # 发「你在干嘛」是想你回。以前这两种在提示词里长得一模一样，模型于是给
@@ -1804,18 +1863,18 @@ class MessageGenerator:
                     "实在接不上，就把你今天那件事本身讲给他听，别在末尾挂一句"
                     "「你今天有什么安排吗」那种谁都能问的话。",
                     "",
-                    # 追问/在不在/回访/收场这四条路的 meta **不带 anchor_fact**
+                    # 追问/在不在/回访/收场/接话这几条路的 meta **不带 anchor_fact**
                     # （`thread_meta` / `loop_meta` / `closer_meta` 都没这个字段）。
                     # 原来它们照样走这一段，于是提示词里出现
                     # 「已经定了…（# 那行就是它）」然后**什么都不给**——
                     # 模型被告知话题已定且已展示，却什么都没看到，只能自己编。
-                    # 这四条路本来就有明确的事由（对方哪句没接、约的是什么事），
+                    # 这几条路本来就有明确的事由（对方哪句没接、约的是什么事），
                     # 那才是这里该写的东西。
                     *([anchor_line] if anchor_line else []),
                     "",
                     # 这一句原来是无条件出现的。上面那句 anchor_line 已经改成「没有就不放」，
                     # 但紧接着又告诉模型「下面已经给了具体的那件事（# 那行就是它）」——
-                    # 追问/在不在/回访/收场这四条路（meta 不带 anchor_fact、reason 也是空串）
+                    # 追问/在不在/回访/收场/接话这几条路（meta 不带 anchor_fact、reason 也是空串）
                     # 于是又落回同一个坑：**告知话题已定且已展示，却什么都没给**，模型只能自己编。
                     # 没有给定的事，就让它从上面摆着的素材里挑。
                     *(["下面已经给了具体的那件事，就照着那件事说。"]
