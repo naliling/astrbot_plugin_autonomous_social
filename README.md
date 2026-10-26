@@ -1,140 +1,132 @@
-<style>
-.ss-hero{background:linear-gradient(135deg,#6d28d9 0%,#8b5cf6 55%,#c084fc 100%);border-radius:20px;padding:30px 28px;color:#fff;box-shadow:0 12px 32px rgba(109,40,217,.28)}
-.ss-kicker{font-size:12px;letter-spacing:4px;opacity:.8}
-.ss-title{font-size:36px;font-weight:800;margin:8px 0 10px;line-height:1.2}
-.ss-sub{font-size:15px;line-height:1.9;opacity:.95}
-.ss-chip{display:inline-block;margin:8px 8px 0 0;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px;color:#fff}
-.ss-card{background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;font-size:14px}
-.ss-note{background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;padding:12px 14px;font-size:14px;color:#4c1d95;line-height:1.9}
-</style>
+<p align="center">
+  <img src="logo.png" alt="主动消息 logo" width="140" />
+</p>
 
-<div class="ss-hero" style="background:linear-gradient(135deg,#6d28d9 0%,#8b5cf6 55%,#c084fc 100%);border-radius:20px;padding:30px 28px;color:#fff;box-shadow:0 12px 32px rgba(109,40,217,.28)">
-  <div class="ss-kicker" style="font-size:12px;letter-spacing:4px;opacity:.8">ASTRBOT · 主动消息</div>
-  <div class="ss-title" style="font-size:36px;font-weight:800;margin:8px 0 10px;line-height:1.2">主动消息</div>
-  <div class="ss-sub" style="font-size:15px;line-height:1.9;opacity:.95">她攒够了念头，会先开口。<br>没说完的话，她记得回来问。</div>
-  <div style="margin-top:16px">
-    <span class="ss-chip" style="display:inline-block;margin:8px 8px 0 0;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px">主动开口</span>
-    <span class="ss-chip" style="display:inline-block;margin:8px 8px 0 0;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px">未完话题</span>
-    <span class="ss-chip" style="display:inline-block;margin:8px 8px 0 0;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px">群聊心流</span>
-  </div>
-</div>
+# 主动消息
+
+> **她攒够了念头，会先开口。**
+> 没说完的话，她记得回来问。
+> 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
+
+![version](https://img.shields.io/badge/version-v1.28.14-7c3aed?style=flat-square)
+![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E4%BB%BB%E6%84%8F%20AstrBot%20%E5%B9%B3%E5%8F%B0-2ea44f?style=flat-square)
+![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
+![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
+
+<sub>作者 **娜莉灵** · 插件 ID `娜莉灵/astrbot_plugin_autonomous_social` · 显示名 **主动消息**</sub>
+
+---
+
+## 它做什么
+
+让她在**没有收到消息的时候**也会主动找你，而且说得像个有自己生活的人，不像一个定时器。
+
+- **先有件具体的事，才开口**：她刚做完的、你提过没下文的、到点该问的；
+- **念头只管等多久，不管发不发**：攒够了也要有由头，派不出就不说；
+- **不合适就憋着**：模型可以先否决，验收不过也会拦下；
+- **三条不发**：派不出由头、模型否决、验收不过——都不发，念头留着下一轮再试。
+
+一次主动消息大概这么走完：看状态 → 选人 → 找由头 → 过闸（安静时段、冷却、频率、关系档）→ 问模型该不该说 → 写 → 发 → 记账。
+
+---
+
+## 特性
 
 ![主动开口](https://img.shields.io/badge/-%E4%B8%BB%E5%8A%A8%E5%BC%80%E5%8F%A3-7c3aed?style=flat-square) ![未完话题](https://img.shields.io/badge/-%E6%9C%AA%E5%AE%8C%E8%AF%9D%E9%A2%98-7c3aed?style=flat-square) ![群聊心流](https://img.shields.io/badge/-%E7%BE%A4%E8%81%8A%E5%BF%83%E6%B5%81-7c3aed?style=flat-square) ![破冰](https://img.shields.io/badge/-%E7%A0%B4%E5%86%B0-7c3aed?style=flat-square) ![念头系统](https://img.shields.io/badge/-%E5%BF%B5%E5%A4%B4%E7%B3%BB%E7%BB%9F-7c3aed?style=flat-square) ![关系记忆](https://img.shields.io/badge/-%E5%85%B3%E7%B3%BB%E8%AE%B0%E5%BF%86-7c3aed?style=flat-square) ![长期记忆](https://img.shields.io/badge/-%E9%95%BF%E6%9C%9F%E8%AE%B0%E5%BF%86-7c3aed?style=flat-square) ![主动消息](https://img.shields.io/badge/-%E4%B8%BB%E5%8A%A8%E6%B6%88%E6%81%AF-7c3aed?style=flat-square) ![时机判断](https://img.shields.io/badge/-%E6%97%B6%E6%9C%BA%E5%88%A4%E6%96%AD-7c3aed?style=flat-square) ![冷却限频](https://img.shields.io/badge/-%E5%86%B7%E5%8D%B4%E9%99%90%E9%A2%91-7c3aed?style=flat-square) ![管理员指令](https://img.shields.io/badge/-%E7%AE%A1%E7%90%86%E5%91%98%E6%8C%87%E4%BB%A4-7c3aed?style=flat-square)
 
-<p style="font-size:15px;line-height:1.9;color:#3b0764;margin:14px 0 0">她不是定时器。什么时候开口、对谁开口、说什么，由攒出来的念头和一件具体的事决定；说不出那件事，这一轮就不说。</p>
+### 什么时候开口
+
+- **主动开口** —— 攒够念头才开口；
+- **未完话题** —— 没说完的会接上；
+- **追问** —— 你敷衍时问那件事；
+- **回访** —— 没结果的事回头问；
+- **主动收场** —— 没人接就收尾；
+- **问候** —— 隔久了问候一句。
+
+### 关系与分寸
+
+- **关系分档** —— 越熟联系越自然，越生越克制；连着发不出去就停发，等对方先开口；
+- **安静时段** —— 深夜不打扰；
+- **跨用户去重** —— 不群发同一句。
+
+### 群聊
+
+- **群聊心流** —— 群里自然接话；
+- **破冰** —— 冷场时开个话头；
+- **不点名** —— 主动开口不叫人；
+- **群聊另算一套** —— 被叫到、接得上才接话；冷场时破冰；没话说就不发，不硬凑。
+
+### 记得住
+
+- **历史导入** —— 认识装插件前就聊过的人；
+- **播种名单** —— 指定的人也能找；
+- **长期记忆** —— 按由头读记忆。
+
+### 说话的样子
+
+- **正在输入** —— 写的时候显示输入中；
+- **连发** —— 拆成几条短句发。
+
+---
+
+## 怎么用（三十秒）
+
+**1. 装上**
+
+AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进 `AstrBot/data/plugins/`，然后重载插件。
+
+**2. 面板里改配置**
+
+不用手改文件。第一次只动四项就够：`activity_level`（整体更主动 / 更安静）、`urge_refill_hours`（两条消息之间隔多久）、`recent_talk_minutes`（刚聊完多久内不另起话）、`quiet_start` / `quiet_end`（晚上几点到几点不说话）。其余项默认值已经调好。
+
+**3. 看一眼通没通**
+
+重载后发 `/自主社交状态`：权限判定依据、LLM 状态、Core 联动会一次列清。
+
+> **升级注意**：卸载时**不要勾**「删除配置」「删除数据」，或者直接覆盖插件目录后重载；状态与配置都不会丢。
+
+---
 
 ## 指令
 
 全部指令默认只有机器人主人（AstrBot 的 `admins_id`）与 AstrBot 管理员能用。要放给别人：先关掉 `owner_only_commands`，再把对方 ID 填进 `allowed_trigger_uids`（关闭后白名单才生效）；非主人在群里发这些指令时，插件完全静默。
 
-<table style="width:100%;border-collapse:collapse;font-size:14px">
-<tr style="background:#f5f3ff;color:#6d28d9">
-  <th style="text-align:left;padding:10px 12px;border-bottom:2px solid #ede9fe;width:36%">指令（仅管理员）</th>
-  <th style="text-align:left;padding:10px 12px;border-bottom:2px solid #ede9fe">作用</th>
-</tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/自主社交状态</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">看运行状态、念头面板、Core 联动、发送通道</td></tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/社交自检</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">不调模型不发消息，几毫秒查链路通不通</td></tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/触发社交</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">立刻挑一个最想说的人开口</td></tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/主动消息预览 [用户ID]</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">只生成不发送，看她此刻想说什么</td></tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/主动消息记录 [用户ID]</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">最近 7 天发过什么，附一句为什么</td></tr>
-<tr><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9;white-space:nowrap"><code>/群社交状态</code></td><td style="padding:9px 12px;border-bottom:1px solid #f1f5f9">群聊心流在管哪些群、是否被隔离</td></tr>
-</table>
+| 指令（仅管理员） | 作用 |
+| --- | --- |
+| `/自主社交状态` | 看运行状态、念头面板、Core 联动、发送通道 |
+| `/社交自检` | 不调模型不发消息，几毫秒查链路通不通 |
+| `/触发社交` | 立刻挑一个最想说的人开口 |
+| `/主动消息预览 [用户ID]` | 只生成不发送，看她此刻想说什么 |
+| `/主动消息记录 [用户ID]` | 最近 7 天发过什么，附一句为什么 |
+| `/群社交状态` | 群聊心流在管哪些群、是否被隔离 |
 
 > 忘了哪条能看什么：先发 `/自主社交状态`，它会把权限判定依据、LLM 状态、Core 联动一次列清。
 
-## 功能
+---
 
-<table style="width:100%;border-collapse:separate;border-spacing:8px;font-size:14px">
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>主动开口</b>　攒够念头才开口</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>未完话题</b>　没说完的会接上</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>追问</b>　你敷衍时问那件事</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>回访</b>　没结果的事回头问</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>主动收场</b>　没人接就收尾</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>问候</b>　隔久了问候一句</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>关系分档</b>　越熟联系越自然</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>安静时段</b>　深夜不打扰</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>群聊心流</b>　群里自然接话</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>破冰</b>　冷场时开个话头</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>不点名</b>　主动开口不叫人</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>历史导入</b>　认识装插件前的人</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>播种名单</b>　指定的人也能找</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>长期记忆</b>　按由头读记忆</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>正在输入</b>　写的时候显示输入中</td>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>连发</b>　拆成几条短句发</td>
-</tr>
-<tr>
-  <td class="ss-card" style="width:50%;background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;vertical-align:top"><b>跨用户去重</b>　不群发同一句</td>
-</tr>
-</table>
+## 配置
 
-## 联动
-
-### 和人形化伴侣一起用（可选）
-
-- 装了：能读到她累不累、今天在忙什么、她那边几点——精力低就少开口
-- 没装：插件用自己的互动记录、念头和冷却判断，功能不受影响
-- 分工：人形化伴侣管她的生活，本插件管她什么时候开口
-
-### 和长期记忆一起用（可选）
-
-- 装了「我会牢牢记住你」：开口前按这次的由头读这个人的长期记忆，发完再写回
-- 没装：主动消息照常发，只是少这一份记忆
-
-## 安装
-
-1. AstrBot 插件页 → 本地安装，上传 zip
-2. 面板里改配置，不用手改文件
-3. 重载插件后发 `/自主社交状态`，看链路通不通
-
-升级时卸载**不要勾**「删除配置」「删除数据」，或者直接覆盖插件目录后重载；状态与配置都不会丢。
-
-## 数据
-
-- 状态文件：<code>data/plugin_data/astrbot_plugin_autonomous_social/state.json</code>
-- 存什么：互动记录、话题关键词、时间锚点、念头与节奏、发送记录
-- 正文存不存：`store_message_text`（默认开），关掉只记结构不记原文
-- 保留多久：`user_retention_days`（默认 30 天，0 = 永不清理）
-- 整条记录清理：`purge_inactive_user_days`（默认 0 = 关；开了会永久删除整条会话记录，不只是正文）
-- 文件读不出来时：先备份成 <code>state.json.unreadable.&lt;时间戳&gt;</code> 再报错，不会拿空状态盖掉
-
-## 先调这几个
+### 关键配置项
 
 其余项大多有合理默认值，第一次用先看这四个：
 
 | 想达到的效果 | 调这个 |
-|---|---|
+| --- | --- |
 | 整体更主动 / 更安静 | `activity_level`（默认 75） |
 | 两条消息之间至少隔多久 | `urge_refill_hours`（默认 4 小时） |
 | 刚聊完多久内不另起话 | `recent_talk_minutes`（默认 18 分钟） |
 | 晚上几点到几点不说话 | `quiet_start` / `quiet_end`（默认 23–7） |
 
-<div class="ss-note" style="background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;padding:12px 14px;font-size:14px;color:#4c1d95;line-height:1.9">
-想让她用会思考的模型说话：`proactive_provider_ids` 填主动消息专用模型，按顺序试第一个能用的；配了却一个都取不到时<b>本轮不主动开口</b>，不退默认模型、不重试——弱模型写出来的话，比不发更糟。
-</div>
+> 想让她用会思考的模型说话：`proactive_provider_ids` 填主动消息专用模型，按顺序试第一个能用的；配了却一个都取不到时**本轮不主动开口**，不退默认模型、不重试——弱模型写出来的话，比不发更糟。
 
 > 插件是按心跳醒来的（默认 8–15 分钟一次），所以分钟级配置最快也要等一个心跳才生效。想让分钟级配置真按分钟走，把 `heartbeat_min_minutes` 调到 1。
 
-## 全部配置项
+### 全部配置项
 
 > 下表与 `_conf_schema.json` 同源，共 97 项；面板里看到的默认值与这里一致。
 
 | 配置 | 默认值 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `enabled` | `true` | 总开关 |
 | `mode` | `auto` | `auto` 自动探测 Core；`standalone` 完全不读 Core |
 | `activity_level` | `75` | 整体想说说话的程度，缩放念头积累速度（不是「每隔几分钟发一条」）；不影响未完话题那几条 |
@@ -233,30 +225,35 @@
 | `seed_users` | `[]` | 【播种】没聊过的人也能写进来，她攒够念头会主动找上门（user_id 或 platform:user_id） |
 | `seed_platform` | `aiocqhttp` | 【播种】seed_users 只填 user_id 时拼私聊目标用的平台标识 |
 
+---
+
+## 联动
+
+### 和人形化伴侣一起用（可选）
+
+- 装了：能读到她累不累、今天在忙什么、她那边几点——精力低就少开口；
+- 没装：插件用自己的互动记录、念头和冷却判断，功能不受影响；
+- 分工：人形化伴侣管她的生活，本插件管她什么时候开口。
+
+### 和长期记忆一起用（可选）
+
+- 装了「我会牢牢记住你」：开口前按这次的由头读这个人的长期记忆，发完再写回；
+- 没装：主动消息照常发，只是少这一份记忆。
+
+---
+
+## 数据与边界
+
+- **状态文件**：`data/plugin_data/astrbot_plugin_autonomous_social/state.json`
+- **存什么**：互动记录、话题关键词、时间锚点、念头与节奏、发送记录
+- **正文存不存**：`store_message_text`（默认开），关掉只记结构不记原文
+- **保留多久**：`user_retention_days`（默认 30 天，0 = 永不清理）
+- **整条记录清理**：`purge_inactive_user_days`（默认 0 = 关；开了会永久删除整条会话记录，不只是正文）
+- **读不出来时**：先备份成 `state.json.unreadable.<时间戳>` 再报错，不会拿空状态盖掉
+- **平台边界**：主动消息要平台支持主动发送（如 qq_official 这类可能发不出去）；发失败不算一次成功交流，也不会误记冷却
+
+---
+
 ## 更新日志
 
-见 [CHANGELOG.md](CHANGELOG.md)。
-
-## 深入一点
-
-<details>
-<summary>一次主动消息是怎么产生的</summary>
-
-1. **看状态**：插件启用了吗、引擎在跑吗、这一轮该不该继续
-2. **选人**：谁攒够了念头，谁此刻适合被找
-3. **找由头**：一件具体的事——她刚做完的、TA 提过没下文的、到点该问的
-4. **过闸**：安静时段、个人冷却、频率上限、关系档的最小间隔
-5. **问模型**：该不该说；模型回 NO，这一轮就不说
-6. **写**：按人设和上下文写，写完过一道验收——跑题、复读、只剩括号动作都拦下
-7. **发**：按平台能力发送；发失败不算一次成功交流
-8. **记账**：更新互动记录、回复率、下一次的节奏
-
-**三条不发**：派不出由头、模型否决、验收不过，都不发；念头留着下一轮再试。
-
-**念头不是许可**：它只决定「有事由之后等多久」，不决定「发不发」。
-
-**关系越熟，最小间隔越短**：越生越克制；连着发不出去就停发，等对方先开口。
-
-**群聊另算一套**：被叫到、接得上才接话；冷场时破冰；没话说就不发，不硬凑。
-
-</details>
+见 [CHANGELOG.md](CHANGELOG.md) · 仓库 [naliling/astrbot_plugin_autonomous_social](https://github.com/naliling/astrbot_plugin_autonomous_social)
