@@ -6,7 +6,6 @@
 .ss-chip{display:inline-block;margin:8px 8px 0 0;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px;color:#fff}
 .ss-card{background:#f5f3ff;border-left:3px solid #7c3aed;border-radius:8px;padding:10px 12px;font-size:14px}
 .ss-note{background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;padding:12px 14px;font-size:14px;color:#4c1d95;line-height:1.9}
-.ss-tag{display:inline-block;background:#f5f3ff;color:#6d28d9;border:1px solid #ddd6fe;border-radius:999px;padding:5px 13px;margin:6px 8px 0 0;font-size:12px;font-weight:600}
 </style>
 
 <div class="ss-hero" style="background:linear-gradient(135deg,#6d28d9 0%,#8b5cf6 55%,#c084fc 100%);border-radius:20px;padding:30px 28px;color:#fff;box-shadow:0 12px 32px rgba(109,40,217,.28)">
@@ -20,7 +19,7 @@
   </div>
 </div>
 
-<div style="margin:14px 0 6px"><span class="ss-tag">主动开口</span><span class="ss-tag">未完话题</span><span class="ss-tag">群聊心流</span><span class="ss-tag">破冰</span><span class="ss-tag">念头系统</span><span class="ss-tag">关系记忆</span><span class="ss-tag">长期记忆</span><span class="ss-tag">主动消息</span><span class="ss-tag">时机判断</span><span class="ss-tag">冷却限频</span><span class="ss-tag">管理员指令</span></div>
+![主动开口](https://img.shields.io/badge/-%E4%B8%BB%E5%8A%A8%E5%BC%80%E5%8F%A3-7c3aed?style=flat-square) ![未完话题](https://img.shields.io/badge/-%E6%9C%AA%E5%AE%8C%E8%AF%9D%E9%A2%98-7c3aed?style=flat-square) ![群聊心流](https://img.shields.io/badge/-%E7%BE%A4%E8%81%8A%E5%BF%83%E6%B5%81-7c3aed?style=flat-square) ![破冰](https://img.shields.io/badge/-%E7%A0%B4%E5%86%B0-7c3aed?style=flat-square) ![念头系统](https://img.shields.io/badge/-%E5%BF%B5%E5%A4%B4%E7%B3%BB%E7%BB%9F-7c3aed?style=flat-square) ![关系记忆](https://img.shields.io/badge/-%E5%85%B3%E7%B3%BB%E8%AE%B0%E5%BF%86-7c3aed?style=flat-square) ![长期记忆](https://img.shields.io/badge/-%E9%95%BF%E6%9C%9F%E8%AE%B0%E5%BF%86-7c3aed?style=flat-square) ![主动消息](https://img.shields.io/badge/-%E4%B8%BB%E5%8A%A8%E6%B6%88%E6%81%AF-7c3aed?style=flat-square) ![时机判断](https://img.shields.io/badge/-%E6%97%B6%E6%9C%BA%E5%88%A4%E6%96%AD-7c3aed?style=flat-square) ![冷却限频](https://img.shields.io/badge/-%E5%86%B7%E5%8D%B4%E9%99%90%E9%A2%91-7c3aed?style=flat-square) ![管理员指令](https://img.shields.io/badge/-%E7%AE%A1%E7%90%86%E5%91%98%E6%8C%87%E4%BB%A4-7c3aed?style=flat-square)
 
 <p style="font-size:15px;line-height:1.9;color:#3b0764;margin:14px 0 0">她不是定时器。什么时候开口、对谁开口、说什么，由攒出来的念头和一件具体的事决定；说不出那件事，这一轮就不说。</p>
 
