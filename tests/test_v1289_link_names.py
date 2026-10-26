@@ -533,9 +533,11 @@ class BondLineNameTest(unittest.TestCase):
         ):
             with self.subTest(target=target):
                 text = _bond_line(target)
-                self.assertIn("叫名字要偶尔、自然", text)
-                self.assertIn("别每条都叫", text)
-                self.assertIn("别每句开头都是名字", text)
+                # v1.28.13：主动消息要开口叫一声（否则一条条发过去都不认人），
+                # 但位置要自然，不许孤零零挂在句尾。
+                self.assertIn("开口要叫一声TA的称呼", text)
+                self.assertIn("别单独挂在句尾", text)
+                self.assertIn("也别每句话都叫", text)
 
     def test_no_name_says_do_not_invent_one(self):
         text = _bond_line({})
@@ -623,7 +625,7 @@ class ProactivePromptNameTest(unittest.TestCase):
     def test_prompt_carries_the_call_name_exactly_once(self):
         text = self._prompt(self._target(_call_name="小明", _name_source="nickname"))
         self.assertIn("你一直叫TA「小明」", text)
-        self.assertIn("别每条都叫", text)
+        self.assertIn("开口要叫一声TA的称呼", text)
         # 名字只能出现在 bond_line 这一处：core_context 的 compact() 与
         # 关系/素材块都不该再提一次（否则模型会把它当复读模板）。
         self.assertEqual(text.count("小明"), 1, "名字在 prompt 里出现了不止一处")

@@ -1028,7 +1028,7 @@
     "owner_only_commands": {
         "type": "bool",
         "description": "指令仅主人可用",
-        "hint": "'触发社交''社交状态'等指令是否仅主人可用。推荐开启。",
+        "hint": "开启（默认）：只有机器人主人与 AstrBot 管理员能用，白名单不生效；关闭：主人 + AstrBot 管理员 + 白名单都能用。",
         "obvious_hint": true,
         "default": true
     },
@@ -1066,6 +1066,20 @@
         "hint": "多少天没联系的用户会被清理历史数据。推荐30天，设0永不清理。",
         "obvious_hint": true,
         "default": 30,
+        "min": 0,
+        "max": 3650,
+        "slider": {
+            "min": 0,
+            "max": 3650,
+            "step": 50
+        }
+    },
+    "purge_inactive_user_days": {
+        "type": "int",
+        "description": "整条记录清理天数",
+        "hint": "超过这么多天没有任何互动、她发过去也没人回的会话，连整条记录一起永久删除（私聊与群）。0 = 永不清理（默认）。这是删整条记录、不只是正文；只想清正文请用上面的「闲置用户清理天数」。",
+        "obvious_hint": true,
+        "default": 0,
         "min": 0,
         "max": 3650,
         "slider": {

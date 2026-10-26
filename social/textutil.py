@@ -62,6 +62,92 @@ def strip_segments(text: Any) -> str:
     return SEGMENT_PLACEHOLDER.sub("", str(text or "")).strip()
 
 
+#: 需要配对的括号/引号：左 → 右。`"` 不在这张表里——它自己就是一对，
+#: 只能按出现顺序配对（见 `balance_brackets`）。
+_BRACKET_PAIRS = {
+    "（": "）", "(": ")",
+    "「": "」", "『": "』", "【": "】",
+    "[": "]", "{": "}",
+    "“": "”",
+}
+_CLOSE_TO_OPEN = {right: left for left, right in _BRACKET_PAIRS.items()}
+#: 对称引号：前后同一个字符，靠顺序两两配对。
+_SYMMETRIC_QUOTES = frozenset({'"'})
+_BRACKET_CHARS = frozenset(_BRACKET_PAIRS) | frozenset(_CLOSE_TO_OPEN) | _SYMMETRIC_QUOTES
+
+
+def balance_brackets(text: Any) -> str:
+    """删掉**不成对**的括号/引号字符，只留成对的；里面的内容一个不动。
+
+    为什么需要这一层
+    ----------------
+    引文进提示词前几乎都要**截断**（`_peer_text` 截 80、`_short` 截 12、
+    `extract_cue` 取 12 字上下文）。截断落在一个成对括号中间，就会切出只剩
+    半边的残句。线上真实出现过的提示词片段（都在 `state.json` / prompt 里抓到）：
+
+        TA最后说的是：「(慢慢躺在你的身边抱着你」。
+        你上次说的「(慢慢躺在你的身边抱着你」后来呢
+        你上次说那不奇怪了……(温柔地揉，后来好点没
+        · 你们说好的：时钟发现很晚了)嘛…不过明天照样美好…
+
+    模型会把这种残缺引文当成「对方就是这么说的」，照着它写断句——用户看到的
+    就是病句。所以把它当成**所有引文片段的最后一道清洗**：截断之后再做，只删
+    单边字符，成对的保持原样。
+
+    不删成对括号是有意的：`（轻轻抱你）` 这种语C 动作是人格自己的说话方式，
+    删掉它就是把角色抄平。
+
+    判定规则（栈式配对，支持嵌套）：
+    * 左括号按顺序入栈；右括号只在能找到自己那个左括号时才成对；
+    * `"` 也是左括号，遇到下一个 `"` 才成对（所以单个 `"` 会被删）；
+    * 落单的左括号、落单的右括号、落单的 `"` 一律删掉；
+    * 其余字符（包括被括号包住的内容）逐字保留，顺序不变。
+
+    空串原样返回；None 当空值；其他非 str 先 `str()`（`None` 不做成 "None"——
+    它进提示词只会变成一句假话）。
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return text
+    stack: list = []      # [(字符, 下标)]：还在等自己右半边的左括号
+    paired: set = set()   # 成对的下标（这些原样保留）
+    for i, ch in enumerate(text):
+        if ch in _SYMMETRIC_QUOTES:
+            # 对称引号：栈里已经有一个同类就当它的右半边，否则自己开一个
+            want = ch
+            if not any(open_ch == ch for open_ch, _i in stack):
+                stack.append((ch, i))
+                continue
+        elif ch in _CLOSE_TO_OPEN:
+            want = _CLOSE_TO_OPEN[ch]
+        elif ch in _BRACKET_PAIRS:
+            stack.append((ch, i))
+            continue
+        else:
+            continue
+        # 从近到远找自己的左半边：正常嵌套时栈顶就是它；
+        # 错序嵌套（「（他说"好」」）也能找回更外层的那个。
+        hit = -1
+        for depth in range(len(stack) - 1, -1, -1):
+            if stack[depth][0] == want:
+                hit = depth
+                break
+        if hit < 0:
+            continue          # 找不到左半边 → 下面统一删掉
+        _, left_i = stack.pop(hit)
+        paired.add(left_i)
+        paired.add(i)
+    if len(paired) == sum(1 for ch in text if ch in _BRACKET_CHARS):
+        return text
+    return "".join(
+        ch for i, ch in enumerate(text)
+        if i in paired or ch not in _BRACKET_CHARS
+    )
+
+
 def is_quotable(text: Any) -> bool:
     """这段能不能被当成「TA 上次说的那件事」引进提示词里。
 

@@ -404,8 +404,8 @@ class AutonomousSocial(Star):
     async def trigger_social(self, event: AstrMessageEvent):
         """手动触发一次主动联系（绕过念头与冷却），挑最想说的人立即发送。
 
-        默认仅机器人主人（全局配置 admins_id）可用；需要放开给别人就在配置里关掉
-        owner_only_commands 并填入白名单。
+        默认仅机器人主人（全局配置 admins_id）与 AstrBot 管理员可用；需要放开给别人，
+        先关掉 owner_only_commands，再把对方 ID 填进 allowed_trigger_uids。
 
         多台 bot 同群时（trigger_group_requires_at，默认开）：群里只有被 @ 的那台
         才执行——不然一条「/触发社交」会同时叫醒群里所有 bot，每台各自发一条，
@@ -557,10 +557,9 @@ class AutonomousSocial(Star):
         except Exception:
             pass
         try:
-            # 白名单**无条件**构建：它的语义是「除主人外还允许谁用指令」，
-            # 与 owner_only_commands（是否额外要求主人身份）无关。原来只在
-            # owner_only_commands=False 时才构建，于是默认值 True 下这个面板项
-            # 完全不读、静默失效 —— 与它自己的 hint 直接矛盾。
+            # 白名单始终读出来：一是状态页要显示「填了谁」，二是
+            # owner_only_commands=False 时它就是放行依据。是否**采用**它由
+            # _check_owner 按 owner_only_commands 决定（开=仅主人与管理员）。
             if self._engine and self._engine.cfg:
                 whitelist = {
                     self._norm_id(x)
@@ -583,8 +582,11 @@ class AutonomousSocial(Star):
             return False, "拿不到发送者 ID"
         if sender in owners:
             return True, f"{sender} 在主人列表里"
-        if sender in whitelist:
-            return True, f"{sender} 在额外白名单里"
+        # owner_only_commands=True（默认）：只认主人与 AstrBot 管理员，
+        # 白名单不参与——面板上写着「仅主人可用」就必须真的仅主人可用。
+        # False：才把额外白名单放进来（README 里的「关掉开关再填白名单」）。
+        if not self._owner_only() and sender in whitelist:
+            return True, f"{sender} 在额外白名单里（owner_only_commands 已关闭）"
         try:
             if hasattr(event, "is_admin") and bool(event.is_admin()):
                 return True, f"{sender} 被 AstrBot 标为 admin"
@@ -594,9 +596,16 @@ class AutonomousSocial(Star):
             f"sender={sender or '空'} 主人={sorted(owners) or '未配置'} "
             f"白名单={sorted(whitelist) or '未配置'}"
         )
+        if self._owner_only():
+            detail += "（owner_only_commands 开启：白名单不生效）"
         return False, detail
 
     def _owner_only(self) -> bool:
+        """管理指令是否仅主人可用。
+
+        True（默认）：只有机器人主人与 AstrBot 管理员能执行，白名单不生效；
+        False：主人 + AstrBot 管理员 + allowed_trigger_uids 白名单都能执行。
+        """
         try:
             return bool(self._engine and self._engine.cfg.owner_only_commands)
         except Exception:
@@ -609,8 +618,12 @@ class AutonomousSocial(Star):
             sender = self._norm_id(event.get_sender_id())
         except Exception:
             sender = "?"
+        if self._owner_only():
+            mode = "仅主人可用（白名单未生效；要放开请关掉 owner_only_commands）"
+        else:
+            mode = "主人 + 白名单可用（owner_only_commands 已关闭）"
         return (
-            "权限：仅主人可用（全局配置 admins_id）\n"
+            f"权限：{mode}\n"
             f"  你的 ID：{sender}\n"
             f"  主人列表：{', '.join(sorted(owners)) or '（空，所以谁都会被拒）'}\n"
             f"  额外白名单：{', '.join(sorted(whitelist)) or '（空）'}"

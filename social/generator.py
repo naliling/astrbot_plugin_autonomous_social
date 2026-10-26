@@ -32,7 +32,7 @@ from .style_profile import (
     build_style_profile,
     emoji_habit,
 )
-from .textutil import is_quotable, short_call_name, strip_segments
+from .textutil import balance_brackets, is_quotable, short_call_name, strip_segments
 from .throttle import throttle
 from .verify import merge_lead_line, strip_echoed_label, strip_title_line
 
@@ -213,12 +213,17 @@ def _peer_text(text: Any, limit: int = 0) -> str:
 
     清完没剩下什么就返回空串——让调用方走「这次没有 TA 的原文」那条路，
     而不是把 `[图片]` 当成 TA 的一句话。
+
+    最后一道是 `balance_brackets`，而且必须放在**截断之后**：截断本身就会把
+    一个成对的括号切成单边——线上真实的 `TA最后说的是：「(慢慢躺在你的身边抱着你」。`
+    正是 `(慢慢躺在你的身边抱着你)` 被截到 12 字的结果。只删单边、不碰成对的
+    语C 动作括号，见 `textutil.balance_brackets`。
     """
     out = strip_segments(text)
     out = re.sub(r"[ \t]{2,}", " ", out).strip(" \t\r\n，。；、")
     if limit and len(out) > limit:
         out = out[:limit]
-    return out
+    return balance_brackets(out)
 
 # llm_gate 关掉时不要求模型输出 SEND/NO 协议，但它养成长习惯了照样会带。
 # 少了这一道，主动消息会真的发出去一句「SEND对了你面试后来咋样」。
@@ -628,6 +633,45 @@ def _decide_note(mode: str) -> str:
     return _DECIDE_NOTES.get(mode, "")
 
 
+def _intimacy_fact_line(target: Dict[str, Any]) -> str:
+    """Core 门面给的亲密状态 → 一句事实（没有就空串）。
+
+    只写状态：想要 / 在场景 / 余韵。不写指令、不写器官、不写动作。
+    没有这一句时生成侧与 1.28.10 逐字一致（旧 Core / ccb 关 / 没档案都不出）。
+    """
+    data = target.get("_intimacy")
+    if not isinstance(data, dict) or not data:
+        return ""
+    try:
+        in_scene = bool(data.get("in_scene"))
+    except Exception:
+        in_scene = False
+    if in_scene:
+        satisfy = data.get("satisfy")
+        try:
+            if satisfy not in (None, ""):
+                return f"你们这会儿正在亲密里（满足 {float(satisfy):.0f}/100）。"
+        except (TypeError, ValueError):
+            pass
+        return "你们这会儿正在亲密里。"
+    try:
+        after = float(data.get("aftercare_left") or 0.0)
+    except (TypeError, ValueError):
+        after = 0.0
+    if after > 0:
+        return f"刚结束不久，她还在余韵里（还剩 {max(1, int(after // 60))} 分钟）。"
+    want = str(data.get("want_line") or target.get("_want_line") or "").strip()
+    if want:
+        return want
+    try:
+        initiative = float(data.get("initiative") or 0.0)
+    except (TypeError, ValueError):
+        initiative = 0.0
+    if initiative >= 0.65:
+        return "她这会儿有点想主动找他。"
+    return ""
+
+
 def _relationship_line(target: Dict[str, Any]) -> str:
     """把好感/攻击性那几个数翻成一句她对 TA 的态度。
 
@@ -981,16 +1025,25 @@ def _bond_line(target: Dict[str, Any]) -> str:
     source = _name_text(target.get("_name_source"))
     # 长名片只叫前一段（线上真实记录：「爱筝挽起·冲击波冠军」被整段念出来）。
     call_name = short_call_name(raw_name)
+    nick_short = short_call_name(nickname)
+    # v1.28.13：**她一直叫的那个称呼优先**。名片名可能是「^0^」这种念不出口的字符串，
+    # 以前它排在昵称前面被拿去叫，结果主动消息里既不叫名字、又不像在找人。
+    if nick_short:
+        call_name = nick_short
     if call_name:
-        if nickname or source == "nickname":
+        if nick_short:
+            bits.append(f"你一直叫TA「{call_name}」")
+        elif source == "nickname":
             bits.append(f"你一直叫TA「{call_name}」")
         else:
             bits.append(f"TA 的名片名是「{call_name}」，你可以偶尔这么叫")
-        # 追一句使用纪律：名字是**称呼**，不是每条的起手模板。不写这句的话，
-        # 模型拿到名字就会每条都喊、而且固定放在开头（「小明，…」）。
+        # v1.28.13：主动消息是「主动找 TA」，得让对方看得出是在找谁。
+        # 原来是「别每条都叫，别每句开头都是名字」——线上实测矫枉过正：
+        # 主动消息一条接一条，没有一条叫名字，用户的原话是「主动消息还是不会认人」。
+        # 现在改成：这条要叫一声，但位置要自然（句首/句中），不许孤零零挂在句尾。
         bits.append(
-            "叫名字要偶尔、自然（比如打招呼、催一句、说到一半提一下），"
-            "别每条都叫，别每句开头都是名字"
+            "这是你主动找TA说话：开口要叫一声TA的称呼，放在句首或句中"
+            "（比如「X，…」「…啊，X」），别单独挂在句尾，也别每句话都叫"
         )
     else:
         bits.append("你还不知道TA叫什么，别自己给TA编名字")
@@ -1539,17 +1592,26 @@ class MessageGenerator:
         relation_line = _relationship_line(target)
         bond_line = _bond_line(target)
         # 由头：这次开口的那件事，由插件给定（不叫模型去找话题）
-        _anchor_fact = str((reason_meta or {}).get("anchor_fact") or "").strip() or (
+        #
+        # `anchor_fact` 是 `anchors.anchor_sentence()` 拼的「{lead}：{about}」——about 是
+        # 截过的片段（`_short`/`_clause`），截断后可能只剩单边括号。它整句进
+        # 提示词（见下面 `anchor_line`），所以这里再洗一次；已经成对的语C 动作不动。
+        _anchor_fact = balance_brackets(
+            str((reason_meta or {}).get("anchor_fact") or "").strip()
+        ) or (
             "（这次没什么具体的事要说）" if not (reason_meta or {}).get("category")
             else ""
         )
         # 已读续接：对方最近说过的那几句。有它的时候补的这一句该接着它们说，
         # 而不是凭空找个话头。对方那几句的回复走的是正常聊天链路，不是插件发的。
+        # 每句都过 `_peer_text`：它是要被「「…」」捧进提示词的**对方原话**，
+        # 长句截断后同样可能留下单边括号（与 `_mode_note` 里的 about/asked 同一类）。
         _exchange = [
-            str(t).strip()
+            _peer_text(t)
             for t in ((reason_meta or {}).get("exchange") or [])
             if str(t).strip()
         ]
+        _exchange = [t for t in _exchange if t]
 
         # ─── 构建上下文片段 ───
 
@@ -1713,6 +1775,9 @@ class MessageGenerator:
         # 而不是把整段 prompt 从中间硬截断（截断会呬掉输出格式要求）。
         def assemble(dropped: frozenset) -> str:
             ref_lines: List[str] = []
+            intimacy_line = _intimacy_fact_line(target)
+            if intimacy_line:
+                ref_lines.append(intimacy_line)
             if intimate:
                 # 亲密氛围：不抹露骨正文，只给一句氛围提示，让她顺着当下的亲昵感接下去
                 ref_lines.append("你们刚才聊得很亲密黏糊，氛围还暖着，顺着这个感觉自然说一句就好。")
@@ -1737,10 +1802,10 @@ class MessageGenerator:
                 last_msg = _peer_text(target.get("last_message"), 120)
                 if last_msg:
                     ref_lines.append(f"对方最近说过的：{last_msg}")
-                spoken = str(target.get("last_spoken_text") or "").strip()
+                spoken = _peer_text(target.get("last_spoken_text"), 120)
                 if spoken and "out_block" not in dropped:
                     # 不记这一笔，她下一句接不上自己刚才说的话，看起来就像换了个人
-                    ref_lines.append(f"你自己上一句对TA说的是：{spoken[:120]}")
+                    ref_lines.append(f"你自己上一句对TA说的是：{spoken}")
                 # **那句话有没有人接**（v1.28.1）。
                 #
                 # 用户原话：「不知道说过啥就只会一个劲的问」。只写「你上一句说的是 X」
@@ -1765,9 +1830,9 @@ class MessageGenerator:
                 said = target.get("_said") or []
                 if said and "history" not in dropped:
                     quotes = "；".join(
-                        f"「{str(x.get('said', '') or '')[:40]}」"
+                        f"「{_peer_text(x.get('said'), 40)}」"
                         for x in said[:3]
-                        if str(x.get("said", "") or "").strip()
+                        if _peer_text(x.get("said"), 40)
                     )
                     if quotes:
                         ref_lines.append(
@@ -1822,14 +1887,17 @@ class MessageGenerator:
                 # reason 也是空串；那种情况下这一行会是空载荷（「已经定了：」后面什么都没有），
                 # 反而告诉模型「话题已定」却不给它内容。没有内容就整行不放。
                 anchor_line = ""
-                if (reason_meta or {}).get("anchor_fact"):
+                if (reason_meta or {}).get("anchor_fact") and _anchor_fact:
                     anchor_line = (
                         "这次开口是因为下面这一件事（**已经定了，你不用再去找话题**）：\n"
                         f"  {_anchor_fact}"
                     )
                 elif str(reason or "").strip():
+                    # `reason` 在 anchored 通道就是 `anchor_sentence(a)`（「{lead}：{about}」），
+                    # 另一条通道里也是带对方原话的句子——同样可能只剩单边括号。
                     anchor_line = (
-                        f"这次开口是因为下面这一件事（已经定了）：\n  {str(reason).strip()}"
+                        "这次开口是因为下面这一件事（已经定了）：\n  "
+                        f"{balance_brackets(str(reason).strip())}"
                     )
                 parts.extend([
                     "",
@@ -1955,7 +2023,10 @@ class MessageGenerator:
             if mode in ("greet_morning", "greet_night") and note:
                 parts.append(note)
             else:
-                parts.append(f"这次你想{msg_type_desc if msg_type_desc else '随便说点什么'}。")
+                # msg_type_desc 里也嵌着 about（`anchor_meta`：「就那件事说句话：{about}」）
+                # 或对方原话（`closer_meta`：「对方说过：…」），同样要配对清洗。
+                _desc = balance_brackets(msg_type_desc) if msg_type_desc else ""
+                parts.append(f"这次你想{_desc or '随便说点什么'}。")
                 if msg_style_hint:
                     parts.append(f"（{msg_style_hint}）")
                 parts.append(note)
@@ -2936,11 +3007,15 @@ class MessageGenerator:
 
         for key, label in (("cue", "你们说好的"), ("loop", "TA提过还没下文的事")):
             try:
-                item = str(target.get(key, "") or "").strip()
+                # 原来这里是 `str(...)[:40]` 直塞：cue/loop 都是从对方原话里**截出来**
+                # 的片段，截断落在括号中间就会留下单边。线上真实 prompt 里那条
+                # 「· 你们说好的：时钟发现很晚了)嘛…不过明天照样美好…」就是它。
+                # 走 `_peer_text`：去占位符 → 截断 → 括号配对清洗（截完再洗，顺序不能反）。
+                item = _peer_text(target.get(key, ""), 40)
             except Exception:
                 item = ""
             if item:
-                facts.append(f"{label}：{item[:40]}")
+                facts.append(f"{label}：{item}")
 
         activity = body.get("activity") if isinstance(body.get("activity"), dict) else {}
         seen_facts: set = set()
@@ -2952,7 +3027,8 @@ class MessageGenerator:
             if not value or value in seen_facts:
                 return
             seen_facts.add(value)
-            facts.append(f"{label}：{value[:40]}")
+            # 同样是截 40 字：截断落在成对括号中间会切出单边，进提示词就成了病句引文。
+            facts.append(f"{label}：{balance_brackets(value[:40])}")
 
         add("你现在的安排", (activity or {}).get("schedule_event", ""))
         add("你在哪", (activity or {}).get("location", ""))

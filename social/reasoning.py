@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .clock import city_epoch, city_now
+from .textutil import balance_brackets
 
 
 def _num(value: Any) -> float:
@@ -199,6 +200,15 @@ _CUE_NEGATIONS = (
 
 # 锚点短语保留长度（作为 prompt 里的「那件事」的线索）
 CUE_TEXT_MAX = 40
+# 取 12 字上下文之前，先把**成对的**语C 动作/旁白括号段整段去掉。
+#
+# 为什么：上下文是从句子中间往前回退 12 字切出来的，落在括号里就会切出半个括号。
+# 线上真实 state.json 里的 cue：
+#     「时钟发现很晚了)嘛…不过明天照样美好…」
+# 原文是 `(看时钟发现很晚了)嘛…不过明天照样美好…`——从「时」字开始取，左括号被
+# 切掉、右括号留了下来。模型照着这种残句写，就是断句/怪句。
+# 只去**成对**的：单边括号是原文自己就残，交给最后的 `balance_brackets`。
+_ACTION_PAIR = re.compile(r"（[^（）\n]*）|\([^()\n]*\)")
 # 由头最多记多久：超过这个时间的约定早就黄了，别拿它当理由
 CUE_TTL_SECONDS = 14 * 86400
 # 过了到期时间多久之内还算「刚过点」（再晚就不适合问了）
@@ -263,23 +273,27 @@ def extract_cue(
         return None, 0.0
     now = time.time() if now is None else float(now)
 
+    # 先整段去掉成对的动作括号，再找锚点、取上下文：位置全部以 scan 为准，
+    # 否则片段会从半个括号中间开始（见 _ACTION_PAIR 上面的线上样本）。
+    scan = _ACTION_PAIR.sub("", msg)
+
     candidates: List[Tuple[int, str, float]] = []
 
     for pattern, days, hour, minute in _CUE_ANCHORS:
-        match = re.search(pattern, msg)
+        match = re.search(pattern, scan)
         if not match:
             continue
         candidates.append((match.start(), pattern,
                            _anchor_due(now, pattern, days, hour, minute, clock_offset_minutes)))
 
-    nw = _CUE_NEXT_WEEK_WEEKDAY.search(msg)
+    nw = _CUE_NEXT_WEEK_WEEKDAY.search(scan)
     if nw:
         idx = _WEEKDAY_CN.find(nw.group(1))
         weekday = 6 if idx < 0 else idx
         candidates.append((nw.start(), "weekday",
                            _next_weekday(now, weekday, offset=clock_offset_minutes) + 7 * 86400.0))
 
-    wd = _CUE_WEEKDAY.search(msg)
+    wd = _CUE_WEEKDAY.search(scan)
     if wd:
         ch = wd.group(1)
         idx = _WEEKDAY_CN.find(ch)
@@ -292,12 +306,14 @@ def extract_cue(
 
     # 句子里最早出现的那个锚点才是正事（「明天面试，今晚先不聊了」跟的是面试）
     start, pattern, due = min(candidates, key=lambda x: x[0])
-    snippet = msg[max(0, start - 12): min(len(msg), start + CUE_TEXT_MAX)]
+    snippet = scan[max(0, start - 12): min(len(scan), start + CUE_TEXT_MAX)]
     if any(neg in snippet for neg in _CUE_NEGATIONS):
         return None, 0.0
     if due <= now or due - now > CUE_TTL_SECONDS:
         return None, 0.0
-    return snippet.strip(), due
+    # 取完再配一次对：上下文从句子中间开始，仍可能带进单边括号
+    # （「)嘛…」这种以右括号开头的 cue 最典型）。空片段照旧返回空串。
+    return balance_brackets(snippet.strip()), due
 
 
 def live_cue(user: Dict[str, Any], now: float) -> Optional[str]:

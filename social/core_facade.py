@@ -251,6 +251,25 @@ def clock(facade: Any, role_id: str) -> Dict[str, Any]:
         return {}
 
 
+def intimacy(facade: Any, role_id: str, user_id: str) -> Dict[str, Any]:
+    """门面 `intimacy()` 的容错封装：拿不到返回 {}，绝不抛。
+
+    与 `brief()` 同一条纪律：门面是**可选**上下文，坏了只让这一条事实消失，
+    不能让主动消息发不出去。
+    """
+    if facade is None:
+        return {}
+    fn = getattr(facade, "intimacy", None)
+    if not callable(fn):
+        return {}
+    try:
+        data = fn(str(role_id or ""), str(user_id or ""))
+    except Exception as exc:
+        logger.debug(f"[autonomous_social] 门面 intimacy 失败: {exc}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def brief(facade: Any, role_id: str, user_id: str = "", *, task: str = "chat",
           text: str = "", char_name: str = "", user_name: str = "") -> Optional[Dict[str, Any]]:
     """门面 `brief()` 的容错封装：拿不到返回 `None`，调用方退回读 state.json。

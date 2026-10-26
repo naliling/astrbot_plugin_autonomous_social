@@ -35,7 +35,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .textutil import OUTSIDE_WORDS as _OUTSIDE_WORDS, outside_lead as _outside_lead
-from .textutil import is_quotable
+from .textutil import balance_brackets, is_quotable
 
 # 一个人身上同时挂着几条「还没用过的事」
 #
@@ -637,17 +637,22 @@ def _short(text: Any, n: int = ANCHOR_TEXT_MAX) -> str:
 
 
 def _clause(text: Any, n: int) -> str:
-    """按停顿截到 n 字以内，别在句子中间硬切。
+    """按停顿截到 n 字以内，别在句子中间硬切；截完再删掉单边的括号/引号。
 
     给**整句原文**用（Core 的天气 `env`、对方说过的原话片段）：那种句子没有模板
     兜着，硬切出来的「外面下着大雨，风也很」就是一句断话，而「你上次说今天加班到
     十一点整个人，后来好点没」也一样。模板拼接的片段各自量好了尺寸，不需要它。
+
+    截断本身会把成对括号切成单边——线上真实由头
+    「你上次说那不奇怪了……(温柔地揉，后来好点没」里的 `(` 就是这么来的。
+    这里返回的片段会被拼进**给模型看的**模板（`你上次说{clause}，后来好点没`、
+    天气由头），所以清洗必须在截断之后做，见 `textutil.balance_brackets`。
     """
     s = _s(text)
     if not s or len(s) <= n:
-        return s
+        return balance_brackets(s)
     head = re.split(r"[，。！？；、,.!?;]", s, maxsplit=1)[0]
-    return head if 0 < len(head) <= n else s[:n]
+    return balance_brackets(head if 0 < len(head) <= n else s[:n])
 
 
 def _derive_from_state(
@@ -1571,7 +1576,13 @@ def derive_topic_relations(
     if want <= 0:
         return []
     for text in _topic_candidates(u, now)[:4]:
-        line = f"你上次说的「{_short(text, 12)}」后来呢"
+        # 片段先截断、再把单边括号删掉——截断本身就会把一个成对括号切成一半
+        # （线上 `你上次说的「(慢慢躺在你的身边抱着你」后来呢` 就是这么来的：
+        # 原文 `(慢慢躺在你的身边抱着你)` 被切到 12 字，右半边没了）。
+        frag = balance_brackets(_short(text, 12))
+        if not frag:
+            continue
+        line = f"你上次说的「{frag}」后来呢"
         if line in taken:
             continue
         taken.add(line)
@@ -1637,6 +1648,9 @@ def derive_relations(
             # 这种**未闭合的引号**——不是在说事，是在掉字。截断必须发生在片段上，
             # 不能发生在模板上（#4 与 #5 是同一个根因）。
             seg = _short(seg, 12)
+            # 同上：截断之后必须再配一次对。成对的语C 动作（`(揉眼)`）原样保留，
+            # 只删被截断切出来的单边——目标句里那个「」由模板自己成对。
+            seg = balance_brackets(seg)
             if len(seg) < 2 or seg in taken:
                 continue
             # 「后来呢」引的必须是一件真的事：`yep`/`怎么`/`[图片][Image`/`打你`

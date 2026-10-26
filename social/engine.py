@@ -2535,6 +2535,15 @@ class SocialEngine:
         if libido is not None:
             u_copy["_libido"] = libido
 
+        # 亲密档案：门面 brief 的 user 块里本来就带着，之前整块丢掉了。
+        # 生成侧只拿它拼一句事实（想不想 / 在不在场景 / 余韵），不写指令。
+        try:
+            intimacy = block.get("intimacy")
+        except Exception:
+            intimacy = None
+        if isinstance(intimacy, dict) and intimacy:
+            u_copy["_intimacy"] = dict(intimacy)
+
     def _remember_clock(self, bid: str, body: Optional[Dict[str, Any]]) -> None:
         """从 Core 记下她所在城市的时区偏移。
 
@@ -5740,17 +5749,31 @@ class SocialEngine:
         """C1：这个人此刻为什么发不出去——把各道闸门的理由串起来。
 
         预览时用来回答「我明明设了，为什么不发」。取不到就返回空串。
+
+        **只读**：这里绝不能走 `state.user(bid, uid)`——那个访问器在记录不存在时
+        会新建一条，而 `/主动消息预览` 允许带一个任意用户 ID（打错字、复制错了、
+        或干脆查一个从没聊过的人）。原来拿它来查「为什么发不出去」，于是每查一个
+        不存在的 ID，state.json 里就永久多出一条空壳用户：状态页的「候选用户」
+        多一个、清理与遍历多一个，而它永远发不出任何东西。预览是只读动作，
+        查询本身不该改变被查对象。同理 `is_send_blocked` 也走 `state.user()`，
+        这里直接从记录里读那个字段。
         """
         try:
-            u = self.state.user(bid, uid)
+            bots = self.state.data.get("bots")
+            bot = bots.get(bid) if isinstance(bots, dict) else None
+            users = bot.get("users") if isinstance(bot, dict) else None
+            u = users.get(uid) if isinstance(users, dict) else None
         except Exception:
             return ""
+        if not isinstance(u, dict):
+            # 不在名单里 ≠ 被闸门挡住：这是「根本没这个人」，说清楚比说「发不出去」有用
+            return "名单里没有这个人（TA 没私聊过 bot，历史导入与播种名单里也没有）"
         if not u.get("umo"):
             return "还没有可用的会话来源（TA 没私聊过 bot）"
         try:
-            if self.state.is_send_blocked(bid, uid, now):
+            if float(u.get("send_blocked_until", 0) or 0) > now:
                 return "发送隔离中（之前发给 TA 失败过）"
-        except Exception:
+        except (TypeError, ValueError):
             pass
         try:
             why = self.gate_reason(bid, uid, u, now)
@@ -5842,6 +5865,16 @@ class SocialEngine:
             cool = float(getattr(self.cfg, "intimacy_cooldown_hours", 48) or 48) * 3600.0
             if last > 0 and now - last < cool:
                 continue
+            # v1.28.11：把 Core 算好的「她这会儿想不想」带进生成侧（没有就空）。
+            # 复制一份再挂 _want_line，绝不往 state.json 里写生成侧字段。
+            want_line = ""
+            try:
+                want_line = self._ccb_want_line(bid, uid)
+            except Exception:
+                want_line = ""
+            if want_line:
+                u = dict(u)
+                u["_want_line"] = want_line
             out.append((uid, u))
         return out
 
@@ -6029,7 +6062,7 @@ class SocialEngine:
             try:
                 # 取 per-(bot,uid) 锁：手动触发与并发心跳可能同时挑中同一个人，
                 # 两边都过 gap/pending 检查就会各发一条（也绕过 observe 的互斥）。
-                # 手动触发本身有 60 秒限频，锁内跑一次 LLM 可以接受。
+                # 手动触发本身有 20 秒限频（TRIGGER_MIN_INTERVAL_SECONDS），锁内跑一次 LLM 可以接受。
                 async with self._user_lock(bid, uid):
                     u = self.state.user(bid, uid)
                     sent, note = await self._speak(
@@ -6792,15 +6825,18 @@ class SocialEngine:
         状态页原来是一锅粥——多 Bot 装了等于看不出任何一个角色的真实情况，
         而「哪个角色坏了」恰恰是排查时要的第一眼。
         """
-        bots = self.state.data.get("bots", {}) or {}
-        if not bots:
+        # 走 _bot_items()：非 dict 的 bot 条目（手改/旧版残留）在这里必须被滤掉，
+        # 否则 `(bot or {}).get(...)` 对字符串/列表条目照样抛 AttributeError，
+        # 面板整段变成「获取状态失败」。
+        bot_rows = self._bot_items()
+        if not bot_rows:
             return "（还没有角色记录）"
         now = self._time()
         self._refresh_clocks()
         lines: List[str] = []
-        for bid, bot in list(bots.items())[:8]:
-            users = (bot or {}).get("users", {}) or {}
-            groups = (bot or {}).get("groups", {}) or {}
+        for bid, bot in bot_rows[:8]:
+            users = bot.get("users") if isinstance(bot.get("users"), dict) else {}
+            groups = bot.get("groups") if isinstance(bot.get("groups"), dict) else {}
             hot = 0
             last_send = 0.0
             streak = 0
@@ -7022,6 +7058,25 @@ class SocialEngine:
         if core_facade.has_capability(facade, "intimacy"):
             return "Core 门面具备 intimacy 能力（能按需读到场景 / 亲近欲）"
         return "Core 门面没有 intimacy 能力（Core < 2.28.6），只能读 state.json 的静态字段"
+
+    def _ccb_want_line(self, bid: str, uid: str) -> str:
+        """Core 门面给的「她这会儿想不想」（只有 ccb_proactive 开着才有那句）。
+
+        场景中返回空：她正在那一场里，不该再发一条「想要了」打断。
+        门面不可用 / 老 Core / 抛异常 → 空串，行为与 1.28.10 一致。
+        """
+        try:
+            facade = self._core_facade()
+        except Exception:
+            return ""
+        if facade is None:
+            return ""
+        data = core_facade.intimacy(facade, str(bid or ""), str(uid or ""))
+        if not isinstance(data, dict) or not data:
+            return ""
+        if data.get("in_scene"):
+            return ""
+        return str(data.get("want_line") or "").strip()
 
     def _probe_ccb_proactive(self, bid: str, uid: str) -> str:
         """能确认才说：门面的 `intimacy()` 只有 `ccb_proactive` 开着才会给「想不想」那句。
@@ -7253,12 +7308,12 @@ class SocialEngine:
         人格是按目标会话的 umo 解析的，所以这里取每个角色最近互动过的那个会话作代表；
         同一角色的不同会话如果绑了不同人设，这里会跟着变。
         """
-        bots = self.state.data.get("bots", {})
-        if not bots:
+        bot_rows = self._bot_items()
+        if not bot_rows:
             return "  暂无角色记录（还没人私聊过 bot）"
         lines: List[str] = []
-        for bid, bot in list(bots.items())[:8]:
-            users = (bot or {}).get("users", {}) or {}
+        for bid, bot in bot_rows[:8]:
+            users = bot.get("users") if isinstance(bot.get("users"), dict) else {}
             rep_umo = ""
             rep_ts = -1.0
             for u in users.values():
@@ -7276,8 +7331,8 @@ class SocialEngine:
                 continue
             name, _ = await self._persona(rep_umo, bid)
             lines.append(f"  · {bid}：{name or '未取到人设（用插件默认口吻）'}")
-        if len(bots) > 8:
-            lines.append(f"  …另有 {len(bots) - 8} 个角色未列出")
+        if len(bot_rows) > 8:
+            lines.append(f"  …另有 {len(bot_rows) - 8} 个角色未列出")
         return "\n".join(lines)
 
     def _bot_label(self, bid: str) -> str:
@@ -7294,7 +7349,7 @@ class SocialEngine:
         """列出此刻念头最重的几个人（状态面板用）。"""
         now = self._time()
         rows: List[Tuple[str, str, float, float, str, float]] = []
-        for bid, bot in self.state.data.get("bots", {}).items():
+        for bid, bot in self._bot_items():
             for uid, u in (bot.get("users") or {}).items():
                 try:
                     urge = _num(u.get("urge", 0) or 0)
@@ -7380,7 +7435,7 @@ class SocialEngine:
         now = self._time()
         best: Optional[Tuple[float, str, str, str]] = None
         skip: Optional[Tuple[float, str, str, str]] = None
-        for bid, bot in self.state.data.get("bots", {}).items():
+        for bid, bot in self._bot_items():
             for uid, u in (bot.get("users") or {}).items():
                 sent = _num(u.get("last_sent", 0) or 0)
                 if sent and (best is None or sent > best[0]):
@@ -7405,6 +7460,21 @@ class SocialEngine:
         base = "\n".join(lines) if lines else "  还没有主动联系过任何人"
         return base + "\n" + self.timeline_text()
 
+    def _bot_items(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """state.json 里所有**有效**的 bot 条目（只保留 dict 值的）。
+
+        面板与日志这几条路径必须用它，不能裸写
+        `self.state.data.get("bots", {}).items()`：手改、旧版残留、外部工具写入都可能
+        留下 `bots[bid] = null`，而只要有一个非 dict 条目，`bot.get("users")` 就抛
+        AttributeError —— 三条管理指令会一起只剩「获取失败: 'NoneType' object has no
+        attribute 'get'」，面板从此打不开，偏偏那正是需要看面板的时候。
+        同一个文件的 `try_once` 早就为此加过守卫（见那里的注释），面板这几处漏了。
+        """
+        bots = self.state.data.get("bots")
+        if not isinstance(bots, dict):
+            return []
+        return [(str(bid), bot) for bid, bot in bots.items() if isinstance(bot, dict)]
+
     def proactive_log_text(self, uid_filter: str = "", limit_users: int = 6, limit_each: int = 15) -> str:
         """按用户列出最近 7 天发过的主动消息（按 bid,uid 隔离不串台），供主人审计。
 
@@ -7413,7 +7483,7 @@ class SocialEngine:
         now = self._time()
         want = str(uid_filter or "").strip()
         rows: List[Tuple[float, str, str, List[Dict[str, Any]]]] = []
-        for bid, bot in self.state.data.get("bots", {}).items():
+        for bid, bot in self._bot_items():
             for uid, u in (bot.get("users") or {}).items():
                 if want and str(uid) != want:
                     continue
@@ -7427,7 +7497,11 @@ class SocialEngine:
                 return f"  {want}：最近 7 天没给 TA 发过主动消息"
             return "  最近 7 天还没给任何人发过主动消息"
         rows.sort(key=lambda x: -x[0])
-        lines: List[str] = ["【最近 7 天主动消息】按用户隔离"]
+        # 标题由调用方（`/主动消息记录` 的回显）给：这里再写一遍，用户看到的就是
+        # 「最近 7 天主动消息记录（按用户隔离）：」下面紧跟「【最近 7 天主动消息】
+        # 按用户隔离」两行同义标题。空表那两种分支本来就没有标题，所以标题只能
+        # 有一个出处——放在指令回显那边，三种分支就都带上了。
+        lines: List[str] = []
         for _last, bid, uid, log in rows[:limit_users]:
             name = str(self.state.user(bid, uid).get("name", "") or uid)
             lines.append("")
@@ -7460,7 +7534,7 @@ class SocialEngine:
             f"　发言参考库：{on if self.cfg.group_ref_lib_enabled else off}",
         ]
         rows: List[Tuple[float, str]] = []
-        for bid, bot in self.state.data.get("bots", {}).items():
+        for bid, bot in self._bot_items():
             for gid, g in (bot.get("groups") or {}).items():
                 seen = _num(g.get("last_seen", 0) or 0)
                 idle_h = (now - seen) / 3600.0 if seen > 0 else -1
@@ -7545,16 +7619,27 @@ class SocialEngine:
         别人的数字来冒充。两个参数都带默认值：任何老的 `status_text()` 调用
         行为不变。
         """
-        bots = self.state.data.get("bots", {})
         # 面板是排障第一入口：一个 null/非 dict 的 bot 条目不该让它整体报错。
-        users = sum(
-            len((x if isinstance(x, dict) else {}).get("users", {}))
-            for x in bots.values()
-        )
+        # 原来只在下面对 users 求和时做了 isinstance 兜底，紧跟着的
+        # `for bot_data in bots.values(): bot_data.get("users")` 仍然裸调，
+        # 于是同一条 null 还是把整块面板打成「获取状态失败」。这里一次滤干净。
+        raw_bots = self.state.data.get("bots")
+        bots = {
+            key: val
+            for key, val in (raw_bots or {}).items()
+            if isinstance(val, dict)
+        } if isinstance(raw_bots, dict) else {}
         total_sent = 0
         total_replied = 0
+        users = 0
         for bot_data in bots.values():
-            for u in bot_data.get("users", {}).values():
+            bot_users = bot_data.get("users")
+            if not isinstance(bot_users, dict):
+                continue
+            users += len(bot_users)
+            for u in bot_users.values():
+                if not isinstance(u, dict):
+                    continue
                 total_sent += int(_num(u.get("proactive_sent", 0)))
                 total_replied += int(_num(u.get("proactive_replied", 0)))
         reply_rate = f"{total_replied}/{total_sent}" if total_sent > 0 else "—"
