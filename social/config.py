@@ -734,6 +734,24 @@ class SocialConfig:
     # 直接按指定的档走（最小间隔、由头池大小、念想门槛都以它为准）。
     tier_override: Any = None
 
+    # ── 特别关心（v1.28.17）─────────────────────────────────────────
+    # 名单里的人：不受关系档位的最小间隔限制、不被「她在睡 / 安静时段 / 太累」挡，
+    # 对方不回也允许再问一句。自动认定读 Core 的关系数据（好感 + 对话轮数），
+    # 认定结果落在用户状态（`special_care` / `special_care_source`），不是每次重算。
+    # 手动名单优先于自动；仍受「单独的最小间隔 + 日上限」约束，防刷屏。
+    special_care_enabled: bool = True
+    # 逐条 "uid"，或 "平台:uid"（平台就是 umo 的第一段，如 aiocqhttp / 娜莉灵）
+    special_care_uids: Any = None
+    special_care_auto: bool = True
+    special_care_min_affection: int = 85
+    special_care_min_turns: int = 100
+    # 自动认定次要依据：Core 老版本没有对话轮数时，退回社交层自己数的消息条数
+    special_care_min_messages: int = 60
+    special_care_gap_minutes: int = 20
+    special_care_daily_cap: int = 8
+    # 静音/睡眠豁免：关掉后「特别关心」只改间隔与追问，不碰安静时段
+    special_care_ignore_quiet: bool = True
+
     # 播种：启动时从 AstrBot 会话库（data/data_v4.db 的 conversations 表）读回装插件
     # 之前就聊过的人，不用等插件装好后先聊一句才认识
     history_ingest: bool = True
@@ -880,6 +898,27 @@ class SocialConfig:
             if level and who and who == target:
                 return level
         return ""
+
+    def special_care_entries(self) -> set:
+        """特别关心名单归一成集合。
+
+        条目可以是纯 uid（"3881756548"），也可以是 "平台:uid"（"娜莉灵:3881756548"）。
+        列表里手填时允许逗号/分号/中文逗号分隔，和面板上其它名单一个写法。
+        """
+        raw = self.special_care_uids
+        if isinstance(raw, str):
+            items = raw.replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            items = []
+            for item in raw:
+                if item is None:
+                    continue
+                items.extend(
+                    str(item).replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+                )
+        else:
+            items = [raw] if raw is not None else []
+        return {str(x).strip() for x in items if str(x).strip()}
 
     def allowed_trigger_uid_set(self) -> set:
         """解析 allowed_trigger_uids 为去重后的集合。
@@ -1108,6 +1147,21 @@ class SocialConfig:
             ),
             allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
             tier_override=g("tier_override", _d("tier_override",  None)),
+            special_care_enabled=bool(g("special_care_enabled", _d("special_care_enabled", True))),
+            special_care_uids=g("special_care_uids", _d("special_care_uids", None)),
+            special_care_auto=bool(g("special_care_auto", _d("special_care_auto", True))),
+            special_care_min_affection=max(
+                0, min(100, gi("special_care_min_affection", 85))
+            ),
+            special_care_min_turns=max(0, min(1_000_000, gi("special_care_min_turns", 100))),
+            special_care_min_messages=max(0, min(1_000_000, gi("special_care_min_messages", 60))),
+            special_care_gap_minutes=max(
+                1, min(1440, gi("special_care_gap_minutes", 20))
+            ),
+            special_care_daily_cap=max(0, min(100, gi("special_care_daily_cap", 8))),
+            special_care_ignore_quiet=bool(
+                g("special_care_ignore_quiet", _d("special_care_ignore_quiet", True))
+            ),
             history_ingest=bool(g("history_ingest", _d("history_ingest",  True))),
             seed_users=g("seed_users", _d("seed_users",  None)),
             seed_platform=str(g("seed_platform", _d("seed_platform",  "aiocqhttp")) or "aiocqhttp").strip() or "aiocqhttp",

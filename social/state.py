@@ -247,6 +247,13 @@ class SocialState:
             "last_replied_at": 0.0,
             "last_skip_at": 0.0,
             "last_skip_reason": "",
+            # v1.28.17 特别关心：手动名单 / Core 关系自动认定后落在用户状态里。
+            # 主动层据此放宽档位间隔、静音与「没回就停」的闸；发送成功时按日计数。
+            "special_care": False,
+            "special_care_source": "",
+            "special_care_at": 0.0,
+            "special_care_sent_day": "",
+            "special_care_sent_count": 0,
             # v1.7.4 由头：对方话里的时间锚点（「明天面试」）与它的到期时间。
             # cue_due 是锚点本身（一旦记下就不再改动），cue_expire_at 是它的绝对寿命，
             # cue_retry_at 只是「最早能再试一次」的重试节奏。三者分开，推迟重试不会

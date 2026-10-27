@@ -1053,6 +1053,99 @@
         "obvious_hint": true,
         "default": null
     },
+    "special_care_enabled": {
+        "type": "bool",
+        "description": "特别关心",
+        "hint": "总开关。开启后，名单里的人（以及关系够近被自动认定的人）放宽主动消息的限制：不被安静时段/睡眠/「太累」挡，对方没回也允许再问一句；仍受单独的最小间隔与日上限约束。",
+        "obvious_hint": true,
+        "default": true
+    },
+    "special_care_uids": {
+        "type": "list",
+        "description": "特别关心名单",
+        "hint": "逐条填 user_id，或「平台:user_id」（平台就是会话地址的第一段，如 aiocqhttp）。名单里的人主动找你时不再被关系档位、安静时段、睡眠和「没回就停」挡；自动认定也以这个名单优先。",
+        "obvious_hint": true,
+        "default": null
+    },
+    "special_care_auto": {
+        "type": "bool",
+        "description": "特别关心自动认定",
+        "hint": "开启后读 Core 的关系数据：好感够高、对话轮数够多的人自动记为特别关心（一次认定，落盘保存）。关掉则只认上面的手动名单。",
+        "obvious_hint": true,
+        "default": true
+    },
+    "special_care_min_affection": {
+        "type": "int",
+        "description": "自动认定好感门槛",
+        "hint": "Core 里这个人的好感度达到多少才自动认定为特别关心。",
+        "obvious_hint": true,
+        "default": 85,
+        "min": 0,
+        "max": 100,
+        "slider": {
+            "min": 0,
+            "max": 100,
+            "step": 5
+        }    },
+    "special_care_min_turns": {
+        "type": "int",
+        "description": "自动认定对话轮数",
+        "hint": "Core 记的对话轮数达到多少才算「关系够近」。Core 没给轮数时改用本插件记的消息条数。",
+        "obvious_hint": true,
+        "default": 100,
+        "min": 0,
+        "max": 100000,
+        "slider": {
+            "min": 0,
+            "max": 100000,
+            "step": 100
+        }    },
+    "special_care_min_messages": {
+        "type": "int",
+        "description": "自动认定消息条数",
+        "hint": "Core 老版本没有对话轮数时的替代门槛：本插件记的消息条数达到多少。",
+        "obvious_hint": true,
+        "default": 60,
+        "min": 0,
+        "max": 100000,
+        "slider": {
+            "min": 0,
+            "max": 100000,
+            "step": 100
+        }    },
+    "special_care_gap_minutes": {
+        "type": "int",
+        "description": "特别关心最小间隔",
+        "hint": "两条主动消息之间至少隔多少分钟。默认 20 分钟，替代按关系档位算出的间隔（生人档默认是 24 小时）。",
+        "obvious_hint": true,
+        "default": 20,
+        "min": 1,
+        "max": 1440,
+        "slider": {
+            "min": 1,
+            "max": 1440,
+            "step": 10
+        }    },
+    "special_care_daily_cap": {
+        "type": "int",
+        "description": "特别关心日上限",
+        "hint": "每个特别关心的人一天最多收几条主动消息。放宽不等于无限发，默认 8 条；0 = 不单独限（每小时总上限仍生效）。",
+        "obvious_hint": true,
+        "default": 8,
+        "min": 0,
+        "max": 100,
+        "slider": {
+            "min": 0,
+            "max": 100,
+            "step": 1
+        }    },
+    "special_care_ignore_quiet": {
+        "type": "bool",
+        "description": "特别关心不受安静时段限制",
+        "hint": "开启（默认）：安静时段/她在睡时也能给她认定的人发。关闭：只放宽间隔与追问，仍然深夜不打扰。",
+        "obvious_hint": true,
+        "default": true
+    },
     "store_message_text": {
         "type": "bool",
         "description": "存储私聊消息",

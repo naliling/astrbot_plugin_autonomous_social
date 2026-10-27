@@ -2860,6 +2860,7 @@ class SocialEngine:
                 desire.decay_streak(u, now)
 
                 affection = None
+                snap: Optional[Dict[str, Any]] = None
                 if core_root is not None:
                     try:
                         snap = self.core.load_snapshot(bid, uid, root=core_root)
@@ -2868,6 +2869,19 @@ class SocialEngine:
                             self._sync_peer_said(u, snap.get("said"))
                     except Exception as e:
                         logger.debug(f"[autonomous_social] 加载用户 {uid} Core 快照失败: {e}")
+                # 特别关心：关系够近就自动认定并落盘（v1.28.17）。
+                # 认定后不吃「她在睡 / 安静时段 / 社交能量低」的念头折价——
+                # 那正是用户说的「明明关系好却被系统强制睡觉」。
+                is_special_care = SocialEngine._special_care_effective(self, 
+                    bid, uid, u, snap=snap, now=now
+                )
+                mood_for_user = mood
+                quiet_for_user = quiet
+                if is_special_care and bool(
+                    getattr(self.cfg, "special_care_ignore_quiet", True)
+                ):
+                    mood_for_user = max(mood, 1.0)
+                    quiet_for_user = False
 
                 target = desire.interest_level(
                     u, affection, weigh_reply_rate=self.cfg.adaptive_reply_rate
@@ -2885,9 +2899,9 @@ class SocialEngine:
                     now,
                     refill_hours=self.cfg.urge_refill_hours,
                     recent_talk_seconds=self.cfg.recent_talk_minutes * 60,
-                    mood_factor=mood,
+                    mood_factor=mood_for_user,
                     rhythm=rhythm,
-                    quiet=quiet,
+                    quiet=quiet_for_user,
                     live_cue=bool(cue),
                 )
                 # 念头天花板：只防长期不结算攒出离谱值；克制由 effective_gate 按 streak 抬门槛承担。
@@ -3308,6 +3322,29 @@ class SocialEngine:
         只把「用常识就能看出来不对」的情况拦掉（便宜又快）；真正需要品味的「现在说
         这句到底合不合适」交给模型的 decide()。
         """
+        # 特别关心（v1.28.17）：这些闸门是给「普通关系」防打扰的；名单里的人已经
+        # 被主人点名「多找 TA」，睡眠/静音/冷落等待/冷却都该让路。只保留对方侧的
+        # 硬事实：TA 自己的作息明确说这个点不玩手机。
+        if SocialEngine._special_care_now(self, uid, u):
+            try:
+                hour = self._moment_of(bid, now).hour
+                if (
+                    self.cfg.respect_user_rhythm
+                    and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF
+                ):
+                    return "按TA 平时的作息，这个点 TA 不玩手机"
+            except Exception:
+                pass
+            # 放宽的是「对方没动静 / 她在睡 / 安静时段」，**不是**「你刚说完她插一句」。
+            # 线上反馈的「接不上话、纯瞎发」有一半是这条：人还在聊，新话题就顶上来了。
+            seen = _num(u.get("last_seen", 0) or 0)
+            if seen > 0 and now - seen < HOT_CHAT_THRESHOLD:
+                return "刚聊上，不插话"
+            if now - seen < self.cfg.recent_talk_minutes * 60:
+                return "不久前才说过话，再另起一句很突兀"
+            if sleep_signal(u, now):
+                return "TA 说过要去睡了，这时发过去不合适"
+            return ""
         # 身体在睡就不是「概率打折」的问题：把人从睡梦中叫醒闲聊不是拟人，是打扰。
         # 作息与安静时段同样的教训：这类东西做成权重会漏，必须是闸。
         if _body_asleep(body):
@@ -3387,22 +3424,24 @@ class SocialEngine:
         等于让这条路径在那种配置下永远不成立（默认 30 分钟配 continue 起点 90 分钟，
         平时碰不到，但不能靠默认值活着）。
         """
-        if _body_asleep(body):
-            return "她正在睡觉"
-        _avoid = SocialEngine._avoidance_note(self, u, now)
-        if _avoid:
-            return _avoid
-        # 「刚聊过」也要拦。追问与「在吗」都是**接续型**——对方刚说完话就追一句
-        # 是打断。对方一小时一条「在吗」，她每两小时（最小间隔一过）追问一次，
-        # 7 天 44 次。
-        if kind != "continue" and now - _num(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
-            return "刚聊过，不追"
+        _sc = SocialEngine._special_care_now(self, uid, u)
+        if not _sc:
+            if _body_asleep(body):
+                return "她正在睡觉"
+            _avoid = SocialEngine._avoidance_note(self, u, now)
+            if _avoid:
+                return _avoid
+            # 「刚聊过」也要拦。追问与「在吗」都是**接续型**——对方刚说完话就追一句
+            # 是打断。对方一小时一条「在吗」，她每两小时（最小间隔一过）追问一次，
+            # 7 天 44 次。
+            if kind != "continue" and now - _num(u.get("last_seen", 0) or 0) < self.cfg.recent_talk_minutes * 60:
+                return "刚聊过，不追"
         last_said = self._last_said(u)
         if last_said > 0 and _num(u.get("thread_for", 0) or 0) == last_said:
             return "这段沉默已经接过一回了，再问就是催"
         if now - _num(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
             return "刚接过一次，给 TA 点时间"
-        if self._quiet_now(bid, self._moment_of(bid, now).hour):
+        if not _sc and self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
         return ""
 
@@ -3512,15 +3551,16 @@ class SocialEngine:
         `COLD_SILENCE_SENT` 的路径，所以它必须自己认这一条——否则「一句不回的人每天
         照样收早安」，而面板上还写着「回避：开」。
         """
-        if _body_asleep(body):
-            return "她正在睡觉"
-        _avoid = SocialEngine._avoidance_note(self, u, now)
-        if _avoid:
-            return _avoid
-        if kind != "night" and sleep_signal(u, now):
-            return "TA 说过要去睡了，这时发过去不合适"
-        if self._quiet_now(bid, self._moment_of(bid, now).hour):
-            return "现在是安静时段"
+        if not SocialEngine._special_care_now(self, uid, u):
+            if _body_asleep(body):
+                return "她正在睡觉"
+            _avoid = SocialEngine._avoidance_note(self, u, now)
+            if _avoid:
+                return _avoid
+            if kind != "night" and sleep_signal(u, now):
+                return "TA 说过要去睡了，这时发过去不合适"
+            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+                return "现在是安静时段"
         return ""
 
     @staticmethod
@@ -3558,6 +3598,120 @@ class SocialEngine:
             anchors.TIER_LOW: 1.6,    # 说「想你了」给没怎么说过话的人，很怪
         }
         return max(0.0, min(100.0, base * scale.get(tier, 1.0)))
+
+    # ─── 特别关心（v1.28.17）──────────────────────────────────────
+    #
+    # 用户提出的需求：名单里的人不该被「档位间隔 24 小时 / 她在睡 / 安静时段 /
+    # 对方没开口就永远不发」这些规则挡死——那会变成「两个插件互相拆台」：
+    # Core 明明说关系很好，社交层却按生人档给她排 24 小时。这里把「特别关心」
+    # 做成**配置项 + 自动认定**（Core 关系数据够近就自动记），而不是给某个人
+    # 开特例；认定结果落在用户状态里，后续所有闸门都读同一份标记。
+
+    def _special_care_manual(self, uid: Any, u: Optional[Dict[str, Any]]) -> bool:
+        """名单里点名的「特别关心」（uid 或 "平台:uid"）。关掉总开关时恒 False。"""
+        if not getattr(self.cfg, "special_care_enabled", True):
+            return False
+        try:
+            entries = self.cfg.special_care_entries()
+        except Exception:
+            return False
+        if not entries:
+            return False
+        target = str(uid or "").strip()
+        if not target:
+            return False
+        if target in entries:
+            return True
+        umo = str((u or {}).get("umo", "") or "")
+        for item in entries:
+            if ":" not in item and "：" not in item:
+                continue
+            plat, _, puid = item.replace("：", ":").partition(":")
+            if puid.strip() == target and plat.strip() and umo.startswith(plat.strip() + ":"):
+                return True
+        return False
+
+    @staticmethod
+    def _snapshot_turns(snap: Optional[Dict[str, Any]]) -> int:
+        """Core 记的对话轮数（mood.turn_count）；拿不到返回 0。"""
+        if not isinstance(snap, dict):
+            return 0
+        mood = snap.get("mood")
+        if not isinstance(mood, dict):
+            return 0
+        try:
+            return int(max(0.0, _num(mood.get("turn_count"), 0.0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _special_care_effective(
+        self,
+        bid: str,
+        uid: str,
+        u: Dict[str, Any],
+        snap: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """这个人算不算「特别关心」，并把认定结果记进用户状态。
+
+        手动名单优先；否则按 Core 的关系数据自动认定：好感够高 + 对话轮数够多
+        （老 Core 没有轮数时退回社交层自己数的消息条数）。认定是一次性的，记下
+        就不再重算——关系掉下来也不撤销，避免同一人一天里忽冷忽热。
+        """
+        if not getattr(self.cfg, "special_care_enabled", True):
+            return False
+        if u.get("special_care"):
+            return True
+        try:
+            ts = self._time() if now is None else float(now)
+        except Exception:
+            ts = 0.0
+        if SocialEngine._special_care_manual(self, uid, u):
+            u["special_care"] = True
+            u["special_care_source"] = "manual"
+            u["special_care_at"] = ts
+            try:
+                self.state.mark_dirty()
+            except Exception:
+                pass
+            return True
+        if not getattr(self.cfg, "special_care_auto", True):
+            return False
+        if not isinstance(snap, dict):
+            return False
+        try:
+            aff = _num(snap.get("affection"), -1.0)
+        except (TypeError, ValueError):
+            return False
+        if aff < float(getattr(self.cfg, "special_care_min_affection", 85) or 85):
+            return False
+        turns = SocialEngine._snapshot_turns(snap)
+        if turns <= 0:
+            try:
+                turns = int(_num(u.get("message_count", 0) or 0))
+            except (TypeError, ValueError):
+                turns = 0
+        need = int(getattr(self.cfg, "special_care_min_turns", 100) or 100)
+        if turns < need:
+            return False
+        u["special_care"] = True
+        u["special_care_source"] = "auto"
+        u["special_care_at"] = ts
+        try:
+            self.state.mark_dirty()
+        except Exception:
+            pass
+        try:
+            self.log(f"{uid} 关系够近（好感 {aff:.0f}、{turns} 轮），记为特别关心")
+        except Exception:
+            pass
+        return True
+
+    def _special_care_now(self, uid: Any, u: Optional[Dict[str, Any]]) -> bool:
+        """不查 Core 的快速判定：只看已落盘的标记与手动名单（发送闸门里用）。"""
+        if not getattr(self.cfg, "special_care_enabled", True):
+            return False
+        return SocialEngine._special_care_manual(self, uid, u) or bool((u or {}).get("special_care"))
 
     def _tier_of(
         self,
@@ -3616,33 +3770,60 @@ class SocialEngine:
             override = ""
         if override:
             tier = override
+        # 特别关心：不论涨幅算出来是什么，都按最高档排节奏——这是用户
+        # 明确点名的「关系好的人」；涨幅 0（好感被 override 钉在 100）不该
+        # 反过来把 TA 分到生人档。
+        if SocialEngine._special_care_now(self, uid, u):
+            tier = anchors.TIER_HIGH
         warmth = (aff - base) if (aff is not None and base is not None) else None
         return tier, aff, warmth
 
-    def _gap_left(self, u: Dict[str, Any], tier: str, now: float) -> float:
+    def _gap_left(
+        self,
+        u: Dict[str, Any],
+        tier: str,
+        now: float,
+        *,
+        special_care: bool = False,
+    ) -> float:
         """按关系档位的最小间隔。档位越高近得越理所当然——她常聊那个人。
 
         `min_gap_minutes` 是**中档**的最小间隔（见配置说明）；高/低档按档位表的比例
         跟着它缩放，这样主人调这一项就能整体收紧或放松节奏（不调就与表一致）。
+
+        `special_care=True` 时用 `special_care_gap_minutes`（默认 20 分钟）：
+        特别关心的人不该被生人档的 24 小时间隔挡住，这是这个功能的**核心**——
+        否则「关系好」只是面板上好看，实际还是收不到消息。
         """
         try:
-            base = float(self.cfg.min_gap_minutes)
-        except (TypeError, ValueError):
-            base = 60.0
-        table = anchors.TIER_MIN_GAP_MINUTES
-        mid = float(table.get(anchors.TIER_MID, 60.0)) or 60.0
-        minutes = float(table.get(tier, mid)) * (max(0.0, base) / mid)
-        minutes = min(max(minutes, 1.0), 1440.0)
-        try:
-            streak = max(0, int(_num(u.get("no_reply_streak", 0) or 0)))
-        except (TypeError, ValueError):
-            streak = 0
-        # 被冷落过就再拉远一点：真人不会一直追一个不回话的人
-        minutes *= min(3.0, 1.0 + 0.4 * streak)
-        last = _num(u.get("last_sent", 0) or 0)
-        if last <= 0:
+            last = _num(u.get("last_sent", 0) or 0)
+            if last <= 0:
+                return 0.0
+            if special_care:
+                try:
+                    minutes = float(self.cfg.special_care_gap_minutes)
+                except (TypeError, ValueError):
+                    minutes = 20.0
+                minutes = min(max(minutes, 1.0), 1440.0)
+                return max(0.0, minutes * 60.0 - (now - last))
+            try:
+                base = float(self.cfg.min_gap_minutes)
+            except (TypeError, ValueError):
+                base = 60.0
+            table = anchors.TIER_MIN_GAP_MINUTES
+            mid = float(table.get(anchors.TIER_MID, 60.0)) or 60.0
+            minutes = float(table.get(tier, mid)) * (max(0.0, base) / mid)
+            minutes = min(max(minutes, 1.0), 1440.0)
+            try:
+                streak = max(0, int(_num(u.get("no_reply_streak", 0) or 0)))
+            except (TypeError, ValueError):
+                streak = 0
+            # 被冷落过就再拉远一点：真人不会一直追一个不回话的人。
+            # 特别关心不走这条：用户要的是「对方没动静去问一下」，不是越冷越远。
+            minutes *= min(3.0, 1.0 + 0.4 * streak)
+            return max(0.0, minutes * 60.0 - (now - last))
+        except Exception:
             return 0.0
-        return max(0.0, minutes * 60.0 - (now - last))
 
     def _greet_pick(
         self,
@@ -3672,12 +3853,14 @@ class SocialEngine:
         for uid, u in list(self.state.bot(bid).get("users", {}).items()):
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
-            if self._quiet_now(bid, hour):
+            # 特别关心：静音/睡意/「很久没来往」都不挡问候（v1.28.17）
+            _sc_here = SocialEngine._special_care_now(self, uid, u)
+            if not _sc_here and self._quiet_now(bid, hour):
                 continue
-            if _body_asleep(body):
+            if not _sc_here and _body_asleep(body):
                 continue
             # 只问候最近有来往的人：对素未谋面或早就不聊的人道早安，像定时群发
-            if now - self._last_said(u) > GREET_FRESH_SECONDS:
+            if not _sc_here and now - self._last_said(u) > GREET_FRESH_SECONDS:
                 continue
             kind = greeting_window_kind(hour, morning, night, midday)
             if not kind:
@@ -3764,18 +3947,19 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """回访那件事的闸门：不看 recent_talk（那件事本来就是聊出来的），但要等这场话凉下来。"""
-        if _body_asleep(body):
-            return "她正在睡觉"
-        # 以前只有另起话题查「TA 说过要去睡」，于是 09:00 说完「我出门了」，
-        # 09:20 就收到「你上次说的那个体检后来咋样」。
-        if sleep_signal(u, now):
-            return "TA 说过要去睡了，这时发过去不合适"
-        if self._quiet_now(bid, self._moment_of(bid, now).hour):
-            return "现在是安静时段"
-        if now - self._last_said(u) < LOOP_QUIET_GAP_SECONDS:
-            return "还在聊，这会儿问「后来呢」太急"
-        if str(u.get("pending_result", "") or "") == "waiting":
-            return "上一条主动发的还没回"
+        if not SocialEngine._special_care_now(self, uid, u):
+            if _body_asleep(body):
+                return "她正在睡觉"
+            # 以前只有另起话题查「TA 说过要去睡」，于是 09:00 说完「我出门了」，
+            # 09:20 就收到「你上次说的那个体检后来咋样」。
+            if sleep_signal(u, now):
+                return "TA 说过要去睡了，这时发过去不合适"
+            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+                return "现在是安静时段"
+            if now - self._last_said(u) < LOOP_QUIET_GAP_SECONDS:
+                return "还在聊，这会儿问「后来呢」太急"
+            if str(u.get("pending_result", "") or "") == "waiting":
+                return "上一条主动发的还没回"
         return ""
 
     @staticmethod
@@ -3855,11 +4039,11 @@ class SocialEngine:
             if not hits:
                 continue
             # 兑现的场合比随口搭话正经：她正在等对方 asleep 或安静时段时先不说
-            if _body_asleep(body):
+            if _body_asleep(body) and not SocialEngine._special_care_now(self, uid, u):
                 continue
-            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if self._quiet_now(bid, self._moment_of(bid, now).hour) and not SocialEngine._special_care_now(self, uid, u):
                 continue
-            if sleep_signal(u, now):
+            if sleep_signal(u, now) and not SocialEngine._special_care_now(self, uid, u):
                 continue
             out.append((uid, u, hits[0][1]))
         return out
@@ -3896,9 +4080,11 @@ class SocialEngine:
                 continue
             if self._miss_sent_today(u, day) >= cap:
                 continue
-            if _body_asleep(body):
+            # 特别关心：想 TA 这句话不该被「她在睡 / 安静时段」挡（v1.28.17）
+            _sc_here = SocialEngine._special_care_now(self, uid, u)
+            if not _sc_here and _body_asleep(body):
                 continue
-            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _sc_here and self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
             if self._min_gap_left(u, bid=bid, now=now) > 0:
                 continue
@@ -4008,11 +4194,13 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """收场那句的闸门：它存在的意义恰恰是绕过「上一条没人回」，所以不查那条。"""
-        if _body_asleep(body):
-            return "她正在睡觉"
+        if not SocialEngine._special_care_now(self, uid, u):
+            if _body_asleep(body):
+                return "她正在睡觉"
+            hour = self._moment_of(bid, now).hour
+            if self._quiet_now(bid, hour):
+                return "现在是安静时段"
         hour = self._moment_of(bid, now).hour
-        if self._quiet_now(bid, hour):
-            return "现在是安静时段"
         if self.cfg.respect_user_rhythm and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF:
             return "按TA 平时的作息，这个点 TA 不玩手机"
         return ""
@@ -5022,7 +5210,11 @@ class SocialEngine:
         # 常态，把它当「累到不能说话」会让整个插件在没接 Core 的机器上永久静默。
         # nan/inf 也走这条：一个坏字段不该让她一整天不开口。
         energy = _num((body or {}).get("energy"), 100.0)
-        if energy < self.cfg.gate_energy_floor:
+        # 特别关心（v1.28.17）：名单/自动认定的人不吃「太累就不开口」这道闸。
+        # 用户的原话是「就算凌晨给我发也不会有事」——她困不困是她的状态，但
+        # 不能拿它当「不许找这个人」的理由；内容层仍由生成器按身体状态收着写。
+        _sc = SocialEngine._special_care_now(self, uid, u)
+        if energy < self.cfg.gate_energy_floor and not _sc:
             logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
 
@@ -5038,6 +5230,27 @@ class SocialEngine:
             _peer_block = SocialEngine._bot_peer_gate_reason(self, bid, uid, u, now)
             if _peer_block:
                 return False, _peer_block
+
+        # 特别关心也**不打断正在进行的对话**（v1.28.17）：放宽的是「对方没动静 /
+        # 她在睡 / 安静时段」，不是「人还在聊她插一句」。线上反馈的「接不上话、
+        # 纯瞎发」有一半是这条——对方刚回完，新话题就顶上来了。
+        if _sc:
+            _cat = ""
+            try:
+                _cat = str((preset[1] or {}).get("category") or "") if preset else ""
+            except Exception:
+                _cat = ""
+            if _cat not in ("greet", "closer", "cue"):
+                try:
+                    _seen = _num(u.get("last_seen", 0) or 0)
+                    _recent = max(
+                        HOT_CHAT_THRESHOLD,
+                        float(self.cfg.recent_talk_minutes) * 60.0,
+                    )
+                    if _seen > 0 and now - _seen < _recent:
+                        return False, "刚聊上，这会儿不插话"
+                except (TypeError, ValueError):
+                    pass
 
         # 最小间隔：不管哪一种主动开口（问候/追问/回访/另起话题/收场），两条之间至少
         # 隔这么久。以前只有「另起话题」查 30 分钟护栏，其余四条全都绕过了它，
@@ -5067,7 +5280,7 @@ class SocialEngine:
         # 一条问候）。每一条主动消息都要经过这里，所以闸落在这儿，对所有 category 生效，
         # 包括 greet / cue / closer。
         _avoid = SocialEngine._avoidance_note(self, u, now)
-        if _avoid:
+        if _avoid and not _sc:
             return False, _avoid
 
         # 上一条主动消息还悬着（发出去了、还没回）：别追着说。
@@ -5087,14 +5300,37 @@ class SocialEngine:
                 silent_sent = int(_num(u.get("silent_sent", 0) or 0))
             except (TypeError, ValueError):
                 silent_sent = 0
-            if silent_sent >= COLD_SILENCE_SENT:
+            if silent_sent >= COLD_SILENCE_SENT and not _sc:
                 return False, f"TA 一直没回、她已经主动发了 {silent_sent} 条，先等 TA 开口"
-            if str(u.get("pending_result", "") or "") == "waiting":
+            if str(u.get("pending_result", "") or "") == "waiting" and not _sc:
                 return False, "上一条主动发的还没回，现在再发就是追着说"
 
-        gap_left = self._gap_left(u, _tier, self._time())
+        # 轻量测试桩只挂了 `_gap_left` 的旧签名（没有 special_care 关键字），
+        # 这里退回旧调用——桩里本来就没有特别关心，行为与旧版一致。
+        try:
+            gap_left = self._gap_left(u, _tier, self._time(), special_care=_sc)
+        except TypeError:
+            gap_left = self._gap_left(u, _tier, self._time())
         if gap_left > 0 and not (self._urge_is_eager(u) or has_cue):
             return False, f"离上一条才过 {int(gap_left / 60)} 分钟，这次先不开口"
+
+        # 特别关心的日上限（v1.28.17）：放宽不等于无限发。默认 8 条/天/人，
+        # 计数落在用户状态里，重启不丢。
+        if _sc:
+            try:
+                _cap = int(getattr(self.cfg, "special_care_daily_cap", 8))
+            except (TypeError, ValueError):
+                _cap = 8
+            _today = self._moment_of(bid, now).strftime("%Y-%m-%d")
+            if str(u.get("special_care_sent_day", "") or "") == _today:
+                try:
+                    _sent_today = int(_num(u.get("special_care_sent_count", 0) or 0))
+                except (TypeError, ValueError):
+                    _sent_today = 0
+            else:
+                _sent_today = 0
+            if _cap > 0 and _sent_today >= _cap:
+                return False, f"特别关心今天已经找过 TA {_sent_today} 次，剩下的明天再说"
 
         # 每小时总预算（安全闸）。**念头不清零**——挡住这一轮，下一轮它还在，
         # 所以这只是「别一次涌出」，不是「今天到此为止」。
@@ -5668,6 +5904,22 @@ class SocialEngine:
                 # 日期取不出来就只记「多久前」，日上限这条失效（6 小时闸仍在）。
                 _peer_day = ""
             note_bot_peer_sent(u, sent_ts, _peer_day)
+        # 特别关心（v1.28.17）：记今天找过 TA 几次（日上限用），顺手把标记落盘。
+        if _sc:
+            _sc_day = self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
+            if str(u.get("special_care_sent_day", "") or "") == _sc_day:
+                try:
+                    u["special_care_sent_count"] = (
+                        int(_num(u.get("special_care_sent_count", 0) or 0)) + 1
+                    )
+                except (TypeError, ValueError):
+                    u["special_care_sent_count"] = 1
+            else:
+                u["special_care_sent_day"] = _sc_day
+                u["special_care_sent_count"] = 1
+            u["special_care"] = True
+            if not u.get("special_care_source"):
+                u["special_care_source"] = "manual"
         bot = self.state.bot(bid)
         bot["last_global_send"] = sent_ts
         self.state.save()
@@ -6073,9 +6325,10 @@ class SocialEngine:
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
-            if _body_asleep(body):
+            _sc_here = SocialEngine._special_care_now(self, uid, u)
+            if not _sc_here and _body_asleep(body):
                 continue
-            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _sc_here and self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
             try:
                 if sleep_signal(u, now):

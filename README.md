@@ -8,7 +8,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v1.28.16-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v1.28.17-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E4%BB%BB%E6%84%8F%20AstrBot%20%E5%B9%B3%E5%8F%B0-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -47,6 +47,7 @@
 ### 关系与分寸
 
 - **关系分档** —— 越熟联系越自然，越生越克制；连着发不出去就停发，等对方先开口；
+- **特别关心** —— 名单里的人放宽档位间隔、安静时段与「没回就停」；关系够近也能自动认定；
 - **安静时段** —— 深夜不打扰；
 - **同平台 bot** —— 也能聊；主动找它隔 6 小时、一天最多一条；
 - **跨用户去重** —— 不群发同一句。
@@ -118,6 +119,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | 两条消息之间至少隔多久 | `urge_refill_hours`（默认 4 小时） |
 | 刚聊完多久内不另起话 | `recent_talk_minutes`（默认 18 分钟） |
 | 晚上几点到几点不说话 | `quiet_start` / `quiet_end`（默认 23–7） |
+| 让某些人一定收得到 | `special_care_uids`（特别关心名单；关系够近也能自动认定） |
 
 > 想让她用会思考的模型说话：`proactive_provider_ids` 填主动消息专用模型，按顺序试第一个能用的；配了却一个都取不到时**本轮不主动开口**，不退默认模型、不重试——弱模型写出来的话，比不发更糟。
 
@@ -125,7 +127,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 
 ### 全部配置项
 
-> 下表与 `_conf_schema.json` 同源，共 97 项；面板里看到的默认值与这里一致。
+> 下表与 `_conf_schema.json` 同源，共 106 项；面板里看到的默认值与这里一致。
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -220,6 +222,15 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `trigger_group_requires_at` | `true` | 【多 bot】群里「触发社交」是否必须 @ 本 bot。多台 bot 同群时保持开，哪台被 @ 就只触发哪台；单台部署想免 @ 可关 |
 | `allowed_trigger_uids` | `[]` | 额外白名单，仅在 `owner_only_commands` 关闭时生效 |
 | `tier_override` | `[]` | 关系档手动覆盖：逐条填 `uid:high`、`uid:mid` 或 `uid:low`。写了的人不再按好感涨幅推算，最小间隔/由头池/念想门槛都按指定档走 |
+| `special_care_enabled` | `true` | 【特别关心】总开关：名单/自动认定的人放宽主动消息限制 |
+| `special_care_uids` | `[]` | 【特别关心】名单，逐条 `uid` 或 `平台:uid`。名单里的人不被档位间隔、安静时段、睡眠和「没回就停」挡 |
+| `special_care_auto` | `true` | 【特别关心】读 Core 关系数据自动认定（好感 + 对话轮数），认定一次后落盘 |
+| `special_care_min_affection` | `85` | 【特别关心】自动认定的好感门槛 |
+| `special_care_min_turns` | `100` | 【特别关心】自动认定的对话轮数门槛；Core 没给轮数时改用消息条数 |
+| `special_care_min_messages` | `60` | 【特别关心】Core 老版本没有轮数时的消息条数门槛 |
+| `special_care_gap_minutes` | `20` | 【特别关心】两条主动消息的最小间隔，替代按关系档位算出的间隔 |
+| `special_care_daily_cap` | `8` | 【特别关心】每人每天最多收几条主动消息；0 = 不单独限 |
+| `special_care_ignore_quiet` | `true` | 【特别关心】安静时段/她在睡时也能发；关掉则只放宽间隔与追问 |
 | `store_message_text` | `true` | 是否把私聊正文存入 state.json |
 | `user_retention_days` | `30` | 长期不活跃用户的历史正文清理天数，0 = 永不清理 |
 | `purge_inactive_user_days` | `0` | 【清理】超过这么多天没互动、她发过去也没人回的会话，连整条记录一起永久删除（私聊与群）；0 = 永不清理。比 `user_retention_days` 更彻底：那个只清正文 |
