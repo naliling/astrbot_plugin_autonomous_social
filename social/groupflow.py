@@ -187,6 +187,116 @@ def flow_context_note(recent_speakers: List[str], addressed_name: str) -> str:
     return ""
 
 
+# ─── 群活跃度分数（v1.28.16）─────────────────────────
+#
+# 从 koishi-plugin-chatluna-proactive-trigger 的 `ActivityScorer` 移植
+# （refs/koishi-check/ptr/package/lib/index.js 的 activity.ts 段）。那边的用途是
+# 「够活跃就主动接话」，**这里反过来只用它做抑制**：分数低 = 群里刚安静下来，
+# 不硬接。分数高不构成任何新的开口理由——开口的资格仍由下面的硬闸单独决定。
+#
+# 窗口与阈值照抄原实现：
+#   recent 90s / instant 20s / burst 30s 三个窗口，都折算成「条/分钟」；
+#   持续阈值 10、瞬时阈值 9（logistic 的陡度分别是 /3、/2）、突发阈值 12；
+#   权重 0.65 / 0.35；突发超过 12 条/分额外加至多 0.25；
+#   新鲜度按 60 秒半衰，乘 0.55 + 0.45 * fresh；最后 clamp 到 [0, 1]。
+
+FLOW_ACTIVITY_MIN = 0.15
+
+# 三个观察窗（秒）与各自的阈值（条/分钟）。名字保持与原实现一致，便于对照。
+_ACTIVITY_WINDOW_RECENT = 90.0
+_ACTIVITY_WINDOW_INSTANT = 20.0
+_ACTIVITY_WINDOW_BURST = 30.0
+_ACTIVITY_THRESHOLD_SUSTAINED = 10.0
+_ACTIVITY_THRESHOLD_INSTANT = 9.0
+_ACTIVITY_THRESHOLD_BURST = 12.0
+_ACTIVITY_WEIGHT_SUSTAINED = 0.65
+_ACTIVITY_WEIGHT_INSTANT = 0.35
+_ACTIVITY_BURST_BONUS = 0.25
+_ACTIVITY_FRESH_HALF_LIFE = 60.0
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _logistic(x: float) -> float:
+    """原实现的 logistic。夹一下 x：`math.exp(±大数)` 会 OverflowError。"""
+    x = max(-60.0, min(60.0, float(x)))
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _activity_rate(timestamps: List[float], now: float, window: float) -> float:
+    """指定窗口内的消息速率（条/分钟）。窗口外的、读不出数的一律不计。"""
+    cutoff = now - window
+    count = 0
+    for ts in timestamps:
+        if ts >= cutoff:
+            count += 1
+    return count / window * 60.0
+
+
+def activity_score(timestamps: Any, now: float) -> float:
+    """群里「现在有多热闹」的分数，0~1（纯函数，不改任何状态）。
+
+    `timestamps` 是真人发言的时刻列表（秒，epoch）。空、全是坏值、或读不出 `now`
+    时返回 0.0——「没有可判的活跃度」按最低分处理，只会导致不接话，不会导致乱接。
+
+    数值口径逐条对应原实现的 `calculateScore`：
+      1. 三个窗口各算一个速率；
+      2. 持续/瞬时速率过 logistic 平滑后按 0.65 / 0.35 加权；
+      3. 突发速率 >12 条/分时补 `clamp((burst-12)/4, 0, 1) * 0.25`；
+      4. 按「最后一条消息距现在多久」算新鲜度（60 秒半衰），
+         乘 `0.55 + 0.45 * fresh`；
+      5. clamp 到 [0, 1]。
+
+    与 JS 版唯一的有意差异（都只会让分数更保守，不会让它变高）：未来时间戳
+    按「刚刚」算（Python 的 `math.exp` 负数过大时会溢出，JS 的 `Math.exp` 只给
+    Infinity）；坏时间戳直接跳过而不是污染分数。
+    """
+    try:
+        now = float(now)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(now):
+        return 0.0
+    valid: List[float] = []
+    try:
+        items = list(timestamps or [])
+    except TypeError:
+        items = []
+    for raw in items:
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(ts):
+            valid.append(ts)
+    if not valid:
+        return 0.0
+    recent_rate = _activity_rate(valid, now, _ACTIVITY_WINDOW_RECENT)
+    instant_rate = _activity_rate(valid, now, _ACTIVITY_WINDOW_INSTANT)
+    burst_rate = _activity_rate(valid, now, _ACTIVITY_WINDOW_BURST)
+    sustained = _logistic(
+        (recent_rate - _ACTIVITY_THRESHOLD_SUSTAINED) / 3.0
+    )
+    instant = _logistic(
+        (instant_rate - _ACTIVITY_THRESHOLD_INSTANT) / 2.0
+    )
+    score = (
+        sustained * _ACTIVITY_WEIGHT_SUSTAINED
+        + instant * _ACTIVITY_WEIGHT_INSTANT
+    )
+    if burst_rate > _ACTIVITY_THRESHOLD_BURST:
+        score += _clamp01((burst_rate - _ACTIVITY_THRESHOLD_BURST) / 4.0) * (
+            _ACTIVITY_BURST_BONUS
+        )
+    # 新鲜度：最后一条消息越久远，分数越靠 0.55 那边收（原实现同一公式）。
+    elapsed = max(0.0, now - max(valid))
+    freshness = math.exp(-elapsed / _ACTIVITY_FRESH_HALF_LIFE * math.log(2.0))
+    score *= 0.55 + 0.45 * freshness
+    return _clamp01(score)
+
+
 def flow_should_consider(
     group: Dict[str, Any],
     now: float,
@@ -202,6 +312,7 @@ def flow_should_consider(
     context_note: str = "",
     interject_gap_seconds: float = 0.0,
     attempt_gap_seconds: float = 0.0,
+    activity: float = 1.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
@@ -214,6 +325,9 @@ def flow_should_consider(
     - 发送隔离中（被踢/会话失效）；
     - 本窗口接够了 / 每小时插话到顶 / 距上一句插话太近；
     - 连续插话没人接，已经到退出阈值；
+    - **群活跃度**（v1.28.16，`activity`）：只做抑制——低于 `FLOW_ACTIVITY_MIN`
+      说明群里刚安静下来，别硬接。默认 1.0 时与旧行为逐字等价；
+      **分数高不构成任何新的开口理由**；
     - **语境**（v1.28.0）：两人对聊、或这句话在叫某个群友时，**不再硬拦**——用户
       明确说「能不能插嘴看模型」。这里只保留两道护栏：`interject_enabled=False`
       退回旧语义（这种场合一律不插）；刚插过话时别人还在对聊就先缓一缓，别在她
@@ -250,6 +364,20 @@ def flow_should_consider(
     try_gap = now - _f(group.get("flow_last_attempt_at", 0))
     if try_gap < max(0.0, attempt_gap_seconds):
         return False, f"心流刚试过（{int(try_gap)} 秒前），先歇会儿"
+    # **群活跃度抑制**（v1.28.16）。只做抑制，**绝不**因为分数高就放行：
+    # 分数低于门槛 = 群里刚安静下来（最后一条真人消息很旧、或者刚才根本没人说话），
+    # 这时候接一句是「硬接」。放在既有硬闸之后、语境判断之前：硬闸管「她还能不能
+    # 开口」，这里管「这会儿群还热不热」。默认 1.0 时与旧行为逐字等价。
+    try:
+        act = float(activity)
+    except (TypeError, ValueError):
+        act = 1.0
+    if not math.isfinite(act):
+        # nan/inf 是「算不出来」，按不抑制处理（与字段没给同一个口径）；
+        # 注意 nan < 0.15 本身就恒假，这里显式写出来只是别让读代码的人误会。
+        act = 1.0
+    if act < FLOW_ACTIVITY_MIN:
+        return False, "群里刚安静下来，不硬接"
     # 语境：她要看这个群**现在在干什么**，而不只是「这一条消息过不过关」。
     # 放在配额检查之后：配额是「她还能不能开口」，语境是「这会儿该不该开口」，
     # 前者更该出现在日志里（调参看的是它）。

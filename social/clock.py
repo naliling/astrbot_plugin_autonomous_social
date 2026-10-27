@@ -15,7 +15,7 @@ from __future__ import annotations
 import calendar
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 
 def _offset(value: Optional[int]) -> Optional[float]:
@@ -53,3 +53,55 @@ def city_epoch(dt: datetime, offset_minutes: Optional[int]) -> float:
     if offset is None:
         return dt.timestamp()
     return float(calendar.timegm(dt.timetuple())) - offset * 60.0
+
+
+def _wall_clock_token(value: Any, span: int) -> Optional[int]:
+    """把墙上时间的一个分量收成可用整数；不合法就给 None（=「看不懂」）。"""
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if 0 <= out < span else None
+
+
+def seconds_until_quiet_end(hour: int, minute: int, start: int, end: int) -> int:
+    """现在离「安静时段结束」还有多少秒；不在安静时段 / 没有安静时段时返回 0。
+
+    `start`/`end` 是配置里的 quiet_start/quiet_end（小时，0–23），与
+    ``SocialConfig.in_quiet_hours`` 同一套语义：
+
+    * ``start == end`` 表示**没有安静时段**（面板上把两头调成一样就是关掉它）；
+    * ``start < end`` 是普通时段（如 1→6）：``[start:00, end:00)``；
+    * ``start > end`` 是跨午夜（默认 23→7）：``[start:00, 24:00) ∪ [0:00, end:00)``。
+
+    存在的意义（v1.28.16）：心跳循环每轮先睡 8–30 分钟再看一眼。安静时段结束时
+    如果那一轮正好睡在中间，就该睡到结束点附近再评估，而不是等整段随机睡眠走完
+    —— 否则「早上 8 点静音结束」可能要拖到 8:20 才有第一个动作。
+
+    返回值一律是 **int 秒**：0 既表示「不在安静时段」也表示「安静时段没启用」，
+    调用方只需要 ``if left <= 0: 不处理``。坏的 hour/minute/start/end（手改配置、
+    nan、越界）一律按 0 处理——宁可这一轮按原节奏睡，也不因为一个坏字段把心跳
+    变成忙循环（那时 `sleep(负数)` 会立刻返回）。
+    """
+    h = _wall_clock_token(hour, 24)
+    m = _wall_clock_token(minute, 60)
+    qs = _wall_clock_token(start, 24)
+    qe = _wall_clock_token(end, 24)
+    if h is None or m is None or qs is None or qe is None:
+        return 0
+    if qs == qe:  # 起 == 止：不启用
+        return 0
+    now_min = h * 60 + m
+    start_min = qs * 60
+    end_min = qe * 60
+    if qs < qe:
+        # 普通时段：[start:00, end:00)
+        if not (start_min <= now_min < end_min):
+            return 0
+        return (end_min - now_min) * 60
+    # 跨午夜：[start:00, 24:00) ∪ [0:00, end:00)
+    if now_min >= start_min:
+        return (24 * 60 - now_min + end_min) * 60
+    if now_min < end_min:
+        return (end_min - now_min) * 60
+    return 0

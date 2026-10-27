@@ -17,6 +17,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -31,7 +32,7 @@ from . import __version__, anchors, anchors as anchor_mod, core_facade, desire
 from . import history_ingest
 from . import memory_bridge
 from . import pacing
-from .clock import city_now
+from .clock import city_now, seconds_until_quiet_end
 from .config import SocialConfig
 from .core_bridge import CORE_SAID_MAX, CoreBridge
 from .input_state import InputStateNotifier
@@ -614,6 +615,81 @@ def _person_flow_state(engine: Any, bid: str, now: float) -> Tuple[bool, bool]:
     return is_quiet, asleep
 
 
+def bot_peer_block_reason(u: Any, now: float, today: str) -> str:
+    """该不该主动找这台「兄弟 bot」。空串 = 可以，否则是拒绝的理由。
+
+    纯函数（不读时钟、不改状态），`today` 由调用方按**她所在城市**的日期传进来，
+    这样日期口径与 greet/icebreak 那些按城市日期记的账一致。
+
+    三道闸（v1.28.16，缺一不可）：
+
+    * 从没聊过（`message_count < 1`）→ 不主动。兄弟 bot 可能只是同进程里另一个
+      身份的账号，主动凑上去等于对着陌生 bot 打招呼；
+    * 距 `bot_peer_last_sent` 不到 `BOT_PEER_MIN_GAP_SECONDS`（6 小时）→ 不发。
+      这是防「两台 bot 互相秒回」的主要一道：一轮对话里她最多接一句；
+    * `bot_peer_sent_day == today` 且 `bot_peer_sent_count >= BOT_PEER_DAILY_CAP`（1）
+      → 不发。6 小时能挡住「一轮」，挡不住「一天四轮」，日上限补上这个洞。
+
+    坏值（state.json 手改、nan、字符串）一律按「没写过」处理：读不出的时间戳
+    当 0（= 不拦 6 小时闸）、读不出的计数当 0（= 没到日上限）。宁可少拦一次
+    （后面还有 6h/日上限在这些字段写坏时也失效）的极端情况，也不让一个坏字段
+    把整轮心跳抛穿——这个函数跑在 `_speak_inner` 的早段，抛穿会作废整轮。
+    """
+    data = u if isinstance(u, dict) else {}
+    try:
+        message_count = int(_num(data.get("message_count", 0) or 0))
+    except (TypeError, ValueError):
+        message_count = 0
+    if message_count < 1:
+        return "没跟这台 bot 聊过，不主动搭话"
+    last_sent = _num(data.get("bot_peer_last_sent", 0) or 0)
+    try:
+        now = float(now)
+    except (TypeError, ValueError):
+        now = 0.0
+    if not math.isfinite(now):
+        now = 0.0
+    # last_sent 在未来（墙钟回拨/坏数据）时 `now - last_sent` 是负数，同样 < 6h，
+    # 于是继续不发——与所有其它冷却字段的口径一致：宁可等，不误发。
+    if last_sent > 0 and now - last_sent < BOT_PEER_MIN_GAP_SECONDS:
+        remain = max(0.0, BOT_PEER_MIN_GAP_SECONDS - (now - last_sent))
+        return f"距上次找这台 bot 还不到 6 小时（还差 {int(remain / 60)} 分钟），先不找"
+    sent_day = str(data.get("bot_peer_sent_day", "") or "")
+    if sent_day and sent_day == str(today or ""):
+        try:
+            sent_count = int(_num(data.get("bot_peer_sent_count", 0) or 0))
+        except (TypeError, ValueError):
+            sent_count = 0
+        if sent_count >= max(1, BOT_PEER_DAILY_CAP):
+            return "今天已经主动找过这台 bot 一次了，明天再说"
+    return ""
+
+
+def note_bot_peer_sent(u: Dict[str, Any], sent_ts: float, today: str) -> None:
+    """记一次「已经主动找过这台兄弟 bot」（只在发送成功后调用）。
+
+    `bot_peer_last_sent` 与 `bot_peer_sent_day`/`bot_peer_sent_count` 分工与 greet 的
+    `greet_at`/`greet_day` 相同：前一个是「多久前」，后两个是「哪天、几次」。
+    跨天时计数从头开始，否则昨天那条会把今天的额度永久吃掉。
+    """
+    if not isinstance(u, dict):
+        return
+    try:
+        ts = float(sent_ts)
+    except (TypeError, ValueError):
+        ts = 0.0
+    u["bot_peer_last_sent"] = ts if math.isfinite(ts) and ts > 0 else 0.0
+    day = str(today or "")
+    if day and str(u.get("bot_peer_sent_day", "") or "") == day:
+        try:
+            u["bot_peer_sent_count"] = int(_num(u.get("bot_peer_sent_count", 0) or 0)) + 1
+        except (TypeError, ValueError):
+            u["bot_peer_sent_count"] = 1
+    else:
+        u["bot_peer_sent_day"] = day
+        u["bot_peer_sent_count"] = 1
+
+
 class _SendFailed(Exception):
     """发送失败。
 
@@ -656,6 +732,21 @@ GREET_FRESH_SECONDS = 4 * 86400.0
 # 用 `silent_sent`（TA 沉默期内的主动条数）而不是 `no_reply_streak`：后者要等
 # 回复窗口（12 小时）过了才 +1，实测「一直发、他一句不回」 4 天才涨到 2，太迟钝。
 COLD_SILENCE_SENT = 3
+
+# ─── 兄弟 bot 可聊、但严格防刷屏（v1.28.16）──────────────
+#
+# 多 bot 同进程部署时，兄弟 bot 的私聊消息以前被 observe 直接丢掉，于是它永远
+# 进不了用户账本、也永远不会被主动找。现在照常记录（它是个会回话的对象），但主动
+# 找它必须极克制：真实使用里两台 bot 互相「你一句我一句」会刷成无限对话。
+# 这三道是 social 侧的第二道闸；Core 侧还有「同机 bot 互聊最多连续 3 轮」，
+# 两边各自独立把关、互不依赖（任何一边修好都能单独生效）。
+BOT_PEER_MIN_GAP_SECONDS = 6 * 3600.0   # 距上次主动找它至少隔 6 小时
+BOT_PEER_DAILY_CAP = 1                  # 每天最多主动找它 1 次
+
+# 群活跃度用的内存时间戳保留多久（秒）。只为算 `groupflow.activity_score`，
+# 不落盘：重启后从空开始，前几分钟按「群里冷」处理——而活跃度只用于抑制，
+# 所以重启的后果最多是少接一句，不会凭空多开口。
+GROUP_ACTIVITY_KEEP_SECONDS = 1800.0
 
 # 连发补发间隔不再用插件自己的常量：拆段与间隔都跟 AstrBot 每个 Bot 的
 # 「分段回复」设置走（见 social/pacing.py）。下面这两个旧常量已无引用。
@@ -845,6 +936,12 @@ class SocialEngine:
         # 活跃群里连来几条消息会各派一个任务、全部抢在计数更新前过闸 → 同时发好
         # 几句，把 min_gap/每窗上限/每小时上限一起击穿。
         self._flow_inflight: Set[Tuple[str, str]] = set()
+        # (bid, gid) -> 真人群消息时刻的 deque（v1.28.16）。内存态、不落盘：
+        # 只用来算 `groupflow.activity_score`（群活跃度），而那个分数**只做抑制**。
+        # 重启后从空开始 → 分数 0 → 心流先不接几分钟，属于安全方向的降级。
+        # 上限由 `GROUP_ACTIVITY_KEEP_SECONDS` 的滑动裁剪保证，不设 maxlen：裁剪在
+        # 每次 append 时做（O(新增)），30 分钟窗口里正常群再热也就几百条。
+        self._group_activity_ts: Dict[Tuple[str, str], deque] = {}
         # 上一次手动触发（`/主动 触发`）的时刻；None = 本次进程还没触发过。
         # 不持久化：重启之后允许立刻再触发一次是合理的。
         self._last_trigger_at: Optional[float] = None
@@ -1139,12 +1236,19 @@ class SocialEngine:
         # bot 会被建成一个「用户」，记下指向自己会话的 umo、攒念头、给自己私聊发「我好想你」
         if uid == bid:
             return
-        # F2：兄弟 bot 的消息也不进私聊观察（多 bot 同进程时，别把另一台当成用户）。
+        # 兄弟 bot（同一进程里的另一台 bot）现在也是「能聊的人」（v1.28.16）。
+        #
+        # 以前这里直接 return：多 bot 同机时它们永远进不了用户账本，于是既不会被
+        # 回、也永远不会被主动找。现在照常 `record_incoming`（它是个会回话的对象，
+        # 该记的 last_seen / conversation / umo 都记），但**不提取 cue/loop**——
+        # 给一台 bot 排「明天问它面试结果」没有意义，只会让两台互相追问。
+        # 真正的防刷屏闸在 `_speak_inner` 早段（`bot_peer_block_reason`：6 小时 +
+        # 每天 1 条）；群聊侧不变，兄弟 bot 在群里仍然不触发心流。
+        is_bot_peer = False
         try:
-            if uid in self.state.known_bot_ids():
-                return
+            is_bot_peer = uid in self.state.known_bot_ids()
         except Exception:
-            pass
+            is_bot_peer = False
 
         # 获取统一消息来源（用于发送）
         umo = ""
@@ -1167,9 +1271,10 @@ class SocialEngine:
             pass
 
         # 记录消息；顺带从话里找可跟进的时间锚点（「明天面试」）
+        # 兄弟 bot 不排追问（见上面 is_bot_peer 的说明）：它回话本身已经记进账本了。
         cue_text: Optional[str] = None
         cue_due = 0.0
-        if self.cfg.cue_followup and self.cfg.store_message_text:
+        if not is_bot_peer and self.cfg.cue_followup and self.cfg.store_message_text:
             try:
                 cue_text, cue_due = extract_cue(
                     msg, self._time(), self._clock_offset_for(bid)
@@ -1180,7 +1285,12 @@ class SocialEngine:
         # 没有锚点但没说完结果的事（「今天面试了」）走另一条路：过几小时回访
         loop_text: Optional[str] = None
         loop_due = 0.0
-        if self.cfg.loop_enabled and self.cfg.store_message_text and not cue_text:
+        if (
+            not is_bot_peer
+            and self.cfg.loop_enabled
+            and self.cfg.store_message_text
+            and not cue_text
+        ):
             try:
                 loop_text, loop_due = extract_open_loop(
                     msg,
@@ -1684,6 +1794,55 @@ class SocialEngine:
 
     # ─── 群聊心流（v1.11.0） ───────────────────
 
+    def _note_group_activity(self, bid: str, gid: str, now: float) -> None:
+        """记一条「真人刚刚在这个群说了话」（只数非 self、非兄弟 bot，见调用点）。
+
+        维护的是内存时间戳队列，喂给 `groupflow.activity_score`。裁剪按
+        `GROUP_ACTIVITY_KEEP_SECONDS`（30 分钟）做：`activity_score` 最长只看 90 秒，
+        留 30 分钟是为了「心流窗口刚开时能立刻判断这个群刚才热不热」，而不是等
+        新消息重新攒。裁剪用 while + popleft：时间戳来自 `self._time()`（单调钳制
+        过的墙钟），append 顺序天然非递减，队头就是最老的。
+        """
+        key = (str(bid or ""), str(gid or ""))
+        if not key[0] or not key[1]:
+            return
+        try:
+            ts = float(now)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(ts):
+            return
+        # 懒建这个 dict：`_observe_group` 会被只挂了少数依赖的轻量引擎桩调用
+        # （本仓库的测试习惯），桩上可能没有构造期那个属性。
+        bucket = getattr(self, "_group_activity_ts", None)
+        if not isinstance(bucket, dict):
+            bucket = self._group_activity_ts = {}
+        dq = bucket.get(key)
+        if dq is None:
+            dq = bucket[key] = deque()
+        # 时钟回拨时 ts 可能小于队尾：插到正确位置代价高且没必要，直接忽略这条
+        # 活跃度采样（心流闸门里还有 is_quiet/asleep 等硬闸兜着）。
+        if dq and ts < dq[-1]:
+            ts = dq[-1]
+        dq.append(ts)
+        cutoff = ts - GROUP_ACTIVITY_KEEP_SECONDS
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    def _group_activity(self, bid: str, gid: str, now: float) -> float:
+        """这个群「现在有多热闹」的分数（0~1）；没有历史时返回 0.0。
+
+        注意 0.0 的含义：**心流闸门会按「群里刚安静下来」抑制**。这是有意的——
+        活跃度只做抑制、不构成任何开口理由，所以「没有数据」落在保守那一侧。
+        """
+        try:
+            dq = self._group_activity_ts.get((str(bid or ""), str(gid or "")), ())
+            return groupflow.activity_score(list(dq), now)
+        except Exception:
+            # 活跃度是辅助信号：算不出来就当 1.0（不抑制），绝不让它把心流链路
+            # 抛穿——那会让一条群消息直接丢掉当前观察。
+            return 1.0
+
     async def _observe_group(self, event: Any, msg: str) -> None:
         """观察一条群消息：进参考库、刷 last_seen；如果心流窗口开着且值得接，派一个后台任务去接。
 
@@ -1734,6 +1893,11 @@ class SocialEngine:
             # 只有「我自己」不算别人开口；兄弟 bot 说话要刷 last_human_at。
             is_self=is_bot,
         )
+        # 群活跃度（v1.28.16）：只数**真人**发言。放在下面所有早退之前——活跃度
+        # 要在任何时候都跟得上，否则「心流窗口刚打开时」永远没有历史、分数恒 0，
+        # 这道抑制会把所有群都按「刚安静下来」处理。
+        if not is_bot and not is_sibling:
+            self._note_group_activity(bid, gid, now)
         # 有人 @ 了 bot 且心流窗口开着：算「接住了我刚插的话」，把连着插没人理的计数清零，
         # 允许继续接。不是 @ 的普通群聊不算接话（避免一有人说话就当受欢迎继续无脑插）。
         if (
@@ -1791,6 +1955,8 @@ class SocialEngine:
             interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
             # 同上：尝试也要节流，别让每条群消息都重打一次 LLM。
             attempt_gap_seconds=self._flow_attempt_gap(),
+            # v1.28.16：群活跃度只做抑制（低于门槛就不硬接），不因高分放行任何东西。
+            activity=self._group_activity(bid, gid, now),
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -1905,6 +2071,8 @@ class SocialEngine:
             interject_gap_seconds=max(self.cfg.flow_min_gap_seconds, 180),
             # 「模型选择不接」也要占一次尝试：不然活跃群里每条消息都重打一次 LLM。
             attempt_gap_seconds=self._flow_attempt_gap(),
+            # 生成前重校（v1.28.16）：这几秒里群里可能已经安静下来了，也重新算一次。
+            activity=self._group_activity(bid, gid, now),
         )
         if not ok:
             return
@@ -2771,6 +2939,58 @@ class SocialEngine:
         lo = max(MIN_HEARTBEAT_SECONDS, int(self.cfg.heartbeat_min_minutes) * 60)
         hi = max(lo, int(self.cfg.heartbeat_max_minutes) * 60)
         return lo, hi
+
+    def _cap_delay_for_quiet_end(
+        self,
+        delay: float,
+        now: Optional[float] = None,
+        jitter: Optional[int] = None,
+    ) -> float:
+        """把这一轮心跳的睡眠截到「安静时段结束」附近（v1.28.16）。
+
+        背景：`run()` 每轮先睡 `random.randint(lo, hi)` 再看一眼。如果这一觉正好
+        跨过静音结束点，那「终于可以开口了」要等剩下那半段随机睡眠走完才被评估——
+        配置 8–30 分钟心跳时，静音结束后第一轮可能拖到 8:20 才跑。用户看到的就是
+        「说好 8 点起床，8 点半还在装睡」。
+
+        规则（只在「当前正处在安静时段」时生效）：
+        睡到 `到静音结束的秒数 + 0~120 秒抖动`，但不短于 30 秒（给时钟边界一点
+        余量，避免正好卡在边界上反复算 0）；如果原本的随机睡眠更短，就按原本的睡。
+        也就是 `delay = min(delay, max(30, left + jitter))`。
+
+        边界（写清楚，免得以后当成 bug 改掉）：
+        - 用的是**配置里的 quiet_start/quiet_end + 本机时钟**，不是 Core 按日程算的
+          生物钟夜——心跳循环是所有角色共用的，这里没有 bid 去查 Core。两者不一致时
+          的后果只是**早醒一次**（下一轮评估时 `_quiet_now` 的硬闸会再把它拦下来），
+          或者晚睡一次（那一轮按原节奏走，行为与旧版一致）；
+        - start == end（不启用）或当前不在安静时段时原样返回 `delay`；
+        - 配置坏值、时钟读不出来一律原样返回：这是「让她早醒」的优化，不是正确性
+          要求，任何异常都不该把后台循环带崩。
+
+        `jitter` 只是给测试钉住随机量的入口；正常运行传 None 走 `random.randint(0, 120)`。
+        """
+        try:
+            ts = self._time() if now is None else float(now)
+            # 本机墙上时间：与 `SocialConfig.in_quiet_hours` 的口径一致。
+            moment = city_now(ts, None)
+            left = seconds_until_quiet_end(
+                moment.hour, moment.minute, self.cfg.quiet_start, self.cfg.quiet_end
+            )
+        except Exception:
+            return delay
+        if left <= 0:
+            return delay
+        if jitter is None:
+            jitter = random.randint(0, 120)
+        try:
+            jitter = max(0, min(120, int(jitter)))
+        except (TypeError, ValueError):
+            jitter = 0
+        try:
+            catchup = max(30.0, float(left) + float(jitter))
+            return min(float(delay), catchup)
+        except (TypeError, ValueError):
+            return delay
 
     def _flow_person_state(self, bid: str, now: float) -> Tuple[bool, bool]:
         """群心流缺的两道人物侧闸：现在是不是安静时段、她是不是在睡。
@@ -4695,6 +4915,34 @@ class SocialEngine:
             except Exception as e:
                 self.log(f"群起话头这一轮出错（不影响其它流程）：{e}")
 
+    def _is_known_bot_peer(self, uid: str) -> bool:
+        """uid 是不是「同一进程里的另一台 bot」（兄弟 bot）。
+
+        名单读不出来时一律当**真人**：这是 v1.28.16 才打开的新路径，名单坏了
+        就该退回旧行为（人类用户照常，不给任何人加一道莫名其妙的闸）。
+        """
+        try:
+            return str(uid or "") in self.state.known_bot_ids()
+        except Exception:
+            return False
+
+    def _bot_peer_gate_reason(
+        self, bid: str, uid: str, u: Dict[str, Any], now: float
+    ) -> str:
+        """这批目标是不是兄弟 bot、现在能不能主动找它（v1.28.16）。
+
+        `uid in self.state.known_bot_ids()` 是唯一判据，与 observe 侧同一份名单；
+        名单读不出来时一律当真人（不改变老行为）。`today` 按**她所在城市**的日期取，
+        与 greet / 破冰那些按城市日期记的账同一个口径。
+        """
+        if not SocialEngine._is_known_bot_peer(self, uid):
+            return ""
+        try:
+            today = self._moment_of(bid, now).strftime("%Y-%m-%d")
+        except Exception:
+            today = ""
+        return bot_peer_block_reason(u, now, today)
+
     async def _speak(
         self,
         bid: str,
@@ -4777,6 +5025,19 @@ class SocialEngine:
         if energy < self.cfg.gate_energy_floor:
             logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
+
+        # **兄弟 bot 的第二道闸**（v1.28.16）。
+        #
+        # 私聊观察不再把同进程的兄弟 bot 整个挡在门外（见 `observe`），它们现在也
+        # 可能成为候选；但主动找它们必须极克制：从没聊过不开口、6 小时内不重复、
+        # 一天最多一条（`bot_peer_block_reason`）。放在电闸/能量之后、LLM 之前：
+        # 被拦下一次 token 都不花，而且真人用户在这里恒为 ""，行为与旧版逐字一致。
+        # Core 侧还有「同机 bot 互聊最多连续 3 轮」，那是另一道闸，两边不互相依赖。
+        is_bot_peer = SocialEngine._is_known_bot_peer(self, uid)
+        if is_bot_peer:
+            _peer_block = SocialEngine._bot_peer_gate_reason(self, bid, uid, u, now)
+            if _peer_block:
+                return False, _peer_block
 
         # 最小间隔：不管哪一种主动开口（问候/追问/回访/另起话题/收场），两条之间至少
         # 隔这么久。以前只有「另起话题」查 30 分钟护栏，其余四条全都绕过了它，
@@ -5398,6 +5659,15 @@ class SocialEngine:
             # 与 closer 分支走同一个标记助手，免得写成 sent_ts 与 last_sent 不等值，
             # 让 closer_reason 的等值守卫失效（等于预告收场没生效）。
             u["closer_for"] = self._closer_marker(u, sent_ts)
+        # 兄弟 bot 的防刷屏账（v1.28.16）：**真的发成功了**才记，失败/被否决不占额度。
+        # 记完 `bot_peer_block_reason` 下次就能算出 6 小时/每天一条两道闸。
+        if is_bot_peer:
+            try:
+                _peer_day = self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
+            except Exception:
+                # 日期取不出来就只记「多久前」，日上限这条失效（6 小时闸仍在）。
+                _peer_day = ""
+            note_bot_peer_sent(u, sent_ts, _peer_day)
         bot = self.state.bot(bid)
         bot["last_global_send"] = sent_ts
         self.state.save()
@@ -6694,7 +6964,11 @@ class SocialEngine:
         crash_streak = 0
         while self.running:
             try:
-                await asyncio.sleep(random.randint(lo, hi))
+                # v1.28.16：这一觉如果跨过静音结束点，就睡到结束点附近再评估，
+                # 别让「终于能开口」被剩下那半段随机睡眠再拖 8–30 分钟。
+                # 不在安静时段时 `_cap_delay_for_quiet_end` 原样返回，行为与旧版一致。
+                delay = self._cap_delay_for_quiet_end(random.randint(lo, hi))
+                await asyncio.sleep(delay)
                 if not self.running:
                     break
                 self._prune_expired()

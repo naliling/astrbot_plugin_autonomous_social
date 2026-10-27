@@ -313,6 +313,13 @@ class SocialState:
             # 发送失败（非好友/不支持主动消息等）隔离：隔离到什么时候、为什么
             "send_blocked_until": 0.0,
             "send_blocked_reason": "",
+            # v1.28.16 兄弟 bot（同一进程里的另一台 bot）的防刷屏账：
+            # 私聊里它们现在也是「能聊的人」，但主动找它们必须极克制——
+            # 最近一次找它的时刻、那天是哪天、当天已经找过几次。
+            # 只有真的发成功了才写（见 engine `_speak_inner` 成功分支）。
+            "bot_peer_last_sent": 0.0,
+            "bot_peer_sent_day": "",
+            "bot_peer_sent_count": 0,
         }
 
     # ─── 群会话（v1.11.0 群聊心流） ─────────────────────
