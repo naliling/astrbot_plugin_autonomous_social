@@ -3,18 +3,16 @@
 这份表记的是**反复犯过的毛病**，不是功能清单。每一条后面都挂着一个（或一组）
 会在旧行为下变红的测试——以后要改同一块代码，先跑它。
 
-用法：
+用法（在插件根目录，和 `main.py` 同一层）：
 
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-..\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
+```bash
+python -m pytest tests -q
 ```
 
 定位单条：
 
-```powershell
-..\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider `
-  tests/test_v1280_group_voice.py -k "NoName"
+```bash
+python -m pytest tests/test_v1280_group_voice.py -q -k "NoName"
 ```
 
 ## 一张表
@@ -37,7 +35,7 @@ $env:PYTHONIOENCODING='utf-8'
 
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
-**不是插件的问题，也无需修。** 已按用户反馈（3231002996，昵称「鲨白」）逐条核对过日志。
+**不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。
 
 ### 数据
 
@@ -45,7 +43,7 @@ $env:PYTHONIOENCODING='utf-8'
 
 | 类型 | 条数 | 昵称显示 |
 |---|---|---|
-| 真正的文字消息 | 39 | 正常显示「鲨白」 |
+| 真正的文字消息 | 39 | 正常显示昵称 |
 | 戳一戳 / 图片 / 表情 / 语音 / 空 | 201 | 显示成 QQ 号 |
 
 ### 官方代码路径
@@ -61,7 +59,7 @@ $env:PYTHONIOENCODING='utf-8'
 `notice` 类事件（戳一戳）和纯图片/表情/语音消息的 `sender` 字段本来就是空的或不完整**，
 于是 AstrBot 只能回退显示 QQ 号。
 
-695 个发件人里昵称含「关系/分组词」的只有 1 个：`开朗的网友/2301401892`，是对方自起的昵称。
+695 个发件人里昵称含「关系/分组词」的只有 1 个，是对方自己起的昵称（其 QQ 号已隐去）。
 没有任何插件调用过 `set_friend_category`（ccb_plus 只读 `get_stranger_info`；
 relationship 的 `delete_friend`/`set_group_leave` 是删好友/退群，与分组无关且需命令触发；
 user_tag 的「网友」是它自己关系库的 DEPRECATED 项，完全不碰 OneBot API）。

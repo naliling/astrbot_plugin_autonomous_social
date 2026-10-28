@@ -57,7 +57,7 @@ class ShortCallNameTest(unittest.TestCase):
         self.assertEqual(short_call_name("超级无敌大风车"), "超级无敌")
 
     def test_latin_name_is_never_cut(self) -> None:
-        for name in ("Regnator", "hanhandouya", "Luture"):
+        for name in ("Alice", "Bob", "Carol"):
             self.assertEqual(short_call_name(name), name)
 
     def test_empty(self) -> None:

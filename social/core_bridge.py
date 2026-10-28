@@ -9,10 +9,19 @@ v1.6.1：
 - 增加类型注解
 - 改进错误处理
 - 增强路径解析健壮性
+
+v2.0.0（审核 social v1.28.17：P2-10 / P2-13）：
+- 契约新鲜度：用 `generated_at` 判定契约是否过期（默认 45 分钟）。过期契约里的
+  「此刻状态」（day/wake/routine/activity/event/ongoing/outfit/weather）不再当作现在，
+  `_build_self_view` 会清空并打上 `contract_stale` / `contract_age_seconds` 标记；
+  user/relationship 数据仍可用。对外提供 `contract_freshness()` / `contract_stale()`。
+- 契约握手校验：读取 `schema` / `capabilities` / `fields_hash`，结构对不上时
+  一次性 warning 并在视图里标记 `contract_handshake`（降级继续，绝不抛异常）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -46,6 +55,31 @@ _SEARCH_HINTS = ("humanoid", "core")
 # 这是塞进 prompt 的素材，不是给人看的完整历史。
 CORE_SAID_MAX = 3
 
+# ─── 契约新鲜度（P2-10）─────────────────────────────────
+
+#: 契约 generated_at 比「现在」旧超过这么久，这份契约里的**此刻状态**就不当作现在。
+#:
+#: Core 正常在身体推进时重写契约（每分钟一次），45 分钟远大于正常重写间隔；而线上
+#: 真实数据见过 14 天前的契约（Core 重启后角色实例惰性创建，空窗期只能读到旧文件）。
+#: 阈值再小会误伤「用户刚启动、Core 还没来得及重写」的头几分钟。
+CONTRACT_STALE_SECONDS = 45 * 60.0
+
+# ─── 契约握手校验（P2-13）───────────────────────────────
+
+#: 社交层真正消费的契约能力。capabilities 缺任何一项，就说明对面的契约结构与本插件
+#: 的读取假设不一致 → 一次性 warning + 在视图里标记降级，绝不抛异常。
+CONTRACT_EXPECTED_CAPABILITIES = (
+    "day",
+    "ongoing",
+    "routine",
+    "wake",
+    "event",
+    "identity",
+    "outfit",
+)
+#: 契约结构标识前缀（Core 2.28.x 起导出 schema="humanoid.contract/2"）。
+CONTRACT_SCHEMA_PREFIX = "humanoid.contract/"
+
 
 class CoreBridge:
     """Humanoid Core 状态桥接（只读）。"""
@@ -68,6 +102,10 @@ class CoreBridge:
         self._searched = False
         self._searched_at = 0.0
         self._search_hit: Optional[str] = None
+        # 握手校验（P2-13）的一次性告警标记。**故意不放进 _warned**：那个字典在
+        # read_root 每成功读一次就整体复位，而契约结构问题会一直存在，放进去等于每个
+        # 心跳都告警一次。这里只在问题消失（握手校验通过）时重新武装。
+        self._handshake_warned: Dict[str, bool] = {}
 
     def _warn_once(self, reason: str, message: str) -> None:
         """按失败原因各警告一次。不同故障互不遮蔽。"""
@@ -340,6 +378,222 @@ class CoreBridge:
                 out.append(text)
         return out
 
+    # ─── 契约新鲜度 / 握手校验（P2-10 / P2-13）──────────────
+
+    def contract_freshness(
+        self,
+        contract: Any,
+        *,
+        now: Optional[float] = None,
+        max_age: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """判断一份契约快照的**新鲜度**（P2-10）：generated_at 距今多久、还能不能信。
+
+        Core 在契约里导出 generated_at（epoch 秒），但契约本身不参与 state.json 的
+        重写判定——Core 重启后角色实例按首条消息惰性创建，空窗期社交侧只能读到旧文件
+        （线上真实数据见过 14 天前的契约）。旧实现从不看 generated_at，于是会把
+        几天前的 day.doing（「正在工作/在睡」）、wake、routine 当成此刻状态生成主动消息。
+
+        本方法只判定、不改数据；`_build_self_view` 按结果把「此刻状态」清空
+        （见 `_neutralize_stale_contract`）。**无法判定时不算过期**：旧版 Core 没有
+        generated_at，按未校验处理（与加这个机制之前逐字等价）。
+
+        返回 dict（键固定）：
+
+        * checked: 是否拿到了可用时间戳
+        * generated_at: 契约时间（epoch 秒）或 None
+        * age_seconds: 距今秒数（未来时间按 0 处理）或 None
+        * max_age_seconds: 本次使用的阈值
+        * fresh: True/False；未校验时为 None
+        * stale: True 表示「此刻状态不可信」（未校验时 False）
+        * reason: 人话说明
+        """
+        limit = float(max_age if max_age is not None else CONTRACT_STALE_SECONDS)
+        info: Dict[str, Any] = {
+            "generated_at": None,
+            "age_seconds": None,
+            "max_age_seconds": limit,
+            "checked": False,
+            "fresh": None,
+            "stale": False,
+            "reason": "",
+        }
+        if not isinstance(contract, dict):
+            info["reason"] = "契约不是 dict，无法判断新鲜度"
+            return info
+        raw = contract.get("generated_at")
+        try:
+            generated_at = float(raw)
+        except (TypeError, ValueError):
+            info["reason"] = "契约没有可解析的 generated_at（旧版 Core），新鲜度未校验"
+            return info
+        if (
+            generated_at != generated_at  # NaN
+            or generated_at in (float("inf"), float("-inf"))
+            or generated_at <= 0.0
+        ):
+            info["reason"] = "契约 generated_at 不是有效时间戳，新鲜度未校验"
+            return info
+        now_value = float(now) if now is not None else time.time()
+        age = max(0.0, now_value - generated_at)
+        info.update({"generated_at": generated_at, "age_seconds": age, "checked": True})
+        if age > limit:
+            info.update(
+                {
+                    "fresh": False,
+                    "stale": True,
+                    "reason": (
+                        f"契约 generated_at 距今约 {age / 60.0:.0f} 分钟"
+                        f"> {limit / 60.0:.0f} 分钟：此刻状态不当作现在"
+                    ),
+                }
+            )
+        else:
+            info.update({"fresh": True, "reason": ""})
+        return info
+
+    def contract_stale(
+        self,
+        contract: Any,
+        *,
+        now: Optional[float] = None,
+        max_age: Optional[float] = None,
+    ) -> bool:
+        """契约是否已过期（`contract_freshness` 的布尔快捷方式）。"""
+        return bool(
+            self.contract_freshness(contract, now=now, max_age=max_age).get("stale")
+        )
+
+    @staticmethod
+    def _fields_hash(contract: Dict[str, Any]) -> str:
+        """按 Core 的算法重算握手结构指纹（排序后的键路径 sha256 前 16 位）。
+
+        与 core/humanoid/link.py::_fields_hash 同一套算法（只 walk dict、键路径排序、
+        sha256）。Core 写 fields_hash 时已经先把 schema / capabilities 放进 dict，
+        所以重算时排除 fields_hash 本身即可。算法对不上（旧版/未来改算法）时也只会
+        得到不一致 → 一次性 warning，不影响读取。
+        """
+        paths: List[str] = []
+
+        def walk(node: Any, prefix: str) -> None:
+            if not isinstance(node, dict):
+                return
+            for key in sorted(node):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                paths.append(path)
+                walk(node[key], path)
+
+        walk({k: v for k, v in contract.items() if k != "fields_hash"}, "")
+        raw = "\n".join(sorted(paths)).encode("utf-8")
+        return "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
+
+    def _handshake_problems(self, contract: Dict[str, Any]) -> List[str]:
+        """P2-13：校验契约的握手三键（schema / capabilities / fields_hash）。
+
+        只返回问题列表，**绝不抛**：这是「把猜变成校验」的观测点，结构对不上时本该
+        留一条能搜到的日志 + 在视图里标记降级，不能让主动消息发不出去。
+        v1 老契约没有这三个键 → 返回空列表（未校验，不告警）。
+        """
+        problems: List[str] = []
+        version = self._contract_v(contract)
+        if version < 1:
+            # 契约版本号是「只加不改」的地基：读不出 v 时其它字段一个都不该信。
+            problems.append(f"契约 v 不可用：{contract.get('v')!r}")
+        schema = contract.get("schema")
+        if schema is not None:
+            if not isinstance(schema, str) or not schema.startswith(CONTRACT_SCHEMA_PREFIX):
+                problems.append(
+                    f"契约 schema 不认识：{schema!r}"
+                    f"（期望 {CONTRACT_SCHEMA_PREFIX}<n>）"
+                )
+            elif version >= 1:
+                expected = f"{CONTRACT_SCHEMA_PREFIX}{version}"
+                if schema != expected:
+                    problems.append(f"契约 schema 与 v 不一致：schema={schema!r}，v={version}")
+        capabilities = contract.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, (list, tuple, set)):
+                problems.append(
+                    f"契约 capabilities 形状不对：{type(capabilities).__name__}"
+                )
+            else:
+                present = {str(item) for item in capabilities}
+                missing = [
+                    name for name in CONTRACT_EXPECTED_CAPABILITIES if name not in present
+                ]
+                if missing:
+                    problems.append(f"契约 capabilities 缺本插件消费的项：{missing}")
+        fields_hash = contract.get("fields_hash")
+        if fields_hash is not None:
+            if not isinstance(fields_hash, str) or not fields_hash.startswith("sha256:"):
+                problems.append(f"契约 fields_hash 格式不认识：{fields_hash!r}")
+            else:
+                recomputed = self._fields_hash(contract)
+                if recomputed and recomputed != fields_hash:
+                    problems.append(
+                        f"契约 fields_hash 与结构不一致：声明 {fields_hash}，重算 {recomputed}"
+                    )
+        return problems
+
+    def _warn_handshake_once(self, problem: str) -> None:
+        """同一类握手问题只 warning 一次（问题消失后由 `_check_handshake` 重新武装）。"""
+        if self._handshake_warned.get(problem):
+            return
+        self._handshake_warned[problem] = True
+        logger.warning(
+            "[autonomous_social] Humanoid Core 契约握手校验未通过："
+            f"{problem}（按降级继续，不抛异常）"
+        )
+
+    def _check_handshake(self, contract: Any) -> Optional[Dict[str, Any]]:
+        """校验握手键并（出问题时）一次性告警；返回视图标记，未校验时返回 None。
+
+        返回 `{"checked": True, "ok": bool, "problems": [...]}`，只在契约**带**了
+        握手键时出现（v1 老契约没有这三键 → 未校验，不占视图字段）。
+        """
+        if not isinstance(contract, dict):
+            return None
+        if not any(key in contract for key in ("schema", "capabilities", "fields_hash")):
+            return None
+        problems = self._handshake_problems(contract)
+        if not problems:
+            # 结构对了：重新武装一次性告警，将来再漂移还能提示。
+            self._handshake_warned.clear()
+            return {"checked": True, "ok": True, "problems": []}
+        for problem in problems:
+            self._warn_handshake_once(problem)
+        return {"checked": True, "ok": False, "problems": problems}
+
+    @staticmethod
+    def _neutralize_stale_contract(view: Dict[str, Any]) -> None:
+        """契约过期时，把「此刻状态」清空（P2-10）：旧答案比没有答案更糟。
+
+        清的都是**由头/上下文派生**字段：day（正在做什么/刚做过/接下来/想做的事/梦）、
+        wake（刚醒）、routine/night_window（作息）、activity（在哪）、event（刚发生的事）、
+        ongoing（手上没做完的事）、outfit（此刻穿着）、weather（此刻天气）。
+        它们回答「她现在在干什么」，几天前的答案会让模型一本正经地说瞎话。
+
+        保留：identity（她是谁，稳定）、body 标量（energy 等，读方本来按「最近已知值」
+        用）、feelings/form（表达约束，不是时刻事实）、contract_v 与新鲜度标记。
+        """
+        view["activity"] = {}
+        view["routine"] = {}
+        view["night_window"] = None
+        view["wake"] = {}
+        view["event"] = {}
+        view["ongoing"] = []
+        view["outfit"] = {}
+        view["weather"] = {}
+        view["day"] = {
+            "doing": "",
+            "done": [],
+            "next": [],
+            "wants": [],
+            "dreams": [],
+            "event": {},
+            "wake": {},
+        }
+
     @staticmethod
     def _wake_block(value: Any) -> Dict[str, Any]:
         """把契约的 `wake` 块读成干净的 dict；拿不到就是空 dict。
@@ -475,14 +729,28 @@ class CoreBridge:
             # 这两个块**不进 compact()**（名字是称呼，不是状态摘要）。
             "identity": {},
             "outfit": {},
+            # 契约新鲜度 / 握手校验（P2-10 / P2-13）。没有契约时保持与旧版逐字等价：
+            # contract_fresh=None 表示未校验、contract_stale=False 表示没判过期。
+            "contract_fresh": None,
+            "contract_stale": False,
+            "contract_age_seconds": None,
         }
         contract = selfs.get("contract")
         # 版本号必须容错：契约里的 v 是跨插件来的值，非数字时裸 int() 会抛穿
         # _build_self_view → _self_view → bot_self_state/load_snapshot 四层。
         if not isinstance(contract, dict) or self._contract_v(contract) < 1:
             return view
+        freshness = self.contract_freshness(contract)
+        stale = bool(freshness.get("stale"))
+        handshake = self._check_handshake(contract)
         body = contract.get("body") if isinstance(contract.get("body"), dict) else {}
         view["contract_v"] = self._contract_v(contract)
+        view["contract_fresh"] = freshness.get("fresh")
+        view["contract_stale"] = stale
+        view["contract_age_seconds"] = freshness.get("age_seconds")
+        if handshake is not None:
+            # 只在契约带了握手键时出现（v1 老契约 → 不占字段）。
+            view["contract_handshake"] = handshake
         if body.get("energy") is not None:
             view["energy"] = body.get("energy")
         if body.get("social_energy") is not None:
@@ -558,6 +826,10 @@ class CoreBridge:
         if "weather" in contract:
             _env = str(contract.get("weather") or "").strip()
             view["weather"] = {"env": _env} if _env else {}
+        if stale:
+            # 契约太旧（P2-10）：清掉「此刻状态」，别把几天前的 day.doing/wake 当现在。
+            # 身份/身体标量/情绪等「最近已知值」保留，消费方本来就有不知道的兜底。
+            self._neutralize_stale_contract(view)
         return view
 
     def load_snapshot(

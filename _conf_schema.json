@@ -8,17 +8,19 @@
     },
     "proactive_provider_ids": {
         "description": "【模型】主动消息专用模型（脑子/思考好的）",
-        "hint": "主动消息是她自己想起来要说什么，所以要用脑子/思考好的模型来生成——不是能跑就行。本插件所有模型调用（1:1 主动、群聊心流、破冰、起话头）按下面顺序试，第一个能用的即止。默认就是三个会思考的（gpt-6.1-sol → gpt-6-sol → gemini-3.5-flash）。配了却一个都取不到时本轮不主动开口，等下一轮——不退默认、不重试：弱模型写出来的主动消息比不发更糟。清空 = 关掉这个功能，回旧行为跟着会话走。",
+        "hint": "留空（默认）= 不指定专供，跟着当前会话的模型走，装上就能说话。想让她用会思考的模型，在这里按顺序选 provider：本插件所有模型调用（1:1 主动、群聊心流、破冰、起话头）都按顺序试，第一个能用的即止。配了却一个都取不到时：默认回退跟随会话模型并打一次性 warning；打开 strict_proactive_provider 才坚持「本轮不主动开口，等下一轮」。",
         "type": "list",
         "items": {
             "type": "string"
         },
         "_special": "select_providers",
-        "default": [
-            "openai/gpt-6.1-sol",
-            "openai/gpt-6-sol",
-            "gemini/gemini-3.5-flash"
-        ]
+        "default": []
+    },
+    "strict_proactive_provider": {
+        "description": "【模型】配了专供模型却取不到时坚持不发",
+        "hint": "默认关：配了主动消息专用模型却一个都解析不到时，回退跟随当前会话的模型并打一次性 warning（每次恢复窗口只提示一次，不会刷屏）。打开后：本轮不主动开口，等下一轮，绝不退默认模型（弱模型写出来的主动消息比不发更糟）。",
+        "type": "bool",
+        "default": false
     },
     "mode": {
         "type": "string",
@@ -1044,14 +1046,14 @@
         "description": "指令白名单",
         "hint": "除主人外允许谁使用指令（填user_id）。",
         "obvious_hint": true,
-        "default": null
+        "default": []
     },
     "tier_override": {
         "type": "list",
         "description": "关系档手动覆盖",
         "hint": "强制指定某人的关系档：逐条填 uid:high、uid:mid 或 uid:low。写了的人不再按好感涨幅推算，最小间隔/由头池/念想门槛都按指定档走。",
         "obvious_hint": true,
-        "default": null
+        "default": []
     },
     "special_care_enabled": {
         "type": "bool",
@@ -1065,7 +1067,7 @@
         "description": "特别关心名单",
         "hint": "逐条填 user_id，或「平台:user_id」（平台就是会话地址的第一段，如 aiocqhttp）。名单里的人主动找你时不再被关系档位、安静时段、睡眠和「没回就停」挡；自动认定也以这个名单优先。",
         "obvious_hint": true,
-        "default": null
+        "default": []
     },
     "special_care_auto": {
         "type": "bool",
@@ -1193,7 +1195,7 @@
         "description": "主动认识名单",
         "hint": "即使没聊过也会主动联系的user_id列表",
         "obvious_hint": true,
-        "default": null
+        "default": []
     },
     "seed_platform": {
         "type": "string",

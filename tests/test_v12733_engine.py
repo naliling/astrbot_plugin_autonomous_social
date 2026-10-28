@@ -140,13 +140,14 @@ class HeartbeatRangeTest(unittest.TestCase):
 
 
 class ClockTest(unittest.TestCase):
-    """墙钟回拨：`_time()` 必须单调不减，否则念头/冷却会算成负数。"""
+    """墙钟回拨：小回拨 `_time()` 单调不减（否则念头/冷却会算成负数）；
+    大回拨（墙钟被改，> TIME_ROLLBACK_RESET_SECONDS）重置高水位、不冻结时间轴。"""
 
-    def test_rollback_is_clamped(self):
+    def test_small_rollback_is_clamped(self):
         clock = _Clock()
         eng = _engine(clock)
         self.assertEqual(eng._time(), NOW)
-        clock.rewind(3600)
+        clock.rewind(200)          # NTP 微调级别，小于重置阈值
         self.assertEqual(eng._time(), NOW)
 
     def test_forward_time_advances(self):
@@ -160,15 +161,27 @@ class ClockTest(unittest.TestCase):
         eng = _engine(clock)
         clock.advance(10)
         self.assertEqual(eng._time(), NOW + 10)   # 先让水位线立起来
-        clock.rewind(500)
+        clock.rewind(200)
         self.assertEqual(eng._time(), NOW + 10)
         # 回拨之后再往前走，必须**越过**水位线才重新前进（判据是 `t < high`，取严格小于）
-        clock.advance(499)   # 墙钟 NOW+9，仍在水位线下
+        clock.advance(199)   # 墙钟 NOW+9，仍在水位线下
         self.assertEqual(eng._time(), NOW + 10)
         clock.advance(1)     # 墙钟 NOW+10，正好追平水位线，仍不前进
         self.assertEqual(eng._time(), NOW + 10)
         clock.advance(1)     # 越过水位线，恢复正常
         self.assertEqual(eng._time(), NOW + 11)
+
+    def test_large_rollback_resets_the_frozen_timeline(self):
+        """P3-09：回拨超过阈值（如系统时钟被改）不能把「现在」冻住一小时。"""
+        clock = _Clock()
+        eng = _engine(clock)
+        self.assertEqual(eng._time(), NOW)
+        clock.advance(600)
+        self.assertEqual(eng._time(), NOW + 600)
+        clock.rewind(7200)                   # 回拨两小时（远超阈值）
+        self.assertEqual(eng._time(), NOW - 6600, "大回拨后时间轴还冻在旧水位")
+        clock.advance(5)
+        self.assertEqual(eng._time(), NOW - 6595, "重置高水位后时间没有继续前进")
 
 
 class BeatSignalsTest(unittest.TestCase):

@@ -211,5 +211,38 @@ class HandoffSpawnsABackgroundWriteTest(unittest.IsolatedAsyncioTestCase):
         SocialEngine._remember_open_closed(engine, "umo", "u1", "面试", "过了")
 
 
+class ReadBudgetSelectionTest(unittest.IsolatedAsyncioTestCase):
+    """v2.0.0（P1-3）：默认预算 600 → 1800。
+
+    对面 `compose_context(max_chars=)` 的预算是**整块注入**上限（含 ~700-900 字符
+    固定骨架），不是正文长度；600 时永远只有「预算不足」壳。这里只钉我们发出去的
+    数字：真正的「有没有正文」契约测试在 `test_v200_memory.py`。
+    """
+
+    async def test_default_budget_reaches_compose_context(self):
+        bridge = _Composer()
+        await memory_bridge.fetch_memory_text(bridge, "umo", "u1", query="面试")
+        self.assertEqual(bridge.kw["max_chars"], memory_bridge.DEFAULT_MAX_CHARS)
+        self.assertGreaterEqual(
+            memory_bridge.DEFAULT_MAX_CHARS, 1800, "P1-3 的发布阻断修复被回退"
+        )
+
+    async def test_legacy_600_is_gone(self):
+        bridge = _Composer()
+        await memory_bridge.fetch_memory_text(bridge, "umo", "u1")
+        self.assertNotEqual(bridge.kw.get("max_chars"), 600, "默认预算又被改回 600")
+
+    async def test_group_chat_does_not_call_the_bridge(self):
+        """P2-15：对面写入固定 private_pair，群聊检索必然为空——干脆不发起。"""
+
+        class _Boom:
+            async def compose_context(self, **kw):
+                raise AssertionError("群聊不该发起记忆检索")
+
+        self.assertEqual(
+            await memory_bridge.fetch_memory_text(_Boom(), "aiocqhttp:group:9", "u1"), ""
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2543,25 +2543,40 @@ class MessageGenerator:
         Returns:
             provider 对象，失败返回 None
         """
-        # 专供模型（v1.28.5）：配了就走它，按顺序试到第一个能用的即止。
-        # **故意不退会话默认**：配了却拿不到，本轮就不发，等下一轮。
-        # 退回去等于「指定的就要管它」白写——弱模型写出来的主动消息比不发更糟。
+        # 专供模型（v1.28.5；v2.0.0 增加回退/严格开关）：
+        #   配了 → 按顺序试到第一个能用的即止；
+        #   取不到 → strict_proactive_provider=True 时本轮不发（v1.28.5 旧行为），
+        #            否则（默认）回退跟随当前会话的模型，并打一次性 warning。
+        # 为什么默认回退：AstrBot 的 provider ID 是用户在面板里起的名字，换环境、
+        # 写错一个字母、禁用某个 provider，都会让专供全部解析不到；一条都不发时
+        # 用户看到的是「插件装了、状态正常、就是永远不说话」——那比弱模型写的更糟。
+        # 「取不到就不发」这条路留给明确知道自己要什么的用户（strict）。
         # 也不重试：一次限流拖成整轮心跳卡住，更糟。
         #
         # 例外：这个 AstrBot 版本压根不支持按 ID 取 provider 时，
-        # `_get_designated_provider` 自己放过一条 warning 并返回 None——那时继续
-        # 按「配了但取不到」处理会让主动消息**全停**，而用户看不出为什么。
-        # 所以那种情况放行到下面的旧路径（跟着会话走）。
+        # `_get_designated_provider` 自己放过一条 warning 并返回 None——那种情况
+        # 本来就用不了专供，直接放行到下面的旧路径（跟着会话走）。
         provider = await self._get_designated_provider()
         if provider is not None:
             return provider
         if self._designated_configured() and self._can_resolve_by_id():
-            # 配了专供模型却一个都没拿到：本轮不发（见上面）。不打 warning——
-            # 心跳 15~120 分钟一轮，限流时每秒刷一行日志会把真问题埋掉。
-            logger.debug(
-                "[autonomous_social] 配了主动专用模型但一个都没取到，本轮不主动开口"
-            )
-            return None
+            if self._strict_designated():
+                # 严格模式：配了专供却一个都没拿到 → 本轮不发。
+                logger.debug(
+                    "[autonomous_social] 配了主动专用模型但一个都没取到，"
+                    "严格模式（strict_proactive_provider=true）：本轮不主动开口"
+                )
+                return None
+            # 默认模式：回退会话默认模型。必须让用户看见一次——选错 ID 时状态页
+            # 一直正常、主动消息却全是「会话默认模型」写的，不提示就无从发现。
+            # 用 throttle 去重：心跳一轮一次、限流时更频繁，每次打 warning 会刷屏。
+            if throttle.allow("provider.designated.fallback"):
+                logger.warning(
+                    "[autonomous_social] 配了主动专用模型但一个都没取到"
+                    f"（{self._designated_ids_text()}），已回退跟随当前会话的模型；"
+                    "想坚持「取不到就不发」请打开 strict_proactive_provider"
+                    + throttle.summary("provider.designated.fallback")
+                )
 
         # 方式1: get_using_provider_async（常见 API）
         if hasattr(self.context, "get_using_provider_async"):
@@ -2622,6 +2637,98 @@ class MessageGenerator:
         manager = getattr(self.context, "provider_manager", None)
         return isinstance(getattr(manager, "inst_map", None), dict)
 
+    def _strict_designated(self) -> bool:
+        """配了专供却取不到时是否坚持「本轮不发」（默认 False = 回退会话默认）。"""
+        try:
+            return bool(getattr(self.cfg, "strict_proactive_provider", False))
+        except Exception:
+            return False
+
+    def _designated_ids_text(self) -> str:
+        """面板上配的专供 ID 拼成一行，给 warning / 状态页用。"""
+        try:
+            ids = [
+                str(x)
+                for x in (getattr(self.cfg, "proactive_provider_ids", ()) or ())
+            ]
+        except Exception:
+            ids = []
+        return " → ".join(ids) if ids else "（空）"
+
+    def proactive_provider_health(self) -> Dict[str, Any]:
+        """主动消息专用模型的体检结果（给 engine 状态页用，**不抛异常**）。
+
+        以前状态页只回显配置的 ID，不校验能不能解析（审核 P3-10）：ID 打错时
+        面板写着「主动消息专用 → xxx」，实际行为却是「本轮不发 / 回退会话默认」，
+        用户看到的事实是错的。这里一次算出「配了几个、能解析几个」，由调用方渲染。
+
+        Returns:
+            dict:
+            - configured (bool): 面板是否配了专供模型（proactive_provider_ids 非空）
+            - resolvable (int): 当前实例能解析出的个数（即 usable）
+            - total (int): 配置的 ID 总数
+            - ids (list[str]): 配置的 ID 列表副本
+            - strict (bool): strict_proactive_provider 当前值
+            - detail (str): 一行可直接嵌状态页的中文文案（无换行）
+        """
+        ids: List[str] = []
+        try:
+            raw = getattr(self.cfg, "proactive_provider_ids", ()) or ()
+            ids = [str(x) for x in raw]
+        except Exception:
+            ids = []
+        total = len(ids)
+        configured = total > 0
+        strict = self._strict_designated()
+
+        resolvable = 0
+        if configured:
+            getter = getattr(self.context, "get_provider_by_id", None)
+            inst_map: Dict[str, Any] = {}
+            if not callable(getter):
+                manager = getattr(self.context, "provider_manager", None)
+                candidate = getattr(manager, "inst_map", None) if manager is not None else None
+                if isinstance(candidate, dict):
+                    inst_map = candidate
+            for pid in ids:
+                try:
+                    provider = getter(pid) if callable(getter) else inst_map.get(pid)
+                except Exception:
+                    provider = None
+                if provider is not None:
+                    resolvable += 1
+
+        if not configured:
+            detail = "模型：未指定专用模型，跟着当前会话的 provider 走"
+        elif not self._can_resolve_by_id():
+            detail = (
+                "⚠️ 模型：这个 AstrBot 版本没有按 ID 取 provider 的能力，"
+                "专供模型不可用，跟随当前会话的模型"
+            )
+        elif resolvable:
+            detail = "模型：主动消息专用 → " + " → ".join(ids) + f"（{resolvable}/{total} 可用）"
+            if strict:
+                detail += "；取不到就本轮不发"
+        elif strict:
+            detail = (
+                f"⚠️ 模型：专供模型 {resolvable}/{total} 可解析，"
+                "严格模式：本轮不主动开口"
+            )
+        else:
+            detail = (
+                f"⚠️ 模型：专供模型 {resolvable}/{total} 可解析，"
+                "已回退跟随当前会话的模型（要坚决不发请打开 strict_proactive_provider）"
+            )
+
+        return {
+            "configured": configured,
+            "resolvable": resolvable,
+            "total": total,
+            "ids": ids,
+            "strict": strict,
+            "detail": detail,
+        }
+
     async def _get_designated_provider(self) -> Optional[Any]:
         """按面板配的顺序取第一个能用的专供 provider。没配返回 None。
 
@@ -2642,11 +2749,13 @@ class MessageGenerator:
             manager = getattr(self.context, "provider_manager", None)
             inst_map = getattr(manager, "inst_map", None) if manager is not None else None
             if not isinstance(inst_map, dict):
-                logger.warning(
-                    "[autonomous_social] 这个 AstrBot 版本没有 get_provider_by_id / "
-                    "provider_manager.inst_map，无法按 ID 取主动专用模型；"
-                    "已退回跟着当前会话的模型走。要启用专用模型请升级 AstrBot。"
-                )
+                if throttle.allow("provider.designated.unsupported"):
+                    logger.warning(
+                        "[autonomous_social] 这个 AstrBot 版本没有 get_provider_by_id / "
+                        "provider_manager.inst_map，无法按 ID 取主动专用模型；"
+                        "已退回跟着当前会话的模型走。要启用专用模型请升级 AstrBot。"
+                        + throttle.summary("provider.designated.unsupported")
+                    )
                 return None
 
         for pid in getattr(self.cfg, "proactive_provider_ids", ()) or ():

@@ -11,3 +11,7 @@ venv/
 state.json
 state.*.json
 *.log
+
+# 测试/调试残留目录（不得进发行包）
+tmp*/
+.tmp*/

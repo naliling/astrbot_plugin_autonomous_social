@@ -1,4 +1,4 @@
-"""v1.28.5：主动消息可以指定专用模型。
+"""v1.28.5：主动消息可以指定专用模型（v2.0.0 改默认 + 增加严格开关）。
 
 ## 为什么
 
@@ -6,18 +6,21 @@
 （`get_using_provider(umo)`）——群里换个模型，她主动找你说话的质量也跟着变。
 而主动消息恰恰是最不该省的那一次：那是她**自己想起来**要说什么。
 
-## 规矩（用户原话）
+## 规矩（v2.0.0 起）
 
-- 「只要是这个插件就用专模型」——1:1 主动、群聊心流、破冰、起话头全走它；
-- 「指定的就要管它」——配了却拿不到就**本轮不发**，不退默认、不重试；
-- provider ID 列表，按顺序试到第一个能用的即止。
+- 默认 **空**：不指定专供，跟着当前会话的模型走；
+  （v1.28.5 的默认是作者自己的三个 provider ID——标准安装一个都解析不到，
+  所有主动消息静默全停，审核 P1-2 发布阻断项。）
+- 想用强模型：面板上显式填 provider ID 列表，按顺序试到第一个能用的即止；
+- 配了却一个都取不到：默认**回退会话模型 + 一次性 warning**；
+  打开 `strict_proactive_provider` 才保留「本轮不发、等下一轮」的旧行为。
 
 ## 本文件盯的
 
 1. 列表解析：list / 逗号文本 / 分号 / 换行都认，去重保序，非字符串跳过；
-2. 取得到就走它，取不到就本轮不发（不偷用会话默认）；
-3. **默认就带值**（「只要是这个插件就用专模型」），老配置读进来也兜到默认链；
-4. schema / dataclass / README 三处默认值一致，且面板描述写着「脑子/思考好的」。
+2. 默认值：`{}` → 空链（跟随会话），schema 与 dataclass 一致；
+3. 取得到就走它；取不到：默认回退会话模型，strict 才本轮不发；
+4. schema / README 文档口径一致（面板说明、默认值、strict 开关）。
 """
 
 from __future__ import annotations
@@ -92,27 +95,25 @@ class ParseTest(unittest.TestCase):
         """None 不能变成 "None"——那会每轮都去解析一个不存在的 provider。"""
         self.assertEqual(_provider_id_list(["a", None, 3, {"x": 1}, "b"]), ["a", "b"])
 
-    def test_none_means_missing_falls_back_to_default(self):
-        """None = 键不存在（老配置）→ 兜到默认链，不是空。"""
+    def test_none_means_missing_follows_session(self):
+        """v2.0.0：None = 键不存在（老配置）→ 空链 = 跟随会话默认。
+
+        v1.28.5 这里兜到作者私有 ID 链，正是 P1-2 的根因。
+        """
+        self.assertEqual(_provider_id_list(None), [])
         self.assertEqual(_provider_id_list(None), list(DEFAULT_PROACTIVE_PROVIDERS))
 
     def test_explicit_empty_stays_empty(self):
-        """`[""]` / `["  "]` / `""` 是用户真的清空了——按空处理，调用方据此走旧行为。"""
+        """`[""]` / `["  "]` / `""` / `[]` 都是「不指定专供」。"""
         self.assertEqual(_provider_id_list([""]), [])
         self.assertEqual(_provider_id_list(["   "]), [])
         self.assertEqual(_provider_id_list(""), [])
         self.assertEqual(_provider_id_list([]), [])
 
-    def test_wrong_type_falls_back_to_default(self):
-        """类型错（数字/字典）是意外，不是「用户清空了」——兜回默认链。"""
-        self.assertEqual(_provider_id_list(42), list(DEFAULT_PROACTIVE_PROVIDERS))
-        self.assertEqual(_provider_id_list({"a": 1}), list(DEFAULT_PROACTIVE_PROVIDERS))
-
-    def test_explicit_empty_stays_empty(self):
-        """`[""]` / `["  "]` 是用户真的清空了——按空处理，调用方据此走旧行为。"""
-        self.assertEqual(_provider_id_list([""]), [])
-        self.assertEqual(_provider_id_list(["   "]), [])
-        self.assertEqual(_provider_id_list(""), [])
+    def test_wrong_type_degrades_to_empty(self):
+        """类型错（数字/字典）是「没配明白」→ 与缺省同口径。"""
+        self.assertEqual(_provider_id_list(42), [])
+        self.assertEqual(_provider_id_list({"a": 1}), [])
 
     def test_capped(self):
         got = _provider_id_list([f"p{i}" for i in range(50)])
@@ -124,31 +125,31 @@ class ParseTest(unittest.TestCase):
 
 
 class DefaultTest(unittest.TestCase):
-    def test_default_is_the_thinking_chain(self):
-        """默认值在**实例**上：`field(default_factory=...)` 是类级 sentinel，
-        dataclass 装饰后不会在类上留同名属性——断言类属性会假失败。
+    def test_default_chain_is_empty(self):
+        """v2.0.0（P1-2）：默认**空** = 跟随当前会话模型。
 
-        默认**不是空**：「只要是这个插件就用专模型」。写成空等于这个功能
-        装上是关的，那句话白说。
+        旧默认是作者自己的三个 provider ID；标准安装解析不到 → 主动消息全停。
         """
-        self.assertEqual(
-            SocialConfig.from_astrbot({}).proactive_provider_ids,
-            list(DEFAULT_PROACTIVE_PROVIDERS),
-        )
+        self.assertEqual(tuple(DEFAULT_PROACTIVE_PROVIDERS), ())
+        self.assertEqual(SocialConfig.from_astrbot({}).proactive_provider_ids, [])
 
     def test_schema_default_matches(self):
         import json
         schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-        self.assertEqual(schema["proactive_provider_ids"]["default"],
-                         list(DEFAULT_PROACTIVE_PROVIDERS))
+        self.assertEqual(schema["proactive_provider_ids"]["default"], [])
         self.assertEqual(schema["proactive_provider_ids"]["type"], "list")
 
-    def test_schema_says_thinking_model(self):
-        """面板那一栏要写着「脑子/思考好的」——那是用户的原话。"""
+    def test_schema_documents_follow_session_and_strict(self):
+        """面板说明必须写清：默认跟随会话；取不到默认回退，strict 才本轮不发。"""
         import json
         schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
-        self.assertIn("脑子/思考好的", schema["proactive_provider_ids"]["description"])
-        self.assertIn("脑子/思考好的", schema["proactive_provider_ids"]["hint"])
+        spec = schema["proactive_provider_ids"]
+        text = spec["description"] + spec["hint"]
+        self.assertIn("跟着当前会话", text)
+        self.assertIn("回退跟随会话", text)
+        self.assertIn("strict_proactive_provider", text)
+        self.assertEqual(schema["strict_proactive_provider"]["type"], "bool")
+        self.assertFalse(schema["strict_proactive_provider"]["default"])
 
     def test_from_astrbot_reads_it(self):
         cfg = SocialConfig.from_astrbot({"proactive_provider_ids": ["a", "b"]})
@@ -158,85 +159,85 @@ class DefaultTest(unittest.TestCase):
         cfg = SocialConfig.from_astrbot({"proactive_provider_ids": "a,b"})
         self.assertEqual(cfg.proactive_provider_ids, ["a", "b"])
 
-    def test_from_astrbot_missing_key_falls_back_to_default(self):
-        """老配置里这一项是空的（装这个版本之前根本没有它）。
-
-        AstrBot 只补缺、不覆盖已存在的键，所以不在这里兜一手，
-        老用户升上来还是空的——那句话又白说。
-        """
+    def test_from_astrbot_missing_key_follows_session(self):
+        """老配置里这一项是空的（装这个版本之前根本没有它）→ 跟随会话默认。"""
         cfg = SocialConfig.from_astrbot({})
-        self.assertEqual(cfg.proactive_provider_ids, list(DEFAULT_PROACTIVE_PROVIDERS))
+        self.assertEqual(cfg.proactive_provider_ids, [])
 
-    def test_from_astrbot_empty_list_disables_the_feature(self):
-        """`[]` 是用户在面板上清空了多选下拉 → 关掉功能，回旧行为。
-
-        与「键不存在」区分：那个才是缺省，兜到默认链。空列表是明确的选择。
-        """
+    def test_from_astrbot_empty_list_follows_session(self):
         cfg = SocialConfig.from_astrbot({"proactive_provider_ids": []})
         self.assertEqual(cfg.proactive_provider_ids, [])
 
-    def test_from_astrbot_bad_value_falls_back_to_default(self):
+    def test_from_astrbot_bad_value_degrades_to_empty(self):
         cfg = SocialConfig.from_astrbot({"proactive_provider_ids": 42})
-        self.assertEqual(cfg.proactive_provider_ids, list(DEFAULT_PROACTIVE_PROVIDERS))
-
-    def test_blank_strings_disable_the_feature(self):
-        """`[""]` / `["  "]` 是「真的清空了」→ 空，调用方据此走旧行为。"""
-        cfg = SocialConfig.from_astrbot({"proactive_provider_ids": [""]})
         self.assertEqual(cfg.proactive_provider_ids, [])
+
+    def test_strict_default_off_and_reads_string(self):
+        self.assertFalse(SocialConfig.from_astrbot({}).strict_proactive_provider)
+        self.assertTrue(
+            SocialConfig.from_astrbot({"strict_proactive_provider": "true"}).strict_proactive_provider
+        )
+        self.assertFalse(
+            SocialConfig.from_astrbot({"strict_proactive_provider": "false"}).strict_proactive_provider
+        )
 
 
 class _Ctx:
-    def __init__(self, ids):
-        self._ids = ids
+    def __init__(self, ids, session_provider="session:default"):
+        self._ids = set(ids)
+        self.session_provider = session_provider
+        self.session_calls = []
 
     def get_provider_by_id(self, pid):
         return f"provider:{pid}" if pid in self._ids else None
+
+    async def get_using_provider_async(self, umo=None):
+        self.session_calls.append(umo)
+        return self.session_provider
 
 
 class GetProviderTest(unittest.TestCase):
     """真调 `MessageGenerator._get_provider`，不是调私有解析。"""
 
-    def _run(self, ids, available):
-        import asyncio
-
+    def _gen(self, ids, available, strict=None, ctx=None):
         from social.generator import MessageGenerator
 
-        cfg = SocialConfig.from_astrbot({"proactive_provider_ids": ids})
-        gen = MessageGenerator(context=_Ctx(available), config=cfg)
+        raw = {"proactive_provider_ids": ids}
+        if strict is not None:
+            raw["strict_proactive_provider"] = strict
+        cfg = SocialConfig.from_astrbot(raw)
+        context = ctx or _Ctx(available)
+        return MessageGenerator(context=context, config=cfg), context
+
+    def _run(self, ids, available, strict=None, ctx=None):
+        gen, _ctx = self._gen(ids, available, strict=strict, ctx=ctx)
         return asyncio.run(gen._get_provider("umo:1"))
 
     def test_uses_first_available(self):
-        self.assertEqual(self._run(["a", "b"], {"a": "P:a", "b": "P:b"}), "provider:a")
+        self.assertEqual(self._run(["a", "b"], {"a"}), "provider:a")
 
     def test_falls_through_to_second(self):
-        self.assertEqual(self._run(["a", "b"], {"b": "P:b"}), "provider:b")
+        self.assertEqual(self._run(["a", "b"], {"b"}), "provider:b")
 
-    def test_none_available_returns_none(self):
-        """配了却拿不到 → None（调用方本轮不发）。绝不能用会话默认。"""
-        self.assertIsNone(self._run(["a", "b"], set()))
+    def test_none_available_falls_back_to_session_by_default(self):
+        """v2.0.0：配了却全取不到 → 回退会话模型（不再是静默全停）。"""
+        self.assertEqual(self._run(["a", "b"], set()), "session:default")
 
-    def test_empty_list_falls_back_to_context(self):
-        """显式清空 = 关掉这个功能，回旧行为跟着会话走。
+    def test_none_available_strict_returns_none(self):
+        """strict=True 保留 v1.28.5「本轮不发」。"""
+        self.assertIsNone(self._run(["a", "b"], set(), strict=True))
 
-        注意：`from_astrbot({})` **不会**清空（它会兜到默认链）；
-        这里传 `[""]` 才是「用户真的清空了」。
-        """
-        import asyncio
-
-        from social.generator import MessageGenerator
-
-        cfg = SocialConfig.from_astrbot({"proactive_provider_ids": [""]})
-        gen = MessageGenerator(context=_Ctx(set()), config=cfg)
-        # context 什么都不给 → None（旧行为：取不到就不发）
-        self.assertIsNone(asyncio.run(gen._get_provider("umo:1")))
+    def test_empty_list_follows_session(self):
+        """空链 = 不指定专供：直接跟会话走。"""
+        gen, ctx = self._gen([], set())
+        self.assertEqual(asyncio.run(gen._get_provider("umo:1")), "session:default")
+        self.assertEqual(len(ctx.session_calls), 1)
 
     def test_partial_availability(self):
-        self.assertEqual(self._run(["a", "b", "c"], {"c": "P:c"}), "provider:c")
+        self.assertEqual(self._run(["a", "b", "c"], {"c"}), "provider:c")
 
     def test_provider_manager_map_fallback(self):
         """没有 get_provider_by_id 时，试 provider_manager.inst_map。"""
-        import asyncio
-
         from social.generator import MessageGenerator
 
         class _Mgr:
@@ -256,10 +257,11 @@ class SchemaAndReadmeTest(unittest.TestCase):
         self.assertIn("proactive_provider_ids", text)
         self.assertIn("主动消息专用模型", text)
 
-    def test_readme_states_no_fallback(self):
-        """README 必须写清「不退默认、不重试」——那是这个功能的核心取舍。"""
+    def test_readme_documents_follow_session_and_strict(self):
+        """README 必须写清 v2.0.0 的新默认与新开关，不然用户以为还是旧行为。"""
         text = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("本轮不主动开口", text)
+        self.assertIn("strict_proactive_provider", text)
+        self.assertIn("跟随当前会话", text)
 
 
 if __name__ == "__main__":

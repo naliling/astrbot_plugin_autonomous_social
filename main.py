@@ -177,7 +177,9 @@ class AutonomousSocial(Star):
             except Exception:
                 pass
 
-        # 方式2: 从 context 获取（新版 AstrBot）
+        # 方式2: 从 context 获取（预留：AstrBot 4.29.3 的 Context 已无此方法，
+        # core/star/base.py 也不再提供；保留 hasattr 分支只为兼容自定义/旧版 Context）。
+        # 正常安装不会走到这里，真正的兜底是方式1的 get_astrbot_data_path()。
         try:
             if hasattr(self.context, "get_plugin_data_dir"):
                 path = self.context.get_plugin_data_dir()
@@ -200,12 +202,14 @@ class AutonomousSocial(Star):
     # ─── 生命周期 ───────────────────────────────────────
 
     async def initialize(self):
-        """插件初始化（旧版生命周期钩子，兼容）。"""
+        """插件初始化：启动引擎与后台任务。
+
+        AstrBot 4.29.3 只调用 initialize()/terminate()（core/star/base.py 的
+        Star 基类），旧版曾额外声明同义的 on_start()/on_stop()，但框架全树没有
+        任何调用点（审核 P3-01）——已删除，避免维护者误以为有两条生命周期路径。
+        """
         await self._start_engine()
 
-    async def on_start(self):
-        """插件启动（新版生命周期钩子）。"""
-        await self._start_engine()
 
     async def _start_engine(self):
         """启动社交引擎和后台任务。"""
@@ -644,11 +648,7 @@ class AutonomousSocial(Star):
     # ─── 停止清理 ───────────────────────────────────────
 
     async def terminate(self):
-        """插件停止（旧版生命周期钩子，兼容）。"""
-        await self._stop_engine()
-
-    async def on_stop(self):
-        """插件停止（新版生命周期钩子）。"""
+        """插件停止：停掉引擎并清理后台任务（框架唯一的停止入口）。"""
         await self._stop_engine()
 
     async def _stop_engine(self):

@@ -35,9 +35,11 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _HERE = Path(__file__).resolve().parent
 if (_HERE.parent / "_conf_schema.json").is_file():
@@ -62,6 +64,7 @@ def _install_stub() -> None:
 _install_stub()
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+from social import core_bridge as core_bridge_module  # noqa: E402
 from social import core_facade  # noqa: E402
 from social.config import SocialConfig  # noqa: E402
 from social.core_bridge import CoreBridge  # noqa: E402
@@ -744,6 +747,147 @@ class FacadeBriefWrapperTest(unittest.TestCase):
 
         self.assertEqual(core_facade.capabilities(Boom()), [])
         self.assertFalse(core_facade.has_capability(Boom(), "user"))
+
+
+# ─── 7. 契约握手校验（P2-13：schema / capabilities / fields_hash）──────
+#
+# Core 在契约里导出握手三键，本意是让社交层把「猜对面版本」变成「校验结构」
+# （core/humanoid/link.py 注释原文：只告警 + 降级，不抛错）。可 social v1.28.17
+# 全仓对这三个键零命中——结构性破坏仍然静默。这里钉住：读、校验、一次性告警、
+# 标记降级，但**绝不**因为握手不过就让读取变空或抛异常。
+
+CAPABILITIES = [
+    "body", "feelings", "form", "activity", "day", "ongoing", "routine",
+    "dreams", "wake", "event", "identity", "outfit",
+]
+
+
+def _handshake_contract(**overrides) -> dict:
+    contract = {
+        "v": 2,
+        "generated_at": time.time(),
+        "schema": "humanoid.contract/2",
+        "capabilities": list(CAPABILITIES),
+        "body": {"energy": 60.0},
+        "day": {"doing": "写报告", "done": ["开会"]},
+        "ongoing": ["整理笔记"],
+        "identity": {"char_name": "小娜"},
+    }
+    contract.update(overrides)
+    return contract
+
+
+class ContractHandshakeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.bridge = CoreBridge("bridge", None)
+
+    def _view(self, contract):
+        return self.bridge._build_self_view({"contract": contract}, "b1")
+
+    def test_valid_handshake_passes(self):
+        contract = _handshake_contract()
+        contract["fields_hash"] = self.bridge._fields_hash(contract)
+        got = self._view(contract)
+        self.assertEqual(
+            got["contract_handshake"], {"checked": True, "ok": True, "problems": []}
+        )
+        self.assertEqual(got["day"]["doing"], "写报告")
+
+    def test_v1_contract_without_handshake_keys_is_unchecked(self):
+        """旧 Core 没有这三键：不占视图字段、不告警（与加机制之前逐字等价）。"""
+        got = self._view({"v": 1, "day": {"doing": "写报告"}})
+        self.assertNotIn("contract_handshake", got)
+        self.assertEqual(got["day"]["doing"], "写报告")
+
+    def test_schema_mismatch_warns_once_and_degrades(self):
+        contract = _handshake_contract(schema="humanoid.contract/1")  # v=2 → 不一致
+        with patch.object(core_bridge_module.logger, "warning") as warned:
+            first = self._view(contract)
+            second = self._view(contract)
+        problems = first["contract_handshake"]["problems"]
+        self.assertTrue(any("schema" in p for p in problems), problems)
+        self.assertFalse(first["contract_handshake"]["ok"])
+        self.assertEqual(first["contract_handshake"], second["contract_handshake"])
+        handshake_warnings = [
+            call for call in warned.call_args_list
+            if call.args and "握手校验" in str(call.args[0])
+        ]
+        self.assertEqual(len(handshake_warnings), 1, "同一次结构漂移被重复告警")
+        # 降级但继续读：已知字段照常给
+        self.assertEqual(first["day"]["doing"], "写报告")
+
+    def test_unknown_schema_warns(self):
+        problems = self.bridge._handshake_problems(_handshake_contract(schema="weird"))
+        self.assertTrue(any("schema 不认识" in p for p in problems))
+
+    def test_missing_capability_warns(self):
+        caps = [c for c in CAPABILITIES if c not in ("identity", "outfit", "day")]
+        problems = self.bridge._handshake_problems(
+            _handshake_contract(capabilities=caps)
+        )
+        self.assertTrue(any("capabilities 缺" in p for p in problems), problems)
+        self.assertTrue(any("identity" in p for p in problems))
+
+    def test_capabilities_wrong_shape_warns(self):
+        problems = self.bridge._handshake_problems(
+            _handshake_contract(capabilities="body, day")
+        )
+        self.assertTrue(any("形状不对" in p for p in problems))
+
+    def test_fields_hash_mismatch_warns(self):
+        problems = self.bridge._handshake_problems(
+            _handshake_contract(fields_hash="sha256:deadbeef")
+        )
+        self.assertTrue(any("fields_hash 与结构不一致" in p for p in problems), problems)
+
+    def test_fields_hash_bad_format_warns(self):
+        for bad in (123, [1, 2], {"x": 1}, "not-a-sha"):
+            with self.subTest(bad=bad):
+                problems = self.bridge._handshake_problems(
+                    _handshake_contract(fields_hash=bad)
+                )
+                self.assertTrue(any("fields_hash 格式" in p for p in problems), problems)
+
+    def test_fields_hash_recompute_ignores_its_own_field(self):
+        contract = _handshake_contract()
+        first = self.bridge._fields_hash(contract)
+        contract["fields_hash"] = "sha256:whatever"
+        self.assertEqual(self.bridge._fields_hash(contract), first)
+
+    def test_handshake_never_raises_on_dirty_types(self):
+        for contract in (
+            _handshake_contract(schema=123, capabilities={"x": 1}, fields_hash=[1]),
+            _handshake_contract(schema=None, capabilities=None, fields_hash=None),
+            _handshake_contract(schema="", capabilities=[], fields_hash=""),
+        ):
+            with self.subTest(contract=contract):
+                got = self._view(contract)
+                # None 视为「没给」；给了但形状不对 → 标记问题但不抛
+                if "contract_handshake" in got:
+                    self.assertIn("checked", got["contract_handshake"])
+
+    def test_warning_rearms_after_the_contract_recovers(self):
+        bad = _handshake_contract(schema="humanoid.contract/1")
+        good = _handshake_contract()
+        good["fields_hash"] = self.bridge._fields_hash(good)
+        with patch.object(core_bridge_module.logger, "warning") as warned:
+            self._view(bad)
+            self._view(good)   # 结构恢复 → 重新武装一次性告警
+            self._view(bad)
+        handshake_warnings = [
+            call for call in warned.call_args_list
+            if call.args and "握手校验" in str(call.args[0])
+        ]
+        self.assertEqual(len(handshake_warnings), 2, "恢复后再次漂移应当还能提示")
+
+    def test_three_problems_are_all_reported(self):
+        contract = _handshake_contract(
+            schema="humanoid.contract/1",
+            capabilities=["body"],
+            fields_hash="sha256:deadbeef",
+        )
+        problems = self.bridge._handshake_problems(contract)
+        self.assertGreaterEqual(len(problems), 3, problems)
 
 
 if __name__ == "__main__":

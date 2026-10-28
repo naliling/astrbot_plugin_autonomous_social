@@ -259,7 +259,7 @@ class BodyEnergyGate(unittest.TestCase):
         import os
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from sim_autonomous_social import FakePlatform, Sim, script_normal
+        from _sim_support import FakePlatform, Sim, script_normal
         s = Sim("energy-gate", llm_script=script_normal, send_script=FakePlatform.OK,
                 days=0.01)
         s.engine._night_windows = {"bot1": (0, 0)}

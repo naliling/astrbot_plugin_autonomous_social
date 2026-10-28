@@ -1,6 +1,6 @@
 """真实使用仿真：把插件当成真人在用好几天，逐条读她发出来的话。
 
-与 `sim_autonomous_social.py` 的区别：那个测的是**故障与指标**（请求放大、熔断、
+与 `_sim_support.py` 的区别：那个测的是**故障与指标**（请求放大、熔断、
 日志刷屏）。这个测的是**用起来像不像人**——会不会说人话、会不会重复、群聊里
 接话有没有接对、用户冷了她会不会继续刷。所以它：
 
@@ -25,7 +25,7 @@ from pathlib import Path
 
 # 复用主仿真基建（假 LLM / 假平台 / 状态构造）
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("_sim_base", HERE / "sim_autonomous_social.py")
+_spec = importlib.util.spec_from_file_location("_sim_base", HERE / "_sim_support.py")
 _base = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_base)
 

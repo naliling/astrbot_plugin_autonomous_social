@@ -88,6 +88,66 @@ def _safe_float(value: Any, default: Any, key: str = "") -> float:
     return fallback if fallback is not None else 0.0
 
 
+# 手写 JSON / 旧面板把布尔项存成字符串时，「false」这个字符串本身是**真值**——
+# `bool("false")` 得到 True。数字项有 _safe_int/_safe_float 防这一类，
+# 布尔项以前没有，于是把 enabled 写成 "false" 反而等于打开（审核 P3-07）。
+_BOOL_TRUE_TEXT = frozenset({"1", "true", "yes", "on", "y", "t"})
+_BOOL_FALSE_TEXT = frozenset({"0", "false", "no", "off", "n", "f"})
+
+
+def _as_bool(value: Any, default: bool = False, key: str = "") -> bool:
+    """安全取布尔配置：字符串 "false"/"0"/"no"/"off" 认成 False，绝不反着来。
+
+    规则：
+    - 布尔、数字原样按真值处理（0/0.0 → False，其余数字 → True，与旧行为一致）；
+    - 字符串先 strip + 小写，"true/1/yes/on/y/t" → True，"false/0/no/off/n/f" → False；
+    - None → default（键缺失时就是 schema 默认值）；
+    - 其它认不出的字符串/类型 → 告警一次并退回 default，**绝不抛异常**
+      （配置构造抛穿会让插件永久加载不了，见 _safe_int 的同类教训）。
+
+    Args:
+        value: 原始配置值
+        default: 认不出时的兜底值（通常是 schema 默认值）
+        key: 配置项名，仅用于告警文案与去重
+
+    Returns:
+        bool
+    """
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        # 数字原样：0 → False，1 → True。旧行为 `bool(0)` 也是 False，不改变语义。
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return bool(default)
+        if text in _BOOL_TRUE_TEXT:
+            return True
+        if text in _BOOL_FALSE_TEXT:
+            return False
+        # 数字形态的字符串（"2"、"0.0"）沿用「数字原样」的老语义：
+        # 非 0 为真、0 为假，而不是当成看不懂的值退回默认。
+        try:
+            return bool(float(text))
+        except (TypeError, ValueError):
+            pass
+        _warn_config_once(
+            key or "<unknown>",
+            f"配置项 {key} 的值 {value!r} 不是有效布尔值（true/false/1/0/yes/no/on/off），"
+            f"已按默认值 {bool(default)!r} 处理；请在 AstrBot 面板里改正（插件不会替你改配置）",
+        )
+        return bool(default)
+    _warn_config_once(
+        key or "<unknown>",
+        f"配置项 {key} 的值 {value!r} 不是有效布尔值，已按默认值 {bool(default)!r} 处理；"
+        "请在 AstrBot 面板里改正（插件不会替你改配置）",
+    )
+    return bool(default)
+
+
 def _fsync_dir(path: str) -> None:
     """fsync 目录项，保证 os.replace 的结果真的落盘。
 
@@ -149,24 +209,17 @@ VALID_FACADE_MODES = {"auto", "on", "off"}
 # 粘一大串进去时，每一轮心跳都要按顺序试到能用为止，那会把主动消息全堵死。
 PROACTIVE_PROVIDER_MAX = 8
 
-# 默认的主动消息模型链。**「只要是这个插件就用专模型」**——所以默认就写死，
-# 装上即生效，不需要装完再去面板选一次。写成空等于这个功能装上是关的，
-# 那句话白说。
+# 默认的主动消息模型链：**空**——不指定专供，跟随当前会话的模型走。
 #
-# 三条的顺序与取舍：
-#   · gpt-6.1-sol 打头——手上最强的，主动消息是她**自己想起来**要说什么，
-#     最该用好模型（用户原话：「描述才要给到强一点的模型用于生成」）；
-#   · gpt-6-sol 兜第二——同族次新，6.1 限流时顶上，说话风格不会跳；
-#   · gemini-3.5-flash 收尾——换厂商，前两个同时限流时还有活路。
-# 不进来：luna / 5.6 / grok / deepseek / agnes / 所有 lite 与 preview。
-# 这条链是「强模型用于生成」，不是「能跑就行」。
+# v2.0.0 修正（审核 P1-2，发布阻断）：旧默认写死作者自己在用的三个 provider ID
+# （openai/gpt-6.1-sol 等）。AstrBot 的 provider ID 是用户在面板里起的名字，
+# 不是模型名——标准安装不可能出现这三个 ID，于是「装上就全静默」：所有主动消息
+# （1:1 / 群心流 / 破冰 / 起话头）每一轮都按「配了专供却取不到 → 本轮不发」处理。
 #
-# 面板上改它照旧生效；清空 = 关掉这个功能，回旧行为跟着会话走。
-DEFAULT_PROACTIVE_PROVIDERS: tuple = (
-    "openai/gpt-6.1-sol",
-    "openai/gpt-6-sol",
-    "gemini/gemini-3.5-flash",
-)
+# 现在默认空 = 不指定专供，跟着会话默认模型走，装上即能说话；想用强模型请到面板
+# 显式选（那本来就该是用户的决定，不该由默认值替他做）。
+# 老配置里已经显式填了 ID 的行为完全不变：仍然按顺序试它。
+DEFAULT_PROACTIVE_PROVIDERS: tuple = ()
 
 
 def _provider_id_list(raw: Any) -> list:
@@ -183,8 +236,9 @@ def _provider_id_list(raw: Any) -> list:
     `test_every_documented_default_is_the_schema_default` 逐项比相等。
     """
     if raw is None:
-        # 键不存在（老配置里本来就没有这一项）→ 兜到默认链。
-        # 「只要是这个插件就用专模型」——缺省不能等于关掉。
+        # 键不存在（老配置里本来就没有这一项）→ 空 = 跟随会话默认。
+        # 旧版这里兜到作者私有 ID 链，正是 P1-2 的根因：标准安装一个都解析不到，
+        # 主动消息全停。缺省必须等于「不指定」，才可能装上就说话。
         return list(DEFAULT_PROACTIVE_PROVIDERS)
     if isinstance(raw, str):
         parts = re.split(r"[,，;；\n\r]+", raw)
@@ -196,11 +250,11 @@ def _provider_id_list(raw: Any) -> list:
             # 列表里混进来的非字符串直接丢，不 str()——见上面
     elif raw:
         # 非 None、非字符串、非列表：类型就不对（数字、字典、布尔）。
-        # 那是意外而不是「用户清空了」——兜回默认链，不静默关掉功能。
+        # 那是「没配明白」，不是「用户点名要这几个」——与缺省同口径（空 = 跟随会话）。
         return list(DEFAULT_PROACTIVE_PROVIDERS)
     else:
-        # 显式的空值（`[]` / `""` / `0` / `False`）：用户主动清空 = 关掉这个功能，
-        # 回旧行为跟着会话走。与上面的 None 区别对待：一个是缺省，一个是选择。
+        # 显式的空值（`[]` / `""` / `0` / `False`）：同样是「不指定专供」，
+        # 跟会话默认走。v2.0.0 起「缺省」与「显式清空」行为一致，不再分成两套。
         return []
 
     out: list = []
@@ -661,30 +715,31 @@ class SocialConfig:
     #   off       ——完全不碰门面，与 1.27.38 逐字一致（出问题时的逃生门）。
     use_core_facade: str = "auto"
 
-    # ── 主动消息专用模型（v1.28.5）─────────────────────────────
+    # ── 主动消息专用模型（v1.28.5；v2.0.0 改默认）─────────────────
     #
     # 以前这个插件的每一次模型调用都跟着**当前会话的** provider 走
-    # （`get_using_provider(umo)`）——群里换个模型，她主动找你说话的质量也跟着变，
-    # 而主动消息恰恰是最不该省的那一次：那是她**自己想起来**要说什么。
+    # （`get_using_provider(umo)`）。这里给一个 provider ID 列表，本插件所有模型
+    # 调用（1:1 主动、群聊心流、破冰、起话头）都按顺序试，第一个能用的即止。
     #
-    # 这里给一个 provider ID 列表，本插件所有模型调用（1:1 主动、群聊心流、
-    # 破冰、起话头）都按顺序试，第一个能用的即止。
+    # **默认空 = 不指定专供，跟着当前会话的模型走**（v2.0.0，审核 P1-2）：
+    # 旧默认写死了作者自己在用的三个 provider ID，而 AstrBot 的 provider ID 是
+    # 用户在面板里起的名字、不是模型名——标准安装一个都解析不到，主动消息全停。
+    # 想用强模型请在面板显式选；老配置里显式填了 ID 的照旧生效。
     #
-    # **「只要是这个插件就用专模型」**：所以默认就带值（见
-    # `DEFAULT_PROACTIVE_PROVIDERS`），装上即生效，不需要装完再去面板选一次。
-    # 默认是三个**会思考的**模型——用户原话「描述才要给到强一点的模型用于生成」，
-    # 面板上那一栏的标题也写着「脑子/思考好的」。
+    # **配了却取不到时**：
+    #   - strict_proactive_provider=False（默认）：回退跟随会话默认模型，并打一次性
+    #     warning。不这么做的话，一旦面板选的 ID 在当前环境不存在，表现就是
+    #     「插件装了、状态正常、就是永远不说话」。
+    #   - strict_proactive_provider=True：本轮不发、等下一轮。弱模型写出来的主动
+    #     消息比不发更糟，这个取舍留给坚持不降级的用户。
     #
-    # **故意不退会话默认**：配了专供模型却拿不到，本轮就不发，等下一轮
-    # （心跳 15~120 分钟，用户配的）。理由很直接——退回去等于「指定的就要管它」
-    # 这句话白写，弱模型写出来的主动消息比不发更糟。也不重试：重试只会把
-    # 一次限流拖成整轮心跳卡住。
-    #
-    # 清空 = 关掉这个功能，回旧行为跟着会话走。默认值必须是 `list` 而不是
-    # `tuple`：schema 里写的是 `[]`，而测试
+    # 默认值必须是 `list` 而不是 `tuple`：schema 里写的是 `[]`，而测试
     # `test_every_documented_default_is_the_schema_default` 逐项比
     # `getattr(cfg, key) != spec["default"]`——两者必须字面相等。
-    proactive_provider_ids: list = field(default_factory=lambda: list(DEFAULT_PROACTIVE_PROVIDERS))
+    proactive_provider_ids: list = field(default_factory=list)
+    # 「配了专供但取不到」时：False（默认）回退会话默认 + 一次性 warning；
+    # True 坚持本轮不发（v1.28.5 的旧行为）。
+    strict_proactive_provider: bool = False
 
     # 时段设置
     quiet_start: int = QUIET_START_DEFAULT
@@ -728,11 +783,13 @@ class SocialConfig:
     intimacy_cooldown_hours: int = 48
 
     # 手动触发白名单：管理面板里逐条添加的列表；留空则回退到 AstrBot 管理员（全局配置 admins_id）
-    allowed_trigger_uids: Any = None
+    # 默认 []（不是 None）：schema 的 default 也是 []，否则 AstrBot 每次加载都判定
+    # 「配置有变更」并回写 config（审核 P3-11）。
+    allowed_trigger_uids: Any = field(default_factory=list)
 
     # 关系档手动覆盖：逐条 "uid:high/mid/low"。设了的人不再按好感涨幅推算档位，
     # 直接按指定的档走（最小间隔、由头池大小、念想门槛都以它为准）。
-    tier_override: Any = None
+    tier_override: Any = field(default_factory=list)
 
     # ── 特别关心（v1.28.17）─────────────────────────────────────────
     # 名单里的人：不受关系档位的最小间隔限制、不被「她在睡 / 安静时段 / 太累」挡，
@@ -741,7 +798,7 @@ class SocialConfig:
     # 手动名单优先于自动；仍受「单独的最小间隔 + 日上限」约束，防刷屏。
     special_care_enabled: bool = True
     # 逐条 "uid"，或 "平台:uid"（平台就是 umo 的第一段，如 aiocqhttp / 娜莉灵）
-    special_care_uids: Any = None
+    special_care_uids: Any = field(default_factory=list)
     special_care_auto: bool = True
     special_care_min_affection: int = 85
     special_care_min_turns: int = 100
@@ -757,7 +814,7 @@ class SocialConfig:
     history_ingest: bool = True
     # 播种名单：没聊过、也读不到历史的人也能写进来，她攒够念头会主动找上门
     # （逐条 user_id，或 platform:user_id）；攒念头的速度按 SEED_URGE_SCALE 打折
-    seed_users: Any = None
+    seed_users: Any = field(default_factory=list)
     # seed_users 只填 user_id 时，用来拼私聊目标的平台标识（与管理面板的平台名一致）
     seed_platform: str = "aiocqhttp"
 
@@ -902,7 +959,7 @@ class SocialConfig:
     def special_care_entries(self) -> set:
         """特别关心名单归一成集合。
 
-        条目可以是纯 uid（"3881756548"），也可以是 "平台:uid"（"娜莉灵:3881756548"）。
+        条目可以是纯 uid（"100000001"），也可以是 "平台:uid"（"aiocqhttp:100000001"）。
         列表里手填时允许逗号/分号/中文逗号分隔，和面板上其它名单一个写法。
         """
         raw = self.special_care_uids
@@ -998,6 +1055,24 @@ class SocialConfig:
                 _warn_clamped(key, value, lo, hi)
             return value
 
+        def gb(key: str, hard_default: bool) -> bool:
+            """安全取布尔：手写 JSON 的 "false"/"0" 归一成 False（审核 P3-07）。
+
+            default 走 _d()：缺键时与 schema 默认一致；认不出的值告警一次后回退它。
+            """
+            default = _d(key, hard_default)
+            return _as_bool(g(key, default), default, key)
+
+        def gl(key: str, hard_default: Any) -> Any:
+            """安全取 list：缺键与显式 null 都归一成 []（审核 P3-11）。
+
+            旧配置里这几项可能是 null，也可能是逗号文本/列表——非 None 原样返回，
+            由下游的 *_entries / *_set / normalize_* 解析（它们本来就两种形态都认）。
+            """
+            default = _d(key, hard_default)
+            value = g(key, default)
+            return [] if value is None else value
+
         # 模式
         mode = str(g("mode", _d("mode",  "auto"))).lower().strip()
         if mode not in VALID_MODES:
@@ -1010,8 +1085,8 @@ class SocialConfig:
 
         # 主动消息专用模型：provider ID 列表。三种写法都认（面板里是 list，
         # 有人会粘一段逗号/分号/换行分隔的文本）。
-        # 默认值传 **None** 而不是 `()`：`_provider_id_list` 靠它区分
-        # 「键不存在（缺省 → 兜到默认链）」与「用户显式清空（→ 关掉功能）」。
+        # v2.0.0（P1-2）：默认空 = 跟随会话默认模型。传 None 给 _provider_id_list
+        # 与显式清空同一个结果（[]），老配置里显式填的 ID 依旧逐条保留。
         proactive_providers = _provider_id_list(g("proactive_provider_ids", None))
 
         # 跟进窗口必须比「多久算没声」长，否则永远落在空区间里一条也发不出
@@ -1055,7 +1130,7 @@ class SocialConfig:
             loop_max = max(loop_min + 1.0, LOOP_MAX_HOURS_DEFAULT)
 
         return cls(
-            enabled=bool(g("enabled", _d("enabled",  True))),
+            enabled=gb("enabled", True),
             mode=mode,
             activity_level=max(
                 ACTIVITY_MIN,
@@ -1078,7 +1153,7 @@ class SocialConfig:
             cross_user_repeat_hours=max(
                 0.0, min(48.0, gf("cross_user_repeat_hours", CROSS_USER_REPEAT_HOURS_DEFAULT))
             ),
-            cross_user_calibrate=bool(g("cross_user_calibrate", _d("cross_user_calibrate",  False))),
+            cross_user_calibrate=gb("cross_user_calibrate", False),
             hourly_sends_cap=max(
                 0, min(HOURLY_SENDS_CAP_MAX, gi("hourly_sends_cap", HOURLY_SENDS_CAP_DEFAULT)),
             ),
@@ -1094,9 +1169,9 @@ class SocialConfig:
                 HOUR_MIN,
                 min(HOUR_MAX, gi("quiet_end", QUIET_END_DEFAULT)),
             ),
-            private_only=bool(g("private_only", _d("private_only",  True))),
-            debug=bool(g("debug", _d("debug",  False))),
-            input_state_enabled=bool(g("input_state_enabled", _d("input_state_enabled", True))),
+            private_only=gb("private_only", True),
+            debug=gb("debug", False),
+            input_state_enabled=gb("input_state_enabled", True),
             input_state_interval_seconds=max(
                 0.1, min(10.0, gf("input_state_interval_seconds", 0.5) )
             ),
@@ -1118,7 +1193,7 @@ class SocialConfig:
             purge_inactive_user_days=max(
                 0, min(3650, gi("purge_inactive_user_days", 0))
             ),
-            weekend_boost=bool(g("weekend_boost", _d("weekend_boost",  True))),
+            weekend_boost=gb("weekend_boost", True),
             energy_threshold=max(
                 ENERGY_THRESHOLD_MIN,
                 min(ENERGY_THRESHOLD_MAX, gi("energy_threshold", ENERGY_THRESHOLD_DEFAULT)),
@@ -1130,12 +1205,12 @@ class SocialConfig:
                     gi("social_energy_threshold", SOCIAL_ENERGY_THRESHOLD_DEFAULT),
                 ),
             ),
-            adaptive_reply_rate=bool(g("adaptive_reply_rate", _d("adaptive_reply_rate",  True))),
+            adaptive_reply_rate=gb("adaptive_reply_rate", True),
             reply_window_hours=max(
                 REPLY_WINDOW_MIN,
                 min(REPLY_WINDOW_MAX, gi("reply_window_hours", REPLY_WINDOW_DEFAULT)),
             ),
-            memory_bridge_enabled=bool(g("memory_bridge_enabled", _d("memory_bridge_enabled", True))),
+            memory_bridge_enabled=gb("memory_bridge_enabled", True),
             intimacy_affection_min=max(
                 0, min(100, gi("intimacy_affection_min", 70)),
             ),
@@ -1145,11 +1220,11 @@ class SocialConfig:
             intimacy_cooldown_hours=max(
                 1, min(720, gi("intimacy_cooldown_hours", 48)),
             ),
-            allowed_trigger_uids=g("allowed_trigger_uids", _d("allowed_trigger_uids",  None)),
-            tier_override=g("tier_override", _d("tier_override",  None)),
-            special_care_enabled=bool(g("special_care_enabled", _d("special_care_enabled", True))),
-            special_care_uids=g("special_care_uids", _d("special_care_uids", None)),
-            special_care_auto=bool(g("special_care_auto", _d("special_care_auto", True))),
+            allowed_trigger_uids=gl("allowed_trigger_uids", None),
+            tier_override=gl("tier_override", None),
+            special_care_enabled=gb("special_care_enabled", True),
+            special_care_uids=gl("special_care_uids", None),
+            special_care_auto=gb("special_care_auto", True),
             special_care_min_affection=max(
                 0, min(100, gi("special_care_min_affection", 85))
             ),
@@ -1159,24 +1234,22 @@ class SocialConfig:
                 1, min(1440, gi("special_care_gap_minutes", 20))
             ),
             special_care_daily_cap=max(0, min(100, gi("special_care_daily_cap", 8))),
-            special_care_ignore_quiet=bool(
-                g("special_care_ignore_quiet", _d("special_care_ignore_quiet", True))
-            ),
-            history_ingest=bool(g("history_ingest", _d("history_ingest",  True))),
-            seed_users=g("seed_users", _d("seed_users",  None)),
+            special_care_ignore_quiet=gb("special_care_ignore_quiet", True),
+            history_ingest=gb("history_ingest", True),
+            seed_users=gl("seed_users", None),
             seed_platform=str(g("seed_platform", _d("seed_platform",  "aiocqhttp")) or "aiocqhttp").strip() or "aiocqhttp",
-            store_message_text=bool(g("store_message_text", _d("store_message_text",  DEFAULT_STORE_MESSAGE_TEXT))),
+            store_message_text=gb("store_message_text", DEFAULT_STORE_MESSAGE_TEXT),
             user_retention_days=max(
                 USER_RETENTION_MIN,
                 min(USER_RETENTION_MAX, gi("user_retention_days", USER_RETENTION_DEFAULT)),
             ),
-            allow_burst=bool(g("allow_burst", _d("allow_burst",  True))),
+            allow_burst=gb("allow_burst", True),
             max_sends_per_round=max(
                 MAX_SENDS_PER_ROUND_MIN,
                 min(MAX_SENDS_PER_ROUND_MAX, gi("max_sends_per_round", MAX_SENDS_PER_ROUND_DEFAULT)),
             ),
             batch_send_concurrency=max(1, min(10, gi("batch_send_concurrency", 3))),
-            greeting_enabled=bool(g("greeting_enabled", _d("greeting_enabled",  GREETING_ENABLED_DEFAULT))),
+            greeting_enabled=gb("greeting_enabled", GREETING_ENABLED_DEFAULT),
             greeting_morning_start=max(
                 HOUR_MIN, min(HOUR_MAX, gi("greeting_morning_start", GREETING_MORNING_START_DEFAULT))
             ),
@@ -1195,10 +1268,10 @@ class SocialConfig:
             greeting_night_end=max(
                 HOUR_MIN + 1, min(HOUR_MAX + 1, gi("greeting_night_end", GREETING_NIGHT_END_DEFAULT))
             ),
-            group_flow_enabled=bool(g("group_flow_enabled", _d("group_flow_enabled",  True))),
-            group_icebreak_enabled=bool(g("group_icebreak_enabled", _d("group_icebreak_enabled",  True))),
-            group_ref_lib_enabled=bool(g("group_ref_lib_enabled", _d("group_ref_lib_enabled",  True))),
-            group_store_message_text=bool(g("group_store_message_text", _d("group_store_message_text",  True))),
+            group_flow_enabled=gb("group_flow_enabled", True),
+            group_icebreak_enabled=gb("group_icebreak_enabled", True),
+            group_ref_lib_enabled=gb("group_ref_lib_enabled", True),
+            group_store_message_text=gb("group_store_message_text", True),
             flow_window_minutes=max(
                 FLOW_WINDOW_MIN, min(FLOW_WINDOW_MAX, gi("flow_window_minutes", FLOW_WINDOW_DEFAULT))
             ),
@@ -1226,7 +1299,7 @@ class SocialConfig:
                 ICEBREAK_DAILY_CAP_MIN,
                 min(ICEBREAK_DAILY_CAP_MAX, gi("icebreak_daily_cap", ICEBREAK_DAILY_CAP_DEFAULT)),
             ),
-            group_topic_enabled=bool(g("group_topic_enabled", _d("group_topic_enabled", True))),
+            group_topic_enabled=gb("group_topic_enabled", True),
             group_topic_gap_hours=max(
                 GROUP_TOPIC_GAP_HOURS_MIN,
                 min(GROUP_TOPIC_GAP_HOURS_MAX, gf("group_topic_gap_hours", GROUP_TOPIC_GAP_HOURS_DEFAULT)),
@@ -1235,8 +1308,8 @@ class SocialConfig:
                 GROUP_TOPIC_DAILY_CAP_MIN,
                 min(GROUP_TOPIC_DAILY_CAP_MAX, gi("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)),
             ),
-            group_mention_member=bool(g("group_mention_member", _d("group_mention_member", False))),
-            group_interject_others=bool(g("group_interject_others", _d("group_interject_others", True))),
+            group_mention_member=gb("group_mention_member", False),
+            group_interject_others=gb("group_interject_others", True),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, gi("group_stale_days", GROUP_STALE_DAYS_DEFAULT))
             ),
@@ -1274,13 +1347,13 @@ class SocialConfig:
                 SKIP_COOLDOWN_MIN,
                 min(SKIP_COOLDOWN_MAX, gi("skip_cooldown_minutes", SKIP_COOLDOWN_DEFAULT)),
             ),
-            llm_gate=bool(g("llm_gate", _d("llm_gate",  True))),
+            llm_gate=gb("llm_gate", True),
             gate_energy_floor=max(
                 0, min(100, gi("gate_energy_floor", GATE_ENERGY_FLOOR_DEFAULT))
             ),
-            respect_user_rhythm=bool(g("respect_user_rhythm", _d("respect_user_rhythm",  False))),
-            cue_followup=bool(g("cue_followup", _d("cue_followup",  True))),
-            followup_enabled=bool(g("followup_enabled", _d("followup_enabled",  True))),
+            respect_user_rhythm=gb("respect_user_rhythm", False),
+            cue_followup=gb("cue_followup", True),
+            followup_enabled=gb("followup_enabled", True),
             followup_after_minutes=followup_after,
             probe_after_minutes=probe_after,
             followup_max_minutes=followup_max,
@@ -1288,9 +1361,7 @@ class SocialConfig:
                 FOLLOWUP_COOLDOWN_MIN,
                 min(FOLLOWUP_COOLDOWN_MAX, gi("followup_cooldown_minutes", FOLLOWUP_COOLDOWN_DEFAULT)),
             ),
-            continue_enabled=bool(
-                g("continue_enabled", _d("continue_enabled", True))
-            ),
+            continue_enabled=gb("continue_enabled", True),
             continue_after_minutes=continue_after,
             continue_window_hours=continue_window_hours,
             silent_giveup_days=max(
@@ -1300,20 +1371,21 @@ class SocialConfig:
                     gi("silent_giveup_days", SILENT_GIVEUP_DAYS_DEFAULT),
                 ),
             ),
-            loop_enabled=bool(g("loop_enabled", _d("loop_enabled",  True))),
+            loop_enabled=gb("loop_enabled", True),
             loop_min_hours=loop_min,
             loop_max_hours=loop_max,
-            closer_enabled=bool(g("closer_enabled", _d("closer_enabled",  True))),
+            closer_enabled=gb("closer_enabled", True),
             closer_after_hours=max(
                 CLOSER_AFTER_MIN,
                 min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
-            track_own_replies=bool(g("track_own_replies", _d("track_own_replies",  True))),
-            use_core_clock=bool(g("use_core_clock", _d("use_core_clock",  True))),
+            track_own_replies=gb("track_own_replies", True),
+            use_core_clock=gb("use_core_clock", True),
             use_core_facade=facade_mode,
             proactive_provider_ids=proactive_providers,
-            owner_only_commands=bool(g("owner_only_commands", _d("owner_only_commands",  True))),
-            trigger_group_requires_at=bool(g("trigger_group_requires_at", _d("trigger_group_requires_at",  True))),
+            strict_proactive_provider=gb("strict_proactive_provider", False),
+            owner_only_commands=gb("owner_only_commands", True),
+            trigger_group_requires_at=gb("trigger_group_requires_at", True),
         )
 
     def in_quiet_hours(self, h: int) -> bool:

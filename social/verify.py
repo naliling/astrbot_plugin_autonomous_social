@@ -197,7 +197,7 @@ def _check_intent_leak(text: str) -> Optional[str]:
     if _NO_TARGET.match(body) and not re.search(r"你|您|TA|他|她", body):
         return "动机泄漏（整条是「表达…/抱怨…」这种描述）"
     # 「整条以说自己要说这句开头」——哪怕后面还有正文，开头那行也是元叙述。
-    # 真实记录里有一句 `想分享下此时此刻偷懒的状态，顺便勾引一下啊散。⏎(…动作…)⏎阳光晃得我心烦…`
+    # 真实记录里有一句 `想分享下此时此刻偷懒的状态，顺便勾引一下用户A。⏎(…动作…)⏎阳光晃得我心烦…`
     # 后半句是真话，但用户看到的第一行是「我想分享…顺便勾引你」，那不是话。
     head = _INTENT_HEAD_ONLY.match(raw)
     if head and not _ADDRESS.search(raw[:head.end() + 12]):
@@ -742,6 +742,13 @@ def verify_message(
     reason = _check_pressure(text)
     if reason:
         return False, reason
+    # P3-06：最后通牒/逼表态。这个检查器定义后一直没被调用（死代码）——
+    # 模型输出「到底想怎样，直说」时没有任何运行时兜底，而生成侧提示词明确要求
+    # 「不下最后通牒」。放在 `_check_pressure` 之后：「催回 + 计较没回」那种要债
+    # 已有更准的结构判据，先让它命中（同一个坏样本会得到更具体的原因）。
+    reason = _check_ultimatum(text)
+    if reason:
+        return False, reason
     reason = _check_wall(text)
     if reason:
         return False, reason
@@ -755,8 +762,13 @@ def verify_message(
 
 # 最后通牒式：把对方逼到必须给个说法。线上真实样本 `到底想怎样，直说`。
 # 只认**命令/逼问**的固定说法，不碰普通的问句——她当然可以问事情。
+#
+# 词表刻意**不含裸「直说」「说清楚」**：它们在正常口语里太常见
+# （「有话就直说，别憋着」是商量语气，不是逼人表态），做成判据会大面积误杀。
+# 审核样本 `到底想怎样，直说` 靠前半句就能命中，去掉裸词不丢这个样本。
 _ULTIMATUM = re.compile(
-    r"到底想怎样|你到底要|给个说法|把话说清楚|说清楚|别装|少来这套|直说"
+    r"到底想怎样|你到底要|给个说法|把话说清楚|少来这套"
+    r"|别装(?:了|蒜|死|傻|没事|无辜)?(?=[，。！？、,.!?;\s]|$)"
 )
 
 

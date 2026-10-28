@@ -669,7 +669,7 @@ class GroupActivityTrackingTest(unittest.TestCase):
         eng = _engine(clock)
         asyncio.run(eng._observe_group(_group_event("u1"), "第一句"))
         first = eng._group_activity_ts[("bot1", "g1")][-1]
-        clock.set(NOW - 500)  # 墙钟回拨：_time() 会钳在 NOW
+        clock.set(NOW - 100)  # 小回拨（< 300s 阈值）：_time() 仍钳在 NOW
         asyncio.run(eng._observe_group(_group_event("u2"), "第二句"))
         dq = eng._group_activity_ts[("bot1", "g1")]
         self.assertEqual(list(dq), sorted(dq))

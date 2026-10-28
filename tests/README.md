@@ -1,21 +1,33 @@
-# tests/ 为什么有两份
+# 运行测试
 
-这个目录是**随包发布**的（和 Core 一样）——容器里的审查工具据此判断这个插件
-「有一个测试套件」，出问题时也能直接定位到版本。
+这个目录是随插件发布的测试套件，用来确认这一版在你的环境里能跑通。测试全部使用内置的 AstrBot 替身与临时目录，**不联网、不改你的插件配置和数据**。
 
-工作区根的 `~/workspace/tests/` 也有一份同样的文件。**两份必须一致**，
-否则会出现「工作区全绿、发出去的包跑不过」。
+## 准备
 
-- 开发时改 `~/workspace/tests/test_autonomous_social.py`
-- 打完包前同步：`cp astrabot_plugin_autonomous_social/tests/test_*.py tests/` 之外的**具名**复制，
-  例如 `cp ~/workspace/tests/test_autonomous_social.py astrabot_plugin_autonomous_social/tests/`
-- 校验一致性：`diff -q tests/test_autonomous_social.py astrabot_plugin_autonomous_social/tests/test_autonomous_social.py`
+- Python 3.10 及以上；
+- 已安装 pytest：`pip install pytest`；
+- 在插件根目录（和 `main.py` 同一层）执行下面的命令。
 
-> **不要用 `cp .../tests/*.py`。** 工作区根的 `tests/` 里除了本插件的测试，还有
-> 工作区级的共享工具（`test_orbit.py` 测的是另一个插件 Orbit Cache、`test_selfcheck.py`
-> 依赖 `astrbot_testkit`、`test_plugin.py` 依赖 `astrbot_stub`）。通配符复制会把它们
-> 一起塞进包里，于是**装好插件跑测试会看到 20 个 error**，而且 `test_orbit.py` 测的是
-> 完全无关的代码。随包发布的测试必须只有本插件自己的。
+## 跑全量
 
-`test_autonomous_social.py` 里的 `PLUGIN_ROOT` 同时认两种摆法
-（tests 在插件里 / tests 在工作区根），所以两份都能直接跑。
+```bash
+python -m pytest tests -q
+```
+
+预期结果：全部通过（0 failed、0 error）。个别用例会打印提示，不影响结果。
+
+## 只跑一部分
+
+```bash
+# 单个文件
+python -m pytest tests/test_v1282_llm_circuit.py -q
+
+# 按名字筛单条
+python -m pytest tests/test_autonomous_social.py -q -k "括号"
+```
+
+## 常见问题
+
+- **提示 `No module named 'astrbot'`**：不用装 AstrBot，测试自带最小替身；请确认是在插件根目录执行。
+- **Windows 控制台中文乱码**：先设 `set PYTHONIOENCODING=utf-8`（PowerShell 用 `$env:PYTHONIOENCODING='utf-8'`）再跑。
+- **测试产生的临时目录**：跑完可以直接删；`tmp*/` 已加入 `.gitignore`，不会进发行包。

@@ -228,6 +228,19 @@ WEEKEND_MOOD_BOOST = 1.25      # 周末人更松，想说话多一点
 # 发送前最终检查
 FINAL_CHECK_GAP_SECONDS = 120
 
+# 墙钟回拨的容忍上限（秒）。小回拨继续只升不降；超过阈值就按「墙钟被改了」处理。
+TIME_ROLLBACK_RESET_SECONDS = 300.0
+
+# 门面存活探测的节流窗口（秒，P2-09）：Core 热重载后旧门面会变成空壳，必须定期用
+# `facade.is_current()` / `role_ids()` 探一下；但每次心跳都探一次是浪费，60 秒一次足够
+# 在「重载后 5 分钟内自动恢复」的验收标准之内。
+FACADE_PROBE_SECONDS = 60.0
+
+# 记忆桥对象的缓存 TTL（秒，P2-07）：成功 5 分钟内复用；失败只等 1 分钟就重试，
+# 这样「social 先启动 / memory_companion 后装或后开」不用重载插件也能自己接上。
+MEMORY_BRIDGE_OK_TTL = 300.0
+MEMORY_BRIDGE_FAIL_TTL = 60.0
+
 # 「没接话」的判定窗口至少给多长。回复率统计用 reply_window_hours（默认 2 小时），
 # 但据此认为对方不想理你、从此不再主动找 TA，需要更长的观察期：晚上发的话早上才回，
 # 完全正常。
@@ -603,11 +616,15 @@ def _person_flow_state(engine: Any, bid: str, now: float) -> Tuple[bool, bool]:
     """
     asleep = False
     try:
-        body = engine.core.bot_self_state(bid)
+        # P2-12：on 模式不读 state.json，改用门面 brief 的自身状态。
+        if SocialEngine._facade_only(engine):
+            body = SocialEngine._facade_body(engine, bid)
+        else:
+            body = engine.core.bot_self_state(bid)
         engine._remember_night(bid, body)
         asleep = _body_asleep(body)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"[autonomous_social] 读取人物侧状态失败（按不安静/没睡降级）: {exc}")
     try:
         is_quiet = engine._quiet_now(bid, engine._moment_of(bid, now).hour)
     except Exception:
@@ -818,8 +835,16 @@ class SocialEngine:
         self.core = CoreBridge(self.cfg.mode, data_dir=data_dir)
         # 契约 v2 的同进程只读门面。懒解析：插件加载顺序不保证，构造时 Core 可能还没起来。
         # `None` 表示「还没查过」或「查过但没找到」，两者都由 `core_facade` 的缓存区分。
+        # 不再有「只查一次」的永久闸（P2-08）：`find_core_facade` 自带 300 秒负缓存，
+        # Core 后装/后启用能自己接上；这里只缓存拿到的门面对象。
         self._facade: Any = None
-        self._facade_tried = False
+        # 门面存活探测（P2-09）：上次探测时刻与结果，最多每 FACADE_PROBE_SECONDS 探一次。
+        self._facade_probe_at = 0.0
+        self._facade_alive_cache: Optional[bool] = None
+        # 记忆桥对象缓存（P2-07）：成功 300 秒 / 失败 60 秒后重查，见 `_memory_bridge`。
+        self._memory_bridge_obj: Any = None
+        self._memory_bridge_at = 0.0
+        self._memory_bridge_resolved = False
         # 写回给 Humanoid Core 的信号（它替她主动开过口、被谁冷落了几次）。写自己目录下的
         # 单独文件，两边不会并发写同一个文件。
         self.signals = SignalsWriter(
@@ -1075,9 +1100,26 @@ class SocialEngine:
             logger.error(f"[autonomous_social] 停止时保存状态失败: {e}")
 
     def _time(self) -> float:
-        """当前时间（墙钟），带回拨钳制。全引擎只认这一个时间源。"""
+        """当前时间（墙钟），带回拨钳制 + 大回拨重置。全引擎只认这一个时间源。
+
+        小回拨（<= TIME_ROLLBACK_RESET_SECONDS）只升不降，避免「时间倒退 → 负数
+        冷却 → 永久静默」；超过阈值则是墙钟被改（NTP 大校正 / 快照恢复 / 手动改
+        时间），继续冻结只会让冷却与安静时段停在错误的时间轴上——这时重置高水位
+        并告警一次，让「现在」重新跟着真实墙钟走（P3-09）。
+        """
         t = self._time_source()
         if t < self._time_high:
+            back = self._time_high - t
+            if back > TIME_ROLLBACK_RESET_SECONDS:
+                if throttle.allow("clock.rollback", window=3600.0):
+                    logger.warning(
+                        f"[autonomous_social] 检测到墙钟回拨 {int(back)} 秒"
+                        f"（阈值 {int(TIME_ROLLBACK_RESET_SECONDS)} 秒），重置时间高水位，"
+                        "冷却/安静时段改按新的墙钟重新计算"
+                        + throttle.summary("clock.rollback")
+                    )
+                self._time_high = t
+                return t
             return self._time_high
         self._time_high = t
         return t
@@ -1104,19 +1146,60 @@ class SocialEngine:
     def _memory_bridge(self):
         """拿 memory_companion 的桥接对象；开关关掉 / 没装都返回 None。
 
-        懒解析一次：插件加载顺序不保证，构造时对面可能还没就绪。
+        懒解析 + **TTL 重试**（P2-07）：成功缓存 `MEMORY_BRIDGE_OK_TTL`（300 秒）、
+        失败只等 `MEMORY_BRIDGE_FAIL_TTL`（60 秒）。原来一次性解析后永久缓存（失败也
+        缓存），于是「social 先启动 / 对面后装 / 面板后开 / 对面重载」整个进程生命周期
+        都拿不到桥，只能重载本插件。现在到点先用 `bridge_alive()` 验活，死了就 reset +
+        重查；并且**只有解析成功才置 `_memory_bridge_resolved`**（失败不算 resolved）。
         """
         if not getattr(self.cfg, "memory_bridge_enabled", True):
             return None
-        if not getattr(self, "_memory_bridge_resolved", False):
+        now_fn = getattr(self, "_time", None)
+        try:
+            now = float(now_fn()) if callable(now_fn) else 0.0
+        except Exception:
+            now = 0.0
+        obj = getattr(self, "_memory_bridge_obj", None)
+        at = float(getattr(self, "_memory_bridge_at", 0.0) or 0.0)
+        if obj is not None:
+            if now > 0 and at > 0 and now - at < MEMORY_BRIDGE_OK_TTL:
+                return obj
+            alive_fn = getattr(memory_bridge, "bridge_alive", None)
+            alive = True
+            if callable(alive_fn):
+                try:
+                    alive = bool(alive_fn(obj))
+                except Exception as exc:
+                    logger.debug(f"[autonomous_social] 记忆桥验活失败（按可用处理）: {exc}")
+                    alive = True
+            if alive:
+                self._memory_bridge_at = now
+                return obj
+            # 对面重载 / 关了桥接：旧对象不会再活，清缓存重查一次。
+            try:
+                memory_bridge.reset()
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 重置记忆桥缓存失败: {exc}")
+            self._memory_bridge_obj = None
+            self._memory_bridge_resolved = False
+        elif now > 0 and at > 0 and now - at < MEMORY_BRIDGE_FAIL_TTL:
+            # 刚查过且失败：一分钟内别反复查注册表（首次失败会打一条 info，见下）。
+            return None
+        try:
+            found = memory_bridge.find_memory_bridge(getattr(self, "context", None))
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 解析记忆桥失败: {exc}")
+            found = None
+        self._memory_bridge_at = now
+        self._memory_bridge_obj = found
+        if found is not None:
             self._memory_bridge_resolved = True
             try:
-                self._memory_bridge_obj = memory_bridge.find_memory_bridge(
-                    getattr(self, "context", None)
-                )
+                if throttle.allow("memory.bridge.connected", window=600.0):
+                    logger.info("[autonomous_social] 记忆桥已连接（memory_companion）")
             except Exception:
-                self._memory_bridge_obj = None
-        return getattr(self, "_memory_bridge_obj", None)
+                pass
+        return found
 
     async def _fetch_memory_note(self, umo: str, uid: str, query: str = "") -> str:
         """生成前拉这个人的长期记忆（拿不到返回空串，不影响发送）。
@@ -1130,7 +1213,13 @@ class SocialEngine:
             return ""
         try:
             return await memory_bridge.fetch_memory_text(bridge, umo, uid, query=query)
-        except Exception:
+        except Exception as exc:
+            # P3-14：关键路径的静默吞异常要有痕迹，但按窗口限流，别每轮心跳刷屏。
+            if throttle.allow("memory.read", window=600.0):
+                logger.debug(
+                    f"[autonomous_social] 拉取长期记忆失败（本轮无记忆）: {exc}"
+                    + throttle.summary("memory.read")
+                )
             return ""
 
     def _remember_proactive(
@@ -1148,8 +1237,12 @@ class SocialEngine:
             )
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
-        except Exception:
-            pass
+        except Exception as exc:
+            if throttle.allow("memory.write.proactive", window=600.0):
+                logger.debug(
+                    f"[autonomous_social] 排记忆写回任务失败: {exc}"
+                    + throttle.summary("memory.write.proactive")
+                )
 
     def _remember_open_closed(
         self, umo: str, uid: str, about: str, result: str = "", kind: str = "loop"
@@ -1171,8 +1264,12 @@ class SocialEngine:
             )
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
-        except Exception:
-            pass
+        except Exception as exc:
+            if throttle.allow("memory.write.closed", window=600.0):
+                logger.debug(
+                    f"[autonomous_social] 排记忆写回任务失败: {exc}"
+                    + throttle.summary("memory.write.closed")
+                )
 
     # ─── 消息观察 ───────────────────────────────────────
 
@@ -1364,6 +1461,12 @@ class SocialEngine:
             if _num(u.get("send_blocked_until", 0)) > 0:
                 u["send_blocked_until"] = 0.0
                 u["send_blocked_reason"] = ""
+                self.state.mark_dirty()
+            # P2-03：对方能发进来 = 这条 umo 至少收得到消息。发送失败的长冷却
+            # （含「未找到匹配的会话平台」升到 12 小时那一档）在这里解除，
+            # 而不是非得等它自己到期——这是「用户重新发消息解除」的落点。
+            if _num(u.get("send_fail_until", 0)) > 0 or u.get("platform_fail_count"):
+                SocialEngine._clear_send_failure(u)
                 self.state.mark_dirty()
         # 注意：这里不调用 save()，靠周期性 flush 落盘
 
@@ -2245,10 +2348,8 @@ class SocialEngine:
         说同一句天气；发送成功后由 `_icebreak` 调 `mark_weather_told` 落账。
         返回空天气表示这次没采用天气（或者压根没天气）。
         """
-        try:
-            body = self.core.bot_self_state(bid) or {}
-        except Exception:
-            body = {}
+        # P2-12：on 模式改由门面 brief 提供自身状态（群通道同样不读 state.json）。
+        body = SocialEngine._body_state(self, bid) or {}
         if not isinstance(body, dict):
             body = {}
         life = groupflow.life_lines(body, now)
@@ -2486,8 +2587,9 @@ class SocialEngine:
             return False
         try:
             self.state.group(bid, gid)["fail_count"] = 0
-        except Exception:
-            pass
+        except Exception as exc:
+            # P3-14：发送记账失败不致命，但静默会让「失败计数一直不清」查不出原因。
+            logger.debug(f"[autonomous_social] 清群 {gid} 发送失败计数失败: {exc}")
         sent_ts = self._time()
         day = self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
         if mode == "icebreak":
@@ -2523,22 +2625,250 @@ class SocialEngine:
         * `on`——只走门面（验证用），找不到也不退回；
         * `off`——完全不碰门面（逃生门，与 1.27.38 逐字一致）。
 
-        这里只在第一次真的去查注册表；之后走 `core_facade` 自己的缓存（含负缓存重试）。
+        P2-08：**不再有「一辈子只查一次」的永久闸**（原 `_facade_tried`）。
+        `core_facade.find_core_facade` 自带 300 秒负缓存与 60 秒存活探测，Core 后装 /
+        后启用都能自己接上，不用重载插件；这里只缓存拿到的门面对象，把它交给
+        `_facade_alive` 校验。
+        P2-09：缓存的门面若已被 Core 热重载换掉（探测失效），清缓存并
+        `reset()` + 强制重查，而不是继续拿着旧对象在状态页说「已连接」。
         """
         mode = str(getattr(self.cfg, "use_core_facade", "auto") or "auto").lower()
         if mode == "off":
             return None
-        if self._facade is not None:
-            return self._facade
-        if self._facade_tried and mode != "on":
-            return None
-        self._facade_tried = True
+        facade = getattr(self, "_facade", None)
+        if facade is not None:
+            if SocialEngine._facade_alive(self, facade):
+                return facade
+            # Core 重载/卸载后旧门面还在：清掉缓存并强制重查一次。
+            self._facade = None
+            try:
+                core_facade.reset()
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 重置门面缓存失败: {exc}")
+            logger.info(
+                "[autonomous_social] 门面的 Core 实例已失效（Core 可能重载过），重新解析"
+            )
         try:
-            self._facade = core_facade.find_core_facade(self.context)
+            facade = core_facade.find_core_facade(self.context)
         except Exception as exc:  # 门面这一路坏掉不该影响任何既有行为
             self.log(f"门面解析失败（退回读文件）: {exc}")
-            self._facade = None
-        return self._facade
+            facade = None
+        self._facade = facade
+        return facade
+
+    def _facade_alive(self, facade: Any) -> bool:
+        """门面对象是否还属于**当前**的 Core 实例（P2-09），探测按 60 秒节流。
+
+        判据优先交给 `core_facade.probe()`（内部：core 3.0.0 的 `is_current()`；没有就
+        用 `role_ids()` 非空；两者都没有的旧门面按「无法判定 = 可用」）。探测抛异常、
+        或轻量测试桩没有 `_time`，一律按「可用」处理——门面是可选上下文，它坏掉不该
+        把主动消息一起停掉，更不该把旧行为改坏。
+        """
+        try:
+            now = float(self._time())
+        except Exception:
+            return True
+        last = float(getattr(self, "_facade_probe_at", 0.0) or 0.0)
+        cached = getattr(self, "_facade_alive_cache", None)
+        if cached is not None and now >= last and now - last < FACADE_PROBE_SECONDS:
+            return bool(cached)
+        probe = getattr(core_facade, "probe", None)
+        if callable(probe):
+            try:
+                alive = bool(probe(facade))
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 门面存活探测失败（按可用处理）: {exc}")
+                alive = True
+        else:
+            # 兼容 `probe()` 尚未落地的中间态：直接用门面自己的入口。
+            is_current = getattr(facade, "is_current", None)
+            role_ids = getattr(facade, "role_ids", None)
+            if callable(is_current):
+                try:
+                    alive = bool(is_current())
+                except Exception:
+                    alive = True
+            elif callable(role_ids):
+                try:
+                    alive = bool(role_ids())
+                except Exception:
+                    alive = True
+            else:
+                alive = True
+        self._facade_probe_at = now
+        self._facade_alive_cache = alive
+        return alive
+
+    @staticmethod
+    def _facade_only(engine: Any) -> bool:
+        """`use_core_facade=on`：主动消息只走门面、不读 Core 的 state.json（P2-12）。"""
+        try:
+            mode = str(getattr(getattr(engine, "cfg", None), "use_core_facade", "auto") or "auto")
+        except Exception:
+            mode = "auto"
+        return mode.strip().lower() == "on"
+
+    def _read_core_root(self) -> Optional[Dict[str, Any]]:
+        """主动链路读 Core state.json 根的唯一入口（P2-12）：on 模式返回 None。
+
+        on 模式的语义是「只走门面」——以前这句话只说在文档/状态页里，实际每条主动
+        消息仍无条件读一遍 state.json，于是「打开 on 验证门面是否在工作」这个用途
+        从一开始就是无效的。读取失败仍按旧行为降级（返回 None），只是补上限流日志。
+        """
+        if SocialEngine._facade_only(self):
+            return None
+        try:
+            return self.core.read_root()
+        except Exception as exc:
+            if throttle.allow("core.read_root", window=600.0):
+                logger.warning(
+                    f"[autonomous_social] 读取 Core 状态失败: {exc}"
+                    + throttle.summary("core.read_root")
+                )
+            return None
+
+    def _body_state(
+        self, bid: str, root: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """她此刻的身体状态；on 模式走门面（brief.self_state / wake），不读文件。"""
+        if SocialEngine._facade_only(self):
+            return SocialEngine._facade_body(self, bid)
+        try:
+            # `root` 为空时不传关键字：轻量测试桩/旧调用点的 `bot_self_state(bid)`
+            # 只接一个位置参数，多传一个 root=None 会让整条精力闸静默失效。
+            if root is not None:
+                return self.core.bot_self_state(bid, root=root)
+            return self.core.bot_self_state(bid)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 读取 {bid} 身体状态失败: {exc}")
+            return None
+
+    def _facade_body(self, bid: str) -> Optional[Dict[str, Any]]:
+        """把门面 brief 的自身状态翻成引擎既有的 `body` 形状（on 模式用，P2-12）。
+
+        门面路径没有契约快照可读，但 `brief.self_state/wake` 给的正是同一批字段
+        （energy / asleep / energy_text / wake 窗口）；时区用 `clock()` 现算，
+        比状态文件里那份更不会过期。
+        """
+        try:
+            brief = SocialEngine._core_brief(self, bid, "")
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 门面取自身状态失败: {exc}")
+            return None
+        if not isinstance(brief, dict):
+            return None
+        body: Dict[str, Any] = {}
+        self_state = brief.get("self_state")
+        if isinstance(self_state, dict):
+            body.update(self_state)
+        wake = brief.get("wake")
+        if isinstance(wake, dict):
+            # 睡眠判定只认 `_body_asleep` 那一份口径（`test_p2_desire` 钉住 engine 里
+            # 不许出现第二处 asleep 真值判断），这里只补「缺这个键」的情况。
+            if "asleep" not in body or body["asleep"] is None:
+                body["asleep"] = wake.get("asleep")
+            body["wake"] = dict(wake)
+        facade = getattr(self, "_facade", None)
+        if facade is not None:
+            clock = core_facade.clock(facade, bid)
+            night = clock.get("night_window")
+            if isinstance(night, (list, tuple)) and len(night) == 2:
+                body["night_window"] = list(night)
+        return body or None
+
+    @staticmethod
+    def _brief_context_lines(
+        brief: Optional[Dict[str, Any]], *, include_day: bool = False
+    ) -> str:
+        """门面 brief 里 `compact()` 不覆盖的字段 → 「背景状态」几行（P2-13）。
+
+        `_apply_core_brief` 早把整份 brief 存进 `u_copy["_brief"]`，但只消费了 user
+        块；her / outfit / persona_framing / holiday / routine / day / weather 一直
+        没有消费者。这里把它们真正拼进生成侧看到的背景状态：
+        * `her.char_name` / `persona_label` / `species`：她是谁；
+        * `outfit.text`：她此刻穿着；
+        * `persona_framing`：Core 的「她/TA 指谁」框架句（主动消息的 system prompt
+          不是普通回复那条链，缺了它模型容易把背景当旁白转述）；
+        * `holiday` / `routine`：节日与作息；
+        * `include_day=True`（没有 state.json 快照，如 on 模式）时再补 day 与 weather。
+          有快照时 day 已由 `compact()` 给过，weather 则刻意只当由头、不摆进背景。
+        """
+        if not isinstance(brief, dict):
+            return ""
+        lines: List[str] = []
+        her = brief.get("her") if isinstance(brief.get("her"), dict) else {}
+        char_name = _brief_text(her.get("char_name"))
+        persona_label = _brief_text(her.get("persona_label"))
+        if char_name:
+            label = f"（{persona_label}）" if persona_label else ""
+            lines.append(f"我的名字: {char_name}{label}")
+        species = _brief_text(her.get("species"))
+        if species:
+            lines.append(f"我的种族: {species}")
+        outfit = brief.get("outfit") if isinstance(brief.get("outfit"), dict) else {}
+        outfit_text = _brief_text(outfit.get("text"))
+        if outfit_text and outfit.get("enabled", True) is not False:
+            lines.append(f"我今天的穿着: {outfit_text}")
+        holiday = _brief_text(brief.get("holiday"))
+        if holiday:
+            lines.append(f"节日: {holiday}")
+        routine = brief.get("routine") if isinstance(brief.get("routine"), dict) else {}
+        if routine:
+            try:
+                start = routine.get("night_start_hour")
+                end = routine.get("night_end_hour")
+                if start is not None and end is not None:
+                    lines.append(
+                        f"作息: 通常在 {int(float(start)) % 24} 点到 "
+                        f"{int(float(end)) % 24} 点休息"
+                    )
+            except (TypeError, ValueError):
+                pass
+        if include_day:
+            day = brief.get("day") if isinstance(brief.get("day"), dict) else {}
+            if day:
+                bits: List[str] = []
+                if day.get("done"):
+                    bits.append("刚做过 " + "、".join(
+                        _brief_text(x) for x in list(day.get("done"))[:2] if _brief_text(x)
+                    ))
+                if day.get("doing"):
+                    bits.append("正在 " + _brief_text(day.get("doing")))
+                if day.get("next"):
+                    bits.append("接下来 " + "、".join(
+                        _brief_text(x) for x in list(day.get("next"))[:1] if _brief_text(x)
+                    ))
+                if bits:
+                    lines.append("今天: " + "；".join(bits))
+            raw_weather = brief.get("weather")
+            if isinstance(raw_weather, dict):
+                weather_text = _brief_text(
+                    raw_weather.get("env") or raw_weather.get("weather")
+                )
+            else:
+                weather_text = _brief_text(raw_weather)
+            if weather_text:
+                lines.append(f"天气: {weather_text}")
+        framing = _brief_text(brief.get("persona_framing")).replace("\n", " ").strip()
+        if framing:
+            lines.append(framing)
+        return "\n".join(line for line in lines if line)
+
+    @staticmethod
+    def _core_context_with_brief(
+        core_context: str,
+        brief: Optional[Dict[str, Any]],
+        *,
+        include_day: bool = False,
+    ) -> str:
+        """把 brief 派生的背景行并进 core_context（P2-13）；都是空时保持原占位。"""
+        base = str(core_context or "").strip()
+        extra = SocialEngine._brief_context_lines(brief, include_day=include_day)
+        if not extra:
+            return base or "没有可用的 Humanoid Core 状态。"
+        if not base or base == "没有可用的 Humanoid Core 状态。":
+            return extra
+        return base + "\n" + extra
 
     def _core_brief(
         self,
@@ -2753,18 +3083,25 @@ class SocialEngine:
         return self._city_offset.get(bid)
 
     def _refresh_clocks(self) -> None:
-        """状态展示前补一次时区：主循环还没跑过时 _city_offset 是空的。"""
-        try:
-            root = self.core.read_root()
-        except Exception:
+        """状态展示前补一次时区：主循环还没跑过时 _city_offset 是空的。
+
+        P2-12：on 模式不读 state.json，只问门面 `clock()`（现算，本来就更不会过期）。
+        """
+        if SocialEngine._facade_only(self):
+            for bid in self.state.data.get("bots", {}):
+                try:
+                    SocialEngine._remember_clock(self, bid, None)
+                except Exception as exc:
+                    logger.debug(f"[autonomous_social] 门面刷新 {bid} 时区失败: {exc}")
             return
+        root = SocialEngine._read_core_root(self)
         if not root:
             return
         for bid in self.state.data.get("bots", {}):
             try:
                 self._remember_clock(bid, self.core.bot_self_state(bid, root=root))
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 刷新 {bid} 时区失败: {exc}")
 
     # ─── 念头结算与选人 ───────────────────────────────
 
@@ -3325,16 +3662,26 @@ class SocialEngine:
         # 特别关心（v1.28.17）：这些闸门是给「普通关系」防打扰的；名单里的人已经
         # 被主人点名「多找 TA」，睡眠/静音/冷落等待/冷却都该让路。只保留对方侧的
         # 硬事实：TA 自己的作息明确说这个点不玩手机。
+        #
+        # P2-01：`special_care_ignore_quiet=False` 时**不**豁免睡眠/安静时段——
+        # README 承诺「关掉则只放宽间隔与追问」，深夜把她爱的人叫醒不是「放宽间隔」。
         if SocialEngine._special_care_now(self, uid, u):
+            _waive_quiet = SocialEngine._special_care_ignore_quiet_on(self)
             try:
                 hour = self._moment_of(bid, now).hour
+            except Exception as exc:
+                hour = 0
+                logger.debug(f"[autonomous_social] gate_reason 取本地小时失败: {exc}")
+            if not _waive_quiet and _body_asleep(body):
+                return "她正在睡觉"
+            try:
                 if (
                     self.cfg.respect_user_rhythm
                     and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF
                 ):
                     return "按TA 平时的作息，这个点 TA 不玩手机"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] gate_reason 作息判定失败: {exc}")
             # 放宽的是「对方没动静 / 她在睡 / 安静时段」，**不是**「你刚说完她插一句」。
             # 线上反馈的「接不上话、纯瞎发」有一半是这条：人还在聊，新话题就顶上来了。
             seen = _num(u.get("last_seen", 0) or 0)
@@ -3344,6 +3691,8 @@ class SocialEngine:
                 return "不久前才说过话，再另起一句很突兀"
             if sleep_signal(u, now):
                 return "TA 说过要去睡了，这时发过去不合适"
+            if not _waive_quiet and self._quiet_now(bid, hour):
+                return "现在是安静时段"
             return ""
         # 身体在睡就不是「概率打折」的问题：把人从睡梦中叫醒闲聊不是拟人，是打扰。
         # 作息与安静时段同样的教训：这类东西做成权重会漏，必须是闸。
@@ -3357,10 +3706,12 @@ class SocialEngine:
             return _avoid
         # C5/D4：Core 那边的情绪也参与——她正在冷静期就不找这个人；
         # 对这个人的气还没消（攻击性远高于基线）也不找。
-        try:
-            snap = self.core.load_snapshot(bid, uid)
-        except Exception:
-            snap = None
+        snap = None
+        if not SocialEngine._facade_only(self):
+            try:
+                snap = self.core.load_snapshot(bid, uid)
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] gate_reason 读 Core 快照失败: {exc}")
         if isinstance(snap, dict):
             mood = snap.get("mood") if isinstance(snap.get("mood"), dict) else {}
             try:
@@ -3425,9 +3776,13 @@ class SocialEngine:
         平时碰不到，但不能靠默认值活着）。
         """
         _sc = SocialEngine._special_care_now(self, uid, u)
-        if not _sc:
+        # P2-01：特别关心只在 `special_care_ignore_quiet=True` 时豁免睡眠/安静时段；
+        # 关掉时只放宽间隔与追问，硬闸照常生效。
+        _waive_quiet = _sc and SocialEngine._special_care_ignore_quiet_on(self)
+        if not _waive_quiet:
             if _body_asleep(body):
                 return "她正在睡觉"
+        if not _sc:
             _avoid = SocialEngine._avoidance_note(self, u, now)
             if _avoid:
                 return _avoid
@@ -3441,9 +3796,19 @@ class SocialEngine:
             return "这段沉默已经接过一回了，再问就是催"
         if now - _num(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
             return "刚接过一次，给 TA 点时间"
-        if not _sc and self._quiet_now(bid, self._moment_of(bid, now).hour):
+        if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
             return "现在是安静时段"
         return ""
+
+    @staticmethod
+    def _special_care_ignore_quiet_on(engine: Any) -> bool:
+        """`special_care_ignore_quiet` 开关（P2-01）：特别关心是否豁免睡眠/安静时段。
+
+        与 `_special_care_now` 配合使用：名单内 **且** 本开关为 True 才豁免。关掉时，
+        README 的承诺是「只放宽间隔与追问」——睡眠/安静时段这两道硬闸必须留下，
+        否则「关掉静音豁免」只是个骗人的开关（深夜照样把 TA 叫醒）。
+        """
+        return bool(getattr(getattr(engine, "cfg", None), "special_care_ignore_quiet", True))
 
     @staticmethod
     def _last_said(u: Dict[str, Any]) -> float:
@@ -3551,16 +3916,20 @@ class SocialEngine:
         `COLD_SILENCE_SENT` 的路径，所以它必须自己认这一条——否则「一句不回的人每天
         照样收早安」，而面板上还写着「回避：开」。
         """
-        if not SocialEngine._special_care_now(self, uid, u):
+        _sc = SocialEngine._special_care_now(self, uid, u)
+        # P2-01：关掉静音豁免后，特别关心也不豁免睡眠/安静时段（问候同样会把人吵醒）。
+        _waive_quiet = _sc and SocialEngine._special_care_ignore_quiet_on(self)
+        if not _waive_quiet:
             if _body_asleep(body):
                 return "她正在睡觉"
-            _avoid = SocialEngine._avoidance_note(self, u, now)
-            if _avoid:
-                return _avoid
             if kind != "night" and sleep_signal(u, now):
                 return "TA 说过要去睡了，这时发过去不合适"
             if self._quiet_now(bid, self._moment_of(bid, now).hour):
                 return "现在是安静时段"
+        if not _sc:
+            _avoid = SocialEngine._avoidance_note(self, u, now)
+            if _avoid:
+                return _avoid
         return ""
 
     @staticmethod
@@ -3687,11 +4056,17 @@ class SocialEngine:
             return False
         turns = SocialEngine._snapshot_turns(snap)
         if turns <= 0:
+            # 老 Core 的契约里没有 mood.turn_count（这正是 special_care_min_messages
+            # 存在的场景）：退回社交层自己数的消息条数，并且兜底门槛用**消息条数**
+            # 那一项。以前这里仍取 min_turns=100，于是 60 条的门槛形同虚设——
+            # 用户按文档调 special_care_min_messages=60，70 条却不会被认定（P2-02）。
             try:
                 turns = int(_num(u.get("message_count", 0) or 0))
             except (TypeError, ValueError):
                 turns = 0
-        need = int(getattr(self.cfg, "special_care_min_turns", 100) or 100)
+            need = int(getattr(self.cfg, "special_care_min_messages", 60) or 60)
+        else:
+            need = int(getattr(self.cfg, "special_care_min_turns", 100) or 100)
         if turns < need:
             return False
         u["special_care"] = True
@@ -3854,10 +4229,13 @@ class SocialEngine:
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
             # 特别关心：静音/睡意/「很久没来往」都不挡问候（v1.28.17）
+            # P2-01：`special_care_ignore_quiet=False` 时只放宽「很久没来往」，
+            # 安静时段/她在睡仍是硬闸（README：关掉则只放宽间隔与追问）。
             _sc_here = SocialEngine._special_care_now(self, uid, u)
-            if not _sc_here and self._quiet_now(bid, hour):
+            _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
+            if not _waive_quiet and self._quiet_now(bid, hour):
                 continue
-            if not _sc_here and _body_asleep(body):
+            if not _waive_quiet and _body_asleep(body):
                 continue
             # 只问候最近有来往的人：对素未谋面或早就不聊的人道早安，像定时群发
             if not _sc_here and now - self._last_said(u) > GREET_FRESH_SECONDS:
@@ -3947,7 +4325,11 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """回访那件事的闸门：不看 recent_talk（那件事本来就是聊出来的），但要等这场话凉下来。"""
-        if not SocialEngine._special_care_now(self, uid, u):
+        _sc = SocialEngine._special_care_now(self, uid, u)
+        # P2-01：关掉静音豁免后，特别关心也不再豁免睡眠/安静时段；间隔与「还没回」
+        # 仍然按特别关心的语义放宽（只看 `_sc`，不看这个开关）。
+        _waive_quiet = _sc and SocialEngine._special_care_ignore_quiet_on(self)
+        if not _waive_quiet:
             if _body_asleep(body):
                 return "她正在睡觉"
             # 以前只有另起话题查「TA 说过要去睡」，于是 09:00 说完「我出门了」，
@@ -3956,6 +4338,7 @@ class SocialEngine:
                 return "TA 说过要去睡了，这时发过去不合适"
             if self._quiet_now(bid, self._moment_of(bid, now).hour):
                 return "现在是安静时段"
+        if not _sc:
             if now - self._last_said(u) < LOOP_QUIET_GAP_SECONDS:
                 return "还在聊，这会儿问「后来呢」太急"
             if str(u.get("pending_result", "") or "") == "waiting":
@@ -4039,11 +4422,14 @@ class SocialEngine:
             if not hits:
                 continue
             # 兑现的场合比随口搭话正经：她正在等对方 asleep 或安静时段时先不说
-            if _body_asleep(body) and not SocialEngine._special_care_now(self, uid, u):
+            # P2-01：这个豁免同样受 `special_care_ignore_quiet` 管。
+            _sc_here = SocialEngine._special_care_now(self, uid, u)
+            _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
+            if _body_asleep(body) and not _waive_quiet:
                 continue
-            if self._quiet_now(bid, self._moment_of(bid, now).hour) and not SocialEngine._special_care_now(self, uid, u):
+            if self._quiet_now(bid, self._moment_of(bid, now).hour) and not _waive_quiet:
                 continue
-            if sleep_signal(u, now) and not SocialEngine._special_care_now(self, uid, u):
+            if sleep_signal(u, now) and not _waive_quiet:
                 continue
             out.append((uid, u, hits[0][1]))
         return out
@@ -4081,10 +4467,12 @@ class SocialEngine:
             if self._miss_sent_today(u, day) >= cap:
                 continue
             # 特别关心：想 TA 这句话不该被「她在睡 / 安静时段」挡（v1.28.17）
+            # P2-01：只有 `special_care_ignore_quiet=True` 时才豁免这两道硬闸。
             _sc_here = SocialEngine._special_care_now(self, uid, u)
-            if not _sc_here and _body_asleep(body):
+            _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
+            if not _waive_quiet and _body_asleep(body):
                 continue
-            if not _sc_here and self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
             if self._min_gap_left(u, bid=bid, now=now) > 0:
                 continue
@@ -4194,7 +4582,10 @@ class SocialEngine:
         body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """收场那句的闸门：它存在的意义恰恰是绕过「上一条没人回」，所以不查那条。"""
-        if not SocialEngine._special_care_now(self, uid, u):
+        _sc = SocialEngine._special_care_now(self, uid, u)
+        # P2-01：关掉静音豁免后，特别关心也要走睡眠/安静时段这两道硬闸。
+        _waive_quiet = _sc and SocialEngine._special_care_ignore_quiet_on(self)
+        if not _waive_quiet:
             if _body_asleep(body):
                 return "她正在睡觉"
             hour = self._moment_of(bid, now).hour
@@ -4286,11 +4677,8 @@ class SocialEngine:
             self._m["last_failure"] = "dry-run：插件已停用"
             self._persist_metrics()
             return self._m
-        core_root = None
-        try:
-            core_root = self.core.read_root()
-        except Exception as exc:
-            logger.warning(f"[autonomous_social] dry-run 读 Core 失败: {exc}")
+        # P2-12：on 模式只走门面（`_read_core_root` 已含失败降级与限流日志）。
+        core_root = SocialEngine._read_core_root(self)
 
         bots = [b for b, x in self.state.data.get("bots", {}).items()
                 if ((x if isinstance(x, dict) else {}).get("users") or {})]
@@ -4394,8 +4782,13 @@ class SocialEngine:
         # 却被判成「安静时段」，一轮 156 个候选全挡住，生成的句子也会带错时段词。
         try:
             self._refresh_clocks()
-        except Exception:
-            pass
+        except Exception as exc:
+            # P3-14：关键路径（Core 时钟）的静默吞异常至少留一条限流 debug。
+            if throttle.allow("core.refresh_clocks", window=600.0):
+                logger.debug(
+                    f"[autonomous_social] 本轮刷新时区失败（沿用上次时区）: {exc}"
+                    + throttle.summary("core.refresh_clocks")
+                )
         self._round_skips = {}
         self._round_skip_samples = {}
         if not self.cfg.enabled:
@@ -4457,16 +4850,8 @@ class SocialEngine:
                     )
             return
 
-        # 每个角色只读一次 Core 状态
-        core_root = None
-        try:
-            core_root = self.core.read_root()
-        except Exception as e:
-            if throttle.allow("core.read_root"):
-                logger.warning(
-                    f"[autonomous_social] 读取 Core 状态失败: {e}"
-                    + throttle.summary("core.read_root")
-                )
+        # 每个角色只读一次 Core 状态（P2-12：on 模式下不读文件，返回 None）
+        core_root = SocialEngine._read_core_root(self)
 
         # 各类候选按用户收集，不挑唯一：同一类里可以同时有多个人等着
         # 早晚问候（时间性触发，窗口过了就没了）
@@ -4900,7 +5285,7 @@ class SocialEngine:
         # 轮转：先按「最久没联系的优先」，念头只做同分次序。
         #
         # 原来是按念头降序。真实记录里 129 条有 100 多条落在同样 6 个人身上
-        # （2047181070 收了 3 次、2163874801 收 3 次、3231002996 收 3 次…），
+        # （示例用户 100000001 收了 3 次、100000002 收 3 次、100000003 收 3 次…），
         # 另外 166 个人一条没收到。原因：**不回复的人的念头会一路涨到封顶 2.80，
         # 每轮都排第一**；会回复的人发完就清零，永远排在后面。插件等于只在跟
         # 从不回复的人说话。按 last_sent 升序就能把它摊开。
@@ -5202,10 +5587,8 @@ class SocialEngine:
         # 原来把这条闸加在 `gate_reason` 里，只挡住了有由头的那一路（实测 61 条里
         # 过了 57 条）——问候/追问/回访/收场各自走自己的检查，根本不经过它。
         # 判据得落在所有开口都要经过的地方。
-        try:
-            body = self.core.bot_self_state(bid)
-        except Exception:
-            body = None
+        # P2-12：on 模式改由门面 brief 提供自身状态；auto/off 仍读状态文件。
+        body = SocialEngine._body_state(self, bid)
         # 读不出来时按 100.0（满精力）而不是 0：Core 没接上、或契约里没这个字段是
         # 常态，把它当「累到不能说话」会让整个插件在没接 Core 的机器上永久静默。
         # nan/inf 也走这条：一个坏字段不该让她一整天不开口。
@@ -5214,7 +5597,10 @@ class SocialEngine:
         # 用户的原话是「就算凌晨给我发也不会有事」——她困不困是她的状态，但
         # 不能拿它当「不许找这个人」的理由；内容层仍由生成器按身体状态收着写。
         _sc = SocialEngine._special_care_now(self, uid, u)
-        if energy < self.cfg.gate_energy_floor and not _sc:
+        # P2-01：`special_care_ignore_quiet=False` 时，特别关心也不再豁免「她太累」
+        # 这道硬闸（能量与睡眠/安静同属「她现在不适合开口」）。
+        _sc_waive_energy = _sc and SocialEngine._special_care_ignore_quiet_on(self)
+        if energy < self.cfg.gate_energy_floor and not _sc_waive_energy:
             logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
 
@@ -5263,11 +5649,8 @@ class SocialEngine:
         # 以前是所有人一个 min_gap_minutes（默认 2 小时）一刀切，而她常聊的那个人本来
         # 就该被多找一点——结果是他一周只收到 2 条。现在按档位：高档 30 分钟，低档
         # 隔一两天试试就好。**没有日上限**——一天能发几次，取决于她当天有几件事发生。
-        core_root = None
-        try:
-            core_root = self.core.read_root()
-        except Exception as e:
-            self.log(f"读 Core 状态目录失败: {e}")
+        # P2-12：on 模式只走门面，这里不再读 state.json（`_read_core_root` 统一收口）。
+        core_root = SocialEngine._read_core_root(self)
         _tier, _aff, _warmth = self._tier_of(bid, uid, u, core_root, self._time())
         if self._quiesced(u):
             return False, "已经决定不再主动找 TA 了（等 TA 先开口）"
@@ -5343,7 +5726,8 @@ class SocialEngine:
         # 这个人的上一次发送失败过：这会儿写好了也送不到。
         # 以前只有 cue/loop 两条路有重试节奏，收场/问候/追问发不出去时下一轮心跳
         # 照旧各写一遍完整 LLM——收场那条能空烧 8 小时。
-        fail_left = _num(u.get("send_fail_until", 0) or 0) - self._time()
+        # P2-03：统一走 `_send_fail_left`，所有发送入口（含连发补发）读同一笔账。
+        fail_left = SocialEngine._send_fail_left(self, u)
         if fail_left > 0:
             return False, f"上次发给 TA 没发出去，{int(fail_left / 60)} 分钟内不再试"
 
@@ -5426,6 +5810,11 @@ class SocialEngine:
             self, bid, uid, user_name=_brief_text(u.get("name"))
         )
         SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
+        # P2-13：门面 brief 的 her/outfit/persona_framing/holiday/routine（没有文件
+        # 快照时再加 day/weather）真正进「背景状态」提示词，而不是只写不读。
+        core_context = SocialEngine._core_context_with_brief(
+            core_context, brief, include_day=not bool(user_core)
+        )
 
         # 会话库只提供用户与正常聊天历史；主动消息留在插件账本里，合并后
         # 一起作为本次主动消息生成的上下文，避免 bot 自己的话被覆盖掉。
@@ -5738,7 +6127,13 @@ class SocialEngine:
             # 下一次心跳前多等一会儿）——直接永久隔离，见下面。
             permanent_dead = peer_unreachable and self._is_permanent_dead_error(err)
             platform_side = self._platform_problem(err or "")
-            if not (permanent_dead or platform_side):
+            # P2-03：**平台侧失败也要落冷却**。原来这里写成
+            # `if not (permanent_dead or platform_side): _mark_send_failed(...)`，
+            # 于是 platform_side=True 时整个调用被跳过——「未找到匹配的会话平台」这类
+            # 不会自愈的失败没有任何冷却，下一轮心跳照样花一次完整 LLM 再撞同一面墙
+            # （线上同一 uid 15.7 小时 46 次）。平台侧由 `_mark_send_failed` 自己按
+            # 30 分钟 → ×4 → 12 小时封顶升档；永久死目标直接走下面的 block_send。
+            if not permanent_dead:
                 self._mark_send_failed(u, platform_side=platform_side, reason=err or "")
             # 平台侧的问题（适配器没就绪/不支持主动消息/抖动）与「他」无关：
             # 无条件计 giveup 时，两次这样的失败就把**低档**用户写 `quiesced_at`，
@@ -5845,12 +6240,8 @@ class SocialEngine:
         # 记忆联动：把这条主动消息写回记忆库（后台任务，失败不影响主链路）。
         # 带上由头：将来按由头检索时，它就是「这件事她开过口」的证据。
         self._remember_proactive(umo, uid, segments[0], sent_ts, about=_sent_about)
-        # 发成功了，之前那次失败就不再约束他
-        u["send_fail_count"] = 0
-        u["send_fail_until"] = 0.0
-        u["platform_fail_count"] = 0
-        # 失败原因也跟着清：留着它会让状态页一直显示一条早就过去的故障
-        u["send_blocked_reason"] = ""
+        # 发成功了，之前那次失败就不再约束他（四个字段一起清，见 `_clear_send_failure`）
+        SocialEngine._clear_send_failure(u)
         # 发成了 → 不再是「连着发不出去」
         u["giveup_count"] = 0
         u["quiesced_at"] = 0.0
@@ -6038,8 +6429,9 @@ class SocialEngine:
             return
         try:
             self._hourly.setdefault(bid, []).append(now)
-        except Exception:
-            pass
+        except Exception as exc:
+            # P3-14：每小时发送配额记账失败会让安全闸失效，至少留痕（罕见，不打节流）。
+            logger.debug(f"[autonomous_social] 记录发送配额失败: {exc}")
 
     def _hourly_reserve(self, bid: str) -> bool:
         """发送**之前**占掉这一小时的一个名额。返回 False 表示已用满、没有占。
@@ -6214,16 +6606,11 @@ class SocialEngine:
 
     async def _preview_run(self, bid: str, now: float, uid_filter: str) -> str:
         """（预览实现，无副作用）拼上下文、调模型拿一句，不发送不改状态。"""
-        core_root = None
-        bot_state = None
-        try:
-            core_root = self.core.read_root()
-            if core_root:
-                bot_state = self.core.bot_self_state(bid, root=core_root)
-                self._remember_clock(bid, bot_state)
-                self._remember_night(bid, bot_state)
-        except Exception as e:
-            logger.warning(f"[autonomous_social] 预览时读 Core 失败: {e}")
+        core_root = SocialEngine._read_core_root(self)
+        bot_state = SocialEngine._body_state(self, bid, core_root)
+        if bot_state:
+            self._remember_clock(bid, bot_state)
+            self._remember_night(bid, bot_state)
 
         ranked = self.settle_minds(
             bid, now, self._moment_of(bid, now), core_root, bot_state, min_urge=0.0
@@ -6326,9 +6713,11 @@ class SocialEngine:
             if not u.get("umo") or self.state.is_send_blocked(bid, uid, now):
                 continue
             _sc_here = SocialEngine._special_care_now(self, uid, u)
-            if not _sc_here and _body_asleep(body):
+            # P2-01：亲密通道的睡眠/安静豁免同样受开关约束。
+            _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
+            if not _waive_quiet and _body_asleep(body):
                 continue
-            if not _sc_here and self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
                 continue
             try:
                 if sleep_signal(u, now):
@@ -6456,6 +6845,10 @@ class SocialEngine:
                 self, bid, uid, user_name=_brief_text(u.get("name"))
             )
             SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
+            # P2-13：预览必须与真实发送看到同一份背景状态（brief 派生行也在内）。
+            core_context = SocialEngine._core_context_with_brief(
+                core_context, brief, include_day=not bool(user_core)
+            )
             session_history = await self._load_session_history(umo)
             u_copy["conversation"] = self._generation_conversation(u, session_history)
             recent_pro = self.state.recent_proactive(bid, uid, now)
@@ -6549,19 +6942,11 @@ class SocialEngine:
                 "可先和 bot 说句话，或在配置里打开 history_ingest / 填 seed_users。"
             )
 
-        core_root = None
-        bot_state = None
-        try:
-            core_root = self.core.read_root()
-            if core_root:
-                bot_state = self.core.bot_self_state(bid, root=core_root)
-                self._remember_clock(bid, bot_state)
-                self._remember_night(bid, bot_state)
-        except Exception as e:
-            if throttle.allow("core.read"):
-                logger.warning(
-                    f"[autonomous_social] 触发时读 Core 失败: {e}" + throttle.summary("core.read")
-                )
+        core_root = SocialEngine._read_core_root(self)
+        bot_state = SocialEngine._body_state(self, bid, core_root)
+        if bot_state:
+            self._remember_clock(bid, bot_state)
+            self._remember_night(bid, bot_state)
 
         # min_urge=0：不管攒没攒满都列出来，手动触发挑念头最高的那个
         ranked = self.settle_minds(
@@ -6616,6 +7001,19 @@ class SocialEngine:
         """
         if not target:
             raise _SendFailed("unified_msg_origin 为空，无法发送主动消息")
+
+        # V8 / P2-03 纵深防御：**底层入口自己也查一次按人发送失败冷却**。
+        # 上层 `_speak_inner`、连发补发都已查过，但冷却这道闸要开在真正发送之前，
+        # 这样未来任何新调用方都无法绕过它；按 umo 找不到这个人时跳过，
+        # 不改变既有语义（群 umo / 已清理的记录都走跳过分支）。
+        _cooldown_user = SocialEngine._resolve_send_user(self, target)
+        if _cooldown_user is not None:
+            _cool_left = SocialEngine._send_fail_left(self, _cooldown_user)
+            if _cool_left > 0:
+                raise _SendFailed(
+                    f"这个人还在发送失败冷却里（还剩 {int(_cool_left / 60)} 分钟），"
+                    "本轮不再尝试"
+                )
 
         # 方式1: AstrBot 官方主动消息 API —— 优先使用 MessageChain
         if hasattr(self.context, "send_message"):
@@ -6754,6 +7152,15 @@ class SocialEngine:
 
         无论成败都会更新熔断计数：连续发不出去时，下一轮就不再先写一遍消息再失败了。
         """
+        # V8 / P2-03 纵深防御：直接调用这个底层入口的路径也受按人冷却约束。
+        # 这里**不进重试循环、不记熔断**：冷却是我们自己主动设的，再撞一次只是浪费。
+        _cooldown_user = SocialEngine._resolve_send_user(self, target, bid)
+        if _cooldown_user is not None:
+            _cool_left = SocialEngine._send_fail_left(self, _cooldown_user)
+            if _cool_left > 0:
+                return False, (
+                    f"上次发给 TA 没发出去，{int(_cool_left / 60)} 分钟内不再试"
+                ), False
         last_err = ""
         peer_unreachable = False
         for attempt in range(SEND_RETRY_COUNT + 1):
@@ -6892,6 +7299,79 @@ class SocialEngine:
             u["quiesced_at"] = now
             self.log(f"{u.get('__uid', '')} 连着 {n} 次发不出去，先不主动找 TA 了（等 TA 先开口）")
 
+    def _resolve_send_user(self, target: str, bid: str = "") -> Optional[Dict[str, Any]]:
+        """按 umo 找到「这个人」的用户记录（底层发送入口做冷却检查用）；找不到返回 None。
+
+        为什么按 umo 反查而不是给 `_send_message` 加参数：底层入口的签名被测试桩与
+        多处调用点共用，加参数会破坏兼容；而 umo 在插件里是这条会话的稳定来源，
+        反查一次是 O(用户数) 的纯内存扫描（真实部署 5000 人约 0.2ms，一次发送才一次）。
+        拿不到（群 umo / 记录已清理 / 轻量测试桩没有 state.data）时返回 None，
+        调用方跳过检查——**不改变既有语义**。
+        """
+        umo = str(target or "")
+        if not umo:
+            return None
+        try:
+            bots = self.state.data.get("bots")
+        except Exception:
+            return None
+        if not isinstance(bots, dict):
+            return None
+        order: List[str] = []
+        if bid and str(bid) in bots:
+            order.append(str(bid))
+        order.extend(str(key) for key in bots.keys() if str(key) not in order)
+        for key in order:
+            bot = bots.get(key)
+            users = bot.get("users") if isinstance(bot, dict) else None
+            if not isinstance(users, dict):
+                continue
+            for user in users.values():
+                if isinstance(user, dict) and str(user.get("umo") or "") == umo:
+                    return user
+        return None
+
+    def _send_fail_left(self, u: Any) -> float:
+        """这个人还有多久才该再试发送（所有发送入口统一读它，P2-03）。
+
+        `send_fail_until` 是发送失败后的**按人**冷却（平台侧 30 分钟起步、×4 升档、
+        12 小时封顶；普通失败 30 分钟起步、8 小时封顶）。以前只有 `_speak_inner`
+        的候选筛选读它，连发补发（`_send_burst_followup`）等发送路径绕过了这道闸，
+        于是「已经知道发不出去」的人还会被继续写、继续发。统一从这里读。
+
+        时间源缺失（轻量测试桩）或字段是脏值时返回 0：宁可照旧发一次，也不要因为
+        读不出冷却就让整条发送路径停摆。
+        """
+        try:
+            until = _num((u or {}).get("send_fail_until", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+        if until <= 0:
+            return 0.0
+        try:
+            now_fn = getattr(self, "_time", None)
+            now = float(now_fn()) if callable(now_fn) else 0.0
+        except Exception:
+            return 0.0
+        if now <= 0:
+            return 0.0
+        return max(0.0, until - now)
+
+    @staticmethod
+    def _clear_send_failure(u: Dict[str, Any]) -> None:
+        """这次发送成功了（或对方先开口了）：清掉按人的发送失败账（P2-03）。
+
+        四个字段必须一起清：只清 `send_fail_until` 会把升档计数留给下一次失败，
+        只清计数又会让状态页一直显示一条早就过去的故障原因。
+        """
+        try:
+            u["send_fail_count"] = 0
+            u["send_fail_until"] = 0.0
+            u["platform_fail_count"] = 0
+            u["send_blocked_reason"] = ""
+        except (TypeError, AttributeError):
+            pass
+
     def _mark_send_failed(
         self, u: Dict[str, Any], platform_side: bool = False, reason: str = ""
     ) -> None:
@@ -6965,6 +7445,15 @@ class SocialEngine:
                 if _num(u.get("last_seen", 0)) > sent_ts:
                     self.log(f"用户 {uid} 已有新消息，取消连发补充")
                     return
+                # P2-03：连发补发也必须尊敬「按人发送失败冷却」。首段发送成功后
+                # 才排的连发，但后续段失败/冷却开始后，剩下的段不该继续撞同一面墙。
+                fail_left = SocialEngine._send_fail_left(self, u)
+                if fail_left > 0:
+                    self.log(
+                        f"用户 {uid} 还在发送失败冷却里（{int(fail_left / 60)} 分钟），"
+                        "取消剩下的连发补充"
+                    )
+                    return
                 umo = str(u.get("umo", "") or "")
                 if not umo:
                     return
@@ -7031,6 +7520,17 @@ class SocialEngine:
                 if _num(g.get("last_human_at", 0) or 0) > sent_ts:
                     self.log(f"群 {gid} 有新群友发言，取消连发补充")
                     return
+                # V8 / P2-03 纵深防御：底层入口也查一次按人冷却。群连发的 umo 是
+                # 群会话，通常解析不到具体的人——那一步就跳过（群侧另有隔离闸）。
+                _cooldown_user = SocialEngine._resolve_send_user(self, umo, bid)
+                if _cooldown_user is not None:
+                    _cool_left = SocialEngine._send_fail_left(self, _cooldown_user)
+                    if _cool_left > 0:
+                        self.log(
+                            f"群 {gid} 连发的目标还在发送失败冷却里"
+                            f"（{int(_cool_left / 60)} 分钟），取消剩下的补发"
+                        )
+                        return
                 ok, err, _peer = await self._send_with_retry(umo, text, bid)
                 if not ok:
                     # 同私聊侧：补发时才发现已被移出群聊 → 永久隔离，
@@ -7253,12 +7753,18 @@ class SocialEngine:
         degraded = _DEGRADED_NOTE
         if self.cfg.mode == "standalone":
             return "独立模式（不联动 Core）" + degraded
+        # P2-12：on 模式 = 主动消息只走门面、不读 state.json。这里不能再读文件
+        # 给出「未找到 Core state.json」这种误导结论，真实连接状态看下一行门面。
+        if SocialEngine._facade_only(self):
+            return (
+                "门面模式（use_core_facade=on）：主动消息只走门面、不读 state.json；"
+                "连接状态与能力见「门面」一行"
+            )
 
-        try:
-            root = self.core.read_root()
-        except Exception as e:
-            return f"❌ Core 读取失败: {e}" + degraded
-
+        # V12（P2-12 单一入口）：`_read_core_root` 是主动链路读 state.json 的唯一入口，
+        # on 模式它返回 None（上面已提前返回），auto/off 的返回值与旧行为一致；
+        # 读取失败的限流告警由那个入口负责，这里不再直接碰 core bridge 的读盘方法。
+        root = self._read_core_root()
         if not root:
             return "❌ 未找到 Core state.json" + degraded
 
@@ -7275,6 +7781,7 @@ class SocialEngine:
 
         # 读到契约 v1 才能用身体轴；否则只能退回两个标量，主动消息的把关会差一大截。
         contract_v = None
+        contract_note = ""
         for bid in matched:
             try:
                 view = self.core.bot_self_state(bid, root=root)
@@ -7282,6 +7789,9 @@ class SocialEngine:
                 view = None
             if view and view.get("contract_v"):
                 contract_v = view["contract_v"]
+                # P2-10 联动显示（行为已由 core_bridge 处理：过期契约的「此刻状态」
+                # 会被清空，这里只把「为什么看起来没数据」说出来，免得用户以为坏了）。
+                contract_note = SocialEngine._contract_view_note(view)
                 break
         if contract_v:
             # 契约里的 persona 是 Core 排日程时用的那个人格，社交层用的是按会话
@@ -7298,7 +7808,7 @@ class SocialEngine:
                 )
             return (
                 f"✅ 联动正常（Core 角色 {len(roles)} 个，匹配 {len(matched)} 个；"
-                f"契约 v{contract_v}，身体轴参与决策）{tz_note}"
+                f"契约 v{contract_v}，身体轴参与决策）{tz_note}{contract_note}"
             )
         return (
             f"⚠️ 联动中但降级：Core 角色 {len(roles)} 个，匹配 {len(matched)} 个，"
@@ -7306,16 +7816,52 @@ class SocialEngine:
             "升级 Core 到 v2.14+ 才能用上睡意/饥饿/时区/句长约束。"
         )
 
+    @staticmethod
+    def _contract_view_note(view: Dict[str, Any]) -> str:
+        """把契约新鲜度/握手校验的结果拼成一句状态页备注（P2-10 显示侧，空串=不显示）。
+
+        行为层面过期契约的「此刻状态」已经被 core_bridge 清空；面板若只说「联动正常」，
+        用户会以为 day/wake 突然丢了是插件坏了。这里把原因说出来。
+        """
+        if not isinstance(view, dict):
+            return ""
+        notes: List[str] = []
+        if view.get("contract_stale"):
+            age = view.get("contract_age_seconds")
+            try:
+                minutes = int(float(age) / 60) if age is not None else 0
+            except (TypeError, ValueError):
+                minutes = 0
+            notes.append(
+                f"⚠️ 契约已过期 {minutes} 分钟（此刻状态不参与判断；"
+                "门面现算的值不受影响）"
+            )
+        handshake = view.get("contract_handshake")
+        if isinstance(handshake, dict) and handshake.get("ok") is False:
+            problems = handshake.get("problems")
+            count = len(problems) if isinstance(problems, list) else 0
+            notes.append(f"⚠️ 契约握手校验未通过（{count} 项）")
+        return "；" + "；".join(notes) if notes else ""
+
     def _facade_status_text(self) -> str:
         """门面（契约 v2 同进程只读接口）这一路的状态。
 
         单独一行是刻意的：读文件和走门面是**两条路**，一条坏了另一条可能还在，
         混成一句「联动正常」等于把「正在用哪条路」这件事藏起来——而排查时最需要
         知道的恰恰是这个。
+
+        P2-09：先走一次 `_core_facade()`。它的存活探测会在 Core 热重载后自动断开
+        旧对象并重连；面板显示的是**探测后的真实状态**，不是缓存里的旧结论。
+        P2-12：on 模式的措辞说准确——是「主动消息只走门面、不读 state.json」，
+        而不是假装门面连不上时还有文件回退。
         """
-        mode = str(getattr(self.cfg, "use_core_facade", "auto") or "auto")
+        mode = str(getattr(self.cfg, "use_core_facade", "auto") or "auto").lower()
         if mode == "off":
             return "门面：已关闭（use_core_facade=off，与 1.27.38 行为一致）"
+        try:
+            SocialEngine._core_facade(self)  # 触发存活探测 / 热重载后自动重连（P2-08/P2-09）
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 状态页刷新门面状态失败: {exc}")
         info = core_facade.status()
         if info.get("connected"):
             caps_list = list(info.get("capabilities") or [])
@@ -7326,25 +7872,112 @@ class SocialEngine:
             caller = "；主动消息的上下文改由 Core 直接给"
             if "user" in caps_list:
                 caller += "（含称呼/好感/说过的话）"
+            alive = info.get("alive")
+            stale = ""
+            if alive is False:
+                stale = "；⚠️ 存活探测未通过（Core 可能刚重载），已触发重连"
             return (
                 f"✅ 门面：已连接（Core API v{info.get('api_version')}；能力：{caps}）"
                 + caller
+                + stale
             )
         reason = str(info.get("reason") or "还没查过")
         if mode == "on":
-            return f"❌ 门面：未连接（{reason}）；use_core_facade=on，所以不读 state.json"
+            return (
+                f"❌ 门面：未连接（{reason}）；use_core_facade=on：主动消息只走门面、"
+                "不读 state.json（不会静默退回文件）"
+            )
         return f"⚠️ 门面：未连接（{reason}）；已退回读 state.json"
 
     def _provider_status_text(self) -> str:
-        """主动消息用哪个模型。配了专供却一个都取不到时，这里必须说出来。
+        """主动消息用哪个模型，以及**配的专供 ID 到底能不能解析**（P3-10）。
 
         不说的后果很具体：那一行会是「跟会话走」，而实际行为是「本轮不开口」——
-        用户以为模型选错了，实际是 ID 打错了、而插件按设计静默不发。
+        用户以为模型选错了，实际是 ID 打错了、而插件按设计静默不发。docstring 一直
+        承诺「一个都取不到时必须说出来」，实现却只回显配置；现在接生成器的
+        `proactive_provider_health()`（provider-config 提供，注意它保证不抛）做预检，
+        明确报 N/M 可用；拿不到这个方法时退回旧的只回显文案。
         """
+        health_fn = getattr(self.generator, "proactive_provider_health", None)
+        if callable(health_fn):
+            try:
+                health = health_fn()
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] provider 预检失败（退回回显）: {exc}")
+                health = None
+            if isinstance(health, dict):
+                detail = str(health.get("detail") or "").replace("\n", " ").strip()
+                if detail:
+                    return detail
+                # 兼容只有数字没有 detail 的实现
+                try:
+                    total = int(health.get("total", 0) or 0)
+                    usable = int(health.get("resolvable", 0) or 0)
+                except (TypeError, ValueError):
+                    total = usable = 0
+                if total:
+                    return f"模型：主动消息专用 → {usable}/{total} 可解析"
         ids = list(getattr(self.cfg, "proactive_provider_ids", []) or [])
         if not ids:
             return "模型：未指定专用模型，跟着当前会话的 provider 走"
-        return "模型：主动消息专用 → " + " → ".join(ids) + "（取不到就本轮不发，不退默认）"
+        return "模型：主动消息专用 → " + " → ".join(ids)
+
+    def _memory_status_text(self) -> str:
+        """状态页【联动】的记忆桥一行（P2-07）：已连接 / 未安装 / 对面关闭 / 失败原因。
+
+        以前记忆桥只有 debug 日志，`last_error()` 也没有生产消费者：线上「装了个寂寞」
+        与「压根没装」在面板上长得一模一样。这里优先用 `memory_bridge.status_text()`
+        （memory-link 提供，enabled 传本插件开关），拿不到就退回 `status()/last_error()`。
+        """
+        enabled = bool(getattr(self.cfg, "memory_bridge_enabled", True))
+        if not enabled:
+            return "记忆：已关闭（memory_bridge_enabled=false）"
+        bridge = None
+        try:
+            bridge = SocialEngine._memory_bridge(self)  # 会按 TTL 重试，见该方法
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 解析记忆桥失败: {exc}")
+        text_fn = getattr(memory_bridge, "status_text", None)
+        if callable(text_fn):
+            try:
+                line = str(text_fn(enabled=True) or "").strip()
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] memory_bridge.status_text() 失败: {exc}")
+                line = ""
+            if line:
+                return line
+        status_fn = getattr(memory_bridge, "status", None)
+        if callable(status_fn):
+            try:
+                info = status_fn()
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] memory_bridge.status() 失败: {exc}")
+                info = None
+            if isinstance(info, dict):
+                state = str(info.get("state") or "").strip()
+                reason = str(info.get("reason") or info.get("last_error") or "").strip()
+                if bridge is not None and state in ("", "connected", "resolved"):
+                    return "✅ 记忆：已连接（memory_companion）"
+                labels = {
+                    "missing": "未安装 memory_companion",
+                    "disabled": "对面关闭了记忆桥（private_companion_bridge.enabled=false）",
+                    "unresolved": "还没解析到（对面可能还没加载完）",
+                    "error": "连接失败",
+                }
+                label = labels.get(state, state or "未连接")
+                if reason:
+                    return f"⚠️ 记忆：{label}：{reason}"
+                return f"⚠️ 记忆：{label}"
+        if bridge is not None:
+            return "✅ 记忆：已连接（memory_companion）"
+        last = ""
+        try:
+            last = str(memory_bridge.last_error() or "").strip()
+        except Exception:
+            last = ""
+        if last:
+            return f"⚠️ 记忆：未连接（{last}）"
+        return "⚠️ 记忆：未连接（memory_companion 未安装，或对面没开桥接）"
 
     def _per_bot_status_text(self) -> str:
         """按角色分行：念头、冷却、发送、熔断、退避各自一格。
@@ -7753,11 +8386,12 @@ class SocialEngine:
            逐字等价。这三件事在 state.json 里长得一样（都没有 ccb 键），所以只认
            「已经有数据」这一种证据；
         3. 有具体 uid 就报那个人的状态；没有就退回能力/配置，绝不拿别人顶替。
+
+        P2-12：on 模式只走门面，本段不读 state.json（ccb 状态没有门面入口，故整段不显示）。
         """
-        try:
-            root = self.core.read_root()
-        except Exception:
-            root = None
+        if SocialEngine._facade_only(self):
+            return ""
+        root = SocialEngine._read_core_root(self)
         if not root:
             return ""
         bid = str(bid or "")
@@ -8211,6 +8845,7 @@ class SocialEngine:
             f"- Core：{self._core_status_text()}\n"
             f"- {self._facade_status_text()}\n"
             f"- 写回：{self._signals_status_text()}\n"
+            f"- {self._memory_status_text()}\n"
             f"- {self._llm_status_text()}\n"
             f"- {self._provider_status_text()}\n"
             f"- 发送：{self._send_status_text()}"

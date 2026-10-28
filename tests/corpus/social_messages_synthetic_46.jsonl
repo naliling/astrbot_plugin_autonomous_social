@@ -1,0 +1,46 @@
+{"bot": "webchat", "cat": "complain", "why": "念头攒到 2.80", "text": "想表达此刻的孤独和饥饿感", "pass": false, "note": "动机泄漏（开头是在说自己要说这句）"}
+{"bot": "webchat", "cat": "check_in", "why": "念头攒到 0.59", "text": "想分享这种懒洋洋的感觉并关心对方", "pass": false, "note": "动机泄漏（开头是在说自己要说这句）"}
+{"bot": "webchat", "cat": "share_thought", "why": "念头攒到 1.28", "text": "表达想念，结束一天的对话", "pass": false, "note": "动机泄漏（整条是「表达…/抱怨…」这种描述）"}
+{"bot": "webchat", "cat": "continue_topic", "why": "话说到一半断了", "text": "刚忙完手头的事，窗外的太阳有点晃眼，你那边忙完了吗？", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "share_daily", "why": "下午的空档", "text": "想找个借口跟你说说话", "pass": false, "note": "动机泄漏（挂着「顺便/不指望回」这类自述）"}
+{"bot": "webchat", "cat": "greeting", "why": "刚忙完一件事", "text": "下午泡了杯茶，突然想起你昨天说的那件事，后来怎么样了？", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.42", "text": "今天在地铁上看到一只很乖的猫，跟你上次说想养的那种很像。", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "(把毯子裹得紧紧的", "pass": false, "note": "括号不配平（多半是超长被截断切在了括号里）"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.59", "text": "(窝在沙发里，手里抓着零食", "pass": false, "note": "括号不配平（多半是超长被截断切在了括号里）"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 1.28", "text": "刚放下碗，顺手擦了擦桌子，窗外风有点凉 ⏎ (把围巾往脖子里塞了塞", "pass": false, "note": "括号不配平（多半是超长被截断切在了括号里）"}
+{"bot": "webchat", "cat": "greeting", "why": "话说到一半断了", "text": "(裹紧毛毯，靠在沙发上)", "pass": false, "note": "只剩括号动作，没有正文"}
+{"bot": "webchat", "cat": "greeting", "why": "下午的空档", "text": "(伸了个懒腰，望向窗外)", "pass": false, "note": "只剩括号动作，没有正文"}
+{"bot": "webchat", "cat": "greeting", "why": "刚忙完一件事", "text": "刚醒", "pass": false, "note": "空泛（正文只有 '刚醒'）"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.42", "text": "在吗", "pass": false, "note": "空泛（正文只有 '在吗'）"}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 2.80", "text": "晚饭吃了碗热汤面，胃里暖过来了，你今晚吃什么？", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "greeting", "why": "念头攒到 0.59", "text": "嗯", "pass": false, "note": "空泛（正文只有 '嗯'）"}
+{"bot": "webchat", "cat": "share_thought", "why": "念头攒到 1.28", "text": "今天有点累，想早点睡。｜表达想念，结束对话", "pass": false, "note": "动机泄漏（正文后面跟着一段对自己的注解）"}
+{"bot": "webchat", "cat": "share_daily", "why": "话说到一半断了", "text": "窗外下雨了，记得带伞，别又淋成落汤鸡。", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "share_thought", "why": "下午的空档", "text": "刚把最后一份文件改完，脑子有点木，想听你说说今天的事。", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "share_daily", "why": "刚忙完一件事", "text": "刚才翻到我们上个月聊的那家店，周末要不要一起去试试？", "pass": true, "note": ""}
+{"bot": "webchat", "cat": "express_feeling", "why": "念头攒到 0.42", "text": "睡前一问：明天那个会你还去吗？", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "check_in", "why": "念头攒到 2.80", "text": "今天走了一万多步，腿有点酸，你那边天气怎么样？", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "greeting", "why": "念头攒到 0.59", "text": "突然想起来，你之前说要早起跑步，这周坚持下来了吗？", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "greeting", "why": "念头攒到 1.28", "text": "晚上有点凉，你把窗户关一下，别着凉。", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "greeting", "why": "话说到一半断了", "text": "刚看完一集剧，结尾有点意思，你猜怎么着？", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "greeting", "why": "下午的空档", "text": "想分享今天遇到的趣事", "pass": false, "note": "动机泄漏（开头是在说自己要说这句）"}
+{"bot": "100000001", "cat": "check_in", "why": "刚忙完一件事", "text": "今天食堂的菜意外好吃，可惜你不在。", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "continue_topic", "why": "念头攒到 0.42", "text": "我把那本书看完了，结局跟你说的一样，果然还是你会挑。", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "check_in", "why": "念头攒到 2.80", "text": "刚路过你说的那家面包店，闻到味儿就想起你了。", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "continue_topic", "why": "念头攒到 0.59", "text": "SEND", "pass": false, "note": "协议残留（正文里混进了独立成行的「SEND」）"}
+{"bot": "100000001", "cat": "greeting", "why": "念头攒到 1.28", "text": "手机屏幕亮了一下，我看着屏幕上的消息打字给你", "pass": false, "note": "打破第四面墙（提了设备「手机」——她活在对话里，不活在设备里）"}
+{"bot": "100000001", "cat": "greeting", "why": "话说到一半断了", "text": "今天风好大，头发都吹乱了，你那边也降温了吗？", "pass": true, "note": ""}
+{"bot": "100000001", "cat": "greeting", "why": "下午的空档", "text": "刚吃完饭。｜描述一下今天的晚饭", "pass": false, "note": "动机泄漏（正文后面跟着一段对自己的注解）"}
+{"bot": "100000001", "cat": "greeting", "why": "刚忙完一件事", "text": "(整理好餐具，翅膀微微收拢", "pass": false, "note": "括号不配平（多半是超长被截断切在了括号里）"}
+{"bot": "100000001", "cat": "greeting", "why": "念头攒到 0.42", "text": "想说说今天发生的事", "pass": false, "note": "动机泄漏（开头是在说自己要说这句）"}
+{"bot": "100000002", "cat": "greeting", "why": "念头攒到 2.80", "text": "突然发现我们认识挺久了，你还记得第一次聊天说的什么吗？", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "check_in", "why": "念头攒到 0.59", "text": "午饭吃得有点撑，现在窝着不想动，你呢？", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "greeting", "why": "念头攒到 1.28", "text": "刚忙完，终于能喘口气了，你那边今天顺利吗？", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "greeting", "why": "话说到一半断了", "text": "晚上留了盏灯，等你忙完说说话。", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "continue_topic", "why": "下午的空档", "text": "今天收到你寄来的东西了，谢谢你，改天请你吃饭。", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "check_in", "why": "刚忙完一件事", "text": "刚跟同事开完会，脑子还在转，你那边下班了吗？", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "check_in", "why": "念头攒到 0.42", "text": "周末想去那家新开的店看看，你要一起吗？", "pass": true, "note": ""}
+{"bot": "100000002", "cat": "check_in", "why": "念头攒到 2.80", "text": "今天早上起晚了，差点没赶上地铁，你送的那个闹钟真该修了。", "pass": true, "note": ""}
+{"bot": "100000003", "cat": "greeting", "why": "念头攒到 0.59", "text": "今天忙了一下午，现在才开始想晚饭吃什么，你有推荐吗？", "pass": true, "note": ""}
+{"bot": "100000003", "cat": "check_in", "why": "念头攒到 1.28", "text": "刚才听到一首歌，想起你上次发的那首，循环了一晚上。", "pass": true, "note": ""}
+{"bot": "100000003", "cat": "greeting", "why": "话说到一半断了", "text": "想找点乐子说两句", "pass": false, "note": "动机泄漏（挂着「顺便/不指望回」这类自述）"}

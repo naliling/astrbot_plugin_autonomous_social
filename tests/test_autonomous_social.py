@@ -731,15 +731,30 @@ class TestGroupSamples(unittest.TestCase):
 class TestClockRollback(unittest.TestCase):
     """墙钟回拨时 `now - last_sent` 会变负，所有冷却同时成立 → 永久静默。"""
 
-    def test_time_never_goes_backwards(self):
+    def test_time_never_goes_backwards_on_small_rollback(self):
         clock = [1_700_000_000.0]
         engine = _ClockEngine(lambda: clock[0])
         self.assertEqual(engine._time(), 1_700_000_000.0)
         clock[0] += 600
         self.assertEqual(engine._time(), 1_700_000_600.0)
-        clock[0] -= 7200                      # NTP 回拨两小时
-        self.assertEqual(engine._time(), 1_700_000_600.0, "时间倒退了")
-        self.assertGreaterEqual(engine._time() - (1_700_000_600.0 - 300), 0)
+        clock[0] -= 200                       # NTP 微调（< 300s 阈值）
+        self.assertEqual(engine._time(), 1_700_000_600.0, "小回拨把时间倒退了")
+        clock[0] += 100                       # 仍在水位线下
+        self.assertEqual(engine._time(), 1_700_000_600.0)
+        clock[0] += 150                       # 越过水位线后恢复正常
+        self.assertEqual(engine._time(), 1_700_000_650.0)
+
+    def test_large_rollback_unfreezes_the_timeline(self):
+        """P3-09：回拨超过阈值按「墙钟被改」处理——重置高水位并告警，不再冻结。"""
+        clock = [1_700_000_000.0]
+        engine = _ClockEngine(lambda: clock[0])
+        self.assertEqual(engine._time(), 1_700_000_000.0)
+        clock[0] += 600
+        self.assertEqual(engine._time(), 1_700_000_600.0)
+        clock[0] -= 7200                      # 回拨两小时（远超 300s 阈值）
+        self.assertEqual(engine._time(), 1_699_993_400.0, "时间轴还被冻着")
+        clock[0] += 5
+        self.assertEqual(engine._time(), 1_699_993_405.0)
 
 
 class _ClockEngine:
@@ -2063,12 +2078,12 @@ class TestHourlyCap(unittest.TestCase):
         self.assertEqual(cfg.hourly_sends_cap, 0, "设 0 应该能关掉")
 
 
-# ─── v1.20.0：真实 197 条记录带出来的六组测试 ───────────────────────
+# ─── v1.20.0：46 条合成语料带出来的六组测试（历史名沿用，现为合成数据）───
 
 def _corpus():
-    """真实发送记录的代表样本（tests/corpus/social_messages_197.jsonl）。"""
+    """合成语料代表样本（tests/corpus/social_messages_synthetic_46.jsonl，46 条）。"""
     import json
-    path = (Path(__file__).resolve().parent / "corpus" / "social_messages_197.jsonl")
+    path = (Path(__file__).resolve().parent / "corpus" / "social_messages_synthetic_46.jsonl")
     rows = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -2374,7 +2389,7 @@ class TestUrgeNotWipedByContact(unittest.TestCase):
 
 
 class TestRelationalAnchors(unittest.TestCase):
-    """真实 197 条记录里没有一条是关于「你」的。现在必须有。"""
+    """46 条合成语料里没有一条是关于「你」的。现在必须有。"""
 
     def _user(self):
         return {
@@ -2409,7 +2424,7 @@ class TestRelationalAnchors(unittest.TestCase):
         self.assertNotIn("有点想你了", got)
 
     def test_relational_pool_ignores_body_state(self):
-        """这一类不碰「她今天在干什么」——那正是 197 条里的毛病。"""
+        """这一类不碰「她今天在干什么」——那正是旧语料里的毛病。"""
         u = self._user()
         picks = anchors.prepare_round_anchors(
             u, {"day": {"doing": "改方案"}}, 1_700_000_000.0,
