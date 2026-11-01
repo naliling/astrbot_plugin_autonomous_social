@@ -1826,7 +1826,15 @@ def anchor_sentence(a: Dict[str, Any]) -> str:
     about = _s(a.get("about")) or "一件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
     lead = _REASON_BY_KIND.get(kind, _REASON_BY_KIND[KIND_DERIVED])
-    return f"{lead}：{about}"
+    if kind == KIND_CUE:
+        material = f"TA之前的原话（保留TA的说话人视角）：{about}"
+    else:
+        material = (
+            "由头素材（按你对TA说话的口吻记述，其中“我”指你自己、“你”指TA；"
+            "转述TA原话的部分仍按TA视角理解，生成时转换人称，不要照抄）：\n"
+            f"{about}"
+        )
+    return f"开口原因：{lead}\n{material}"
 
 
 def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
