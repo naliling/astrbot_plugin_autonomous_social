@@ -419,7 +419,7 @@ TOPIC_MEMORY_DEFAULT = 5
 # 太多浪费 token 也容易跑题。
 CONTEXT_INJECT_MIN = 0
 CONTEXT_INJECT_MAX = 50
-CONTEXT_INJECT_DEFAULT = 10
+CONTEXT_INJECT_DEFAULT = 5
 
 ENERGY_THRESHOLD_MIN = 0
 ENERGY_THRESHOLD_MAX = 100
@@ -807,7 +807,7 @@ class SocialConfig:
     special_care_gap_minutes: int = 20
     special_care_daily_cap: int = 8
     # 静音/睡眠豁免：关掉后「特别关心」只改间隔与追问，不碰安静时段
-    special_care_ignore_quiet: bool = True
+    special_care_ignore_quiet: bool = False
 
     # 播种：启动时从 AstrBot 会话库（data/data_v4.db 的 conversations 表）读回装插件
     # 之前就聊过的人，不用等插件装好后先聊一句才认识
@@ -1234,7 +1234,7 @@ class SocialConfig:
                 1, min(1440, gi("special_care_gap_minutes", 20))
             ),
             special_care_daily_cap=max(0, min(100, gi("special_care_daily_cap", 8))),
-            special_care_ignore_quiet=gb("special_care_ignore_quiet", True),
+            special_care_ignore_quiet=gb("special_care_ignore_quiet", False),
             history_ingest=gb("history_ingest", True),
             seed_users=gl("seed_users", None),
             seed_platform=str(g("seed_platform", _d("seed_platform",  "aiocqhttp")) or "aiocqhttp").strip() or "aiocqhttp",

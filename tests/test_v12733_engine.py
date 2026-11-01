@@ -317,19 +317,24 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), SEND_RETRY_COUNT + 1)
         self.assertFalse(unreachable)
 
-    async def test_a_later_attempt_can_succeed(self):
+    async def test_failure_is_not_retried(self):
+        """`SEND_RETRY_COUNT = 0`：失败一次就收手，等下一轮心跳再试。
+
+        原名 `test_a_later_attempt_can_succeed`，断言的是「第一次失败、
+        重试后成功」的旧行为；现在重试次数已经是 0，不会再发第二次。
+        """
         eng = _engine()
         calls = []
 
-        async def _flaky(target, text):
+        async def _always_fail(target, text):
             calls.append(text)
-            if len(calls) == 1:
-                raise _SendFailed("连接被拒", unknown=False)
+            raise _SendFailed("连接被拒", unknown=False)
 
-        eng._send_message = _flaky
+        eng._send_message = _always_fail
         ok, err, unreachable = await eng._send_with_retry("umo", "hi", "b1")
-        self.assertTrue(ok)
-        self.assertEqual(err, "")
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1, "不复重试：只发一次")
+        self.assertIn("连接被拒", err)
         self.assertFalse(unreachable)
 
     async def test_success_clears_the_breaker(self):

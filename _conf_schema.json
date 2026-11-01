@@ -916,7 +916,7 @@
         "description": "上下文条数",
         "hint": "引用对方的发言样本几条",
         "obvious_hint": true,
-        "default": 10,
+        "default": 5,
         "min": 0,
         "max": 50,
         "slider": {
@@ -1144,9 +1144,9 @@
     "special_care_ignore_quiet": {
         "type": "bool",
         "description": "特别关心不受安静时段限制",
-        "hint": "开启（默认）：安静时段/她在睡时也能给她认定的人发。关闭：只放宽间隔与追问，仍然深夜不打扰。",
+        "hint": "关闭（默认）：安静时段/她在睡时也不打扰，只放宽间隔与追问。开启：这两个时段也照发。",
         "obvious_hint": true,
-        "default": true
+        "default": false
     },
     "store_message_text": {
         "type": "bool",

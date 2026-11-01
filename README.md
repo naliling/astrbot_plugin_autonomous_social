@@ -8,7 +8,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.0.0-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.0.4-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E5%BE%AE%E4%BF%A1%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -227,7 +227,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `group_ref_sample_size` | `30` | 【群聊心流】参考库每群保留多少条样本 |
 | `group_ref_prompt_count` | `8` | 【群聊心流】生成时抽多少条当风格参考（设 0 不注入） |
 | `topic_memory_count` | `5` | 话题记忆数量 |
-| `context_inject_count` | `10` | 生成时注入多少条最近对话当上下文（含 bot 自己的发言） |
+| `context_inject_count` | `5` | 生成时注入多少条最近对话当上下文（含 bot 自己的发言） |
 | `weekend_boost` | `true` | 周末念头涨得快些 |
 | `energy_threshold` | `15` | 精力低于此值念头几乎涨不动（需 Core） |
 | `social_energy_threshold` | `20` | 社交能量低于此值念头涨得极慢（需 Core） |
@@ -248,7 +248,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `special_care_min_messages` | `60` | 【特别关心】Core 老版本没有轮数时的消息条数门槛 |
 | `special_care_gap_minutes` | `20` | 【特别关心】两条主动消息的最小间隔，替代按关系档位算出的间隔 |
 | `special_care_daily_cap` | `8` | 【特别关心】每人每天最多收几条主动消息；0 = 不单独限 |
-| `special_care_ignore_quiet` | `true` | 【特别关心】安静时段/她在睡时也能发；关掉则只放宽间隔与追问 |
+| `special_care_ignore_quiet` | `false` | 【特别关心】安静时段/她在睡时也能发；默认关着，只放宽间隔与追问 |
 | `store_message_text` | `true` | 是否把私聊正文存入 state.json |
 | `user_retention_days` | `30` | 长期不活跃用户的历史正文清理天数，0 = 永不清理 |
 | `purge_inactive_user_days` | `0` | 【清理】超过这么多天没互动、她发过去也没人回的会话，连整条记录一起永久删除（私聊与群）；0 = 永不清理。比 `user_retention_days` 更彻底：那个只清正文 |

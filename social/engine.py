@@ -197,7 +197,7 @@ def _looks_like_command(event: Any, raw: str, msg: str) -> bool:
     if str(raw or "").lstrip().startswith("/") or str(msg or "").lstrip().startswith("/"):
         return True
     try:
-        wake = bool(getattr(event, "is_at_or_wake_command", True))
+        wake = bool(getattr(event, "is_at_or_wake_command", False))
     except Exception:
         wake = True
     if wake:
@@ -257,7 +257,7 @@ CUE_MAX_TRIES = 3
 # 主动消息对时效性不敏感，重试三次意义不大；而 try_once 是串行的：每次失败的发送要
 # 2×8 秒的等待，一轮里遇到几个失败的人就能把整个心跳占住几十秒，期间所有用户都停摆。
 # 宁可少试、快点失败——下一轮心跳本来还会再试。
-SEND_RETRY_COUNT = 1
+SEND_RETRY_COUNT = 0
 SEND_RETRY_DELAY = 3.0
 
 # 一轮里「试着说」的次数上限 = max_sends_per_round × 这个倍数。
@@ -1544,7 +1544,7 @@ class SocialEngine:
         但会留在 state 的 conversation 里。两者按文本去重后合并，避免会话库
         存在时把 bot 自己的主动消息覆盖掉。
         """
-        limit = int(getattr(self.cfg, "context_inject_count", 10) or 0)
+        limit = int(getattr(self.cfg, "context_inject_count", 5) or 0)
         if limit <= 0:
             return []
 
@@ -1593,7 +1593,7 @@ class SocialEngine:
         从 state 的 conversation 合并回来。条数由 context_inject_count 控制。
         """
         if limit is None:
-            limit = int(getattr(self.cfg, "context_inject_count", 10) or 0)
+            limit = int(getattr(self.cfg, "context_inject_count", 5) or 0)
         if limit <= 0:
             return []
         cm = getattr(self.context, "conversation_manager", None)
@@ -2226,7 +2226,7 @@ class SocialEngine:
         # 交给它定：主人没开分段就合并回一条，开了才按框架的拆法与间隔发。
         segments, waits = pacing.plan_segments(
             parts, umo, self.context,
-            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+            allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
         )
         if not segments:
             return
@@ -2263,8 +2263,28 @@ class SocialEngine:
                     logger.warning(f"[autonomous_social] 群 {gid}（bid={bid}）发送失败，隔离 {SEND_BLOCK_HOURS}h：{err}")
             else:
                 self.log(f"群 {gid} 心流发送失败：{err}")
+                g = self.state.group(bid, gid)
+                try:
+                    n = int(g.get("fail_count", 0) or 0) + 1
+                except (TypeError, ValueError):
+                    n = 1
+                g["fail_count"] = n
+                delay = min(
+                    SEND_FAIL_COOLDOWN_BASE * (2 ** min(n - 1, 6)),
+                    SEND_FAIL_COOLDOWN_MAX,
+                )
+                self.state.block_group(
+                    bid, gid, self._time() + delay, err or "发送失败"
+                )
+                self.log(
+                    f"群 {gid} 心流发送失败，{int(delay / 60)} 分钟后再试：{err}"
+                )
             return
         sent_ts = self._time()
+        try:
+            self.state.group(bid, gid)["fail_count"] = 0
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 清群 {gid} 发送失败计数失败: {exc}")
         self.state.note_flow_reply(
             bid, gid, sent_ts, segments[0],
             sample_cap=self.cfg.group_ref_sample_size,
@@ -2279,7 +2299,7 @@ class SocialEngine:
     def _build_group_ctx(self, bid: str, gid: str, g: Dict[str, Any]) -> Dict[str, Any]:
         """给生成侧凑群上下文：风格参考 + 最近几条群友发言 + 上一句心流接的话。"""
         samples = g.get("samples", []) or []
-        n = max(1, int(getattr(self.cfg, "context_inject_count", 10) or 10))
+        n = max(1, int(getattr(self.cfg, "context_inject_count", 5) or 5))
         recent = [
             {
                 "name": str(s.get("name", "") or ""),
@@ -2526,7 +2546,7 @@ class SocialEngine:
         # 先拆段再逐段验，后续补发的段不再免检。
         segments, waits = pacing.plan_segments(
             parts, umo, self.context,
-            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+            allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
         )
         if not segments:
             return False
@@ -3214,9 +3234,7 @@ class SocialEngine:
                 )
                 mood_for_user = mood
                 quiet_for_user = quiet
-                if is_special_care and bool(
-                    getattr(self.cfg, "special_care_ignore_quiet", True)
-                ):
+                if is_special_care and SocialEngine._special_care_ignore_quiet_on(self):
                     mood_for_user = max(mood, 1.0)
                     quiet_for_user = False
 
@@ -3808,7 +3826,7 @@ class SocialEngine:
         README 的承诺是「只放宽间隔与追问」——睡眠/安静时段这两道硬闸必须留下，
         否则「关掉静音豁免」只是个骗人的开关（深夜照样把 TA 叫醒）。
         """
-        return bool(getattr(getattr(engine, "cfg", None), "special_care_ignore_quiet", True))
+        return bool(getattr(getattr(engine, "cfg", None), "special_care_ignore_quiet", False))
 
     @staticmethod
     def _last_said(u: Dict[str, Any]) -> float:
@@ -6062,7 +6080,7 @@ class SocialEngine:
         # 没开分段的 Bot：多段合并为整条发；开了的：按它的拆分法与间隔逐段发。
         segments, waits = pacing.plan_segments(
             parts, umo, self.context,
-            allow_burst=bool(getattr(self.cfg, "allow_burst", True)),
+            allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
         )
         if not segments:
             return False, "拆段规划为空"
@@ -7163,7 +7181,7 @@ class SocialEngine:
                 ), False
         last_err = ""
         peer_unreachable = False
-        for attempt in range(SEND_RETRY_COUNT + 1):
+        for attempt in range(1):
             try:
                 await self._send_message(target, text)
                 self._note_send_ok(bid)
@@ -7392,10 +7410,9 @@ class SocialEngine:
                 n = int(_num(u.get("platform_fail_count", 0) or 0)) + 1
             except (TypeError, ValueError):
                 n = 1
-            delay = min(
-                SEND_FAIL_PLATFORM_COOLDOWN * (4 ** min(n - 1, 6)),
-                SEND_FAIL_PLATFORM_MAX,
-            )
+            delay = SEND_FAIL_PLATFORM_COOLDOWN * (4 ** min(n - 1, 6))
+            if delay > SEND_FAIL_PLATFORM_MAX:
+                delay = SEND_FAIL_PLATFORM_MAX
             u["platform_fail_count"] = n
             u["send_fail_until"] = self._time() + delay
             u["send_blocked_reason"] = f"平台侧（与TA无关）：{(reason or '原因未知')[:80]}"
@@ -7405,9 +7422,9 @@ class SocialEngine:
             n = int(_num(u.get("send_fail_count", 0) or 0)) + 1
         except (TypeError, ValueError):
             n = 1
-        delay = min(
-            SEND_FAIL_COOLDOWN_BASE * (2 ** (n - 1)), SEND_FAIL_COOLDOWN_MAX
-        )
+        delay = SEND_FAIL_COOLDOWN_BASE * (2 ** (n - 1))
+        if delay > SEND_FAIL_COOLDOWN_MAX:
+            delay = SEND_FAIL_COOLDOWN_MAX
         u["send_fail_count"] = n
         u["send_fail_until"] = self._time() + delay
         if reason:
@@ -7929,7 +7946,7 @@ class SocialEngine:
         与「压根没装」在面板上长得一模一样。这里优先用 `memory_bridge.status_text()`
         （memory-link 提供，enabled 传本插件开关），拿不到就退回 `status()/last_error()`。
         """
-        enabled = bool(getattr(self.cfg, "memory_bridge_enabled", True))
+        enabled = bool(getattr(self.cfg, "memory_bridge_enabled", False))
         if not enabled:
             return "记忆：已关闭（memory_bridge_enabled=false）"
         bridge = None

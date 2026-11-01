@@ -131,7 +131,10 @@ class SpecialCareConfigTest(unittest.TestCase):
         self.assertTrue(cfg.special_care_auto)
         self.assertEqual(cfg.special_care_gap_minutes, 20)
         self.assertEqual(cfg.special_care_daily_cap, 8)
-        self.assertTrue(cfg.special_care_ignore_quiet)
+        self.assertFalse(
+            cfg.special_care_ignore_quiet,
+            "v2.0.4 起默认不豁免安静/睡眠时段：特别关心也要深夜不打扰",
+        )
 
     def test_entries_from_list(self):
         cfg = SocialConfig(special_care_uids=["u1", " u2 ", None, "p:u3"])
@@ -268,7 +271,8 @@ class SpecialCareGateTest(unittest.TestCase):
     """闸门豁免：睡着了/安静时段/没被接住这些「普通关系」的护栏，对特别关心让路。"""
 
     def _eng(self):
-        eng = _engine(special_care_uids=["10086"])
+        # 豁免路径要显式打开开关：v2.0.4 起默认关闭（默认值本身另有测试守着）。
+        eng = _engine(special_care_uids=["10086"], special_care_ignore_quiet=True)
         return eng
 
     def test_gate_reason_skips_asleep(self):
@@ -278,6 +282,12 @@ class SpecialCareGateTest(unittest.TestCase):
         self.assertIn("睡", eng.gate_reason("b1", "n1", blocked, NOW, body))
         special = _user("10086")
         self.assertEqual(eng.gate_reason("b1", "10086", special, NOW, body), "")
+
+    def test_gate_reason_default_does_not_skip_asleep(self):
+        """默认关闭：不打开开关时，特别关心也不得越过睡眠/安静时段。"""
+        eng = _engine(special_care_uids=["10086"])
+        body = {"asleep": True}
+        self.assertIn("睡", eng.gate_reason("b1", "10086", _user("10086"), NOW, body))
 
     def test_greet_gate_skips_asleep(self):
         eng = self._eng()
@@ -313,7 +323,10 @@ class SpecialCareGateTest(unittest.TestCase):
 
 class SpecialCareSettleTest(unittest.TestCase):
     def test_quiet_hours_do_not_freeze_special_care_urge(self):
-        eng = _engine(_Clock(NOW), special_care_uids=["sc1"], quiet_start=23, quiet_end=7)
+        eng = _engine(
+            _Clock(NOW), special_care_uids=["sc1"], quiet_start=23, quiet_end=7,
+            special_care_ignore_quiet=True,
+        )
         sc = _user("sc1", urge=0.0, urge_at=NOW - 4 * 3600, interest=0.5,
                    last_seen=NOW - 100000)
         plain = _user("n1", urge=0.0, urge_at=NOW - 4 * 3600, interest=0.5,

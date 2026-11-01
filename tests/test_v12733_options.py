@@ -534,7 +534,7 @@ class TopicAndContextOptionTest(unittest.TestCase):
     def test_defaults(self):
         cfg = _cfg()
         self.assertEqual(cfg.topic_memory_count, 5)
-        self.assertEqual(cfg.context_inject_count, 10)
+        self.assertEqual(cfg.context_inject_count, 5)
 
     def test_topic_memory_clamped(self):
         self.assertEqual(_cfg(topic_memory_count=-1).topic_memory_count, TOPIC_MEMORY_MIN)
