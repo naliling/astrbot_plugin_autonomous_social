@@ -88,6 +88,9 @@ MAX_CONVERSATION_HISTORY = 10
 MESSAGE_TRUNCATE_LENGTH = 200
 # 对话历史单条截断长度
 CONVERSATION_TRUNCATE_LENGTH = 200
+# pending_proactive_context 最多保留几条：每次主动发送追加一条，用户下一次
+# LLM 请求时整段消费掉；不设上限的话长时间没人回会一直攒。
+PENDING_PROACTIVE_KEEP = 8
 # 最近消息类型追踪数量
 RECENT_MSG_TYPES_COUNT = 6
 # 每用户主动消息日志保留天数：只记自己主动发出的那几条，按（bid,uid）天然隔离不串台，
@@ -298,9 +301,10 @@ class SocialState:
             "proactive_replied": 0,
             "last_proactive_sent": 0.0,
             "last_proactive_replied": True,
-            # 尚未被用户下一次 LLM 请求消费的主动消息原文；只在状态里暂存，
-            # 由 on_llm_request 作为临时内容块注入一次，不写入 AstrBot 会话库。
-            "pending_proactive_context": "",
+            # 尚未被用户下一次 LLM 请求消费的主动消息原文。每项
+            # {text, ts, in_history}：in_history=True 表示这条已经补写进 AstrBot
+            # 会话历史，on_llm_request 不能再把它当临时内容块注入一遍。
+            "pending_proactive_context": [],
             # v2: 回复时间统计
             "avg_reply_seconds": 0.0,
             "reply_samples": 0,
@@ -1740,14 +1744,22 @@ class SocialState:
         # 口径）：关掉「更隐私」之后，主动消息原文不该还落 120 字在盘上。
         u["last_spoken"] = ts
         u["last_spoken_text"] = str(text or "")[:120] if store_text else ""
-        # 暂存完整文本，等用户回复时由 on_llm_request 作为本轮临时内容块注入。
-        # 主动消息不再写进 AstrBot 会话库；消费后清空，避免每条消息都重复注入。
-        # 连发（burst）时追加而不是覆盖：两条都得让 AI 看得见。
-        existing = str(u.get("pending_proactive_context", "") or "")
-        if existing and len(existing) < 500:
-            u["pending_proactive_context"] = existing + "\n" + str(text or "")[:300]
-        else:
-            u["pending_proactive_context"] = str(text or "")[:500]
+        # 暂存完整文本：同步写进 AstrBot 会话历史是后台任务，可能还没写完用户就
+        # 回了；那时仍要靠 on_llm_request 临时注入一次。写成功后会打 in_history
+        # 标记，消费时跳过，避免模型看到两遍。连发（burst）时追加而不是覆盖。
+        pending = u.get("pending_proactive_context")
+        if isinstance(pending, str):
+            # 旧状态里的字符串格式，升级时归一成列表
+            pending = (
+                [{"text": pending, "ts": ts, "in_history": False}] if pending else []
+            )
+        elif not isinstance(pending, list):
+            pending = []
+        # 已经进会话历史的条目不再需要临时注入，顺手丢掉，状态不会越攒越大
+        pending = [m for m in pending if isinstance(m, dict) and not m.get("in_history")]
+        pending.append({"text": str(text or ""), "ts": ts, "in_history": False})
+        del pending[:-PENDING_PROACTIVE_KEEP]
+        u["pending_proactive_context"] = pending
 
         self.mark_dirty()
         return u

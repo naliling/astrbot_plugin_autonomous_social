@@ -311,6 +311,11 @@ MISS_DAILY_CAP_DEFAULT = 3
 # 两条主动消息的最小间隔（分钟）默认值与范围；
 MIN_GAP_MINUTES_DEFAULT = 60
 MIN_GAP_MAX = 720
+# 档位间隔按 min_gap 等比缩放后的硬上限（分钟）。LOW 档本身就是 720，
+# 缩放后很容易顶到上限；以前写死 1440（一天），LOW 几乎永远被它卡死。
+MAX_GAP_MINUTES_MIN = 60
+MAX_GAP_MINUTES_MAX = 10080
+MAX_GAP_MINUTES_DEFAULT = 1440
 
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
 # 心跳间隔（分钟）。它决定所有分钟级配置的实际精度
@@ -388,9 +393,10 @@ CLOSER_AFTER_MAX = 72
 CLOSER_AFTER_DEFAULT = 8
 
 # 模型否决（想过但决定不说）之后，多久之内不再就同一个人重新纠结
+# 10 → 30（v2.0.5）：10 分钟太短，一次真心的「不想说」几乎立刻被重新提问，等于没有否决。
 SKIP_COOLDOWN_MIN = 5
 SKIP_COOLDOWN_MAX = 480
-SKIP_COOLDOWN_DEFAULT = 10
+SKIP_COOLDOWN_DEFAULT = 30
 
 HOUR_MIN = 0
 HOUR_MAX = 23
@@ -652,6 +658,8 @@ class SocialConfig:
     # 的护栏，问候/追问/回访/收场全都绕过了它，于是早安 08:00、追问 08:12 这种
     # 扎堆从来没被挡过。这个覆盖全部五条路径。
     min_gap_minutes: int = MIN_GAP_MINUTES_DEFAULT
+    # 档位间隔缩放后的硬上限（分钟）。LOW 档 720 分钟起步，缩放后需要能超过 1440。
+    max_gap_minutes: int = MAX_GAP_MINUTES_DEFAULT
     # 「念想」通道：没有正事、只是想 TA 说一句。这一类**不受「刚聊过」阻断**——
     # 「刚聊完还发一条」是打断，「过了一阵子想你了」不是。
     miss_affection_min: int = MISS_AFFECTION_MIN_DEFAULT
@@ -705,6 +713,9 @@ class SocialConfig:
 
     # 是否把 bot 在主链路里自己说的话也记进对话账本（追问判定的地基）
     track_own_replies: bool = True
+
+    # 主动发出的消息要不要追加进 AstrBot 的会话历史（WebUI 可见、别的插件读得到）
+    persist_proactive_history: bool = True
 
     # 安静时段与作息画像按她所在城市的小时走（需要 Humanoid Core 提供时区偏移）
     use_core_clock: bool = True
@@ -1129,6 +1140,9 @@ class SocialConfig:
         except (TypeError, ValueError):
             loop_max = max(loop_min + 1.0, LOOP_MAX_HOURS_DEFAULT)
 
+        _max_gap = gi("max_gap_minutes", MAX_GAP_MINUTES_DEFAULT)
+        if _max_gap <= 0:
+            _max_gap = MAX_GAP_MINUTES_DEFAULT
         return cls(
             enabled=gb("enabled", True),
             mode=mode,
@@ -1138,6 +1152,9 @@ class SocialConfig:
             ),
             min_gap_minutes=max(
                 10, min(MIN_GAP_MAX, gi("min_gap_minutes", MIN_GAP_MINUTES_DEFAULT)),
+            ),
+            max_gap_minutes=max(
+                MAX_GAP_MINUTES_MIN, min(MAX_GAP_MINUTES_MAX, _max_gap)
             ),
             miss_affection_min=max(
                 0, min(100, gi("miss_affection_min", MISS_AFFECTION_MIN_DEFAULT)),
@@ -1380,6 +1397,7 @@ class SocialConfig:
                 min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
             track_own_replies=gb("track_own_replies", True),
+            persist_proactive_history=gb("persist_proactive_history", True),
             use_core_clock=gb("use_core_clock", True),
             use_core_facade=facade_mode,
             proactive_provider_ids=proactive_providers,

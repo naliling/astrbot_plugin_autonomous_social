@@ -61,7 +61,7 @@ from .reasoning import (
     sleep_signal,
     time_slot,
 )
-from .state import SocialState
+from .state import CONVERSATION_TRUNCATE_LENGTH, SocialState
 from . import groupflow
 from .threads import (
     live_loops,
@@ -110,6 +110,18 @@ def _strip_ts(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for m in conv if isinstance(m, dict)]
 
 
+def _dedupe_key(direction: Any, text: Any) -> Tuple[str, str]:
+    """账本与会话库的去重键：两侧必须用同一套截断。
+
+    账本每条 text 由 state 层截到 CONVERSATION_TRUNCATE_LENGTH（200）字，而会话库
+    载入时截到 300 字。直接拿截断后的字符串精确比较，超过 200 字的主动消息就会
+    「账本 200 字 ≠ 会话库 300 字」被当成缺条目再插一遍，同一句在 prompt 里出现
+    两次。这里统一按 200 截断、并去掉首尾空白（会话库侧还会过 sanitize）。
+    """
+    body = str(text or "").strip()[:CONVERSATION_TRUNCATE_LENGTH]
+    return (str(direction or ""), body)
+
+
 def _splice_ledger_into_session(
     session_history: List[Dict[str, Any]],
     ledger: List[Dict[str, Any]],
@@ -132,7 +144,7 @@ def _splice_ledger_into_session(
     """
     anchor_ts: Dict[Tuple[str, str], float] = {}
     for item in ledger:
-        key = (item["dir"], item["text"])
+        key = _dedupe_key(item.get("dir"), item.get("text"))
         # 账本可能因 store_text 关掉而过期，取不到 ts 时按 0（最旧）
         ts = _num(item.get("ts", 0.0) or 0.0)
         if key not in anchor_ts or ts > anchor_ts[key]:
@@ -141,6 +153,7 @@ def _splice_ledger_into_session(
     # 主干：会话库原样搬过来。**不去重**——用户连着说两句一样的「早」是真实发生的，
     # 原来（按来源拼接那版）也保留；这里不能顺手改掉这个既有行为。
     out: List[Dict[str, Any]] = []
+    out_keys: List[Tuple[str, str]] = []
     seen = set()
     for s in session_history:
         if not isinstance(s, dict):
@@ -148,18 +161,19 @@ def _splice_ledger_into_session(
         text = str(s.get("text", "") or "").strip()
         if not text:
             continue
-        key = (str(s.get("dir", "") or ""), text)
+        key = _dedupe_key(s.get("dir"), text)
         seen.add(key)
         out.append({"dir": key[0], "text": text})
+        out_keys.append(key)
 
     # 主干上每个位置的时刻。找不到锚点的位置（会话库有、账本没有：历史导入或手改过库）
     # 记 +inf —— 不知道它何时发生，就不拿它去挡任何缺条目，缺条目因此都排在它后面，
     # 而不会因为一个未知时刻被错误地顶到用户刚说的话前面。
-    slot_ts = [anchor_ts.get((m["dir"], m["text"]), float("inf")) for m in out]
+    slot_ts = [anchor_ts.get(k, float("inf")) for k in out_keys]
 
     missing = [
         item for item in ledger
-        if (item["dir"], item["text"]) not in seen
+        if _dedupe_key(item.get("dir"), item.get("text")) not in seen
     ]
     # 稳定排序：同 ts 保持账本顺序（连发的 p1、p2 不会颠倒）
     missing.sort(key=lambda m: _num(m.get("ts", 0.0) or 0.0))
@@ -172,6 +186,7 @@ def _splice_ledger_into_session(
                 pos = i
                 break
         out.insert(pos, {"dir": item["dir"], "text": item["text"]})
+        out_keys.insert(pos, _dedupe_key(item.get("dir"), item.get("text")))
         slot_ts.insert(pos, ts)
 
     if limit > 0:
@@ -1244,6 +1259,121 @@ class SocialEngine:
                     + throttle.summary("memory.write.proactive")
                 )
 
+    def _persist_proactive_to_history(
+        self, bid: str, uid: str, umo: str, text: str
+    ) -> None:
+        """把刚发出的主动消息追加进 AstrBot 会话历史（后台任务，失败不影响主链路）。
+
+        主动消息走 context.send_message，不经过 respond 阶段，AstrBot 不会自己
+        把它写进会话库：WebUI 看不到、记忆类插件也读不到。这里在发送成功后补
+        一条 assistant 条目；写成功后把 pending 里对应的临时注入条目打上
+        in_history 标记，on_llm_request 就不会再把同一句塞临时块（否则模型
+        会看到两遍）。失败/没写时保持旧行为：照旧靠临时块注入。
+
+        默认开，可用 persist_proactive_history 关掉（关掉即回到 v2.0.4 的行为）。
+        """
+        if not getattr(self.cfg, "persist_proactive_history", True):
+            return
+        if not umo or not str(text or "").strip():
+            return
+        try:
+            task = asyncio.create_task(
+                self._persist_proactive_to_history_inner(bid, uid, umo, text)
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except Exception as exc:
+            if throttle.allow("history.persist.proactive", window=600.0):
+                logger.debug(
+                    f"[autonomous_social] 排会话历史写回任务失败: {exc}"
+                    + throttle.summary("history.persist.proactive")
+                )
+
+    async def _persist_proactive_to_history_inner(
+        self, bid: str, uid: str, umo: str, text: str
+    ) -> bool:
+        """真正读-改-写会话历史；任何异常都吞掉，绝不外抛。"""
+        body = str(text or "").strip()
+        if not body:
+            return False
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None:
+            return False
+        # 读与写之间只隔一次 await（get_conversation 算读、update_conversation 算写）
+        # 仍有并发丢失窗口：主链路同一时刻回消息会整段重写 history。失败重试一次；
+        # 重试前重新读，且按「末条同文」去重，写成功但报错时也不会重复追加。
+        for attempt in (0, 1):
+            try:
+                cid = await cm.get_curr_conversation_id(umo)
+                if not cid:
+                    return False
+                conv = await cm.get_conversation(umo, cid)
+                history: List[Dict[str, Any]] = []
+                raw_history = getattr(conv, "history", "") if conv is not None else ""
+                if raw_history:
+                    try:
+                        loaded = json.loads(raw_history)
+                    except (TypeError, ValueError):
+                        loaded = []
+                    if isinstance(loaded, list):
+                        history = [m for m in loaded if isinstance(m, dict)]
+                last = history[-1] if history else {}
+                already = (
+                    str(last.get("role") or "") == "assistant"
+                    and str(last.get("content") or "").strip() == body
+                )
+                if not already:
+                    history.append({"role": "assistant", "content": body})
+                    await cm.update_conversation(umo, cid, history=history)
+                self._mark_pending_in_history(bid, uid, body)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt == 0:
+                    continue
+                if throttle.allow("history.persist.proactive", window=600.0):
+                    logger.debug(
+                        f"[autonomous_social] 主动消息写会话历史失败: {exc}"
+                        + throttle.summary("history.persist.proactive")
+                    )
+                return False
+        return False
+
+    def _mark_pending_in_history(self, bid: str, uid: str, text: str) -> None:
+        """把 pending 里已经写进会话历史的条目打上标记（同步、不抛异常）。"""
+        try:
+            if not bid or not uid:
+                return
+            u = self.state.user(bid, uid)
+            pending = u.get("pending_proactive_context")
+            if isinstance(pending, str):
+                # 旧状态里的字符串格式：归一成列表再标记，否则升级途中这一条会被
+                # 既写进历史、又临时注入一次（模型看到两遍）。
+                pending = (
+                    [{"text": pending, "ts": 0.0, "in_history": False}]
+                    if pending.strip()
+                    else []
+                )
+                u["pending_proactive_context"] = pending
+            if not isinstance(pending, list):
+                return
+            key = str(text or "").strip()[:CONVERSATION_TRUNCATE_LENGTH]
+            changed = False
+            for item in pending:
+                if not isinstance(item, dict) or item.get("in_history"):
+                    continue
+                item_text = str(item.get("text") or "").strip()[
+                    :CONVERSATION_TRUNCATE_LENGTH
+                ]
+                if item_text == key:
+                    item["in_history"] = True
+                    changed = True
+            if changed:
+                self.state.mark_dirty()
+        except Exception:
+            return
+
     def _remember_open_closed(
         self, umo: str, uid: str, about: str, result: str = "", kind: str = "loop"
     ) -> None:
@@ -1522,27 +1652,43 @@ class SocialEngine:
         """取出并清除待注入本轮 LLM 请求的主动消息文本。
 
         主动消息走 context.send_message，不经过 AstrBot 的 respond 阶段，
-        因此不会自动进入会话历史。用户回复时由 on_llm_request 把它作为临时
-        内容块注入；消费后立即清空，避免后续请求重复注入。
+        因此不会自动进入会话历史；写进历史的动作由
+        _persist_proactive_to_history 补，写成功后这一条会带上
+        in_history 标记。已经进历史的条目模型在正常历史里就能看到，
+        这里只返回还没进去的那些，**不能**再当临时块注入一遍（否则模型
+        会看到同一句两遍）。消费后整段清空，避免后续请求重复注入。
         """
         if not bid or not uid:
             return ""
         u = self.state.user(bid, uid)
-        text = str(u.get("pending_proactive_context", "") or "")
-        if not text:
+        pending = u.get("pending_proactive_context")
+        lines: List[str] = []
+        if isinstance(pending, str):
+            # 旧状态里的字符串格式（手工改库、刚升级时还会遇到）
+            text = pending.strip()
+            if text:
+                lines.append(text)
+        elif isinstance(pending, list):
+            for item in pending:
+                if not isinstance(item, dict) or item.get("in_history"):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if text:
+                    lines.append(text)
+        if not pending:
             return ""
-        u["pending_proactive_context"] = ""
+        u["pending_proactive_context"] = []
         self.state.mark_dirty()
-        return text
+        return "\n".join(lines)
 
     def _generation_conversation(
         self, user: Dict[str, Any], session_history: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """合并用户/正常聊天历史与插件账本，供本次主动消息生成使用。
 
-        AstrBot 会话库是只读来源；插件自己主动发出的消息不再写进会话库，
-        但会留在 state 的 conversation 里。两者按文本去重后合并，避免会话库
-        存在时把 bot 自己的主动消息覆盖掉。
+        AstrBot 会话库是只读来源；插件自己主动发出的消息默认会补写进会话库
+        （persist_proactive_history），补写失败时才只留在 state 的 conversation
+        里。两者按文本去重后合并，避免同一句在 prompt 里出现两遍。
         """
         limit = int(getattr(self.cfg, "context_inject_count", 5) or 0)
         if limit <= 0:
@@ -1589,8 +1735,9 @@ class SocialEngine:
     async def _load_session_history(self, umo: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """只读 AstrBot 会话库，取最近几轮用户与正常聊天记录。
 
-        插件自己主动发出的消息不写入会话库；生成时由 _generation_conversation
-        从 state 的 conversation 合并回来。条数由 context_inject_count 控制。
+        插件主动发出的消息默认也会补写进会话库（persist_proactive_history）；
+        生成时仍由 _generation_conversation 用账本补齐漏写的那些。
+        条数由 context_inject_count 控制。
         """
         if limit is None:
             limit = int(getattr(self.cfg, "context_inject_count", 5) or 0)
@@ -4206,7 +4353,16 @@ class SocialEngine:
             table = anchors.TIER_MIN_GAP_MINUTES
             mid = float(table.get(anchors.TIER_MID, 60.0)) or 60.0
             minutes = float(table.get(tier, mid)) * (max(0.0, base) / mid)
-            minutes = min(max(minutes, 1.0), 1440.0)
+            # 上限可配（v2.0.5）：LOW 档本身就是 720 分钟，缩放后写死的 1440（一天）
+            # 几乎总把它夹住，等于用户根本调不动「关系淡的人隔多久」。
+            try:
+                cap = float(getattr(self.cfg, "max_gap_minutes", 1440))
+            except (TypeError, ValueError):
+                cap = 1440.0
+            if not math.isfinite(cap) or cap <= 0:
+                cap = 1440.0
+            cap = max(60.0, min(10080.0, cap))
+            minutes = min(max(minutes, 1.0), cap)
             try:
                 streak = max(0, int(_num(u.get("no_reply_streak", 0) or 0)))
             except (TypeError, ValueError):
@@ -6258,6 +6414,8 @@ class SocialEngine:
         # 记忆联动：把这条主动消息写回记忆库（后台任务，失败不影响主链路）。
         # 带上由头：将来按由头检索时，它就是「这件事她开过口」的证据。
         self._remember_proactive(umo, uid, segments[0], sent_ts, about=_sent_about)
+        # 会话历史：主动消息不经过 respond，框架不会自己记；补一条 assistant 条目
+        self._persist_proactive_to_history(bid, uid, umo, segments[0])
         # 发成功了，之前那次失败就不再约束他（四个字段一起清，见 `_clear_send_failure`）
         SocialEngine._clear_send_failure(u)
         # 发成了 → 不再是「连着发不出去」
@@ -7491,6 +7649,7 @@ class SocialEngine:
                     bid, uid, text, count_proactive=False,
                     store_text=self.cfg.store_message_text,
                 )
+                self._persist_proactive_to_history(bid, uid, umo, text)
                 self.state.save()
                 self.log(f"已连发补充给 {uid}")
         except asyncio.CancelledError:

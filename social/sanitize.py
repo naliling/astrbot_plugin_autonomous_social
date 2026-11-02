@@ -175,6 +175,27 @@ def sanitize_user_record(u: Dict[str, Any]) -> bool:
         if cleaned != pending:
             u["pending_proactive_context"] = cleaned
             changed = True
+    elif isinstance(pending, list):
+        # v2.0.5：pending 改成 [{text, ts, in_history}]，逐条洗正文；in_history
+        # 与 ts 原样保留（前者决定还要不要临时注入，后者只用于排序）。
+        cleaned_list: List[Dict[str, Any]] = []
+        for item in pending:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            text = sanitize_incoming(item.get("text"))
+            if not str(text or "").strip():
+                changed = True
+                continue
+            if text != item.get("text"):
+                item = dict(item)
+                item["text"] = text
+                changed = True
+            cleaned_list.append(item)
+        if len(cleaned_list) != len(pending):
+            changed = True
+        if changed:
+            u["pending_proactive_context"] = cleaned_list
 
     conv = u.get("conversation")
     if isinstance(conv, list):

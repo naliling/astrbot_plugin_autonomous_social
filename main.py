@@ -61,7 +61,9 @@ else:
     HOOK_AFTER_SENT = True
 
 # on_llm_request 钩子：把主动消息作为本轮临时上下文补回 LLM 请求。
-# 主动消息走 context.send_message，不经过 respond 阶段，因此不会自动进入会话历史。
+# 主动消息走 context.send_message，不经过 respond 阶段，框架不会自动把它写进会话历史；
+# 引擎会另外补写一条 assistant 条目（persist_proactive_history）。补写成功的那条
+# 在 pending 里打了 in_history 标记，这里只挑还没进历史的临时注入一次。
 # 新版用 TextPart.mark_as_temp()：本轮模型看得到，但 AstrBot 不会把它持久化。
 # 老版本没有临时块 API 时，才退回追加 req.contexts。
 on_llm_request = None
@@ -261,7 +263,8 @@ class AutonomousSocial(Star):
 
         AstrBot 在 respond 阶段把消息发完之后才调这个钩子（此时 clear_result() 还没跑，
         event.get_result() 拿得到刚发出去的内容），而插件自己主动发的消息走
-        context.send_message，不经过 respond 阶段，因此不会在这里重复记账。
+        context.send_message，不经过 respond 阶段，因此不会在这里重复记账
+        （它由引擎在发送成功后单独补写会话历史）。
         """
         if self._engine is None:
             return
@@ -276,8 +279,9 @@ class AutonomousSocial(Star):
     ):
         """把用户回复前主动发出的消息作为本轮临时上下文注入。
 
-        主动消息不会进入 AstrBot 的会话历史；这里用官方临时内容块让模型在
-        本轮看到自己刚说过的话，消费后清空，不会污染后续会话。旧版没有
+        已经补写进 AstrBot 会话历史的那几条不用注入（模型在正常历史里能看到），
+        由 consume_pending_proactive_context 过滤；剩下没写进去的用官方临时
+        内容块让模型本轮看到，消费后清空，不会污染后续会话。旧版没有
         mark_as_temp() 时才退回 req.contexts。
         """
         if self._engine is None:

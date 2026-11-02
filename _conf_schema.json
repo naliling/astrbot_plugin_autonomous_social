@@ -115,7 +115,7 @@
         "description": "被拒后冷却（分钟）",
         "hint": "模型决定不说了之后，多久内不再纠结同一个人",
         "obvious_hint": true,
-        "default": 10,
+        "default": 30,
         "min": 5,
         "max": 480,
         "slider": {
@@ -326,6 +326,13 @@
         "obvious_hint": true,
         "default": true
     },
+    "persist_proactive_history": {
+        "type": "bool",
+        "description": "主动消息写入会话历史",
+        "hint": "开启后她主动发出的消息会追加进 AstrBot 的会话记录，WebUI 和记忆类插件都能看到；关闭则继续只靠临时上下文注入。",
+        "obvious_hint": true,
+        "default": true
+    },
     "use_core_clock": {
         "type": "bool",
         "description": "按角色时区计时",
@@ -371,6 +378,20 @@
             "min": 10,
             "max": 720,
             "step": 10
+        }
+    },
+    "max_gap_minutes": {
+        "type": "int",
+        "description": "档位间隔上限（分钟）",
+        "hint": "按关系档位缩放后的最短间隔最高到多少分钟。LOW 档本身就是 720 分钟，默认 1440（一天）会把它卡死；想让关系淡的人隔更久再联系，可以调到 2880（两天）或更大。",
+        "obvious_hint": true,
+        "default": 1440,
+        "min": 60,
+        "max": 10080,
+        "slider": {
+            "min": 60,
+            "max": 10080,
+            "step": 60
         }
     },
     "miss_affection_min": {

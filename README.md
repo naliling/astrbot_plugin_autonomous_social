@@ -8,7 +8,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.0.4-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.0.5-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E5%BE%AE%E4%BF%A1%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -144,7 +144,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 
 ### 全部配置项
 
-> 下表与 `_conf_schema.json` 同源，共 107 项；面板里看到的默认值与这里一致。
+> 下表与 `_conf_schema.json` 同源，共 109 项；面板里看到的默认值与这里一致。
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -157,7 +157,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `heartbeat_max_minutes` | `30` | 心跳间隔上限（分钟），实际间隔在上下界之间随机取 |
 | `llm_gate` | `true` | 发送前让模型判断该不该说，它可以说 NO |
 | `memory_bridge_enabled` | `true` | 【记忆】装了「我会牢牢记住你」时，主动消息按由头读这个人的长期记忆、发完再写回，事有结果还会交棒；没装自动跳过。仅私聊生效，写入会产生一次 embedding 成本（对方的检索能力） |
-| `skip_cooldown_minutes` | `10` | 模型否决后，多久之内不再就同一个人重新纠结 |
+| `skip_cooldown_minutes` | `30` | 模型否决后，多久之内不再就同一个人重新纠结 |
 | `respect_user_rhythm` | `false` | 按对方平时的活跃时段挑时机。**默认关**：本插件就是用来主动社交的，不该拿「对方现在多半没在线」压住开口的时机；深夜由 `quiet_start`/`quiet_end` 单独兜底 |
 | `cue_followup` | `true` | 记住对方说的时间锚点，到点当成开口的由头 |
 | `followup_enabled` | `true` | 【未完话题】这场话断了就接一句（自动分「追问那件事」与「问在不在」两种） |
@@ -175,6 +175,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `closer_enabled` | `true` | 【收场】她主动发的话一直没人接时，自己冒一句收场 |
 | `closer_after_hours` | `8` | 【收场】隔多久没人回才适合自己收尾（一共最多收三次） |
 | `track_own_replies` | `true` | 【拟人地基】把 bot 自己说过的话也记进对话账本，追问才接得上话头 |
+| `persist_proactive_history` | `true` | 【拟人地基】她主动发出的消息也追加进 AstrBot 会话历史：WebUI 能看到，记忆类插件也读得到。写进去的那条不再重复注入临时上下文；关掉则回到旧行为 |
 | `use_core_clock` | `true` | 【时区】安静时段与作息画像按她所在城市的小时算（需 Core 提供时区） |
 | `use_core_facade` | `auto` | 【联动】走 Core 的同进程只读门面（契约 v2）：`auto` 找得到就用、找不到退回读状态文件；`on` 只走门面、不读文件（验证模式，文件派生的由头/CCB 等能力按预期降级）；`off` 完全不碰（出问题时的逃生门，行为与旧版一致） |
 | `proactive_provider_ids` | `[]` | 【模型】主动消息专用模型（脑子/思考好的）：主动消息是她自己想起来要说什么，要用会思考的模型生成，不是能跑就行。本插件所有模型调用（1:1 主动、群聊心流、破冰、起话头）按顺序试，第一个能用的即止。默认空 = 跟随当前会话的模型（不再自带作者的私有模型 ID）；显式配了却都取不到时默认回退会话模型并打一次性 warning，打开 `strict_proactive_provider` 才本轮不发 |
@@ -194,6 +195,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `miss_affection_min` | `42` | 「念想」通道的好感门槛。对陌生人说「想你了」很怪，所以门要高 |
 | `miss_daily_cap` | `3` | 每天最多几条「念想」。这一类不受「刚聊过」阻断，所以单独限次 |
 | `min_gap_minutes` | `60` | **中等关系的人**两条主动消息的最小间隔（分钟）。关系很熟的 30 分钟、关系一般的隔 1~2 天。防扎堆另有 `hourly_sends_cap` 那道安全闸 |
+| `max_gap_minutes` | `1440` | 按关系档位缩放后的最小间隔最高到多少分钟（上限）。关系淡的人本身要隔 720 分钟，默认 1440（一天）会把它卡死；想让这类人隔更久，调到 2880 或更大（最多 10080，即 7 天） |
 | `greeting_midday_start` | `12` | 午间问候开始（小时） |
 | `greeting_midday_end` | `14` | 午间问候结束（小时）。这是**早安错过时的兜底**，今天已经问候过就不会再补 |
 | `gate_energy_floor` | `35` | 【硬闸】精力低于这个值就不主动开口（0=不按精力拦）。「累到坐不住」不交给模型判断 |
