@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # 删掉它与 Core v2.27.29 删 generator.py/persona.py 同类兜底是同一个理由。
 from astrbot.api import logger
 
+# 安静时段的窗口语义只有一份实现（social/clock.py），配置层不再抄一遍区间比较。
+from .clock import QUIET_CLOCK_LOCAL, normalize_quiet_clock
+
 # 非法/越界的配置值只告警一次（按 key 去重），避免每轮心跳、每次构造刷屏
 _CONFIG_WARNED: Set[str] = set()
 
@@ -402,6 +405,8 @@ HOUR_MIN = 0
 HOUR_MAX = 23
 QUIET_START_DEFAULT = 23
 QUIET_END_DEFAULT = 7
+# 面板上这两个小时按哪个时钟读：local（默认）= 插件所在机器；core = 她所在城市。
+QUIET_CLOCK_DEFAULT = QUIET_CLOCK_LOCAL
 
 MAX_MSG_LEN_MIN = 10
 MAX_MSG_LEN_MAX = 500
@@ -755,6 +760,23 @@ class SocialConfig:
     # 时段设置
     quiet_start: int = QUIET_START_DEFAULT
     quiet_end: int = QUIET_END_DEFAULT
+    # quiet_start/quiet_end 按哪个时钟读（v2.0.6 新增）。
+    #
+    # local（默认）—— 插件所在机器的墙上时间。面板上那个 23→7 是操作者按自己的
+    #   作息写的，就该按本机判；
+    # core —— 她所在城市（Core 契约的 utc_offset_minutes）。
+    #
+    # v2.0.5 之前没有这个选项，实际行为固定是 core：她设定在 UTC+2、宿主在 UTC+8
+    # 时，本机凌晨 4 点在她那边是 22 点，「现在是安静时段」不成立，凌晨 4:06 那条
+    # continue_topic 就是这么发出去的（issue #3）。
+    quiet_clock: str = QUIET_CLOCK_DEFAULT
+    # Core 的生物钟夜（night_window）要不要也当安静时段。
+    #
+    # v2.0.5 的写法是「有 Core 的夜就**顶替**面板窗口」（见旧 _quiet_now）：面板写
+    # 23→7、Core 给出 00:15–05:30，那 23:00–00:15 与 05:30–07:00 就又成了可发时段；
+    # Core 给出一个午睡（16:45–18:15）时 23–7 干脆不存在。现在两条来源取并集，
+    # 这条开关只决定 Core 那条参不参与。
+    quiet_use_core_night: bool = True
 
     # 行为限制
     private_only: bool = True
@@ -1186,6 +1208,12 @@ class SocialConfig:
                 HOUR_MIN,
                 min(HOUR_MAX, gi("quiet_end", QUIET_END_DEFAULT)),
             ),
+            # 认不出的值一律按 local：面板上这两个小时是操作者按自己的作息填的，
+            # 退回本机时钟至少是「他写的那个意思」，退回她所在城市则可能是任意偏移。
+            quiet_clock=normalize_quiet_clock(
+                g("quiet_clock", _d("quiet_clock", QUIET_CLOCK_DEFAULT))
+            ),
+            quiet_use_core_night=gb("quiet_use_core_night", True),
             private_only=gb("private_only", True),
             debug=gb("debug", False),
             input_state_enabled=gb("input_state_enabled", True),

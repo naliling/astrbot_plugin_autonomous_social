@@ -526,6 +526,21 @@
             "step": 1
         }
     },
+    "quiet_clock": {
+        "type": "string",
+        "description": "安静时段按哪个时钟算",
+        "hint": "local（默认）：按本机时钟——面板上填的 23→7 就是主人自己的作息。core：按她所在城市的小时算。v2.0.5 一律按她那边算，所以本机凌晨 4 点、她那边才 22 点时安静时段根本不生效（issue #3）。",
+        "obvious_hint": false,
+        "default": "local",
+        "options": ["local", "core"]
+    },
+    "quiet_use_core_night": {
+        "type": "bool",
+        "description": "把她的生物钟夜也算进安静时段",
+        "hint": "开启（默认）：Core 给的作息夜里也不发（按她那边的小时算）。关闭：只认上面的 quiet_start/quiet_end。这是**叠加**关系：v2.0.5 里 Core 的夜会顶替你填的窗口，Core 一给退化窗口整道闸就静默失效。",
+        "obvious_hint": false,
+        "default": true
+    },
     "private_only": {
         "type": "bool",
         "description": "只主动私聊",

@@ -274,12 +274,19 @@ class QuietHoursOptionTest(unittest.TestCase):
         engine = _engine(quiet_start=8, quiet_end=8)
         self.assertFalse(engine._quiet_now("bot1", 3), "端点相同＝关掉，不该还判安静")
 
-    def test_core_night_window_wins_over_the_option(self):
-        """Core 报了她今天几点睡，就用她的生物钟，不再看这个配置。"""
+    def test_core_night_window_adds_to_the_option(self):
+        """Core 报了她今天几点睡：她的夜和面板窗口**都算**，谁也不顶替谁。
+
+        v2.0.5 断言的是「Core 说了 1-5 点，23 点不该安静」——这条预期本身就是
+        issue #3 的根因之一：Core 的夜把面板上配的 23→7 顶掉了，凌晨照样发。
+        """
         engine = _engine(quiet_start=23, quiet_end=7)
         engine._night_windows["bot1"] = (1.0, 5.0)
         self.assertTrue(engine._quiet_now("bot1", 3))
-        self.assertFalse(engine._quiet_now("bot1", 23), "Core 说了 1-5 点，23 点不该安静")
+        self.assertTrue(
+            engine._quiet_now("bot1", 23), "面板写了 23→7，Core 的夜不能把它顶掉"
+        )
+        self.assertFalse(engine._quiet_now("bot1", 12), "两条来源都说清醒才不安静")
 
 
 # ── 问候窗口：六个小时端点 ────────────────────────────────────────

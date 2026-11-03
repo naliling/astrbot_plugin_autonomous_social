@@ -32,7 +32,13 @@ from . import __version__, anchors, anchors as anchor_mod, core_facade, desire
 from . import history_ingest
 from . import memory_bridge
 from . import pacing
-from .clock import city_now, seconds_until_quiet_end
+from .clock import (
+    city_now,
+    normalize_quiet_clock,
+    quiet_decision,
+    quiet_overlap_seconds,
+    seconds_until_quiet_end,
+)
 from .config import SocialConfig
 from .core_bridge import CORE_SAID_MAX, CoreBridge
 from .input_state import InputStateNotifier
@@ -641,7 +647,7 @@ def _person_flow_state(engine: Any, bid: str, now: float) -> Tuple[bool, bool]:
     except Exception as exc:
         logger.debug(f"[autonomous_social] 读取人物侧状态失败（按不安静/没睡降级）: {exc}")
     try:
-        is_quiet = engine._quiet_now(bid, engine._moment_of(bid, now).hour)
+        is_quiet = engine._quiet_at(bid, now)
     except Exception:
         is_quiet = False
     return is_quiet, asleep
@@ -3331,8 +3337,8 @@ class SocialEngine:
             mood *= WEEKEND_MOOD_BOOST
         # 记下 Core 算出的生物钟夜：本函数的 bot_state 由 try_once 传进来，
         # 安静时段要用它判（见 _quiet_now）
-        self._remember_night(bid, bot_state)
-        quiet = self._quiet_now(bid, dt.hour)
+        SocialEngine._remember_night(self, bid, bot_state)
+        quiet = SocialEngine._quiet_at(self, bid, now)
         reply_window = self._pending_window()
 
         ready: List[Tuple[str, Dict[str, Any], float]] = []
@@ -3477,7 +3483,9 @@ class SocialEngine:
         边界（写清楚，免得以后当成 bug 改掉）：
         - 用的是**配置里的 quiet_start/quiet_end + 本机时钟**，不是 Core 按日程算的
           生物钟夜——心跳循环是所有角色共用的，这里没有 bid 去查 Core。两者不一致时
-          的后果只是**早醒一次**（下一轮评估时 `_quiet_now` 的硬闸会再把它拦下来），
+          的后果只是**早醒一次**（下一轮评估时 `_quiet_at` 的硬闸会再把它拦下来），
+          同理 `quiet_clock=core` 时这里按本机算会与闸门差几个小时，后果同样只是
+          早醒/晚睡，不会发错时段（判定在 `_quiet_state` 一处收口）；
           或者晚睡一次（那一轮按原节奏走，行为与旧版一致）；
         - start == end（不启用）或当前不在安静时段时原样返回 `delay`；
         - 配置坏值、时钟读不出来一律原样返回：这是「让她早醒」的优化，不是正确性
@@ -3524,6 +3532,12 @@ class SocialEngine:
         key = str(bid or "")
         if not key:
             return
+        # 用 getattr：这个方法的调用方包含只实现了部分引擎面的替身对象（测试里的
+        # `_RoundEngine` / SimpleNamespace 桩），它们没有 `_night_windows`。没有这个
+        # 字典就等于「没有 Core 夜窗这条来源」，不是错误。
+        windows = getattr(self, "_night_windows", None)
+        if not isinstance(windows, dict):
+            return
         try:
             if window and len(window) == 2:
                 start, end = _num(window[0], math.nan), _num(window[1], math.nan)
@@ -3531,29 +3545,157 @@ class SocialEngine:
                 # `nan < end`、`hour >= nan` 全假，于是这道「安静时段」硬闸静默失效、
                 # 深夜照样开口。和「读不到」同等处理——清掉，退回插件自己的配置窗口。
                 if math.isfinite(start) and math.isfinite(end):
-                    self._night_windows[key] = (start % 24.0, end % 24.0)
+                    # 收进 [0, 24]：`end == 24` 是「到午夜」，不能被 `% 24` 折成 0
+                    # ——那会把 0→24（一整天）退化成 0→0（= 安静时段没开）。
+                    start = start % 24.0
+                    end = 24.0 if end == 24.0 else end % 24.0
+                    windows[key] = (start, end)
                 else:
-                    self._night_windows.pop(key, None)
+                    windows.pop(key, None)
             else:
-                self._night_windows.pop(key, None)
+                windows.pop(key, None)
         except (TypeError, ValueError):
-            self._night_windows.pop(key, None)
+            windows.pop(key, None)
 
-    def _quiet_now(self, bid: str, hour: int) -> bool:
-        """这个角色现在该不该安静。
+    def _core_night_quiet(self, bid: str, city_hour: int) -> bool:
+        """Core 的生物钟夜盖不盖住「她那边」的这个小时（只看 Core 这一条来源）。
 
-        优先用 Core 按她今天日程推出的生物钟夜——那才是她几点睡到几点；
-        拿不到才退回本插件配置的 quiet_start/quiet_end。
+        `quiet_use_core_night=False` 时恒为 False；Core 给出 start==end 的退化窗口、
+        或压根读不到，都按「没有这条来源」处理——v2.0.5 是把它当成「安静时段关闭」，
+        一个退化窗口就能把整道闸静默拆掉。
         """
+        if not bool(getattr(self.cfg, "quiet_use_core_night", True)):
+            return False
         window = self._night_windows.get(str(bid or ""))
         if not window:
-            return self.cfg.in_quiet_hours(hour)
-        start, end = window
+            return False
+        try:
+            start, end = float(window[0]), float(window[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if not (math.isfinite(start) and math.isfinite(end)):
+            return False
         if abs(start - end) < 1e-9:
             return False
         if start < end:
-            return start <= hour < end
-        return hour >= start or hour < end
+            return start <= city_hour < end
+        return city_hour >= start or city_hour < end
+
+    def _quiet_state(self, bid: str, now: float) -> Tuple[bool, str]:
+        """这一刻算不算安静时段、为什么——**唯一**判定入口（对外这一层不抛异常）。
+
+        判定本身出错时按「不安静」返回：把整台插件永久静音比偶尔多发一条更难查，
+        而且安静时段只是「别打扰」的礼貌，不该变成能把所有通道一起掐死的单点。
+        真正的判定逻辑在 `_quiet_state_inner`。
+        """
+        try:
+            return SocialEngine._quiet_state_inner(self, bid, now)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 安静时段判定失败（按不安静处理）: {exc}")
+            return False, ""
+    def _quiet_state_inner(self, bid: str, now: float) -> Tuple[bool, str]:
+        """这一刻算不算安静时段、为什么——**唯一**判定入口（实现）。
+
+        v2.0.5 的判定散在八条通道各自的 pick 里，而且口径是
+        `_quiet_now(bid, 她那边的小时)`：面板上写的 23→7 被当成「她所在城市的
+        23→7」，同时 Core 的生物钟夜又是**顶替**这个窗口而不是叠加。issue #3 的
+        凌晨 4:06 就是这么出去的：宿主在 UTC+8、她在 UTC+2，本机 04:06 她那边
+        22:06，「现在是安静时段」不成立，continue_topic 就发了。
+
+        现在两条来源取**并集**，且各自用对的时钟：
+        - 面板窗口 quiet_start/quiet_end：默认按**本机**小时（`quiet_clock=local`），
+          因为那是操作者按自己的作息填的；
+        - Core 的生物钟夜：按**她那边**的小时（她几点睡是她的本地时间）。
+        """
+        local_hour: Optional[int] = None
+        try:
+            local_hour = city_now(now, None).hour
+        except (TypeError, ValueError, OSError, OverflowError) as exc:
+            logger.debug(f"[autonomous_social] 取本机小时失败: {exc}")
+        city_hour = local_hour
+        try:
+            city_hour = self._moment_of(bid, now).hour
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取 {bid} 的城市小时失败（退回本机）: {exc}")
+            city_hour = local_hour
+        return quiet_decision(
+            local_hour,
+            city_hour,
+            self.cfg.quiet_start,
+            self.cfg.quiet_end,
+            clock_mode=getattr(self.cfg, "quiet_clock", "local"),
+            core_window=self._night_windows.get(str(bid or "")),
+            use_core_night=bool(getattr(self.cfg, "quiet_use_core_night", True)),
+        )
+
+    def _quiet_at(self, bid: str, now: float) -> bool:
+        """这一刻算不算安静时段（所有闸门都该问这一句）。"""
+        try:
+            return bool(SocialEngine._quiet_state(self, bid, now)[0])
+        except Exception as exc:
+            # 判定本身出错时按「不安静」处理：把整台插件永久静音比偶尔多发一条更难查。
+            logger.debug(f"[autonomous_social] 安静时段判定失败（按不安静处理）: {exc}")
+            return False
+
+    def _quiet_overlap(self, bid: str, start_ts: float, end_ts: float) -> float:
+        """[start_ts, end_ts) 里被安静时段吃掉了多少秒（对外这一层不抛异常）。
+
+        用途只有一个：continue 的窗口顺延。算不出来就返回 0——窗口按原样过期，
+        不会因为一个坏时钟/坏配置把续聊窗口无限延长。
+        """
+        try:
+            return float(SocialEngine._quiet_overlap_inner(self, bid, start_ts, end_ts))
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 安静时段重叠计算失败（按 0 处理）: {exc}")
+            return 0.0
+    def _quiet_overlap_inner(self, bid: str, start_ts: float, end_ts: float) -> float:
+        """[start_ts, end_ts) 里被安静时段吃掉了多少秒（两条来源都算，实现）。
+
+        用途只有一个：continue 的窗口顺延。一段「她回完、对方消失」的窗口如果整段
+        落在夜里，它不该在 07:00 之前悄悄过期，而该把被夜吃掉的那段时间还回来
+        （issue #3 的建议二）。
+        """
+        try:
+            start_ts = float(start_ts)
+            end_ts = float(end_ts)
+        except (TypeError, ValueError):
+            return 0.0
+        if not (math.isfinite(start_ts) and math.isfinite(end_ts)) or end_ts <= start_ts:
+            return 0.0
+        total = 0.0
+        city_offset = self._city_offset.get(str(bid or ""))
+        cfg_offset = None
+        if normalize_quiet_clock(getattr(self.cfg, "quiet_clock", "local")) == "core":
+            cfg_offset = city_offset
+        try:
+            total += quiet_overlap_seconds(
+                start_ts, end_ts, self.cfg.quiet_start, self.cfg.quiet_end, cfg_offset
+            )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 计算安静时段重叠失败: {exc}")
+        if bool(getattr(self.cfg, "quiet_use_core_night", True)):
+            window = self._night_windows.get(str(bid or ""))
+            if window:
+                try:
+                    total += quiet_overlap_seconds(
+                        start_ts, end_ts, float(window[0]), float(window[1]), city_offset
+                    )
+                except Exception as exc:
+                    logger.debug(f"[autonomous_social] 计算 Core 夜间重叠失败: {exc}")
+        return total
+
+    def _quiet_now(self, bid: str, hour: int) -> bool:
+        """兼容旧调用：给定小时算不算安静（配置窗口 + Core 的夜，两条都看）。
+
+        新代码一律用 `_quiet_at(bid, now)`——它自己决定该用哪个时钟，不会再把
+        「她那边的小时」当成操作者写的 23→7。
+        """
+        try:
+            if self.cfg.in_quiet_hours(hour):
+                return True
+        except Exception:
+            pass
+        return self._core_night_quiet(bid, hour)
 
     def _pending_window(self) -> float:
         """多久没回算「没接话」：在回复统计窗口基础上至少给半天。"""
@@ -3856,7 +3998,7 @@ class SocialEngine:
                 return "不久前才说过话，再另起一句很突兀"
             if sleep_signal(u, now):
                 return "TA 说过要去睡了，这时发过去不合适"
-            if not _waive_quiet and self._quiet_now(bid, hour):
+            if not _waive_quiet and SocialEngine._quiet_at(self, bid, now):
                 return "现在是安静时段"
             return ""
         # 身体在睡就不是「概率打折」的问题：把人从睡梦中叫醒闲聊不是拟人，是打扰。
@@ -3916,7 +4058,7 @@ class SocialEngine:
         hour = self._moment_of(bid, now).hour
         if self.cfg.respect_user_rhythm and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF:
             return "按TA 平时的作息，这个点 TA 不玩手机"
-        if self._quiet_now(bid, hour):
+        if SocialEngine._quiet_at(self, bid, now):
             return "现在是安静时段"
         return ""
 
@@ -3961,7 +4103,7 @@ class SocialEngine:
             return "这段沉默已经接过一回了，再问就是催"
         if now - _num(u.get("thread_at", 0) or 0) < self.cfg.followup_cooldown_minutes * 60:
             return "刚接过一次，给 TA 点时间"
-        if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
+        if not _waive_quiet and SocialEngine._quiet_at(self, bid, now):
             return "现在是安静时段"
         return ""
 
@@ -4032,6 +4174,13 @@ class SocialEngine:
                 continue
             if self.state.is_send_blocked(bid, uid, now):
                 continue
+            # v2.0.6（issue #3 建议二）：continue 的窗口被安静时段吃掉多久就还回多久。
+            # 一段「她回完、对方消失」的窗口整段落在夜里时，它会在 07:00 之前悄悄
+            # 过期，那句该接的话就永远接不上了。把被夜吃掉的时间补进上限，窗口于是
+            # 顺延到安静时段结束之后——而不是在凌晨把这条消息发出去。
+            _continue_max = continue_max
+            if continue_max > 0:
+                _continue_max += SocialEngine._quiet_overlap(self, bid, self._last_said(u), now)
             kind, reason = thread_reason(
                 u,
                 now,
@@ -4041,7 +4190,7 @@ class SocialEngine:
                 context_seconds=context,
                 presence_floor_seconds=presence,
                 continue_after_seconds=continue_after,
-                continue_max_seconds=continue_max,
+                continue_max_seconds=_continue_max,
             )
             if not kind:
                 continue
@@ -4089,7 +4238,7 @@ class SocialEngine:
                 return "她正在睡觉"
             if kind != "night" and sleep_signal(u, now):
                 return "TA 说过要去睡了，这时发过去不合适"
-            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if SocialEngine._quiet_at(self, bid, now):
                 return "现在是安静时段"
         if not _sc:
             _avoid = SocialEngine._avoidance_note(self, u, now)
@@ -4407,7 +4556,7 @@ class SocialEngine:
             # 安静时段/她在睡仍是硬闸（README：关掉则只放宽间隔与追问）。
             _sc_here = SocialEngine._special_care_now(self, uid, u)
             _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
-            if not _waive_quiet and self._quiet_now(bid, hour):
+            if not _waive_quiet and SocialEngine._quiet_at(self, bid, now):
                 continue
             if not _waive_quiet and _body_asleep(body):
                 continue
@@ -4510,7 +4659,7 @@ class SocialEngine:
             # 09:20 就收到「你上次说的那个体检后来咋样」。
             if sleep_signal(u, now):
                 return "TA 说过要去睡了，这时发过去不合适"
-            if self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if SocialEngine._quiet_at(self, bid, now):
                 return "现在是安静时段"
         if not _sc:
             if now - self._last_said(u) < LOOP_QUIET_GAP_SECONDS:
@@ -4601,7 +4750,7 @@ class SocialEngine:
             _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
             if _body_asleep(body) and not _waive_quiet:
                 continue
-            if self._quiet_now(bid, self._moment_of(bid, now).hour) and not _waive_quiet:
+            if SocialEngine._quiet_at(self, bid, now) and not _waive_quiet:
                 continue
             if sleep_signal(u, now) and not _waive_quiet:
                 continue
@@ -4646,7 +4795,7 @@ class SocialEngine:
             _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
             if not _waive_quiet and _body_asleep(body):
                 continue
-            if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _waive_quiet and SocialEngine._quiet_at(self, bid, now):
                 continue
             if self._min_gap_left(u, bid=bid, now=now) > 0:
                 continue
@@ -4762,8 +4911,7 @@ class SocialEngine:
         if not _waive_quiet:
             if _body_asleep(body):
                 return "她正在睡觉"
-            hour = self._moment_of(bid, now).hour
-            if self._quiet_now(bid, hour):
+            if SocialEngine._quiet_at(self, bid, now):
                 return "现在是安静时段"
         hour = self._moment_of(bid, now).hour
         if self.cfg.respect_user_rhythm and desire.rhythm_factor(u, hour) == desire.RHYTHM_OFF:
@@ -5058,6 +5206,33 @@ class SocialEngine:
             if bot_state:
                 bodies[bid] = bot_state
                 self._remember_clock(bid, bot_state)
+            # v2.0.6（issue #3）：安静时段是**整轮**的硬闸——先把整个角色关掉，再谈挑谁。
+            #
+            # v2.0.5 只让八条通道各自的 pick 查一次，而 pick 与真正发出去之间还隔着
+            # 预算排序、两次 LLM、校验、分段发送（几十秒到几分钟）：23:59 挑中、
+            # 00:01 发出去，就成了夜里那条消息。更要命的是 pick 查的是「她那边几点」，
+            # 本机 04:06 在她那边是 22:06，闸门直接放行——issue #3 的 continue_topic
+            # 就是这么出去的。这里一次性收口：安静时段这一轮谁都不挑。
+            #
+            # 念头仍然要结算：`settle_minds` 会把 quiet 传进 desire.settle（夜里长得
+            # 极慢）。整轮跳过结算的话，一到 07:00 所有念头一起攒满，反而在早上炸一批。
+            SocialEngine._remember_night(self, bid, bot_state)
+            if not SocialEngine._special_care_ignore_quiet_on(self):
+                _q_now, _q_why = SocialEngine._quiet_state(self, bid, now)
+                if _q_now:
+                    try:
+                        self.settle_minds(
+                            bid, now, self._moment_of(bid, now), core_root, bot_state
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[autonomous_social][{bid}] 安静时段结算念头失败: {e}"
+                        )
+                    self._round_skips["安静时段"] = (
+                        self._round_skips.get("安静时段", 0) + 1
+                    )
+                    logger.debug(f"[autonomous_social][{bid}] 本轮不发：{_q_why}")
+                    continue
             # 冷落计数与 Core 无关，只看本插件的账本。放在 bot_state 判断里的话，
             # Core 装着但该角色还没进它 state.json 时会恒为 0，然后把这个 0 写回
             # 信号文件——Core 读到的就是「她最近没被冷落过」。
@@ -5777,6 +5952,17 @@ class SocialEngine:
         if energy < self.cfg.gate_energy_floor and not _sc_waive_energy:
             logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
             return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
+
+        # v2.0.6（issue #3）：安静时段在「唯一收口」上必须是硬闸。
+        #
+        # 文档一直把这里写成所有主动发送的唯一收口，v2.0.5 里它却压根没查安静时段：
+        # 全部依赖压在各通道 pick 上，而 pick 到真正发信之间还隔着两次 LLM（几十秒
+        # 到几分钟）。与能量那道闸并列放在最前面：被拦下时一个 token 都不花。
+        if not _sc_waive_energy:
+            _q_here, _q_why = SocialEngine._quiet_state(self, bid, now)
+            if _q_here:
+                logger.debug(f"[autonomous_social] 没发（{uid}）：{_q_why}")
+                return False, f"现在是安静时段（{_q_why}），不打扰"
 
         # **兄弟 bot 的第二道闸**（v1.28.16）。
         #
@@ -6736,6 +6922,33 @@ class SocialEngine:
             )
         return True, ""
 
+    def _quiet_trigger_block(self, bid: str = "") -> str:
+        """手动触发要真发出去时，安静时段这一道硬闸的说明（空串＝可以发）。
+
+        v2.0.6（issue #3）：心跳在安静时段整轮不挑人（见 try_once），手动触发要是还能
+        发，那道闸就只是装饰——凌晨点一下照样把人叫醒。提前拦住并把「想现在看效果
+        怎么办」直接写在回执里，比挨个候选人试过去、最后甩一句「候选都试过了」有用。
+
+        **只给真会发消息的 `trigger_once` 用**：`/主动消息预览` 是 dry run（不发送、
+        不记账），任何时段都该能用，不能连它一起拦。
+
+        `special_care_ignore_quiet=True` 时不拦：那条路本来就要放行特别关心的人。
+        """
+        try:
+            if SocialEngine._special_care_ignore_quiet_on(self):
+                return ""
+            _q_now, _q_why = SocialEngine._quiet_state(self, bid, self._time())
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 手动触发的安静时段判定失败（放行）: {exc}")
+            return ""
+        if not _q_now:
+            return ""
+        return (
+            f"{_q_why}，不打扰——手动触发和心跳走的是同一道闸。"
+            "想现在看效果：把 quiet_start 与 quiet_end 填成同一个值即可关闭安静时段，"
+            "或用 /主动消息预览（只生成不发送，任何时候都能用）。"
+        )
+
     async def preview_once(self, bid: str, uid_filter: str = "") -> str:
         """只生成、不发送：看一眼她此刻想对谁开口、打算说出一句什么。
 
@@ -6786,7 +6999,7 @@ class SocialEngine:
         bot_state = SocialEngine._body_state(self, bid, core_root)
         if bot_state:
             self._remember_clock(bid, bot_state)
-            self._remember_night(bid, bot_state)
+            SocialEngine._remember_night(self, bid, bot_state)
 
         ranked = self.settle_minds(
             bid, now, self._moment_of(bid, now), core_root, bot_state, min_urge=0.0
@@ -6893,7 +7106,7 @@ class SocialEngine:
             _waive_quiet = _sc_here and SocialEngine._special_care_ignore_quiet_on(self)
             if not _waive_quiet and _body_asleep(body):
                 continue
-            if not _waive_quiet and self._quiet_now(bid, self._moment_of(bid, now).hour):
+            if not _waive_quiet and SocialEngine._quiet_at(self, bid, now):
                 continue
             try:
                 if sleep_signal(u, now):
@@ -7117,12 +7330,16 @@ class SocialEngine:
                 "还没有可联系的用户（都没人私聊过 bot，且历史导入与播种名单都是空的）。"
                 "可先和 bot 说句话，或在配置里打开 history_ingest / 填 seed_users。"
             )
+        # v2.0.6（issue #3）：安静时段对「手动触发」同样成立——这里是真正会发消息的那条路。
+        _quiet_block = SocialEngine._quiet_trigger_block(self, bid)
+        if _quiet_block:
+            return _quiet_block
 
         core_root = SocialEngine._read_core_root(self)
         bot_state = SocialEngine._body_state(self, bid, core_root)
         if bot_state:
             self._remember_clock(bid, bot_state)
-            self._remember_night(bid, bot_state)
+            SocialEngine._remember_night(self, bid, bot_state)
 
         # min_urge=0：不管攒没攒满都列出来，手动触发挑念头最高的那个
         ranked = self.settle_minds(
@@ -7313,6 +7530,35 @@ class SocialEngine:
         # 方式3: 兜底
         raise _SendFailed("无法找到可用的发送消息 API")
 
+    def _quiet_send_block(self, bid: str, target: str = "") -> str:
+        """发信口上的安静时段闸：返回拒绝理由，空串表示可以发。
+
+        特别关心（且 `special_care_ignore_quiet=True`）照旧放行——那是主人明确说过
+        的「就算凌晨给我发也不会有事」。群会话的 umo 解析不到具体的人，就按「不是
+        特别关心」处理。
+        """
+        _u = None
+        if target:
+            try:
+                _u = SocialEngine._resolve_send_user(self, target, bid)
+            except Exception:
+                _u = None
+        if isinstance(_u, dict) and _u:
+            try:
+                if SocialEngine._special_care_now(
+                    self, str(_u.get("__uid") or ""), _u
+                ) and SocialEngine._special_care_ignore_quiet_on(self):
+                    return ""
+            except Exception:
+                pass
+        try:
+            is_quiet, why = SocialEngine._quiet_state(self, bid, self._time())
+        except Exception:
+            return ""
+        if not is_quiet:
+            return ""
+        return f"现在是安静时段（{why}），不打扰"
+
     async def _send_with_retry(
         self, target: str, text: str, bid: str = ""
     ) -> Tuple[bool, str, bool]:
@@ -7328,6 +7574,12 @@ class SocialEngine:
 
         无论成败都会更新熔断计数：连续发不出去时，下一轮就不再先写一遍消息再失败了。
         """
+        # v2.0.6（issue #3）：真正的发信口上再放一道。上面各层都是「挑人时」的判断，
+        # 一条 job 可能在被挑中之后排队几十秒才轮到自己；连发补发更是分好几段、
+        # 每段隔几秒到几十秒。只在挑人处查表，等于给「跨过整点」留了一道缝。
+        _quiet_block = SocialEngine._quiet_send_block(self, bid, target)
+        if _quiet_block:
+            return False, _quiet_block, False
         # V8 / P2-03 纵深防御：直接调用这个底层入口的路径也受按人冷却约束。
         # 这里**不进重试循环、不记熔断**：冷却是我们自己主动设的，再撞一次只是浪费。
         _cooldown_user = SocialEngine._resolve_send_user(self, target, bid)
@@ -7617,6 +7869,11 @@ class SocialEngine:
                 if self.send_breaker_left(bid) > 0:
                     return
                 u = self.state.user(bid, uid)
+                # v2.0.6（issue #3）：补发的每一段也要看表——第一段可能是 22:59 发
+                # 出去的，这一段已经跨过 23:00。这条路径原来只查熔断与失败冷却。
+                if SocialEngine._quiet_send_block(self, bid, str(u.get("umo", "") or "")):
+                    self.log(f"已进入安静时段，取消给 {uid} 的连发补充")
+                    return
                 if _num(u.get("last_seen", 0)) > sent_ts:
                     self.log(f"用户 {uid} 已有新消息，取消连发补充")
                     return
@@ -7707,6 +7964,10 @@ class SocialEngine:
                             f"（{int(_cool_left / 60)} 分钟），取消剩下的补发"
                         )
                         return
+                # v2.0.6（issue #3）：群心流连发的后续句子同样不能跨进安静时段。
+                if SocialEngine._quiet_send_block(self, bid, umo):
+                    self.log(f"群 {gid} 已进入安静时段，取消剩下的连发补充")
+                    return
                 ok, err, _peer = await self._send_with_retry(umo, text, bid)
                 if not ok:
                     # 同私聊侧：补发时才发现已被移出群聊 → 永久隔离，
@@ -9009,8 +9270,11 @@ class SocialEngine:
             f"　模式：{self.cfg.mode}"
             f"　活跃度：{self.cfg.activity_level}（×{self.cfg.mood_scale:.2f}）\n"
             f"- 当前时段：{slot_names.get(slot, '未知')} {dt.strftime('%H:%M')}"
-            f"{'（安静时段，念头长得极慢）' if self._quiet_now(ref_bid, dt.hour) else ''}"
+            f"{'（安静时段，念头长得极慢）' if SocialEngine._quiet_at(self, ref_bid, self._time()) else ''}"
             f"　{'按她所在城市' if self._city_offset.get(ref_bid) is not None else '按本机时钟'}"
+            f"　安静时段按"
+            f"{'她所在城市' if normalize_quiet_clock(getattr(self.cfg, 'quiet_clock', 'local')) == 'core' else '本机时钟'}"
+            f"算"
             + (f"\n- 本次运行：{boot_line}" if boot_line else "")
         )
         sections.append(

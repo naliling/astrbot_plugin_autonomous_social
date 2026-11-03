@@ -415,7 +415,14 @@ class PendingWindowTest(unittest.TestCase):
 
 
 class QuietHoursTest(unittest.TestCase):
-    """安静时段：Core 的生物钟优先，配置兜底，跨午夜要能算对。"""
+    """安静时段：Core 的生物钟与面板窗口**取并集**，跨午夜要能算对。
+
+    v2.0.5 的口径是「Core 优先、配置兜底」——Core 一旦报了她今天几点睡，面板上
+    配的 quiet_start/quiet_end 就整个作废。那正是 issue #3 的根因之一：面板写
+    23→7 的人，Core 报个 00:15–05:30，23:00–00:15 与 05:30–07:00 就重新变成可发
+    时段，凌晨 4 点的 continue_topic 就是这么出去的。现在谁说了都不算「顶掉」谁，
+    任一来源说安静就安静。
+    """
 
     def test_zero_length_window_is_never_quiet(self):
         eng = _engine(quiet_start=7, quiet_end=7)
@@ -436,14 +443,17 @@ class QuietHoursTest(unittest.TestCase):
         self.assertFalse(eng._quiet_now("b1", 7))
         self.assertFalse(eng._quiet_now("b1", 12))
 
-    def test_core_window_overrides_the_config(self):
+    def test_core_window_adds_to_the_config_window(self):
         # 配置说 13-15 点安静；Core 说她 22 点到 6 点睡。
-        # 14 点：配置说安静、Core 说清醒 —— 必须听 Core 的。
+        # 14 点：配置说安静、Core 说清醒 —— 安静时段仍然成立（不是「听 Core 的」）。
         eng = _engine(quiet_start=13, quiet_end=15)
         eng._remember_night("b1", {"night_window": [22, 6]})
-        self.assertFalse(eng._quiet_now("b1", 14))
-        self.assertTrue(eng._quiet_now("b1", 23))
-        self.assertFalse(eng._quiet_now("b1", 12))
+        self.assertTrue(
+            eng._quiet_now("b1", 14), "面板说 13-15 点安静，Core 的夜不能把它顶掉"
+        )
+        self.assertTrue(eng._quiet_now("b1", 23), "Core 的夜盖住了 23 点")
+        self.assertTrue(eng._quiet_now("b1", 3), "Core 的夜盖住了凌晨 3 点")
+        self.assertFalse(eng._quiet_now("b1", 12), "两条来源都说清醒才不安静")
 
     def test_invalid_window_falls_back_to_the_config(self):
         eng = _engine(quiet_start=1, quiet_end=2)

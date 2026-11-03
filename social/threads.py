@@ -29,7 +29,14 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .clock import city_epoch, city_now
-from .reasoning import is_leaving, is_thin, last_direction, sleep_signal, busy_signal
+from .reasoning import (
+    busy_signal,
+    is_leaving,
+    is_thin,
+    last_direction,
+    said_goodnight,
+    sleep_signal,
+)
 
 # ─── 1. 这一场话还没完 ──────────────────────────────
 
@@ -144,6 +151,27 @@ def thread_reason(
     if continue_max_seconds > 0:
         asked_at = _num(user.get("thread_asked_at", 0))
         since_spoken = now - spoken
+        # v2.0.6（m00055）：接话之前先确认「确实有一场能接的话」。
+        #
+        # v2.0.5 这里只看时间戳：她说过话、对方沉默了、时间落在窗口里，就判「接话」。
+        # 于是下面三种情况它也会开口——
+        #   1) 她自己那句已经是收尾（「晚安」「先这样吧」），再接着说等于把人叫回来；
+        #   2) 账本里根本没有可接的内容（对方只发过「嗯」/她只回过一句「好」），
+        #      生成侧拿不到话头，只能吐一句「继续」「然后呢」——「一句回一句」就是
+        #      这么来的；
+        #   3) 她上一句已经在问对方话了，再来一句问句就成了连问。
+        # 前两条在这里用硬条件拦掉：话头两端都得在（对方说过、她也回过），且她那句
+        # 不是道别。第三条是写法问题，交给生成侧的提示词（thread_meta 带 asked_question）。
+        her_text = str(user.get("last_spoken_text", "") or "").strip()
+        peer_text = str(user.get("last_message", "") or "").strip()
+        _near = [
+            item for item in _conversation(user)
+            if 0 < now - _num(item.get("ts", 0)) <= continue_max_seconds
+        ]
+        _has_exchange = (
+            (any(_is_inbound(it) for it in _near) and any(not _is_inbound(it) for it in _near))
+            or bool(peer_text and her_text)
+        )
         if (
             spoken >= seen                                  # 最后一句是她说的
             and continue_after_seconds <= since_spoken <= continue_max_seconds
@@ -153,6 +181,9 @@ def thread_reason(
             and not (
                 is_leaving(last_msg) or sleep_signal(user, now) or busy_signal(user, now)
             )
+            and _has_exchange                               # 真的有一场话可以接
+            and not is_leaving(her_text)                    # 她自己那句不是在道别
+            and not said_goodnight(her_text)                # 也不是在说晚安
         ):
             return "continue", ""
     # 断点必须是**对方**那句还热着的时候。只看 max(seen, spoken) 的话，她在群里或跟
@@ -253,6 +284,12 @@ def thread_meta(
         # 两种都不许查岗、不许提「你怎么不回」——那是催，不是接话。
         minutes = int(silence_minutes or 0)
         away = f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
+        # v2.0.6（m00055）：沉默多长、她上一句是不是问句，生成侧都要知道。
+        # v2.0.5 的 _MODE_NOTES["continue"] 本来就写着「沉默还短就顺着说、沉默久了
+        # 就问人去哪了」，但这份时长从来没进过提示词——模型无从分支，只能回一句
+        # 「继续」「然后呢」。这里把它作为字段交出去。
+        asked_text = str(asked or "").strip()
+        asked_question = asked_text.endswith("？") or asked_text.endswith("?")
         return {
             "category": "continue",
             "intent": "followup",
@@ -266,19 +303,23 @@ def thread_meta(
             "about": about,
             "asked": asked,
             "silence_minutes": minutes,
+            "short_silence": minutes <= 120,
+            "asked_question": asked_question,
         }
     if kind == "probe":
         return {
             "category": "probe",
             "intent": "followup",
             "mode": "probe",
-            "msg_type": "continue_topic",
-        "msg_type_desc": "就着刚才那件事再问一句",
-        # 原来这里给五条现成的话（「后来呢」「真的假的」…）让模型照着挑。
-        # 那是替她写台词：追问的说法就那么几种，模型每轮都在这几条里轮，
-        # 同一个人的「追问」听起来永远一模一样。现在只给写法要求。
-        "style_hint": "直接问那件事的进展，别绕成寒暄；一两句说完就停，别连着追问",
-        "about": about,
+            # v2.0.6（m00055）：原来这里也写 continue_topic，于是面板/日志里
+            # 「接话」和「追问」永远是同一个 cat，主人没法判断到底是哪条路在发。
+            "msg_type": "probe_topic",
+            "msg_type_desc": "就着刚才那件事再问一句",
+            # 原来这里给五条现成的话（「后来呢」「真的假的」…）让模型照着挑。
+            # 那是替她写台词：追问的说法就那么几种，模型每轮都在这几条里轮，
+            # 同一个人的「追问」听起来永远一模一样。现在只给写法要求。
+            "style_hint": "直接问那件事的进展，别绕成寒暄；一两句说完就停，别连着追问",
+            "about": about,
             "asked": asked,
         }
     return {

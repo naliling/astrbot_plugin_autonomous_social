@@ -517,9 +517,11 @@ _MODE_NOTES = {
         "- 也别道歉、别解释你上次为什么发那句。"
     ),
     "continue": (
-        "你们刚才在聊，你回完那句之后 TA 就没声了。你想接一句，或者问一句人去哪了。\n"
-        "- 沉默还短：接着上一个话题往下说，别重新起头；\n"
-        "- 沉默久了：就问一句 TA 去哪了 / 怎么突然没声了；\n"
+        "你们刚才在聊，你回完那句之后 TA 就没声了。你想把这场话接上。\n"
+        "- 沉默还短：顺着上一个话题往下说，把没说完的那半句补完，别重新起头；\n"
+        "- 沉默久了：先问一句人去哪了，再顺手把话题带回来；\n"
+        "- 不许只回「继续」「然后呢」「人呢」这种空话——那等于把话头又推回给 TA，"
+        "什么内容都没接上；要具体说点那件事里的东西；\n"
         "- 不许查岗，也不许提「你怎么不回」——那是催，不是接话；一两句说完就停。"
     ),
     "greet_morning": (
@@ -562,37 +564,67 @@ _MODE_ASK = {
     "closer": "你上次发出去没人接的那句是：「{about}」。",
     "presence": "你自己上一句说的是：「{asked}」。",
     # 接话要引**她自己上一句**：那是她回完就断掉的那半句话，接着它往下说才像同一场话
-    # （引对方那句会把「她说完之后对方消失」讲成「对方的话悬着」，那是 probe/presence）。
-    "continue": "你自己上一句说的是：「{asked}」。",
+    # （只引对方那句会把「她说完之后对方消失」讲成「对方的话悬着」，那是 probe/presence）。
+    #
+    # v2.0.6（m00055）：两句话头都要给。v2.0.5 只引她自己那句，于是模型手里没有
+    # 「TA 最后说了什么」——接话只能接自己的半句，写出来就是一句空泛的「继续」。
+    # 两条模板分别渲染：哪条引文不成立（空/不可引）就只出另一条，不会出现空引号。
+    "continue": (
+        "你自己上一句说的是：「{asked}」。",
+        "TA 最后回你的是：「{about}」。",
+    ),
 }
 
 
-def _mode_note(mode: str, about: str = "", asked: str = "") -> str:
-    """这一条到底要说什么。没 mode（另起话题）时返回空串，由调用方走通用文案。"""
+def _mode_note(
+    mode: str,
+    about: str = "",
+    asked: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> str:
+    """这一条到底要说什么。没 mode（另起话题）时返回空串，由调用方走通用文案。
+
+    `meta` 是 `reason_meta`：只有 continue 用它——同一句「你人呢」在沉默 20 分钟和
+    5 小时之后是两种说法，而 v2.0.5 从来没把时长交给模型（`thread_meta` 早就把它算
+    好放在 `silence_minutes` 里，生成侧却一次都没读过）。
+    """
     note = _MODE_NOTES.get(mode)
     if not note:
         return ""
     hint = _MODE_ASK.get(mode, "")
+    hints = hint if isinstance(hint, (list, tuple)) else ((hint,) if hint else ())
     # 判定条件必须是「该模板实际用到的占位符有值」，而不是「任意一个字段有值」：
     # presence 模式只要 about 有值而 asked 为空，就会渲染出「你自己上一句说的是：「」。」，
     # 那个空引号就是给模型的错误线索，追问质量直接塔在这里
-    if hint:
-        _about = _peer_text(about, 80)
-        _asked = _peer_text(asked, 80)
-        if "{about}" in hint and _about and is_quotable(_about):
-            fill = hint.format(about=_about, asked=_asked)
-        elif "{asked}" in hint and _asked and is_quotable(_asked):
-            fill = hint.format(about=_about, asked=_asked)
-        else:
-            # 引文不成立（「时间」「yep」「[图片]」）就不引：空着比给一句假上下文好。
-            # 原来这里只判「有没有值」，于是提示词里会出现
-            # 「TA最后说的是：「时间」。」——模型照着这句去追问一个不存在的「时间」。
-            fill = ""
-    else:
-        fill = ""
-    if not fill:
-        return "\n" + note
-    return "\n" + note + "\n- " + fill
+    _about = _peer_text(about, 80)
+    _asked = _peer_text(asked, 80)
+    fills: List[str] = []
+    for tpl in hints:
+        try:
+            if "{about}" in tpl and _about and is_quotable(_about):
+                fills.append(tpl.format(about=_about, asked=_asked))
+            elif "{asked}" in tpl and _asked and is_quotable(_asked):
+                fills.append(tpl.format(about=_about, asked=_asked))
+        except (KeyError, IndexError, ValueError):
+            # 模板坏了就少一条引文，不能让整轮生成塌在这里。
+            continue
+        # 引文不成立（「时间」「yep」「[图片]」）就不引：空着比给一句假上下文好。
+        # 原来这里只判「有没有值」，于是提示词里会出现
+        # 「TA最后说的是：「时间」。」——模型照着这句去追问一个不存在的「时间」。
+    extra: List[str] = []
+    if mode == "continue":
+        minutes = 0
+        try:
+            minutes = int(float((meta or {}).get("silence_minutes") or 0))
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes > 0:
+            away = f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
+            extra.append(f"到现在 TA 已经 {away}没声了。")
+        if (meta or {}).get("asked_question"):
+            extra.append("你上一句已经是问句了，这一句别再问一遍，说点具体的内容。")
+    lines = [note] + [f"- {fill}" for fill in fills] + [f"- {line}" for line in extra]
+    return "\n" + "\n".join(lines)
 
 
 _DECIDE_NOTES = {
@@ -629,8 +661,23 @@ _DECIDE_NOTES = {
 }
 
 
-def _decide_note(mode: str) -> str:
-    return _DECIDE_NOTES.get(mode, "")
+def _decide_note(mode: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    """否决权那一段的补充说明。continue 还要把「沉默多久」告诉模型，
+
+    否则它无从判断这该是「顺着说」还是「问一句人去哪了」——那是 issue #3 里那条
+    凌晨消息读起来像模板话的原因之一。
+    """
+    note = _DECIDE_NOTES.get(mode, "")
+    if mode != "continue":
+        return note
+    try:
+        minutes = int(float((meta or {}).get("silence_minutes") or 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes <= 0:
+        return note
+    away = f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
+    return note + f"到现在 TA 已经 {away}没声了。"
 
 
 def _intimacy_fact_line(target: Dict[str, Any]) -> str:
@@ -1965,7 +2012,7 @@ class MessageGenerator:
                     "实在没什么可说的，同样答 NO。",
                 ])
                 if is_followup:
-                    parts.append(_decide_note(mode))
+                    parts.append(_decide_note(mode, reason_meta))
                 elif mode == "miss":
                     # 「念想」这一类：她不是有事要说，就是想到了这个人。
                     # 不点破的话模型会滑回「我今天怎么样」——197 条真实记录里
@@ -2023,7 +2070,7 @@ class MessageGenerator:
             # 问候类的 mode_note 自带「现在几点、想做什么」的开头，再单独写一遍
             # msg_type_desc 就是同一句话说两遍，后面 style_hint 与 mode_note 的第二条
             # 也在说同一件事。一条早安因此多花掉近一整段 token，还把重点冲淡。
-            note = _mode_note(mode, about, asked)
+            note = _mode_note(mode, about, asked, reason_meta)
             if mode in ("greet_morning", "greet_night") and note:
                 parts.append(note)
             else:

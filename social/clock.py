@@ -15,7 +15,7 @@ from __future__ import annotations
 import calendar
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
 def _offset(value: Optional[int]) -> Optional[float]:
@@ -63,6 +63,34 @@ def _wall_clock_token(value: Any, span: int) -> Optional[int]:
         return None
     return out if 0 <= out < span else None
 
+def _window_token(value: Any) -> Optional[int]:
+    """安静时段窗口的端点（小时）：允许 **24**，表示「当天的 24:00」。
+
+    和 `_wall_clock_token` 分开是因为两者语义不同：`hour` 永远是 0–23 的钟点，
+    而窗口端点允许写 24——`0 → 24` 是「一整天」，`22 → 24` 是「到午夜」。
+    `SocialConfig.in_quiet_hours` 一直就是这个口径（`start <= h < end`），
+    v2.0.6 的 clock 助手如果把它当成越界丢掉，面板上填 0/24 的用户会看到
+    「配置说安静、闸门说不安静」——同一个问题两套答案。
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if 0 <= out <= 24 else None
+
+
+def _window_hour_float(value: Any) -> Optional[float]:
+    """窗口端点的浮点版（Core 的夜是 1.75 这种半点）：同样保留 24。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    if out < 0.0 or out > 24.0:
+        out = out % 24.0
+    return out
+
 
 def seconds_until_quiet_end(hour: int, minute: int, start: int, end: int) -> int:
     """现在离「安静时段结束」还有多少秒；不在安静时段 / 没有安静时段时返回 0。
@@ -85,8 +113,8 @@ def seconds_until_quiet_end(hour: int, minute: int, start: int, end: int) -> int
     """
     h = _wall_clock_token(hour, 24)
     m = _wall_clock_token(minute, 60)
-    qs = _wall_clock_token(start, 24)
-    qe = _wall_clock_token(end, 24)
+    qs = _window_token(start)
+    qe = _window_token(end)
     if h is None or m is None or qs is None or qe is None:
         return 0
     if qs == qe:  # 起 == 止：不启用
@@ -105,3 +133,203 @@ def seconds_until_quiet_end(hour: int, minute: int, start: int, end: int) -> int
     if now_min < end_min:
         return (end_min - now_min) * 60
     return 0
+
+
+# ─── 安静时段：一个判定，两处来源，谁都替代不了谁 ──────────────────────────
+#
+# v2.0.6 之前的写法（engine._quiet_now）把两件事塞进同一个 if 里：
+#
+#     window = self._night_windows.get(bid)          # Core 的生物钟夜
+#     if not window:
+#         return self.cfg.in_quiet_hours(hour)       # 只有拿不到 Core 时才看配置
+#     start, end = window
+#     ...
+#
+# 后果有两个，都是线上真出过的：
+#
+# 1. **Core 的夜「顶替」了面板上配的安静时段**。面板上写 23→7 的人，只要 Core
+#    给出一个 00:15–05:30 的夜，23:00–00:15 与 05:30–07:00 就重新变成可发时段；
+#    Core 给出的夜如果是 16:45–18:15（一个午睡），那 23–7 就彻底不存在了；
+#    而 Core 的夜若退化成 start==end，安静时段会被整体关掉。
+# 2. **配置窗口是在「她所在城市」的时钟上判的**（调用方传的是 _moment_of().hour）。
+#    她设定在加里宁格勒（UTC+2）而宿主在北京（UTC+8）时，本机 04:06 在她那边是
+#    22:06，于是「现在是安静时段」不成立——issue #3 里凌晨 4 点那条 continue_topic
+#    就是这么出去的。
+#
+# 所以判定拆成两个纯函数：窗口语义（in_window）与「用哪个时钟 + 取并集」
+# （quiet_decision）。engine 只负责取数，不再自己写一遍区间比较。
+
+QUIET_CLOCK_LOCAL = "local"
+QUIET_CLOCK_CORE = "core"
+
+_CORE_CLOCK_ALIASES = {
+    "core", "city", "her", "character", "role", "persona",
+    "她", "角色", "人物", "城市", "她那边",
+}
+
+
+def normalize_quiet_clock(value: Any) -> str:
+    """把 quiet_clock 配置收成 local / core；看不懂的一律当 local。
+
+    默认 local 是**修 issue #3 的关键**：面板上那个 23→7 是操作者按自己的作息
+    写的，就该按插件所在机器的墙上时间判，而不是按角色的虚构城市。
+    """
+    try:
+        text = str(value or "").strip().lower()
+    except Exception:
+        return QUIET_CLOCK_LOCAL
+    return QUIET_CLOCK_CORE if text in _CORE_CLOCK_ALIASES else QUIET_CLOCK_LOCAL
+
+
+def in_window(hour: Any, start: Any, end: Any) -> bool:
+    """hour 是否落在 [start, end) 这段小时区间里（支持跨午夜、端点可写 24）。
+
+    与 SocialConfig.in_quiet_hours 同一套语义：start == end 表示这段区间不启用
+    （面板上把两头调成一样就是关掉它）。坏的入参一律 False。
+    """
+    h = _wall_clock_token(hour, 24)
+    qs = _window_token(start)
+    qe = _window_token(end)
+    if h is None or qs is None or qe is None:
+        return False
+    if qs == qe:
+        return False
+    if qs < qe:
+        return qs <= h < qe
+    return h >= qs or h < qe
+
+
+def window_span_hours(start: Any, end: Any) -> float:
+    """这段窗口一共几个小时（跨午夜按加法算；起止相同 = 0 = 未启用）。"""
+    qs = _window_token(start)
+    qe = _window_token(end)
+    if qs is None or qe is None or qs == qe:
+        return 0.0
+    # 端点允许 24：0 → 24 是一整天，不能折成 (24-0) % 24 = 0
+    return float(qe - qs) if qs < qe else float((qe - qs) % 24)
+
+
+def _hour_float(value: Any) -> Optional[float]:
+    """Core 的 night_window 是浮点小时（01:45 = 1.75），收进 [0, 24)。"""
+    try:
+        out = float(value) % 24.0
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _in_window_float(hour: Any, start: float, end: float) -> bool:
+    """浮点小时版本的 in_window（Core 的夜可能是 1.75 这种半点）。"""
+    try:
+        h = float(hour) % 24.0
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(h):
+        return False
+    if abs(start - end) < 1e-9:
+        return False
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
+
+
+def quiet_decision(
+    local_hour: Any,
+    city_hour: Any,
+    start: Any,
+    end: Any,
+    *,
+    clock_mode: Any = QUIET_CLOCK_LOCAL,
+    core_window: Optional[Any] = None,
+    use_core_night: bool = True,
+) -> Tuple[bool, str]:
+    """现在是不是安静时段，以及为什么。
+
+    两条来源取**并集**，谁也不顶替谁：
+
+    * 面板配置 quiet_start / quiet_end：按 clock_mode 选时钟。
+      local（默认）= 插件所在机器的墙上时间；core = 她所在城市。
+    * Core 契约里的生物钟夜 night_window：按她所在城市的小时判。
+      use_core_night=False 时不参与。
+
+    返回 (是否安静, 原因)；原因串直接进闸门日志与 _round_skips，
+    这样「为什么没发」在面板和日志里是可查的事实，而不是靠猜。
+    """
+    reasons: list = []
+
+    qs = _window_token(start)
+    qe = _window_token(end)
+    if qs is not None and qe is not None and qs != qe:
+        mode = normalize_quiet_clock(clock_mode)
+        if mode == QUIET_CLOCK_CORE:
+            h = _wall_clock_token(city_hour, 24)
+            if h is not None and in_window(h, qs, qe):
+                reasons.append(f"安静时段（{qs:02d}:00–{qe:02d}:00，她那边 {h:02d} 点）")
+        else:
+            h = _wall_clock_token(local_hour, 24)
+            if h is not None and in_window(h, qs, qe):
+                reasons.append(f"安静时段（{qs:02d}:00–{qe:02d}:00，本机 {h:02d} 点）")
+
+    if use_core_night and core_window:
+        try:
+            raw_start, raw_end = core_window[0], core_window[1]
+        except (TypeError, IndexError, KeyError):
+            raw_start = raw_end = None
+        cs = _window_hour_float(raw_start) if raw_start is not None else None
+        ce = _window_hour_float(raw_end) if raw_end is not None else None
+        if cs is not None and ce is not None and abs(cs - ce) >= 1e-9:
+            h = _wall_clock_token(city_hour, 24)
+            if h is not None and _in_window_float(h, cs, ce):
+                reasons.append(f"她的夜里（{cs:04.2f}–{ce:04.2f}，她那边 {h:02d} 点）")
+
+    return (bool(reasons), "；".join(reasons))
+
+
+def quiet_overlap_seconds(
+    start_ts: Any,
+    end_ts: Any,
+    start: Any,
+    end: Any,
+    offset_minutes: Optional[int] = None,
+) -> float:
+    """[start_ts, end_ts) 这段时间里，有多少秒落在安静时段窗口内。
+
+    存在的意义是 issue #3 的第二条建议：**跨过安静时段的接话窗口不该被安静时段
+    白白烧掉**。原来 continue_window_hours=8 是一个绝对的 8 小时，人在 23:00
+    睡着、07:00 醒，凌晨那 8 小时里窗口就过期了——她醒来时这段沉默已经「超时」，
+    接话永远轮不上。用这个函数把落在静音里的秒数补回窗口长度，语义就变成
+    「醒着的时间里给 8 小时」。
+
+    start / end 是小时（可带小数，Core 的夜是 1.75 这种）；offset_minutes
+    为 None 表示按本机墙上时间算，否则按 city_now 那个城市算。
+    """
+    try:
+        a = float(start_ts)
+        b = float(end_ts)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (math.isfinite(a) and math.isfinite(b)) or b <= a:
+        return 0.0
+    qs = _window_hour_float(start)
+    qe = _window_hour_float(end)
+    if qs is None or qe is None or abs(qs - qe) < 1e-9:
+        return 0.0
+    total = 0.0
+    t = a
+    # 逐分钟走：窗口边界可能落在半点（01:45），按小时步进会判错。
+    # 上限 14 天，避免手改出来的远古时间戳把这一轮心跳拖成忙循环。
+    for _ in range(int(min(b - a, 14 * 24 * 3600.0) // 60) + 2):
+        if t >= b:
+            break
+        dt = city_now(t, offset_minutes)
+        minute_of_day = dt.hour * 60 + dt.minute + dt.second / 60.0
+        nxt = dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        nxt_ts = city_epoch(nxt, offset_minutes)
+        seg_end = min(b, nxt_ts) if nxt_ts > t else b
+        now_hour = (minute_of_day / 60.0) % 24.0
+        if _in_window_float(now_hour, qs, qe):
+            total += seg_end - t
+        if seg_end <= t:
+            break
+        t = seg_end
+    return total

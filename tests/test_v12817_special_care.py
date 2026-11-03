@@ -323,8 +323,11 @@ class SpecialCareGateTest(unittest.TestCase):
 
 class SpecialCareSettleTest(unittest.TestCase):
     def test_quiet_hours_do_not_freeze_special_care_urge(self):
+        # 安静时段压成全天（0→24）：v2.0.6 起它按**真实时钟**判（本机小时 + 她那边
+        # 的小时），不再拿调用方传进来的 dt.hour 当「她的城市几点」，所以这里不能
+        # 靠 dt=23:30 制造夜晚，否则断言会取决于跑测试的时刻。
         eng = _engine(
-            _Clock(NOW), special_care_uids=["sc1"], quiet_start=23, quiet_end=7,
+            _Clock(NOW), special_care_uids=["sc1"], quiet_start=0, quiet_end=24,
             special_care_ignore_quiet=True,
         )
         sc = _user("sc1", urge=0.0, urge_at=NOW - 4 * 3600, interest=0.5,
@@ -332,7 +335,7 @@ class SpecialCareSettleTest(unittest.TestCase):
         plain = _user("n1", urge=0.0, urge_at=NOW - 4 * 3600, interest=0.5,
                       last_seen=NOW - 100000)
         eng.state.bot("b1")["users"] = {"sc1": sc, "n1": plain}
-        dt = datetime(2026, 5, 1, 23, 30)  # 落在 quiet 窗口里
+        dt = datetime(2026, 5, 1, 23, 30)  # 只用来算日程；安静时段不看它
         eng.settle_minds(
             "b1", NOW, dt, core_root=None,
             bot_state={"energy": 80.0, "social_energy": 80.0},
@@ -343,11 +346,12 @@ class SpecialCareSettleTest(unittest.TestCase):
         )
 
     def test_quiet_hours_freeze_normal_users(self):
-        eng = _engine(_Clock(NOW), quiet_start=23, quiet_end=7)
+        # 同上：0→24 全天安静，断言与跑测试的时刻无关。
+        eng = _engine(_Clock(NOW), quiet_start=0, quiet_end=24)
         plain = _user("n1", urge=0.0, urge_at=NOW - 4 * 3600, interest=0.5,
                       last_seen=NOW - 100000)
         eng.state.bot("b1")["users"] = {"n1": plain}
-        dt = datetime(2026, 5, 1, 23, 30)
+        dt = datetime(2026, 5, 1, 23, 30)  # 只用来算日程；安静时段不看它
         eng.settle_minds(
             "b1", NOW, dt, core_root=None,
             bot_state={"energy": 80.0, "social_energy": 80.0},

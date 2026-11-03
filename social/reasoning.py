@@ -386,6 +386,20 @@ def sleep_signal(user: Dict[str, Any], now: float) -> bool:
         return now - _num(user.get("last_seen", 0)) <= SLEEP_SUPPRESS_SECONDS
     return False
 
+
+def said_goodnight(text: str) -> bool:
+    """这句话是不是在道晚安 / 说要睡了——**不分是谁说的**。
+
+    `sleep_signal` 故意只看对方（她自己道的晚安不该让插件以为对方要睡），但
+    「她上一句已经是晚安」时再回头接话，等于把人从被窝里叫回来。这条判据属于
+    接话侧（threads 的 continue 分支），所以单独给一个不分方向的小工具，
+    不去动 `sleep_signal` 已经定死的语义。
+    """
+    body = str(text or "")
+    if not body:
+        return False
+    return any(word in body for word in _SLEEP_WORDS)
+
 # ─── 离开语 ────────────────────────────────
 
 # 未完话题的判定都放在 threads.py；这里只留两个被多处复用的底层判断。

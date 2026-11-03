@@ -2444,7 +2444,10 @@ class TestMissChannelBypassesRecentTalk(unittest.TestCase):
                          "念想通道不该被「刚聊过」拦住")
         self.assertNotIn("gate_reason(", body,
                          "念想通道不该走接话那一整套闸门")
-        self.assertIn("_quiet_now", body, "但安静时段仍然要守")
+        # v2.0.6 起安静时段只有一个入口 `_quiet_at`（它自己决定用本机还是她那边
+        # 的时钟，并把 Core 的夜与面板窗口取并集），旧的 `_quiet_now(bid, hour)`
+        # 已经只是兼容壳。
+        self.assertIn("_quiet_at", body, "但安静时段仍然要守")
         self.assertIn("_min_gap_left", body, "最小间隔仍然要守")
 
     def test_miss_requires_about_peer(self):
