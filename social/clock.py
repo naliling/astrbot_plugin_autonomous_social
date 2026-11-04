@@ -285,6 +285,20 @@ def quiet_decision(
     return (bool(reasons), "；".join(reasons))
 
 
+_OVERLAP_MAX_SPAN = 14 * 24 * 3600.0
+
+
+def _window_edges(qs: float, qe: float) -> Tuple[Tuple[float, float], ...]:
+    """安静窗口在**一天之内**的段（小时，24 = 当天结束）。
+
+    不跨午夜是一段；跨午夜拆成 [qs, 24) 与 [0, qe) 两段。逐日求交时只按这个
+    形状算，不再逐分钟走钟。
+    """
+    if qs < qe:
+        return ((qs, qe),)
+    return ((qs, 24.0), (0.0, qe))
+
+
 def quiet_overlap_seconds(
     start_ts: Any,
     end_ts: Any,
@@ -302,6 +316,17 @@ def quiet_overlap_seconds(
 
     start / end 是小时（可带小数，Core 的夜是 1.75 这种）；offset_minutes
     为 None 表示按本机墙上时间算，否则按 city_now 那个城市算。
+
+    v2.0.7（2026-11-04 事件循环卡顿）：这里原来是**逐分钟**遍历，跨度 14 天时
+    每次 20160 次 city_now + city_epoch（实测 0.40 秒），而它被放在「每轮心跳 ×
+    每个用户」里——468 个用户、302 个 last_said 超过 14 天，一轮心跳纯 CPU
+    33–89 秒，asyncio 事件循环被独占，AstrBot 看门狗连抓 41 次主线程栈，最深帧
+    全落在这个函数里。窗口端点是整点（Core 夜窗最多带半点），完全不需要逐分钟：
+    按**本地日界**切段，每天最多两段，14 天 = 28 次区间求交。结果与逐分钟版本
+    逐秒一致（见 tests/test_v207_quiet_overlap.py 的等价性用例），耗时从 0.40 秒
+    降到 0.08 毫秒（有 Core 的固定偏移钟）／0.33 毫秒（本机时钟）。
+    固定偏移的城市钟没有夏令时，日界就是 86400 秒，所以那一支一天只折一次
+    epoch、其余用算术推进；本机时钟会碰夏令时，才逐段折。
     """
     try:
         a = float(start_ts)
@@ -314,22 +339,48 @@ def quiet_overlap_seconds(
     qe = _window_hour_float(end)
     if qs is None or qe is None or abs(qs - qe) < 1e-9:
         return 0.0
+    # 与逐分钟版本同一个上限：最多数 14 天（手改出来的远古时间戳不该把心跳拖住）。
+    if b - a > _OVERLAP_MAX_SPAN:
+        b = a + _OVERLAP_MAX_SPAN
+    try:
+        first = city_now(a, offset_minutes)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 0.0
+    day = first.replace(hour=0, minute=0, second=0, microsecond=0)
+    edges = _window_edges(qs, qe)
+    # 先把「每天那段安静窗口」折成 epoch 区间，再统一求交——两种时钟各生成一次，
+    # 求交只写一遍。
+    spans: list = []
+    steps = int(math.ceil((b - a) / 86400.0)) + 2  # 跨度/一天 + 首尾两个半截日
+    offset = _offset(offset_minutes)
+    if offset is not None:
+        # 有 Core 的城市钟是**固定偏移**，没有夏令时：一天就是 86400 秒，
+        # 日界用算术推进，一天只折一次 epoch（原来每段都要 timegm 一次，
+        # 14 天 = 80 次，0.4 毫秒；现在是 1 次 + 32 次加法）。
+        day_epoch = city_epoch(day, offset)
+        for _ in range(steps):
+            if day_epoch >= b:
+                break
+            for ws_h, we_h in edges:
+                spans.append((day_epoch + ws_h * 3600.0, day_epoch + we_h * 3600.0))
+            day_epoch += 86400.0
+    else:
+        # 本机时钟会碰夏令时，日界不一定是 86400 秒，只能逐段折。
+        for _ in range(steps):
+            if city_epoch(day, offset_minutes) >= b:
+                break
+            for ws_h, we_h in edges:
+                spans.append(
+                    (
+                        city_epoch(day + timedelta(hours=ws_h), offset_minutes),
+                        city_epoch(day + timedelta(hours=we_h), offset_minutes),
+                    )
+                )
+            day = day + timedelta(days=1)
     total = 0.0
-    t = a
-    # 逐分钟走：窗口边界可能落在半点（01:45），按小时步进会判错。
-    # 上限 14 天，避免手改出来的远古时间戳把这一轮心跳拖成忙循环。
-    for _ in range(int(min(b - a, 14 * 24 * 3600.0) // 60) + 2):
-        if t >= b:
-            break
-        dt = city_now(t, offset_minutes)
-        minute_of_day = dt.hour * 60 + dt.minute + dt.second / 60.0
-        nxt = dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
-        nxt_ts = city_epoch(nxt, offset_minutes)
-        seg_end = min(b, nxt_ts) if nxt_ts > t else b
-        now_hour = (minute_of_day / 60.0) % 24.0
-        if _in_window_float(now_hour, qs, qe):
-            total += seg_end - t
-        if seg_end <= t:
-            break
-        t = seg_end
+    for lo, hi in spans:
+        lo = max(a, lo)
+        hi = min(b, hi)
+        if hi > lo:
+            total += hi - lo
     return total

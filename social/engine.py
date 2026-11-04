@@ -99,6 +99,15 @@ MIN_HEARTBEAT_SECONDS = 60      # 心跳间隔下限，防止有人把配置填�
 FLUSH_INTERVAL_SECONDS = 30      # 状态刷盘间隔
 HOT_CHAT_THRESHOLD = 900         # 十分钟内还在聊，不插话
 
+# v2.0.7（2026-11-04 事件循环卡顿）：_thread_pick 每轮遍历一个角色的全部用户，
+# 里面曾经对**每个**用户算一次「安静时段吃掉了多少秒」。468 个用户、302 个
+# last_said 超过 14 天，一轮心跳纯 CPU 33–89 秒，事件循环被独占。现在：
+#   * 重叠计算本身是 O(天数) 的（clock.quiet_overlap_seconds）；
+#   * 只有「基准窗口差一点够不着」的人才会去算（见 _continue_max_with_quiet）；
+#   * 整轮再给一个时间预算兜底，超了就按原窗口判、本轮不再顺延。
+_THREAD_PICK_BUDGET = 0.2        # 一轮接话挑人的时间预算（秒）
+_QUIET_DEFER_MAX_SPAN = 14 * 24 * 3600.0   # 顺延最多看得见 14 天，与重叠计算同上限
+
 # F1：本插件已注册的指令名（用于识别被框架剪掉 `/` 的指令消息）。
 _COMMAND_NAMES = (
     "自主社交状态", "社交自检", "触发社交", "主动消息预览", "主动消息记录", "群社交状态",
@@ -3662,6 +3671,9 @@ class SocialEngine:
             return 0.0
         if not (math.isfinite(start_ts) and math.isfinite(end_ts)) or end_ts <= start_ts:
             return 0.0
+        # v2.0.7：没有对话记录就没有可顺延的窗口，别去走时区换算。
+        if start_ts <= 0:
+            return 0.0
         total = 0.0
         city_offset = self._city_offset.get(str(bid or ""))
         cfg_offset = None
@@ -4169,18 +4181,16 @@ class SocialEngine:
             return None
         probe, presence, ceiling, context, continue_after, continue_max = self._thread_windows()
         best: Optional[Tuple[float, str, Dict[str, Any], str, str]] = None
+        # v2.0.7（卡顿报告 ④）：整轮一个时间预算。安静时段顺延是锦上添花，不该让它
+        # 把事件循环占住；超预算就按原窗口判，本轮不再算顺延（logger.debug 记一次）。
+        deadline = time.monotonic() + _THREAD_PICK_BUDGET
+        budget_warned = False
         for uid, u in self.state.bot(bid).get("users", {}).items():
             if not u.get("umo"):
                 continue
             if self.state.is_send_blocked(bid, uid, now):
                 continue
-            # v2.0.6（issue #3 建议二）：continue 的窗口被安静时段吃掉多久就还回多久。
-            # 一段「她回完、对方消失」的窗口整段落在夜里时，它会在 07:00 之前悄悄
-            # 过期，那句该接的话就永远接不上了。把被夜吃掉的时间补进上限，窗口于是
-            # 顺延到安静时段结束之后——而不是在凌晨把这条消息发出去。
-            _continue_max = continue_max
-            if continue_max > 0:
-                _continue_max += SocialEngine._quiet_overlap(self, bid, self._last_said(u), now)
+            # 先用**原窗口**判一次：绝大多数人连候选都不是，这一步就够了。
             kind, reason = thread_reason(
                 u,
                 now,
@@ -4190,8 +4200,34 @@ class SocialEngine:
                 context_seconds=context,
                 presence_floor_seconds=presence,
                 continue_after_seconds=continue_after,
-                continue_max_seconds=_continue_max,
+                continue_max_seconds=continue_max,
             )
+            # v2.0.6（issue #3 建议二）：continue 的窗口被安静时段吃掉多久就还回多久。
+            # 一段「她回完、对方消失」的窗口整段落在夜里时，它会在 07:00 之前悄悄
+            # 过期，那句该接的话就永远接不上了。把被夜吃掉的时间补进上限，窗口于是
+            # 顺延到安静时段结束之后——而不是在凌晨把这条消息发出去。
+            #
+            # v2.0.7（2026-11-04 卡顿报告 ②③）：旧写法是**先**给每个用户算一次重叠
+            # 再判，468 个用户里 302 个 last_said 超过 14 天，每次都要走满 20160 次
+            # 循环，一轮心跳纯 CPU 33–89 秒。现在先用**原窗口**判（绝大多数人连候选
+            # 都不是，这一步就结束了），只有基准窗口差一点够不着的人，才去算重叠并
+            # 重判一次——判据的三道短路都在 _continue_max_with_quiet 里。
+            if continue_max > 0 and kind != "continue":
+                _extended, budget_warned = SocialEngine._continue_max_with_quiet(
+                    self, bid, u, now, continue_max, deadline, budget_warned
+                )
+                if _extended > continue_max:
+                    kind, reason = thread_reason(
+                        u,
+                        now,
+                        probe_after_seconds=probe,
+                        presence_after_seconds=presence,
+                        max_seconds=ceiling,
+                        context_seconds=context,
+                        presence_floor_seconds=presence,
+                        continue_after_seconds=continue_after,
+                        continue_max_seconds=_extended,
+                    )
             if not kind:
                 continue
             # followup 关掉时只留 continue：上面虽然放行了这一轮，但 `thread_reason`
@@ -4206,6 +4242,57 @@ class SocialEngine:
         if best is None:
             return None
         return best[1], best[2], best[3], best[4], best[0]
+
+    def _continue_max_with_quiet(
+        self,
+        bid: str,
+        u: Dict[str, Any],
+        now: float,
+        continue_max: float,
+        deadline: Optional[float] = None,
+        warned: bool = False,
+    ) -> Tuple[float, bool]:
+        """接话窗口 + 「被安静时段吃掉的秒数」；不值得算就原样返回。
+
+        返回 (窗口上限, 是否已经为时间预算告过警)。
+
+        v2.0.7（2026-11-04 事件循环卡顿）：v2.0.6 对**每个**有 umo 的用户先算一次
+        重叠再判，468 个用户里 302 个 last_said 超过 14 天，每次都要走满 20160 次
+        循环，一轮心跳 33–89 秒纯 CPU，asyncio 事件循环被独占。这里三道短路把它
+        收敛到「真的差一点够不着」的少数人：
+
+        1. 没有可接的沉默（没说过话 / 最后一句是对方说的）→ 原窗口；
+        2. 沉默没超出原窗口 → 本来就接得上，顺延不改变结果 → 原窗口；
+        3. 沉默超出原窗口 14 天以上 → 顺延也够不着 → 原窗口。
+
+        剩下的才去算重叠，且只算一次（结果要么让窗口变宽、要么不变）。
+        """
+        if continue_max <= 0:
+            return continue_max, warned
+        seen = _num(u.get("last_seen", 0) or 0)
+        spoken = _num(u.get("last_spoken", 0) or 0)
+        if seen <= 0 or spoken <= 0:
+            return continue_max, warned
+        if spoken < seen:
+            # 最后一句是对方说的：thread_reason 的 continue 分支要求 spoken >= seen，
+            # 这一条本来就不成立，顺延没有意义。
+            return continue_max, warned
+        gap = now - min(seen, spoken)
+        if gap <= continue_max:
+            return continue_max, warned
+        if gap > continue_max + _QUIET_DEFER_MAX_SPAN:
+            return continue_max, warned
+        if deadline is not None and time.monotonic() > deadline:
+            if not warned:
+                logger.debug(
+                    f"[autonomous_social] {bid} 接话挑人超过 "
+                    f"{_THREAD_PICK_BUDGET:.1f}s 预算，本轮不再计算安静时段顺延"
+                )
+            return continue_max, True
+        overlap = SocialEngine._quiet_overlap(self, bid, self._last_said(u), now)
+        if overlap <= 0:
+            return continue_max, warned
+        return continue_max + overlap, warned
 
     def greet_gate(
         self,
