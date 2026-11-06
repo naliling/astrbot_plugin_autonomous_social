@@ -34,10 +34,27 @@ FIRE_THRESHOLD = 2.10
 # 判定时还会被 effective_gate 压到念头天花板之内，所以这个区间只是「节奏快慢」的
 # 调节量，不再是「能不能发」的生死线。
 FIRE_GATE_SPAN = 0.65
-# 念头的绝对上限，避免长期不结算的人攒出一个离谱的值
-URGE_CEILING = 3.0
+# fire_gate 的合法上界：new_fire_gate() 只会抽到 FIRE_THRESHOLD + FIRE_GATE_SPAN。
+#
+# 2.0.8 新增：after_skip 以前每被否决一次就把 fire_gate 往上加一截
+# （min(base + bump, URGE_CEILING)），而它没有任何回落路径，等于给这个人永久调高了
+# 开口难度（实测报告 P0-1 的棘轮）。现在不再抬高；老数据里被加出去的越界值由
+# settle() 一次性夹回这个区间——门槛该有的「随机抖动」由 new_fire_gate 每次发送后
+# 重抽负责，不靠只涨不跌维持，也不靠逐轮衰减慢慢磨掉。
+FIRE_GATE_MAX = FIRE_THRESHOLD + FIRE_GATE_SPAN
+# 念头的绝对上限，避免长期不结算的人攒出一个离谱的值。
+#
+# 2.0.8 起 3.0 → 4.0：天花板与门槛用的是同一个量纲，天花板只比
+# FIRE_THRESHOLD(2.10) 高 0.9 时，只要被冷落几次把门槛抬到 2.75 以上，攒到顶也
+# 常常刚够、门槛再抖一下就永远够不着——「攒到顶也发不出去」不是克制，是死锁。
+# 抬到 4.0 后天花板高于门槛上限（2.75 + 抖动），攒满一定过闸，克制交给门槛本身。
+URGE_CEILING = 4.0
 # 被否决（模型说不用发）之后保留多少念头。清零式惩罚会让模型不敢说 NO（见 after_skip）
-SKIP_KEEP_RATIO = 0.45
+#
+# 2.0.8 起 0.45 → 0.85：0.45 是「一次否决扣掉一半以上的攒劲」，连着被否两次
+# urge 就从 2.27 掉到 0.2，而门槛还被 after_skip 抬高，两边一起把节奏拖死
+# （实测报告 P0-1 的棘轮）。否决只是「现在别说」，不该等价于「重新攒」。
+SKIP_KEEP_RATIO = 0.85
 # 保留旧常量名以免外部引用断掉；新逻辑不再用它
 SKIP_FALLBACK = 0.18
 # 发送成功后念头清零
@@ -63,8 +80,13 @@ RHYTHM_SMOOTH = (0.25, 0.5, 0.25)
 # 压低它反而让门槛更低、更容易发（方向是反的）。封顶值不高于 URGE_CEILING，
 # 避免「被冷落够次数后永久不再主动」的自锁。时间上的克制另由
 # engine._gap_left（最小间隔随 streak 拉长）承担，两者互补。
-STREAK_GATE_STEP = 0.2
-STREAK_GATE_MAX_STREAK = 4
+#
+# 2.0.8 起 0.2→0.05、封顶 4→2：配合 refill_hours 从 4 降到 1.5，一轮攒劲只有
+# 1.5 小时；门槛每格 +0.2、封顶 +0.8 会把「4 小时能攒满」直接推到 8 小时开外，
+# 实测报告 P0-2 里 8.7~11.3 小时才够一次就是这么叠出来的。封顶 2 格 = 最多 +0.1，
+# 克制仍在（被冷落两次比一次难开口），但不至于把节奏整体吃掉。
+STREAK_GATE_STEP = 0.05
+STREAK_GATE_MAX_STREAK = 2
 # `interest_level` 里冷落惩罚项 -0.03*streak 的封顶格数。取 8 的依据有两条：
 #   1. 与门槛那侧的克制封顶（STREAK_GATE_MAX_STREAK=4）同源，惩罚允许比门槛更早封顶，
 #      但都在「连着 4~8 次没回」这个真人量级内；而 streak 本身每次被晾 +1、衰减要
@@ -363,9 +385,15 @@ def settle(
     惰性积分：只在被读到时按经过的时间补算，不需要为每个用户跑定时器。
 
     Args:
-        user: 用户状态 dict（就地更新 urge / urge_at）
+        user: 用户状态 dict（就地更新 urge / urge_at / fire_gate）
         now: 当前时间戳
-        refill_hours: 最在意的人攒满一次念头需要的小时数
+        refill_hours: **只是速率的缩放因子，不是「几小时攒满」**。
+            实际速率 = (BASE_RATE + INTEREST_RATE * interest) / max(refill_hours, 0.5)，
+            再乘作息/情绪/势头系数。也就是说 refill_hours=4 时，interest=1 的人
+            4 小时只能攒到 1.0 个「单位念头」，而门槛是 2.10——真要过闸得攒两个多
+            周期。这个参数名叫 refill、语义却是分母；2.0.7 的文档把它读成「4 小时
+            攒满」，于是默认值 4 看起来合理，实际要 8.7~11.3 小时才够一次
+            （实测报告 P0-2）。
         recent_talk_seconds: 刚聊过多久之内念头清零
         mood_factor: 我自己此刻想说话的程度（精力/社交能量/是否被理）
         rhythm: 对方作息系数，None 表示自行判断
@@ -429,6 +457,19 @@ def settle(
     urge = clamp(urge, 0.0, URGE_CEILING)
     user["urge"] = round(urge, 4)
     user["urge_at"] = now
+    # 门槛归位：fire_gate 只该落在 new_fire_gate() 的抽取区间里。2.0.7 的 after_skip
+    # 会把它往上加且永不回落，老用户盘上留着被加到 3.0（当年被 URGE_CEILING 夹住）的值，
+    # 那是「棘轮」的痕迹，不是这个人的真实意愿。这里把越界值夹回 [FIRE_THRESHOLD,
+    # FIRE_GATE_MAX]。
+    #
+    # 为什么是「夹一次」而不是「每轮退一点」：settle() 一轮里可能被同一人调用好几次
+    # （每个候选各结算一次），按次衰减会让速度取决于调用次数；而且衰减会把
+    # new_fire_gate 抽出来的抖动一并磨平，让所有人最终都落在同一个门槛上。越界值只有
+    # 旧版本会写，夹一次就够；区间内的值一律不动，随机性留给 new_fire_gate。
+    gate_now = _float(user.get("fire_gate", FIRE_THRESHOLD), FIRE_THRESHOLD)
+    gate_fixed = clamp(gate_now, FIRE_THRESHOLD, FIRE_GATE_MAX)
+    if gate_fixed != gate_now:
+        user["fire_gate"] = round(gate_fixed, 4)
     return urge
 
 
@@ -519,17 +560,20 @@ def after_skip(user: Dict[str, Any], now: float) -> None:
     原来是压回 SKIP_FALLBACK(0.18)——清零式惩罚。那样「说不」其实很贵：模型会发现
     说一次 NO 会把攒了半天的念头作废，于是宁可硬挤一句也说 SEND。模型的判断于是不可信。
 
-    改成**部分保留 + 抬高下次的门槛**：「想过但算了」本来就该让下一次开口更难一点
-    （这是真实代价，不是惩罚），但不该把之前的积累作废。这样 decide 的 NO 才是可以
-    放心说的话，攒下的念头也不会因为一次没发成而白扔。
+    改成**部分保留**：「想过但算了」确实该有点代价，但不该把之前的积累作废——这样
+    decide 的 NO 才是可以放心说的话，攒下的念头也不会因为一次没发成而白扔。
+
+    2.0.8 起**不再抬高 fire_gate**。旧版每被否决一次就 min(base+bump, URGE_CEILING)
+    往上加一截，而 fire_gate 平时没有任何回落路径：连着几次「想过但算了」，门槛就
+    一路爬到天花板并停在那里，念头天花板与门槛同值 → 攒到顶也只是勉强够，中间
+    任何一次否决又把它推回去。这是实测报告 P0-1 那个棘轮的另一半，光调
+    SKIP_KEEP_RATIO 治不了。要克制，交给 no_reply_streak（被晾才是真代价）和
+    engine 的最小间隔；「想过但算了」不是对方的态度，不该记在这个人头上。
     """
     urge = _float(user.get("urge") or 0.0, 0.0)
     user["urge"] = round(max(0.0, urge * SKIP_KEEP_RATIO), 4)
     user["urge_at"] = now
     user["last_skip_at"] = now
-    base = _float(user.get("fire_gate") or FIRE_THRESHOLD, FIRE_THRESHOLD)
-    bump = random.uniform(0.0, FIRE_GATE_SPAN * 0.5)
-    user["fire_gate"] = min(base + bump, URGE_CEILING)
 
 
 def mood_multiplier(

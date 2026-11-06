@@ -79,6 +79,11 @@ class _BatchEngine:
     try_once = SocialEngine.try_once
     _user_lock = SocialEngine._user_lock
     _persist_metrics = SocialEngine._persist_metrics
+    # v2.1.2：本轮候选的排序键从 try_once 里抽成了 _candidate_sort_key
+    # （特别关心 → 关系档 → 最久没联系 → 念头）。try_once 里是无条件
+    # `anchored.sort(key=self._candidate_sort_key)`，所以替身必须带上它，
+    # 否则一轮心跳在排序那一行就 AttributeError（本文件 5 个用例全炸）。
+    _candidate_sort_key = SocialEngine._candidate_sort_key
 
     def __init__(self, uids, miss_dupes=(), budget=2, concurrency=4):
         self.cfg = SocialConfig.from_astrbot({})

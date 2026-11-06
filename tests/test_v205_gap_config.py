@@ -73,19 +73,25 @@ def _gap(overrides: dict, tier: str, *, streak: int = 0) -> float:
 
 
 class DefaultCapTest(unittest.TestCase):
-    """默认值就是 1440，行为与 v2.0.4 一致——改配置不能顺手改变默认节奏。"""
+    """上限默认值就是 1440；档位间隔按 min_gap_minutes 缩放（v2.1.0 基准 60→30）。
+
+    这一层盯的是「上限夹取」本身：夹子在不在、先夹后乘的顺序对不对、脏值会不会炸。
+    """
 
     def test_default_constant_and_config(self) -> None:
         self.assertEqual(MAX_GAP_MINUTES_DEFAULT, 1440)
         self.assertEqual(SocialConfig().max_gap_minutes, MAX_GAP_MINUTES_DEFAULT)
 
-    def test_low_tier_keeps_its_own_720_minutes(self) -> None:
-        # LOW 档 720 < 1440，本来就不该被夹，默认下必须还是 720。
-        self.assertAlmostEqual(_gap({}, anchors.TIER_LOW), 720 * 60.0)
+    def test_low_tier_scales_from_its_720_baseline(self) -> None:
+        # v2.1.0：min_gap_minutes 默认 60→30。档位表（LOW 720 / MID 60 / HIGH 20）
+        # 只是基准，实际按 min_gap_minutes/60 缩放，默认下 LOW = 720×(30/60)=360 分钟。
+        # 旧断言写死 720 分钟——那是 min_gap_minutes 还是 60 时的结果。
+        self.assertAlmostEqual(_gap({}, anchors.TIER_LOW), 360 * 60.0)
 
-    def test_mid_and_high_tiers_unchanged(self) -> None:
-        self.assertAlmostEqual(_gap({}, anchors.TIER_MID), 60 * 60.0)
-        self.assertAlmostEqual(_gap({}, anchors.TIER_HIGH), 20 * 60.0)
+    def test_mid_and_high_tiers_follow_the_same_base(self) -> None:
+        # 同上：MID 60×(30/60)=30 分钟，HIGH 20×(30/60)=10 分钟。
+        self.assertAlmostEqual(_gap({}, anchors.TIER_MID), 30 * 60.0)
+        self.assertAlmostEqual(_gap({}, anchors.TIER_HIGH), 10 * 60.0)
 
     def test_scaled_gap_still_clipped_at_default(self) -> None:
         # min_gap=720（中档上限）→ LOW 缩放成 720*(720/60)=8640 分钟，默认仍夹到 1440。

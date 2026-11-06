@@ -6,6 +6,43 @@
         "obvious_hint": true,
         "default": true
     },
+    "timezone_offset": {
+        "type": "string",
+        "description": "主动消息时区（UTC±N）",
+        "hint": "默认 UTC+8。主动消息的所有时间判定（安静时段、问候、每日额度、作息画像、状态页时间）都按这个钟走，不再看 AstrBot 主机时区——宿主跑在 UTC 容器里也不会把凌晨当成下午。填 auto 才回到旧行为：有 Humanoid Core 就用她所在城市的时区，没有就用本机时间。面板下拉只有整点档；半小时/45 分档（如 UTC+5:30）请直接改配置文件写 UTC+5:30，插件认这种写法。",
+        "obvious_hint": true,
+        "default": "UTC+8",
+        "options": [
+            "auto",
+            "UTC-12",
+            "UTC-11",
+            "UTC-10",
+            "UTC-9",
+            "UTC-8",
+            "UTC-7",
+            "UTC-6",
+            "UTC-5",
+            "UTC-4",
+            "UTC-3",
+            "UTC-2",
+            "UTC-1",
+            "UTC+0",
+            "UTC+1",
+            "UTC+2",
+            "UTC+3",
+            "UTC+4",
+            "UTC+5",
+            "UTC+6",
+            "UTC+7",
+            "UTC+8",
+            "UTC+9",
+            "UTC+10",
+            "UTC+11",
+            "UTC+12",
+            "UTC+13",
+            "UTC+14"
+        ]
+    },
     "proactive_provider_ids": {
         "description": "【模型】主动消息专用模型（脑子/思考好的）",
         "hint": "留空（默认）= 不指定专供，跟着当前会话的模型走，装上就能说话。想让她用会思考的模型，在这里按顺序选 provider：本插件所有模型调用（1:1 主动、群聊心流、破冰、起话头）都按顺序试，第一个能用的即止。配了却一个都取不到时：默认回退跟随会话模型并打一次性 warning；打开 strict_proactive_provider 才坚持「本轮不主动开口，等下一轮」。",
@@ -48,31 +85,31 @@
         }
     },
     "urge_refill_hours": {
-        "type": "int",
+        "type": "float",
         "description": "主动间隔（小时）",
-        "hint": "攒够一次主动联系要几小时",
+        "hint": "攒够一次主动联系要几小时。注意它进的是速率的分母：实际速率 =(0.25+1.10×在意度)/这个数，而门槛是 2.10，所以 1.5 大约 3~4 小时够一次，4 要 9~11 小时。",
         "obvious_hint": true,
-        "default": 4,
+        "default": 1.5,
         "min": 1,
         "max": 96,
         "slider": {
             "min": 1,
             "max": 96,
-            "step": 2
+            "step": 0.5
         }
     },
     "recent_talk_minutes": {
         "type": "int",
         "description": "刚聊完静默期（分钟）",
-        "hint": "刚聊完多久内不另起话题",
+        "hint": "刚聊完多久内不另起话题。18 分钟太长（对方回一句后半小时内她都不会再开口），3 分钟只挡住真正的抢话。",
         "obvious_hint": true,
-        "default": 18,
-        "min": 5,
+        "default": 3,
+        "min": 3,
         "max": 720,
         "slider": {
-            "min": 5,
+            "min": 3,
             "max": 720,
-            "step": 10
+            "step": 3
         }
     },
     "heartbeat_min_minutes": {
@@ -127,7 +164,7 @@
     "gate_energy_floor": {
         "type": "int",
         "description": "精力硬闸下限（0-100）",
-        "default": 35,
+        "default": 20,
         "min": 0,
         "max": 100,
         "hint": "精力低于这个值就不主动开口（0=不按精力拦）。「累到坐不住」做成硬闸，不再交给模型自己判断——它每次给的理由都不一样，拦不稳",
@@ -238,9 +275,9 @@
     "silent_giveup_days": {
         "type": "int",
         "description": "对方几天不开口就全面停发（天）",
-        "hint": "对方连续这么多天一句话没说、她这期间主动发过、也一直没人回，就停下来等对方先开口（早安晚安也算）。0=关闭。真人不会一直追一个不回话的人。",
+        "hint": "对方连续这么多天一句话没说、她这期间主动发过、也一直没人回，就停下来等对方先开口（早安晚安也算）。0=关闭（默认关闭：出差/考试/生病都算「没开口」，而这条闸一开就没有自动恢复）。",
         "obvious_hint": true,
-        "default": 3,
+        "default": 0,
         "min": 0,
         "max": 30,
         "slider": {
@@ -371,7 +408,7 @@
         "description": "中等关系的人，两条主动消息的最小间隔（分钟）",
         "hint": "中等关系的人两条消息最少隔多久",
         "obvious_hint": true,
-        "default": 60,
+        "default": 30,
         "min": 10,
         "max": 720,
         "slider": {
@@ -425,9 +462,9 @@
     "max_sends_per_round": {
         "type": "int",
         "description": "每轮最多联系几人",
-        "hint": "一轮心跳最多主动联系几个不同的人。每轮尝试次数 = 这个数 × 2（ATTEMPT_PER_SEND），所以它同时决定了一轮最多打几次 LLM。一个人一轮里最多说 2 件不同的事（由头条数），所以实际发出的条数会比这个数多一点。推荐3-4个。",
+        "hint": "一轮心跳最多主动联系几个不同的人。每轮尝试次数 = 这个数 × 4（ATTEMPT_PER_SEND），所以它同时决定了一轮最多打几次 LLM。一个人一轮里最多说 2 件不同的事（由头条数），所以实际发出的条数会比这个数多一点。候选很多时 8 才不至于让排序决定一切。",
         "obvious_hint": true,
-        "default": 3,
+        "default": 8,
         "min": 1,
         "max": 10,
         "slider": {
@@ -452,9 +489,9 @@
     "cross_user_repeat_ratio": {
         "type": "float",
         "description": "跨用户撞车的相似度上限",
-        "hint": "和最近发给别人的消息太像就不发",
+        "hint": "和最近发给别人的消息太像就不发。0.6 太松（换个说法就能过），0.88 才拦得住几乎逐字相同。",
         "obvious_hint": true,
-        "default": 0.6,
+        "default": 0.88,
         "min": 0.1,
         "max": 1.0,
         "slider": {
@@ -466,9 +503,9 @@
     "cross_user_repeat_hours": {
         "type": "float",
         "description": "跨用户撞车回看多久（小时）",
-        "hint": "往前比多少小时的记录；0 = 关掉这道检查",
+        "hint": "往前比多少小时的记录；0 = 关掉这道检查。0.5 小时只拦「刚跟别人说过同样的话」，这才是会被看出群发的窗口。",
         "obvious_hint": true,
-        "default": 2.0,
+        "default": 0.5,
         "min": 0,
         "max": 48.0,
         "slider": {
@@ -748,6 +785,48 @@
         "slider": {
             "min": 1,
             "max": 5,
+            "step": 1
+        }
+    },
+    "group_daily_total_cap": {
+        "type": "int",
+        "description": "群聊主动发言每天总上限（所有群加起来）",
+        "hint": "每个角色一天在所有群里最多主动说几条：破冰、起话头、心流接话都算。每群自己的额度只管单群，群一多就会变成一天几十上百条、把私聊挤没。0 = 不设总上限。推荐12条。",
+        "obvious_hint": true,
+        "default": 12,
+        "min": 0,
+        "max": 100,
+        "slider": {
+            "min": 0,
+            "max": 100,
+            "step": 1
+        }
+    },
+    "group_topic_dedup_hours": {
+        "type": "float",
+        "description": "跨群重复的窗口（小时）",
+        "hint": "她只有一份生活、群却有好几个：同一件事/同一句话在这个窗口内不会在第二个群再说一遍。起话头管素材和措辞，心流接话管措辞（撞车的那一段直接丢）。0 = 关闭。推荐6小时。",
+        "obvious_hint": true,
+        "default": 6.0,
+        "min": 0.0,
+        "max": 48.0,
+        "slider": {
+            "min": 0.0,
+            "max": 48.0,
+            "step": 0.5
+        }
+    },
+    "group_topic_max_segments": {
+        "type": "int",
+        "description": "群主动发言最多几段",
+        "hint": "起话头、心流接话都算：多出来的段并进最后一段，不再碎句连发。0 = 不限。推荐2段。",
+        "obvious_hint": true,
+        "default": 2,
+        "min": 0,
+        "max": 4,
+        "slider": {
+            "min": 0,
+            "max": 4,
             "step": 1
         }
     },
@@ -1115,9 +1194,9 @@
     "special_care_min_affection": {
         "type": "int",
         "description": "自动认定好感门槛",
-        "hint": "Core 里这个人的好感度达到多少才自动认定为特别关心。",
+        "hint": "Core 里这个人的好感度达到多少才自动认定为特别关心。55 是 Core 的中性起点：聊得好就能自己走到，85 等于只有手动塞满好感的号才够得到。",
         "obvious_hint": true,
-        "default": 85,
+        "default": 55,
         "min": 0,
         "max": 100,
         "slider": {
@@ -1177,6 +1256,20 @@
             "max": 100,
             "step": 1
         }    },
+    "special_care_hourly_cap": {
+        "type": "int",
+        "description": "特别关心每小时配额",
+        "hint": "特别关心的人有自己的一小时额度，不必跟所有人一起抢每小时总上限（否则总是排在队尾轮不到）。0 = 跟随每小时总上限。推荐6条。",
+        "obvious_hint": true,
+        "default": 6,
+        "min": 0,
+        "max": 60,
+        "slider": {
+            "min": 0,
+            "max": 60,
+            "step": 1
+        }
+    },
     "special_care_ignore_quiet": {
         "type": "bool",
         "description": "特别关心不受安静时段限制",

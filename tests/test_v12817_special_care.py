@@ -253,7 +253,9 @@ class SpecialCarePacingTest(unittest.TestCase):
         normal = eng._gap_left(u, anchors.TIER_LOW, NOW)
         special = eng._gap_left(u, anchors.TIER_HIGH, NOW, special_care=True)
         self.assertAlmostEqual(special, 600.0, places=1)
-        self.assertGreater(normal, 40000.0)
+        # v2.1.0：min_gap_minutes 默认 60→30，而 LOW 档基准是 720 分钟，
+        # 按 30/60 缩放后 = 360 分钟 = 21600 秒；已过 600 秒，剩 21000 秒。
+        self.assertAlmostEqual(normal, 21600.0 - 600.0, places=1)
 
     def test_gap_zero_when_never_sent(self):
         eng = _engine()

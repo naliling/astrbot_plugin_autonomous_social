@@ -56,6 +56,43 @@ def _safe_ts(value: Any, default: float = 0.0) -> float:
         return default
     return out if math.isfinite(out) else default
 
+
+# ─── v2.1.0：跨群去重 / 反问频控用的小工具 ─────────────
+
+# 生活素材的归一化：Core 给的素材行前面常挂「正在/接下来/今天想去/还在/梦到」这些
+# 拼装前缀（见 groupflow.life_lines），同一条事换个前缀就是另一个字符串。去重比的是
+# **这件事本身**，所以前缀先剥掉。
+_LIFE_PREFIXES = ("正在", "接下来", "今天想去", "今天想", "还在", "梦到", "刚")
+
+
+def _norm_life_key(line: Any) -> str:
+    """把一条生活素材压成去重用的键（剥前缀、去空白、限长）。"""
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    text = "".join(text.split())
+    changed = True
+    while changed:
+        changed = False
+        for pre in _LIFE_PREFIXES:
+            if text.startswith(pre) and len(text) > len(pre):
+                text = text[len(pre):]
+                changed = True
+                break
+    return text[:40]
+
+
+# 「这句是不是在反问」。只看**结尾**：中间带问号的多半是引用/语气，不算把问题抛给对方。
+_QUESTION_TAIL = re.compile(r"[?？]\s*$|[吗呢啥]\s*[。！!…~～\s]*$")
+
+
+def _is_question_text(text: Any) -> bool:
+    """这句话是不是以问句收尾（反问/提问）。"""
+    body = str(text or "").strip()
+    if not body:
+        return False
+    return bool(_QUESTION_TAIL.search(body))
+
 # ─── 常量定义 ───────────────────────────────────────
 
 # umo 的 message_type 段里，哪些表示「这是一个群/频道会话」。
@@ -643,6 +680,35 @@ class SocialState:
             g["topic_count_day"] = 1
         g["topic_at"] = now
         self.mark_dirty()
+
+    def note_group_send(self, bid: str, now: float, day: str) -> None:
+        """v2.1.2：记一次群里的主动发言（破冰/起话头/心流都算），给全局日上限用。
+
+        原来只有「每群每天几条」的账（`note_icebreak` / `note_group_topic`），
+        群一多就没人管总数：线上 11-06 群发 68 条、私聊只有 13 条。这本账记在
+        角色上（`bot`），因为上限是「她今天在群里说了几句」，不是某个群的。
+        """
+        b = self.bot(bid)
+        if str(b.get("group_send_day", "") or "") == day:
+            try:
+                b["group_send_count_day"] = int(b.get("group_send_count_day", 0) or 0) + 1
+            except (TypeError, ValueError):
+                b["group_send_count_day"] = 1
+        else:
+            b["group_send_day"] = day
+            b["group_send_count_day"] = 1
+        b["group_send_at"] = now
+        self.mark_dirty()
+
+    def group_send_count(self, bid: str, day: str) -> int:
+        """v2.1.2：这个角色今天在群里已经主动说了几条（跨天自动归零）。"""
+        b = self.bot(bid)
+        if str(b.get("group_send_day", "") or "") != day:
+            return 0
+        try:
+            return max(0, int(b.get("group_send_count_day", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def is_group_blocked(self, bid: str, gid: str, now: float) -> bool:
         return float(self.group(bid, gid).get("blocked_until", 0) or 0) > now
@@ -1815,6 +1881,111 @@ class SocialState:
                     rows.append((ts, str(other), text))
         rows.sort(key=lambda r: -r[0])          # 最近的排前面
         return [(who, text) for _ts, who, text in rows]
+
+    # ─── v2.1.0：跨群去重 / 反问频控 ────────────────────
+    #
+    # 为什么账要记在**角色级**：她的生活只有一份（Core 的日程挂在角色上），而群有好
+    # 几个。_run_group_topics 每轮只挑一个群，于是同一件事会在一小时里挨个群播一遍
+    # ——线上 11-06 16:40 五个群收到的是同一套「刚睡醒/端牛奶/窝沙发」。文本级去重
+    # （比措辞）抓不住「换了个说法的同一件事」，所以素材这一层再记一本账。
+
+    def note_life_used(
+        self, bid: str, line: str, gid: str, now: float, hours: float = 6.0
+    ) -> None:
+        """记一条「她自己的生活」素材已经给哪个群用过（角色级，跨群去重）。"""
+        key = _norm_life_key(line)
+        if not key:
+            return
+        bot = self.bot(bid)
+        used = bot.get("life_used")
+        if not isinstance(used, dict):
+            used = {}
+            bot["life_used"] = used
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows = [
+            r for r in (used.get(key) or [])
+            if isinstance(r, dict) and _safe_ts(r.get("ts")) >= cutoff
+        ]
+        rows.append({"gid": str(gid), "ts": float(now)})
+        used[key] = rows[-20:]
+        # 顺手丢掉过期的键：角色级字典，跑久了会攒成一本没用的账。
+        for other in [k for k in used if k != key]:
+            keep = [
+                r for r in (used.get(other) or [])
+                if isinstance(r, dict) and _safe_ts(r.get("ts")) >= cutoff
+            ]
+            if keep:
+                used[other] = keep
+            else:
+                used.pop(other, None)
+        self.mark_dirty()
+
+    def life_used_elsewhere(
+        self, bid: str, line: str, gid: str, now: float, hours: float = 6.0
+    ) -> bool:
+        """这条素材最近是不是已经给**别的群**用过了。"""
+        key = _norm_life_key(line)
+        if not key:
+            return False
+        used = self.bot(bid).get("life_used")
+        if not isinstance(used, dict):
+            return False
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        for r in (used.get(key) or []):
+            if not isinstance(r, dict):
+                continue
+            if _safe_ts(r.get("ts")) < cutoff:
+                continue
+            if str(r.get("gid", "")) != str(gid):
+                return True
+        return False
+
+    def recent_group_self_others(
+        self, bid: str, gid: str, now: float, hours: float = 2.0
+    ) -> List[Tuple[str, str]]:
+        """这个角色**最近在别的群**说过的话，返回 [(gid, 正文)]，最近的排前面。
+
+        私聊侧早就有 recent_proactive_others（跨用户撞车），群侧一直没有对应物：
+        起话头/破冰只跟**本群**自己的近期发言比，于是同一句话可以在五个群各说一遍。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows: List[Tuple[float, str, str]] = []
+        for other_gid, g in (self.bot(bid).get("groups") or {}).items():
+            if str(other_gid) == str(gid) or not isinstance(g, dict):
+                continue
+            for e in (g.get("samples") or []):
+                if not isinstance(e, dict) or not e.get("self"):
+                    continue
+                ts = _safe_ts(e.get("ts"))
+                if ts < cutoff:
+                    continue
+                text = str(e.get("text", "") or "").strip()
+                if text:
+                    rows.append((ts, str(other_gid), text))
+        rows.sort(key=lambda r: -r[0])          # 最近的排前面
+        return [(who, text) for _ts, who, text in rows]
+
+    def note_send_shape(self, bid: str, text: str, now: float) -> None:
+        """记一条她**发出去**的话是不是问句（角色级，跨群/跨会话共用一本账）。
+
+        线上 67 条主动群发里 16 条（24%）以问句收尾，且「你们今天都干嘛呢」这种句式
+        跨五个群重复——那不是她在问，是模板在问。
+        """
+        bot = self.bot(bid)
+        rows = bot.get("send_shape")
+        if not isinstance(rows, list):
+            rows = []
+        rows.append({"ts": float(now), "q": 1 if _is_question_text(text) else 0})
+        bot["send_shape"] = [r for r in rows if isinstance(r, dict)][-12:]
+        self.mark_dirty()
+
+    def question_pressure(self, bid: str, window: int = 3) -> float:
+        """最近 window 条里问句占几成。生成侧据此决定「这条不许问」。"""
+        rows = [r for r in (self.bot(bid).get("send_shape") or []) if isinstance(r, dict)]
+        rows = rows[-max(1, int(window)):]
+        if not rows:
+            return 0.0
+        return sum(1 for r in rows if int(r.get("q", 0) or 0)) / float(len(rows))
 
     def recent_proactive(
         self, bid: str, uid: str, now: Optional[float] = None, days: float = PROACTIVE_LOG_DAYS

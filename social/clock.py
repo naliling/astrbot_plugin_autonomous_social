@@ -35,6 +35,102 @@ def _offset(value: Optional[int]) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
+# ─── 插件自己的时区（v2.1.1）───────────────────────────────────────────────
+#
+# 面板最上面那个「时区」是**插件自己的钟**：填 UTC+8 就永远按 UTC+8 判，
+# 不看 AstrBot 主机所在时区，也不需要 Core 在场。auto 才回到旧行为
+# （有 Core 用 Core 给的偏移，没有就用本机时间）。
+#
+# 之前所有时间判定最终都落在 offset_minutes=None 那条路上——也就是
+# datetime.fromtimestamp()，宿主时区是什么就是什么。宿主跑在 UTC 的容器里、
+# 或者主人自己不在 UTC+8，安静时段、问候、每日额度、作息画像会集体错几个小时。
+# 有了这个值，插件只要自己就能算对时间。
+
+TIMEZONE_AUTO = "auto"
+_TZ_MIN_MINUTES = -12 * 60
+_TZ_MAX_MINUTES = 14 * 60
+_TZ_AUTO_ALIASES = {
+    "auto", "core", "follow", "local", "host",
+    "自动", "跟随", "跟随核心", "跟随角色", "本机", "主机",
+}
+
+
+def _clamp_tz_minutes(minutes: int) -> int:
+    return max(_TZ_MIN_MINUTES, min(_TZ_MAX_MINUTES, minutes))
+
+
+def parse_utc_offset(value: Any) -> Optional[int]:
+    """把「UTC+8」「+8」「8」「UTC-3.5」「UTC+05:30」「5:30」收成分钟数。
+
+    None / 空 / auto 一类「跟随」写法 → None（不指定插件时区）。
+    看不懂的也回 None：宁可退回旧行为（Core / 本机），也别把一个坏字符串
+    当成 UTC+0，让所有人半夜收到消息。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        hours = float(value)
+        if not math.isfinite(hours):
+            return None
+        return _clamp_tz_minutes(int(round(hours * 60)))
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if not text or text in {alias.upper() for alias in _TZ_AUTO_ALIASES}:
+        return None
+    for prefix in ("UTC", "GMT", "时区"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    sign = 1
+    if text[:1] in ("+", "-"):
+        sign = -1 if text[0] == "-" else 1
+        text = text[1:].strip()
+    if not text:
+        return None
+    try:
+        if ":" in text:
+            head, _, tail = text.partition(":")
+            tail_min = int(round(float(tail)))
+            if tail_min >= 60 or tail_min < 0:
+                # 「UTC+5:75」不是时区，是手滑：宁可退回 auto，也别算成 UTC+6:15
+                return None
+            minutes = int(round(float(head) * 60)) + tail_min
+        elif text.isdigit() and len(text) in (3, 4):
+            # 「+0530」这种紧凑写法：后两位是分钟
+            tail_min = int(text[-2:])
+            if tail_min >= 60:
+                return None
+            minutes = int(text[:-2]) * 60 + tail_min
+        else:
+            minutes = int(round(float(text) * 60))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return _clamp_tz_minutes(sign * minutes)
+
+
+def format_utc_offset(minutes: Any) -> str:
+    """分钟数 → 「UTC+8」/「UTC-3:30」这种面板上的写法。"""
+    try:
+        total = int(round(float(minutes)))
+    except (TypeError, ValueError, OverflowError):
+        return TIMEZONE_AUTO
+    sign = "-" if total < 0 else "+"
+    total = abs(total)
+    hours, mins = divmod(total, 60)
+    if mins:
+        return f"UTC{sign}{hours}:{mins:02d}"
+    return f"UTC{sign}{hours}"
+
+
+def normalize_timezone(value: Any) -> str:
+    """配置里的时区收成规范写法：UTC±H[:MM]；跟随写法一律 auto。"""
+    minutes = parse_utc_offset(value)
+    if minutes is None:
+        return TIMEZONE_AUTO
+    return format_utc_offset(minutes)
+
 def city_now(epoch: float, offset_minutes: Optional[int]) -> datetime:
     """把 epoch 换算成「她所在城市」的墙上时间（naive datetime）。
 
@@ -242,6 +338,7 @@ def quiet_decision(
     clock_mode: Any = QUIET_CLOCK_LOCAL,
     core_window: Optional[Any] = None,
     use_core_night: bool = True,
+    local_label: str = "本机",
 ) -> Tuple[bool, str]:
     """现在是不是安静时段，以及为什么。
 
@@ -268,7 +365,9 @@ def quiet_decision(
         else:
             h = _wall_clock_token(local_hour, 24)
             if h is not None and in_window(h, qs, qe):
-                reasons.append(f"安静时段（{qs:02d}:00–{qe:02d}:00，本机 {h:02d} 点）")
+                reasons.append(
+                    f"安静时段（{qs:02d}:00–{qe:02d}:00，{local_label} {h:02d} 点）"
+                )
 
     if use_core_night and core_window:
         try:

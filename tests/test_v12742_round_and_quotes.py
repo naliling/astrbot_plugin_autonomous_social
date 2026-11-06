@@ -103,6 +103,11 @@ class _RoundEngine:
     _user_lock = SocialEngine._user_lock
     _persist_metrics = SocialEngine._persist_metrics
     _is_infra_note = staticmethod(SocialEngine._is_infra_note)
+    # v2.1.2：候选排序键抽成了 _candidate_sort_key（try_once 里无条件调用），
+    # 替身不带上它，整轮在排序那一行就 AttributeError，测不到尝试次数上限。
+    # 排序键内部对 _relation_bucket/_special_care_now 都有 try/except，
+    # 下面那个 _relation_bucket 返回 0 就够了（同档 → 保持原顺序）。
+    _candidate_sort_key = SocialEngine._candidate_sort_key
 
     def __init__(self, n_users=30, budget=3, result="ok", backoff=0.0):
         self.cfg = SocialConfig.from_astrbot({})

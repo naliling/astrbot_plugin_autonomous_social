@@ -331,8 +331,17 @@ class StreakPenaltyCapTest(unittest.TestCase):
         self.assertAlmostEqual(
             0.03 * desire.STREAK_INTEREST_PENALTY_CAP, 0.24
         )
-        self.assertLessEqual(
-            desire.STREAK_INTEREST_PENALTY_CAP, desire.STREAK_GATE_MAX_STREAK * 2
+        # v2.1.0：门槛侧的克制封顶降到 2 格（STREAK_GATE_MAX_STREAK=2，最多 +0.10），
+        # 惩罚侧仍单独封顶 8 格（0.03×8=0.24，正好是回复率那一项的权重）。
+        # 旧断言「惩罚上限 ≤ 门槛上限×2」是两者同源、同为 4 时的写法；
+        # 现在两条线各管一头，该盯的是惩罚封顶不会一个人就把 interest 打到下限。
+        self.assertGreater(
+            desire.STREAK_INTEREST_PENALTY_CAP, desire.STREAK_GATE_MAX_STREAK
+        )
+        self.assertLess(
+            0.03 * desire.STREAK_INTEREST_PENALTY_CAP,
+            0.35,
+            "封顶后的惩罚不该一个人就把 interest 打到下限",
         )
 
     def test_penalty_stops_growing_at_the_cap(self):

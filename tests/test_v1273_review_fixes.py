@@ -595,10 +595,21 @@ class DirtyGroupEntryTest(unittest.TestCase):
             enabled_attr: True,
             "group_idle_hours": 1, "icebreak_daily_cap": 1, "group_stale_days": 7,
             "group_topic_gap_hours": 1, "group_topic_daily_cap": 1,
+            # v2.1.2：破冰/起话头入口多了一道「这个角色今天在群里说满没有」的闸，
+            # 上限记在角色上（默认 12）。给它真实默认值，闸才会真的被求值。
+            "group_daily_total_cap": 12,
         })
         stub._moment_of = lambda bid, now: _DtStub()
         stub._quiet_now = lambda bid, hour: False
-        stub.state = SimpleNamespace(groups=lambda bid: groups)
+        stub.state = SimpleNamespace(
+            groups=lambda bid: groups,
+            group_send_count=lambda bid, day: 0,
+        )
+        # 绑定真实实现，而不是写个 `return False` 糊过去：这里要验的正是
+        # 「脏群条目不能让整个角色这一轮报废」，而新闸就在脏条目循环之前。
+        stub._group_daily_exhausted = types.MethodType(
+            SocialEngine._group_daily_exhausted, stub
+        )
         return stub
 
     def test_icebreak_pick_skips_dirty_group_entries(self):
@@ -723,6 +734,12 @@ class SendMessageExceptionClassificationTest(unittest.IsolatedAsyncioTestCase):
         async def send_message(self, target, text):
             raise self._exc
 
+    # v2.1.2：`_send_message` 开头先用 `_bad_umo` 挡掉不合法的会话地址（段数不对 /
+    # 第二段不是 GroupMessage|FriendMessage|OtherMessage），挡下来时抛的 `_SendFailed`
+    # 两个标志都是 False。原来这里传的 "umo:1" 正好是这种不合法地址，于是四个用例
+    # 测的都不是异常分类，而是「地址不合法直接跳过」——换成真实形状的 umo 才回到本意。
+    UMO = "aiocqhttp:FriendMessage:1"
+
     async def _raise(self, context):
         from social.engine import _SendFailed
 
@@ -730,7 +747,7 @@ class SendMessageExceptionClassificationTest(unittest.IsolatedAsyncioTestCase):
         # 桩不跑真实 __init__：`_send_message` 会调这个静态方法做错误分类。
         stub._is_unreachable_error = SocialEngine._is_unreachable_error
         with self.assertRaises(_SendFailed) as cm:
-            await SocialEngine._send_message(stub, "umo:1", "你好")
+            await SocialEngine._send_message(stub, self.UMO, "你好")
         return cm.exception
 
     async def test_platform_path_marks_peer_unreachable(self):

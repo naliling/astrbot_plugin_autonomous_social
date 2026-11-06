@@ -503,15 +503,30 @@ class IcebreakDecisionParseTest(unittest.IsolatedAsyncioTestCase):
 
 
 class _HintEngine:
-    """只使用 `_group_topic_hint` 的最小替身。"""
+    """只使用 `_group_topic_hint` 的最小替身。
+
+    v2.1.0 起这个函数还会读 `cfg.group_topic_dedup_hours`（跨群素材去重，
+    默认 6 小时）和 `state.life_used_elsewhere(...)`，并在剔掉素材时调 `self.log`。
+    替身缺这三样就整段 AttributeError，测不到天气闸本身——所以补上最小实现：
+    去重一律「没在别的群用过」，即素材全保留，这正是本文件要验的前提。
+    """
 
     _group_topic_hint = SocialEngine._group_topic_hint
 
     def __init__(self, body):
         self.core = types.SimpleNamespace(bot_self_state=lambda _bid: body)
+        self.cfg = SocialConfig.from_astrbot({})
+        self.state = types.SimpleNamespace(life_used_elsewhere=lambda *a, **k: False)
+
+    def log(self, *a, **k):
+        pass
 
 
 class GroupTopicHintTest(unittest.TestCase):
+    """v2.1.0 起 `_group_topic_hint` 返回三元组：(素材文本, 采用的天气, 剔重后的生活行)，
+    第三项给 `_icebreak` 记账用（真发出去之后才知道该把哪条记成「这个群用过了」）。
+    本类只关心前两项，第三项接成 `_life`。"""
+
     def test_life_first_then_weather(self):
         body = {
             "day": {"done": ["下午去了一趟银行"], "doing": "整理个案笔记"},
@@ -519,7 +534,7 @@ class GroupTopicHintTest(unittest.TestCase):
             "weather": {"env": "中雨，气温 9℃"},
         }
         g: dict = {}
-        text, weather = _HintEngine(body)._group_topic_hint("b", "g", g, NOW)
+        text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", g, NOW)
         lines = text.splitlines()
         self.assertIn("下午去了一趟银行", lines[0])
         self.assertIn("中秋", text)
@@ -530,30 +545,30 @@ class GroupTopicHintTest(unittest.TestCase):
         body = {"weather": {"env": "中雨，气温 9℃"}}
         g: dict = {}
         engine = _HintEngine(body)
-        _text, weather = engine._group_topic_hint("b", "g", g, NOW)
+        _text, weather, _life = engine._group_topic_hint("b", "g", g, NOW)
         self.assertTrue(weather)
         # 发送成功的路径会记账；这里直接替它记上，模拟「刚在群里说过天气」。
         anchors.mark_weather_told(g, {"weather": {"env": weather}}, NOW)
-        text, again = engine._group_topic_hint("b", "g", g, NOW + 3600)
+        text, again, _life = engine._group_topic_hint("b", "g", g, NOW + 3600)
         self.assertEqual(again, "", "6 小时闸没生效，天气又被当成话头")
         self.assertNotIn("中雨", text)
         # 一字不差永远不再说；变了样的天气要过了 6 小时才轮到它。
-        same, unchanged = engine._group_topic_hint("b", "g", g, NOW + 7 * 3600)
+        same, unchanged, _life = engine._group_topic_hint("b", "g", g, NOW + 7 * 3600)
         self.assertEqual(unchanged, "")
         self.assertNotIn("中雨", same)
         changed = {"weather": {"env": "小雨，10℃"}}
         changed_engine = _HintEngine(changed)
-        held_text, held = changed_engine._group_topic_hint("b", "g", g, NOW + 3600)
+        held_text, held, _life = changed_engine._group_topic_hint("b", "g", g, NOW + 3600)
         self.assertEqual(held, "", "变了样的天气在一小时内又说了一遍")
         self.assertNotIn("小雨", held_text)
-        text2, after = changed_engine._group_topic_hint("b", "g", g, NOW + 7 * 3600)
+        text2, after, _life = changed_engine._group_topic_hint("b", "g", g, NOW + 7 * 3600)
         self.assertTrue(after)
         self.assertIn("小雨", text2)
 
     def test_old_core_without_day_fields_is_tolerated(self):
         for body in ({}, None, {"day": None}, {"holiday": "", "weather": {}}):
             with self.subTest(body=body):
-                text, weather = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
+                text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
                 self.assertEqual(text, "")
                 self.assertEqual(weather, "")
 
@@ -564,7 +579,7 @@ class GroupTopicHintTest(unittest.TestCase):
 
         engine = _HintEngine({})
         engine.core = _Boom()
-        self.assertEqual(engine._group_topic_hint("b", "g", {}, NOW), ("", ""))
+        self.assertEqual(engine._group_topic_hint("b", "g", {}, NOW), ("", "", []))
 
 
 class _FakeGenerator:

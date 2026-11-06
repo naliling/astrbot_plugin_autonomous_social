@@ -285,7 +285,9 @@ class ThrottleDefaultsTest(unittest.TestCase):
             (PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         )
         self.assertEqual(schema["heartbeat_max_minutes"]["default"], 30)
-        self.assertEqual(schema["max_sends_per_round"]["default"], 3)
+        # v2.1.0 松闸（CHANGELOG「默认值松闸」）：3 → 8。面板提示同步改成
+        # 「每轮尝试次数 = 这个数 × 4」，所以 8 同时意味着一轮最多 32 次尝试。
+        self.assertEqual(schema["max_sends_per_round"]["default"], 8)
 
     def test_config_fallback_defaults_match_schema(self) -> None:
         from social.config import (
@@ -294,23 +296,28 @@ class ThrottleDefaultsTest(unittest.TestCase):
         )
 
         self.assertEqual(HEARTBEAT_MAX_DEFAULT, 30)
-        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 3)
+        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 8)
 
     def test_attempts_per_round_is_bounded(self) -> None:
-        """一轮 LLM 尝试次数 = max_sends × ATTEMPT_PER_SEND，必须 ≤ 6。
+        """一轮 LLM 尝试次数 = max_sends_per_round × ATTEMPT_PER_SEND，且被面板上界夹住。
 
-        上限从 4 抬到 6：再往上就是「一轮里把所有候选挨个试一遍」，那正是 v1.28.2
-        要防的事（550 个候选 = 550 次失败）。6 次与 v1.28.2 之前同级。
+        v2.1.0 把默认 3→8、每轮配额 2 倍→4 倍（ATTEMPT_PER_SEND=4），一轮上限
+        8×4=32 次。这不是推翻 v1.28.2 的结论——那一版的账是「候选根本进不了发送段」
+        造成的空转（每轮 6 次全白烧）；现在配额只花在「还有机会发出去」的候选上，
+        跨轮熔断（llm_circuit_state）继续管上游坏掉那一头。所以这里断言的是
+        「面板拉到最大也不至于无限烧」：上界 10 × 4 = 40 次就是这个量级的硬顶，
+        而不是把某个时刻的默认值写死成 6。
         """
-        from social.config import SocialConfig
+        from social.config import MAX_SENDS_PER_ROUND_MAX, SocialConfig
         from social.engine import ATTEMPT_PER_SEND
 
         cfg = SocialConfig.from_astrbot({})
-        self.assertLessEqual(
-            cfg.max_sends_per_round * ATTEMPT_PER_SEND,
-            6,
-            "一轮尝试次数又涨回 8 次以上了，限流下这些都是白烧的请求",
-        )
+        self.assertEqual(cfg.max_sends_per_round, 8)
+        self.assertEqual(ATTEMPT_PER_SEND, 4)
+        # 默认一轮 8×4=32 次尝试、面板拉到最大 10×4=40 次。写成等值而不是
+        # 「<= 40」：后者恒真（左边就是 40），改了什么它都不会红。
+        self.assertEqual(cfg.max_sends_per_round * ATTEMPT_PER_SEND, 32)
+        self.assertEqual(MAX_SENDS_PER_ROUND_MAX * ATTEMPT_PER_SEND, 40)
 
 
 if __name__ == "__main__":

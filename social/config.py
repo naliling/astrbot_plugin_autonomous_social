@@ -23,7 +23,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from astrbot.api import logger
 
 # 安静时段的窗口语义只有一份实现（social/clock.py），配置层不再抄一遍区间比较。
-from .clock import QUIET_CLOCK_LOCAL, normalize_quiet_clock
+from .clock import (
+    QUIET_CLOCK_LOCAL,
+    normalize_quiet_clock,
+    normalize_timezone,
+)
 
 # 非法/越界的配置值只告警一次（按 key 去重），避免每轮心跳、每次构造刷屏
 _CONFIG_WARNED: Set[str] = set()
@@ -292,10 +296,22 @@ URGE_REFILL_MAX = 96
 # v1.9.0 直接降到下限 2：再配合更低的冷却，主动消息才算真的「频繁」
 # v1.9.x 一度降到下限 2：更像话多的人，心里一有事就想找人说
 # （注释原来写「实际为 2」，与代码和 schema 都不符：URGE_REFILL_DEFAULT 实际为 4）
-URGE_REFILL_DEFAULT = 4
-# 跨用户撞车：同一 bot 近 2 小时发给别人的消息，和这条重合度到这个线就拦。
-CROSS_USER_REPEAT_RATIO_DEFAULT = 0.6
-CROSS_USER_REPEAT_HOURS_DEFAULT = 2.0
+#
+# 2.0.8：4 → 1.5。这个名字一直骗人——它进的是**分母**：
+#   rate = (0.25 + 1.10*interest) / max(refill_hours, 0.5)
+# 而门槛是 2.10 起（不是 1.0）。refill_hours=4、interest 0.65 时 rate 只有 0.24/h，
+# 攒到门槛要 8.7~11.3 小时（实测报告 P0-2），与「4 小时攒满」的字面意思差了三倍。
+# 1.5 之后同样的 interest 是 0.64/h，约 3.3~4.3 小时够一次——这才是「一晚上想找人
+# 说句话」的量级。要更快就继续往下调，别指望改名字。
+URGE_REFILL_DEFAULT = 1.5
+# 跨用户撞车：同一 bot 近 N 小时发给别人的消息，和这条重合度到这个线就拦。
+#
+# 2.0.8：0.6 → 0.88、2.0 → 0.5 小时。0.6 太松——同一句「刚忙完个案笔记」换个说法
+# 就能过（实测跨用户撞车一次没拦住，报告 P1-3），而拦截总量 57 次里绝大多数是
+# 一天里不同时段的正常重复。收紧到 0.88 才拦得住「几乎逐字相同」，窗口收到 0.5
+# 小时才只拦「这一小时内给别人发过同样的话」——真正会让人看出「群发」的那个窗口。
+CROSS_USER_REPEAT_RATIO_DEFAULT = 0.88
+CROSS_USER_REPEAT_HOURS_DEFAULT = 0.5
 HOURLY_SENDS_CAP_DEFAULT = 24
 HOURLY_SENDS_CAP_MAX = 200
 GREETING_MIDDAY_START_DEFAULT = 12
@@ -312,7 +328,7 @@ MISS_AFFECTION_MIN_DEFAULT = 42
 # 被主动联系的那批，而这条专程为他们开的通道一天只给两句。
 MISS_DAILY_CAP_DEFAULT = 3
 # 两条主动消息的最小间隔（分钟）默认值与范围；
-MIN_GAP_MINUTES_DEFAULT = 60
+MIN_GAP_MINUTES_DEFAULT = 30
 MIN_GAP_MAX = 720
 # 档位间隔按 min_gap 等比缩放后的硬上限（分钟）。LOW 档本身就是 720，
 # 缩放后很容易顶到上限；以前写死 1440（一天），LOW 几乎永远被它卡死。
@@ -330,12 +346,17 @@ HEARTBEAT_MAX_MINUTES_MAX = 120
 HEARTBEAT_MIN_DEFAULT = 8
 # v1.28.2：15 → 30。原值下一天约 96 轮，而每轮最多 `max_sends_per_round × 2`
 # 次 LLM 尝试——上游一限流（429 恢复窗口按小时计），这些请求全部白烧。
+# （2.0.8 起倍数是 ATTEMPT_PER_SEND=4，上面那句「×2」按当时的取值理解即可。）
 # 30 分钟仍在她「想起来看一眼手机」的尺度内，轮次与请求量直接减半。
 HEARTBEAT_MAX_DEFAULT = 30
 
-RECENT_TALK_MIN = 5
+# 2.0.8：下限 5 → 3，与默认值 3 对齐（默认值不能低于自己的下限）
+RECENT_TALK_MIN = 3
 RECENT_TALK_MAX = 720
-RECENT_TALK_DEFAULT = 18
+# 2.0.8：18 → 3。这个值是「刚聊过多久之内念头清零、绝不主动开口」。18 分钟意味着
+# 对方回一句之后她半小时内都不会再说话，可真人接话的间隔常常是几分钟——结果是
+# 「她好像没在听」。3 分钟只挡住「对方还在打字就插一句」这种真正的抢话。
+RECENT_TALK_DEFAULT = 3
 
 # 这一场话断了：多久之后接一句。追问那件事（有由头）比光问「在吗」可以更早。
 FOLLOWUP_AFTER_MIN = 3
@@ -380,7 +401,11 @@ CONTINUE_WINDOW_HOURS_DEFAULT = 8
 # 现有九道闸没有任何一道看得见这件事）。
 SILENT_GIVEUP_DAYS_MIN = 0
 SILENT_GIVEUP_DAYS_MAX = 30
-SILENT_GIVEUP_DAYS_DEFAULT = 3
+# 2.0.8：3 → 0（默认关闭）。这条闸是「对方连续 N 天不开口就全面停发，等 TA 先开口」，
+# 出发点是好的（上面那段线上记录），但它默认开着，而 3 天沉默在真实用户里太常见——
+# 出差、考试、生病、单纯不想聊天。实测报告 P1-1 里它把一整个人的主动消息全停了，
+# 而且恢复条件只有「对方先开口」，插件自己没有任何出口。默认改成关闭，需要的人自己开。
+SILENT_GIVEUP_DAYS_DEFAULT = 0
 
 # 隔一阵回访那件事：对方提了个没说完结果的事，过几小时问「后来呢」
 LOOP_MIN_HOURS_FLOOR = 1.0
@@ -408,6 +433,12 @@ QUIET_END_DEFAULT = 7
 # 面板上这两个小时按哪个时钟读：local（默认）= 插件所在机器；core = 她所在城市。
 QUIET_CLOCK_DEFAULT = QUIET_CLOCK_LOCAL
 
+# 插件自己的时区（v2.1.1）：面板最上面那一项，默认 UTC+8。
+# 填了它，主动消息的所有时间判定（安静时段、问候、每日额度、作息画像）
+# 都按这个钟走，不再看 AstrBot 主机时区；auto 才退回「有 Core 用 Core、
+# 没有用本机」的老行为。
+TIMEZONE_DEFAULT = "UTC+8"
+
 MAX_MSG_LEN_MIN = 10
 MAX_MSG_LEN_MAX = 500
 # 60：没人用一条消息发小作文，分段发的时候每段更短才对。容器实测一条 110 字
@@ -419,7 +450,12 @@ MAX_MSG_LEN_DEFAULT = 60
 # 精力低于这个值就不主动开口。做得成闸是因为「累」是硬事实：累到坐不住的人
 # 不会先去想「我该不该找 TA 说话」。设高了会把「有点倦」也当成累，于是白天
 # 大量本该说的话被挡掉。
-GATE_ENERGY_FLOOR_DEFAULT = 35
+GATE_ENERGY_FLOOR_DEFAULT = 20
+
+# 【特别关心】自动认定的好感门槛。85 只有被手动塞满好感的号够得到：普通人从
+# 中性起点起跑、每轮最多涨 2 分，85 等于「永远不可能自动认定」，自动认定形同关闭。
+# 55 与 Core 的中性起点对齐（mood_initial_affection 也是 55）：聊得好就能自己走到。
+SPECIAL_CARE_MIN_AFFECTION_DEFAULT = 55
 
 TOPIC_MEMORY_MIN = 0
 TOPIC_MEMORY_MAX = 20
@@ -444,7 +480,8 @@ SOCIAL_ENERGY_THRESHOLD_DEFAULT = 20
 # 跟一个素未谋面的人开口，间隔本来就比熟人长，不能拿熟人节奏硬套
 SEED_URGE_SCALE = 0.5
 
-# 早晚问候（时间性触发）：早安/晚安窗口（小时，按她所在城市的钟走）
+# 早晚问候（时间性触发）：早安/晚安窗口（小时）。v2.1.1 起按插件时区
+# （timezone_offset，默认 UTC+8）的钟走；填 auto 才退回她所在城市/本机时钟
 GREETING_ENABLED_DEFAULT = True
 GREETING_MORNING_START_DEFAULT = 7
 GREETING_MORNING_END_DEFAULT = 11
@@ -457,7 +494,7 @@ GREETING_NIGHT_END_DEFAULT = 24   # 24 视作 0（午夜）
 # 这条只是别在一轮里全发出去的护栏。
 MAX_SENDS_PER_ROUND_MIN = 1
 MAX_SENDS_PER_ROUND_MAX = 10
-# v1.28.2：3 → 2。每轮 LLM 尝试次数 = 这个数 × ATTEMPT_PER_SEND(2)，所以它就是
+# v1.28.2：3 → 2。每轮 LLM 尝试次数 = 这个数 × ATTEMPT_PER_SEND（当时是 2），所以它就是
 # 「一轮最多打几次模型」。降到 2 之后一轮最多 4 次尝试（原 6 次）。
 # 发送成功率并没有变差：线上 998 轮只发出去 582 条，瓶颈从来不在尝试次数上。
 #
@@ -466,7 +503,13 @@ MAX_SENDS_PER_ROUND_MAX = 10
 # 由头来源扩了（wake/体感/feelings/next）、一个人一轮能说两件事之后，
 # 3 条名额 + 每小时 24 条的上限才配得上「她一天发生几次变化就有几次机会」。
 # 3 条 × 2 = 6 次尝试，与 v1.28.2 之前同级，不是新量级。
-MAX_SENDS_PER_ROUND_DEFAULT = 3
+#
+# 2.0.8：3 → 8。实测报告 P1-2 那一轮「候选 893 个，尝试 14 次，发出 1 条，尝试配额
+# 用完跳过 860 个」——名额和尝试次数都比候选少一个数量级，等于让排序决定一切、
+# 后面的人永远轮不到。8 条配合 ATTEMPT_PER_SEND=4 = 32 次尝试：心跳最短 8 分钟、
+# 批量并发 3，按每次 10~30 秒算是 110~320 秒，仍在一轮之内；每小时上限
+# （HOURLY_SENDS_CAP_DEFAULT=24）仍是最终的天花板，不会被这条冲破。
+MAX_SENDS_PER_ROUND_DEFAULT = 8
 
 # ─── 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰 ───
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
@@ -528,6 +571,35 @@ GROUP_TOPIC_GAP_HOURS_DEFAULT = 8.0
 GROUP_TOPIC_DAILY_CAP_MIN = 1
 GROUP_TOPIC_DAILY_CAP_MAX = 5
 GROUP_TOPIC_DAILY_CAP_DEFAULT = 1
+# v2.1.0：跨群去重窗口（小时）。她只有一份生活，群有好几个，而 _run_group_topics
+# 每轮只挑一个群——于是同一件事会在一小时里挨个群播一遍。这个窗口内的素材和措辞
+# 不会在第二个群再说一遍。0 = 关掉（退回 2.0.7 的行为）。
+GROUP_TOPIC_DEDUP_HOURS_MIN = 0.0
+GROUP_TOPIC_DEDUP_HOURS_MAX = 48.0
+GROUP_TOPIC_DEDUP_HOURS_DEFAULT = 6.0
+
+# v2.1.2：每个角色**在所有群里**一天最多主动说几条（破冰 + 起话头 + 心流都算）。
+# 每群各自的额度只管单群，59 个群 × 2 就是一天 118 条——线上 11-06 群发 68 条、
+# 私聊 13 条，群聊把私聊挤没了，而主人以为「她不太找我」。
+GROUP_DAILY_TOTAL_CAP_DEFAULT = 12
+GROUP_DAILY_TOTAL_CAP_MAX = 100
+
+# v2.1.2：特别关心的**独立**小时配额。特别关心已经绕过「TA 没开口」「没回就停」，
+# 但还得跟所有人一起抢每小时总预算（hourly_sends_cap），于是名单里的人常常排在
+# 队尾轮不到。给它一份自己的小时额度：0 = 跟随 hourly_sends_cap。
+SPECIAL_CARE_HOURLY_CAP_DEFAULT = 6
+SPECIAL_CARE_HOURLY_CAP_MAX = 60
+# v2.1.0：一次起话头最多发几段（0 = 不限）。线上有单群一分钟 4 条的记录，碎句连发
+# 不是「想到什么分两条说」，是弹幕。超出的段并进最后一段，不再单独发。
+GROUP_TOPIC_MAX_SEGMENTS_MIN = 0
+GROUP_TOPIC_MAX_SEGMENTS_MAX = 4
+GROUP_TOPIC_MAX_SEGMENTS_DEFAULT = 2
+# v2.1.0：群聊跨群撞车判定用的相似度阈值。私聊侧的 cross_user_repeat_ratio 在
+# 2.1.0 松到了 0.88（「同一个人别再听第二遍」本来就该宽），但群里要抓的是
+# 「同一句话换个群又说一遍」——0.88 只认近乎逐字，实测抓不到 11-06 那批
+# 「刚睡醒」/「你们今天都干嘛呢」的换群复读。所以群侧取两者更严的那个：
+# 用户把私聊阈值调得更严就跟着更严，但不会比 0.6 更宽。
+GROUP_CROSS_GROUP_RATIO_MAX = 0.6
 
 # 超过这么多天没在某个群见到任何消息，就当已经不在这个群了（被踢/退群/群解散）：
 # 不再对它破冰，并在清理时丢掉它的样本。心流本身只由实时群消息驱动，被踢自然就停。
@@ -564,10 +636,19 @@ USER_RETENTION_DEFAULT = 30
 LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "user_cooldown_minutes": {180, 720, 120, 90, 45},
     "min_gap_minutes": {60, 45, 30},
+    # 2.1.0 把「松闸」那一批默认值一起改了：老用户盘上还是旧值，AstrBot 不会覆盖，
+    # 所以只能在这里提醒一句。注意 30 现在是新默认，写在集合里也不会重复提示
+    # （下面 probe == new_value 就跳过）。
+    "gate_energy_floor": {35},
+    "max_sends_per_round": {3, 2},
+    "cross_user_repeat_ratio": {0.6},
+    "cross_user_repeat_hours": {2.0},
+    "silent_giveup_days": {3},
+    "special_care_min_affection": {85},
     "max_message_length": {200, 60},
     "reply_window_hours": {6},
     "urge_refill_hours": {8, 4, 3, 2},
-    "recent_talk_minutes": {45, 30, 25},
+    "recent_talk_minutes": {45, 30, 25, 18},
     "skip_cooldown_minutes": {40, 25, 15},
     "activity_level": {45, 55, 65},
     "followup_after_minutes": {12, 6},
@@ -680,7 +761,8 @@ class SocialConfig:
     heartbeat_max_minutes: int = HEARTBEAT_MAX_DEFAULT
 
     # 念头模型
-    urge_refill_hours: int = URGE_REFILL_DEFAULT
+    # 2.0.8 起是 float：默认 1.5，整数类型会把 1.5 截成 1（见 gi/_safe_int）
+    urge_refill_hours: float = URGE_REFILL_DEFAULT
     recent_talk_minutes: int = RECENT_TALK_DEFAULT
     skip_cooldown_minutes: int = SKIP_COOLDOWN_DEFAULT
     gate_energy_floor: int = GATE_ENERGY_FLOOR_DEFAULT
@@ -722,7 +804,16 @@ class SocialConfig:
     # 主动发出的消息要不要追加进 AstrBot 的会话历史（WebUI 可见、别的插件读得到）
     persist_proactive_history: bool = True
 
-    # 安静时段与作息画像按她所在城市的小时走（需要 Humanoid Core 提供时区偏移）
+    # 主动消息的时区（v2.1.1）：插件自己的钟，默认 UTC+8，与宿主时区无关。
+    #
+    # 填 UTC±N（也认「+8」「8」「UTC+5:30」）就固定按它判；填 auto 才是旧行为：
+    # 有 Core 用 Core 给的偏移，没有 Core 就用本机时间。
+    # 之前没有这一项，所有时间判定最终都落到「本机时间」——宿主在 UTC 容器里、
+    # 或者主人自己不在 UTC+8 时，安静时段/问候/每日额度会集体错几个小时。
+    timezone_offset: str = TIMEZONE_DEFAULT
+
+    # 安静时段与作息画像按她所在城市的小时走（需要 Humanoid Core 提供时区偏移）。
+    # timezone_offset 不是 auto 时，这一项不再参与计时（Core 只提供作息夜窗）。
     use_core_clock: bool = True
 
     # 要不要走 Humanoid Core 的只读门面（同进程直连，契约 v2）。
@@ -833,12 +924,14 @@ class SocialConfig:
     # 逐条 "uid"，或 "平台:uid"（平台就是 umo 的第一段，如 aiocqhttp / 娜莉灵）
     special_care_uids: Any = field(default_factory=list)
     special_care_auto: bool = True
-    special_care_min_affection: int = 85
+    special_care_min_affection: int = SPECIAL_CARE_MIN_AFFECTION_DEFAULT
     special_care_min_turns: int = 100
     # 自动认定次要依据：Core 老版本没有对话轮数时，退回社交层自己数的消息条数
     special_care_min_messages: int = 60
     special_care_gap_minutes: int = 20
     special_care_daily_cap: int = 8
+    # v2.1.2：特别关心的小时配额（独立于 hourly_sends_cap）。0 = 跟随总预算。
+    special_care_hourly_cap: int = SPECIAL_CARE_HOURLY_CAP_DEFAULT
     # 静音/睡眠豁免：关掉后「特别关心」只改间隔与追问，不碰安静时段
     special_care_ignore_quiet: bool = False
 
@@ -904,6 +997,15 @@ class SocialConfig:
     group_topic_enabled: bool = True
     group_topic_gap_hours: float = GROUP_TOPIC_GAP_HOURS_DEFAULT
     group_topic_daily_cap: int = GROUP_TOPIC_DAILY_CAP_DEFAULT
+    # v2.1.0：跨群去重窗口（小时）。她只有一份生活、群有好几个，而每轮只挑一个群，
+    # 于是同一件事一小时里挨个群播一遍（线上 11-06 16:40 五个群收到同一套）。这个
+    # 窗口内用过的素材/措辞不在第二个群再说。0 = 关。
+    group_topic_dedup_hours: float = GROUP_TOPIC_DEDUP_HOURS_DEFAULT
+    # v2.1.2：每个角色在所有群里一天最多主动说几条（破冰 + 起话头 + 心流都算）。
+    # 0 = 不设总上限（只按每群各自的额度）。
+    group_daily_total_cap: int = GROUP_DAILY_TOTAL_CAP_DEFAULT
+    # v2.1.0：一次起话头最多发几段（0 = 不限）。多出来的段并进最后一段。
+    group_topic_max_segments: int = GROUP_TOPIC_MAX_SEGMENTS_DEFAULT
     # G3 → v1.28.0：群主动**默认不点名**。用户原话是「主动消息发群时会叫别人」
     # ——模型只要拿到名字，就会拿别人的名字去提问/点评/招呼，而打招呼本来该对着
     # 整个群说。打开后也只剩一种用法：心流接话时，可以叫**正在接的那一个人**一句；
@@ -1213,6 +1315,11 @@ class SocialConfig:
             quiet_clock=normalize_quiet_clock(
                 g("quiet_clock", _d("quiet_clock", QUIET_CLOCK_DEFAULT))
             ),
+            # 看不懂的时区回 auto（旧行为），不拿 UTC+0 顶：填错一个字符就让
+            # 所有人半夜收到消息，比退回本机时间糟糕得多。
+            timezone_offset=normalize_timezone(
+                g("timezone_offset", _d("timezone_offset", TIMEZONE_DEFAULT))
+            ),
             quiet_use_core_night=gb("quiet_use_core_night", True),
             private_only=gb("private_only", True),
             debug=gb("debug", False),
@@ -1271,7 +1378,7 @@ class SocialConfig:
             special_care_uids=gl("special_care_uids", None),
             special_care_auto=gb("special_care_auto", True),
             special_care_min_affection=max(
-                0, min(100, gi("special_care_min_affection", 85))
+                0, min(100, gi("special_care_min_affection", SPECIAL_CARE_MIN_AFFECTION_DEFAULT))
             ),
             special_care_min_turns=max(0, min(1_000_000, gi("special_care_min_turns", 100))),
             special_care_min_messages=max(0, min(1_000_000, gi("special_care_min_messages", 60))),
@@ -1279,6 +1386,13 @@ class SocialConfig:
                 1, min(1440, gi("special_care_gap_minutes", 20))
             ),
             special_care_daily_cap=max(0, min(100, gi("special_care_daily_cap", 8))),
+            special_care_hourly_cap=max(
+                0,
+                min(
+                    SPECIAL_CARE_HOURLY_CAP_MAX,
+                    gi("special_care_hourly_cap", SPECIAL_CARE_HOURLY_CAP_DEFAULT),
+                ),
+            ),
             special_care_ignore_quiet=gb("special_care_ignore_quiet", False),
             history_ingest=gb("history_ingest", True),
             seed_users=gl("seed_users", None),
@@ -1353,6 +1467,27 @@ class SocialConfig:
                 GROUP_TOPIC_DAILY_CAP_MIN,
                 min(GROUP_TOPIC_DAILY_CAP_MAX, gi("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)),
             ),
+            group_topic_dedup_hours=max(
+                GROUP_TOPIC_DEDUP_HOURS_MIN,
+                min(
+                    GROUP_TOPIC_DEDUP_HOURS_MAX,
+                    gf("group_topic_dedup_hours", GROUP_TOPIC_DEDUP_HOURS_DEFAULT),
+                ),
+            ),
+            group_daily_total_cap=max(
+                0,
+                min(
+                    GROUP_DAILY_TOTAL_CAP_MAX,
+                    gi("group_daily_total_cap", GROUP_DAILY_TOTAL_CAP_DEFAULT),
+                ),
+            ),
+            group_topic_max_segments=max(
+                GROUP_TOPIC_MAX_SEGMENTS_MIN,
+                min(
+                    GROUP_TOPIC_MAX_SEGMENTS_MAX,
+                    gi("group_topic_max_segments", GROUP_TOPIC_MAX_SEGMENTS_DEFAULT),
+                ),
+            ),
             group_mention_member=gb("group_mention_member", False),
             group_interject_others=gb("group_interject_others", True),
             group_stale_days=max(
@@ -1380,9 +1515,11 @@ class SocialConfig:
                     gi("heartbeat_max_minutes", HEARTBEAT_MAX_DEFAULT),
                 ),
             ),
+            # 2.0.8：gi → gf。默认值改成 1.5 之后 gi 会把它截成 1（int(1.5)），
+            # 于是「配置里写 1.5、实际按 1 跑」——正是本文件开头警告的那种漂移。
             urge_refill_hours=max(
                 URGE_REFILL_MIN,
-                min(URGE_REFILL_MAX, gi("urge_refill_hours", URGE_REFILL_DEFAULT)),
+                min(URGE_REFILL_MAX, gf("urge_refill_hours", URGE_REFILL_DEFAULT)),
             ),
             recent_talk_minutes=max(
                 RECENT_TALK_MIN,
@@ -1469,6 +1606,15 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     # LEGACY_DEFAULTS 里有这两个键，_NEW_DEFAULTS 必须同样有，否则迁移循环取 new_value 时 KeyError
     "probe_after_minutes": PROBE_AFTER_DEFAULT,
     "followup_max_minutes": FOLLOWUP_MAX_DEFAULT,
+    # 2.1.0 新进 LEGACY_DEFAULTS 的这几项
+    "gate_energy_floor": GATE_ENERGY_FLOOR_DEFAULT,
+    "max_sends_per_round": MAX_SENDS_PER_ROUND_DEFAULT,
+    "cross_user_repeat_ratio": CROSS_USER_REPEAT_RATIO_DEFAULT,
+    "cross_user_repeat_hours": CROSS_USER_REPEAT_HOURS_DEFAULT,
+    "silent_giveup_days": SILENT_GIVEUP_DAYS_DEFAULT,
+    "special_care_min_affection": SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
+    "group_daily_total_cap": GROUP_DAILY_TOTAL_CAP_DEFAULT,
+    "special_care_hourly_cap": SPECIAL_CARE_HOURLY_CAP_DEFAULT,
 }
 
 
@@ -1524,7 +1670,12 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
             try:
                 probe = int(str(current).strip())
             except (TypeError, ValueError):
-                pass
+                # 浮点默认值（cross_user_repeat_ratio 这类）用 int() 永远转不过去，
+                # 面板把值存成字符串 "0.6" 时就会被判成「不是旧默认」而漏掉提示。
+                try:
+                    probe = float(str(current).strip())
+                except (TypeError, ValueError):
+                    pass
             if probe not in legacy_values and current not in legacy_values:
                 continue
             new_value = _d(key, _NEW_DEFAULTS.get(key))

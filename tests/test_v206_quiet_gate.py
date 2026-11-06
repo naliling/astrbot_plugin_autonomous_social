@@ -266,7 +266,9 @@ class EngineQuietStateTest(unittest.TestCase):
         is_quiet, why = eng._quiet_state("b1", NOW)
         self.assertTrue(is_quiet)
         self.assertIn("安静时段", why)
-        self.assertIn("本机", why)
+        # v2.1.1：面板窗口按「插件时区」判（默认 UTC+8），文案给的是偏移；
+        # 只有时区填 auto 才写「本机」。旧断言把 auto 的口径当成了默认。
+        self.assertIn("UTC+8", why)
 
     def test_zero_window_is_never_quiet(self):
         eng = _engine()

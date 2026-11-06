@@ -542,11 +542,18 @@ class MainUserIsActuallyServed(unittest.TestCase):
         import inspect
         from social.engine import SocialEngine
         src = inspect.getsource(SocialEngine.try_once)
+        key_src = inspect.getsource(SocialEngine._candidate_sort_key)
         # 必须是 `self.`。写成裸名的话单测全绿（单测调的是类方法，走类作用域），
         # 而 `try_once` 里走的是局部作用域 —— 仿真一跑就是
         # NameError: name '_relation_bucket' is not defined。
         # 同一个坑踩过两次：v2.25.0 往 `__init__` 中间插方法定义，把后半截截断了。
-        self.assertIn("self._relation_bucket(x[2])", src,
+        #
+        # v2.1.2：排序键从 try_once 里的内联 lambda 抽成了 _candidate_sort_key
+        # （前面多了一段「特别关心置顶」），关系档跟着搬进了那个方法。所以要查两处：
+        # try_once 必须经 self._candidate_sort_key 排序，方法体里必须经 self._relation_bucket 取档。
+        self.assertIn("self._candidate_sort_key", src,
+                      "anchored 必须按 _candidate_sort_key 排（特别关心 → 关系档 → 轮转）")
+        self.assertIn("self._relation_bucket(", key_src,
                       "裸名在 try_once 的作用域里取不到，单测会假绿")
         i_anchor = src.index("for bid, uid, u, urge, a in anchored:")
         before = src[:i_anchor]

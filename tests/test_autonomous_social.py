@@ -457,6 +457,13 @@ class _Resp:
 class TestSendDelivery(unittest.TestCase):
     """重试间隔是真实等待，会把测试拖慢；这里压到 0，只测语义不测等待。"""
 
+    # v2.1.2：`_send_message` / `_send_with_retry` 开头都先用 `_bad_umo` 挡掉明显
+    # 不合法的会话地址（段数不对、第二段不是 GroupMessage|FriendMessage|OtherMessage）。
+    # 被这道闸挡下时抛出的 `_SendFailed` 两个标志都是 False、也根本不进重试——
+    # 原来这些用例传的 "umo" 正好是这种地址，于是测的全是「地址不合法直接跳过」，
+    # 不是投递语义。换成真实形状的 umo 才回到本意。
+    UMO = "aiocqhttp:FriendMessage:u1"
+
     def setUp(self):
         self._orig_delay = engine_mod.SEND_RETRY_DELAY
         engine_mod.SEND_RETRY_DELAY = 0.0
@@ -478,7 +485,7 @@ class TestSendDelivery(unittest.TestCase):
                 raise asyncio.TimeoutError("回执超时")
 
         ctx = Ctx()
-        ok, _err, peer = _run(self._engine(ctx)._send_with_retry("umo", "你好"))
+        ok, _err, peer = _run(self._engine(ctx)._send_with_retry(self.UMO, "你好"))
         self.assertEqual(ctx.calls, 1, f"发送被调用了 {ctx.calls} 次（叠加重试最多 6 条）")
         self.assertFalse(ok)
         self.assertFalse(peer)
@@ -489,7 +496,7 @@ class TestSendDelivery(unittest.TestCase):
             async def send_message(self, target, payload):
                 return False
 
-        ok, _err, peer = _run(self._engine(Ctx())._send_with_retry("umo", "x"))
+        ok, _err, peer = _run(self._engine(Ctx())._send_with_retry(self.UMO, "x"))
         self.assertFalse(peer, "平台级失败被误判成「这个人发不了」")
 
     def test_platform_saying_not_friend_does_block_user(self):
@@ -497,7 +504,7 @@ class TestSendDelivery(unittest.TestCase):
             async def send_message(self, target, payload):
                 raise RuntimeError("发送失败：请添加对方为好友")
 
-        _ok, _err, peer = _run(self._engine(Ctx())._send_with_retry("umo", "x"))
+        _ok, _err, peer = _run(self._engine(Ctx())._send_with_retry(self.UMO, "x"))
         self.assertTrue(peer, "平台明说不是好友时应当隔离")
 
     def test_platform_capability_error_does_not_block_user(self):
@@ -506,7 +513,7 @@ class TestSendDelivery(unittest.TestCase):
                 async def send_message(self, target, payload):
                     raise RuntimeError(msg)
 
-            _ok, err, peer = _run(self._engine(Ctx())._send_with_retry("umo", "x"))
+            _ok, err, peer = _run(self._engine(Ctx())._send_with_retry(self.UMO, "x"))
             self.assertFalse(peer, f"{msg!r} 属平台级问题，不该隔离用户")
             self.assertTrue(SocialEngine._platform_problem(err), f"{msg!r} 应识别为平台问题")
 
@@ -523,7 +530,7 @@ class TestSendDelivery(unittest.TestCase):
                 return True
 
         ctx = Ctx()
-        ok, _err, _peer = _run(self._engine(ctx)._send_with_retry("umo", "x"))
+        ok, _err, _peer = _run(self._engine(ctx)._send_with_retry(self.UMO, "x"))
         self.assertTrue(ok)
         self.assertEqual(ctx.calls, 2, "链式失败后应回退纯文本")
 
@@ -1751,15 +1758,21 @@ class TestTriggerPacing(unittest.TestCase):
 
         以前是所有人一个 min_gap_minutes，一刀切的结果是他一周只收到 2 条。
         """
-        u = {"last_sent": self.clock - 40 * 60}
+        # v2.1.0：min_gap_minutes 默认 60→30，而它只是**中档**的基准——三档按
+        # anchors.TIER_MIN_GAP_MINUTES（high 20 / mid 60 / low 720）与中档 60 的
+        # 比例缩放，默认配置下实际是 10 / 30 / 360 分钟。40 分钟早已同时越过
+        # 高档和中档（旧默认 60 时中档就是 60 分钟，40 分钟还在闸内），取 20 分钟
+        # 才落在中档的闸里、同时低档仍然远未到点。
+        u = {"last_sent": self.clock - 20 * 60}
         high = self.engine._gap_left(u, "high", self.clock)
         mid = self.engine._gap_left(u, "mid", self.clock)
         low = self.engine._gap_left(u, "low", self.clock)
-        self.assertEqual(high, 0.0, "高档隔 40 分钟就该能开口了")
-        self.assertGreater(mid, 0.0, "中档不该这么近")
+        self.assertEqual(high, 0.0, "高档隔 20 分钟就该能开口了（实际间隔 10 分钟）")
+        self.assertGreater(mid, 0.0, "中档不该这么近（实际间隔 30 分钟）")
         self.assertGreater(low, mid, "低档应该更远")
-        # v1.27.8（F4）：低档 1440→720 分钟（12 小时），整体更频繁。
-        self.assertGreater(low, 10 * 3600.0, "低档应该明显更远")
+        # v2.1.0：低档基准 720 分钟 ×（30/60）= 360 分钟（6 小时），
+        # 不再是 v1.27.8 的 720 分钟（12 小时）。
+        self.assertGreater(low, 5 * 3600.0, "低档应该明显更远")
 
     def test_gap_stretches_when_ignored(self):
         a = {"last_sent": self.clock - 30 * 60, "no_reply_streak": 0}
@@ -2972,9 +2985,13 @@ class TestCrossUserCollision(unittest.TestCase):
         self.assertIn("_check_cross_user", src[i:j], "验收里没接跨用户撞车检查")
 
     def test_config_exists(self):
+        # v2.1.0 松闸（CHANGELOG「默认值松闸」）：私聊侧阈值 0.6→0.88、
+        # 窗口 2.0→0.5 小时。群侧仍另有上限：engine 取
+        # min(私聊阈值, GROUP_CROSS_GROUP_RATIO_MAX=0.6)，所以 0.6 这个数没有消失，
+        # 只是从「私聊默认值」挪成了「群侧上限」。
         cfg = SocialConfig()
-        self.assertEqual(cfg.cross_user_repeat_ratio, 0.6)
-        self.assertEqual(cfg.cross_user_repeat_hours, 2.0)
+        self.assertEqual(cfg.cross_user_repeat_ratio, 0.88)
+        self.assertEqual(cfg.cross_user_repeat_hours, 0.5)
         self.assertFalse(cfg.cross_user_calibrate)
 
     def test_zero_really_disables_it(self):

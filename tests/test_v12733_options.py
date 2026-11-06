@@ -407,8 +407,12 @@ class WeekendBoostOptionTest(unittest.TestCase):
         now = SATURDAY.timestamp()
         on = _engine(weekend_boost=True)
         off = _engine(weekend_boost=False)
+        # v2.1.0：mood_scale 默认 1.4875，而 desire.settle 把 mood_factor 夹在 1.5。
+        # 4 小时的增量两边都顶到 URGE_CEILING=4.0，加成被夹成同一个数（旧断言
+        # 的 4 小时基准是 refill_hours=4 时代攒不满时的写法）。取 2 小时（约 2.4，
+        # 未到顶）才看得见 1.25 倍周末加成。
         for engine in (on, off):
-            _seed_user(engine, interest=0.9, urge_at=now - 4 * 3600)
+            _seed_user(engine, interest=0.9, urge_at=now - 2 * 3600)
         on.settle_minds("bot1", now, SATURDAY)
         off.settle_minds("bot1", now, SATURDAY)
         self.assertGreater(
@@ -421,8 +425,10 @@ class WeekendBoostOptionTest(unittest.TestCase):
         now = WEDNESDAY.timestamp()
         on = _engine(weekend_boost=True)
         off = _engine(weekend_boost=False)
+        # 同样取未到顶的 2 小时：4 小时两边都被 URGE_CEILING 夹平，
+        # 「相等」就变成「都被夹住」，测不出工作日到底有没有加成。
         for engine in (on, off):
-            _seed_user(engine, interest=0.9, urge_at=now - 4 * 3600)
+            _seed_user(engine, interest=0.9, urge_at=now - 2 * 3600)
         on.settle_minds("bot1", now, WEDNESDAY)
         off.settle_minds("bot1", now, WEDNESDAY)
         self.assertAlmostEqual(

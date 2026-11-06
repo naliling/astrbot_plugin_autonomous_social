@@ -271,6 +271,13 @@ class SendBreakerTest(unittest.TestCase):
 class SendRetryTest(unittest.IsolatedAsyncioTestCase):
     """`_send_with_retry` 的三元返回值决定「要不要隔离这个人」。"""
 
+    # v2.1.2：`_send_with_retry` 开头先用 `_bad_umo` 挡掉明显不合法的会话地址
+    # （段数不对、第二段不是 GroupMessage|FriendMessage|OtherMessage）。被挡下时
+    # 直接 return (False, 原因, False)，`_send_message` 一次都不会被调用——原来这里
+    # 传的 "umo" 正是这种地址，五个用例测的全是「地址不合法直接跳过」，重试语义一条
+    # 都没测到。换成真实形状的 umo 才回到本意。
+    UMO = "aiocqhttp:FriendMessage:u1"
+
     async def test_unknown_failure_is_not_retried(self):
         eng = _engine()
         calls = []
@@ -280,7 +287,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
             raise _SendFailed("结果未知", unknown=True)
 
         eng._send_message = _boom
-        ok, err, unreachable = await eng._send_with_retry("umo", "hi", "b1")
+        ok, err, unreachable = await eng._send_with_retry(self.UMO, "hi", "b1")
         self.assertFalse(ok)
         self.assertEqual(len(calls), 1)  # 未知结果重发会重复收到，所以不重试
         self.assertFalse(unreachable)
@@ -299,7 +306,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
             raise _SendFailed("不是好友", unknown=True, peer_unreachable=True)
 
         eng._send_message = _boom
-        ok, err, unreachable = await eng._send_with_retry("umo", "hi", "b1")
+        ok, err, unreachable = await eng._send_with_retry(self.UMO, "hi", "b1")
         self.assertFalse(ok)
         self.assertTrue(unreachable)
 
@@ -312,7 +319,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
             raise _SendFailed("连接被拒", unknown=False)
 
         eng._send_message = _boom
-        ok, err, unreachable = await eng._send_with_retry("umo", "hi", "b1")
+        ok, err, unreachable = await eng._send_with_retry(self.UMO, "hi", "b1")
         self.assertFalse(ok)
         self.assertEqual(len(calls), SEND_RETRY_COUNT + 1)
         self.assertFalse(unreachable)
@@ -331,7 +338,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
             raise _SendFailed("连接被拒", unknown=False)
 
         eng._send_message = _always_fail
-        ok, err, unreachable = await eng._send_with_retry("umo", "hi", "b1")
+        ok, err, unreachable = await eng._send_with_retry(self.UMO, "hi", "b1")
         self.assertFalse(ok)
         self.assertEqual(len(calls), 1, "不复重试：只发一次")
         self.assertIn("连接被拒", err)
@@ -346,7 +353,7 @@ class SendRetryTest(unittest.IsolatedAsyncioTestCase):
             return None
 
         eng._send_message = _ok
-        ok, _, _ = await eng._send_with_retry("umo", "hi", "b1")
+        ok, _, _ = await eng._send_with_retry(self.UMO, "hi", "b1")
         self.assertTrue(ok)
         self.assertEqual(eng.send_breaker_left("b1"), 0.0)
 

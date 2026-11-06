@@ -132,7 +132,8 @@ class SilentGiveupHelperTest(unittest.TestCase):
 
     def test_exactly_at_the_threshold_counts(self):
         """刚好 3 天：`>=` 而不是 `>`——差一分钟就是「还没到」，差一整天就是「到了」。"""
-        eng = _quiet_off(_engine())
+        # v2.1.0 起默认 0（关闭），这里显式开 3 天，测的是边界本身。
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 3 * DAY, silent_sent=2)
         self.assertEqual(eng.silent_giveup_days(u, NOW), 3.0)
 
@@ -143,7 +144,7 @@ class SilentGiveupHelperTest(unittest.TestCase):
 
     def test_returns_the_real_day_count(self):
         """返回的是**真实天数**而不是布尔：面板与拦截文案都要念「N 天」。"""
-        eng = _quiet_off(_engine())
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 4.5 * DAY, silent_sent=1)
         self.assertAlmostEqual(eng.silent_giveup_days(u, NOW), 4.5, places=6)
 
@@ -162,12 +163,13 @@ class SilentGiveupHelperTest(unittest.TestCase):
 
     def test_dirty_counters_do_not_raise(self):
         """状态文件是外部可改的：`silent_sent="abc"` 不能把整轮心跳抛穿。"""
-        eng = _quiet_off(_engine())
+        # 显式开 3 天：否则默认关闭，脏数据根本没被读到就返回 0，测了个寂寞。
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 5 * DAY, silent_sent="abc")
         self.assertEqual(eng.silent_giveup_days(u, NOW), 0.0)
 
     def test_avoidance_note_is_empty_when_not_avoiding(self):
-        eng = _quiet_off(_engine())
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 60, silent_sent=3)
         self.assertEqual(eng._avoidance_note(u, NOW), "")
 
@@ -183,6 +185,9 @@ class AvoidanceGatesTest(unittest.TestCase):
     """
 
     def _avoided(self, **cfg):
+        # v2.1.0 起默认 0（关闭）：这里显式开 3 天，测的是闸本身而不是默认值；
+        # 要测「关掉」的用例传 silent_giveup_days=0 覆盖。
+        cfg.setdefault("silent_giveup_days", 3)
         eng = _quiet_off(_engine(**cfg))
         u = _user(eng, last_seen=NOW - 4 * DAY, silent_sent=3, last_message="嗯")
         return eng, u
@@ -231,14 +236,14 @@ class SpeakInnerAvoidanceTest(unittest.IsolatedAsyncioTestCase):
     """
 
     async def test_speak_inner_refuses_while_avoiding(self):
-        eng = _quiet_off(_engine())
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 4 * DAY, silent_sent=3, last_message="嗯")
         ok, why = await eng._speak_inner("b1", "u1", u, 3.0, NOW)
         self.assertFalse(ok)
         self.assertIn("没开口", why)
 
     async def test_speak_inner_says_how_many_days(self):
-        eng = _quiet_off(_engine())
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         u = _user(eng, last_seen=NOW - 5 * DAY, silent_sent=2)
         _ok, why = await eng._speak_inner("b1", "u1", u, 3.0, NOW)
         self.assertIn("5 天", why)
@@ -280,7 +285,8 @@ class AvoidancePanelTest(unittest.TestCase):
 
     def test_full_status_page_carries_both_lines(self):
         """整页拼出来看一遍：配置行 + 「念头」段那个人身上的「回避中」。"""
-        eng = _quiet_off(_engine())
+        # 配置行要念「连续 3 天」：显式开 3 天，否则默认关闭时只有「- 回避：关」。
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         _user(eng, last_seen=NOW - 4 * DAY, silent_sent=3)
         text = asyncio.run(eng.status_text())
         self.assertIn("- 回避：开", text)
@@ -288,7 +294,7 @@ class AvoidancePanelTest(unittest.TestCase):
         self.assertIn("｜回避中（4 天没开口）", text)
 
     def test_thread_mark_flags_an_avoiding_user(self):
-        eng = _quiet_off(_engine())
+        eng = _quiet_off(_engine(silent_giveup_days=3))
         _user(eng, last_seen=NOW - 4 * DAY, silent_sent=3)
         mark = eng._thread_mark("b1", "u1", NOW)
         self.assertIn("回避中", mark)
@@ -321,11 +327,20 @@ class AvoidanceBlockCategoryTest(unittest.TestCase):
 
 
 class SilentGiveupConfigTest(unittest.TestCase):
-    def test_default_is_three_days(self):
-        self.assertEqual(SocialConfig().silent_giveup_days, 3)
-        self.assertEqual(SILENT_GIVEUP_DAYS_DEFAULT, 3)
-        # 走 from_astrbot（面板路径）拿到的也必须是 schema 里那个 3
-        self.assertEqual(SocialConfig.from_astrbot({}).silent_giveup_days, 3)
+    def test_default_is_off_since_v2_1_0(self):
+        """v2.1.0 松闸（CHANGELOG「默认值松闸」）：默认 3 天 → 0（关闭）。
+
+        默认关是刻意的：出差/考试/生病都算「没开口」，而这条闸一开就没有自动恢复，
+        新装用户不该被一条自己没选过的规则停发。想用的人自己填天数。
+        """
+        self.assertEqual(SocialConfig().silent_giveup_days, 0)
+        self.assertEqual(SILENT_GIVEUP_DAYS_DEFAULT, 0)
+        # 走 from_astrbot（面板路径）拿到的也必须是 schema 里那个 0
+        self.assertEqual(SocialConfig.from_astrbot({}).silent_giveup_days, 0)
+        # 填了天数仍然照旧生效（功能没被删掉，只是默认不启用）
+        self.assertEqual(
+            SocialConfig.from_astrbot({"silent_giveup_days": 3}).silent_giveup_days, 3
+        )
 
     def test_range_constants_match_the_schema(self):
         self.assertEqual(SILENT_GIVEUP_DAYS_MIN, 0)
