@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
+import inspect
 import json
 import math
 import os
@@ -29,7 +31,7 @@ try:
 except ImportError:
     MessageChain = None
 
-from . import __version__, anchors, anchors as anchor_mod, core_facade, desire
+from . import __version__, anchors, anchors as anchor_mod, core_facade, desire, guards
 from . import history_ingest
 from . import memory_bridge
 from . import pacing
@@ -44,13 +46,18 @@ from .clock import (
     quiet_overlap_seconds,
     seconds_until_quiet_end,
 )
+from .closing import (
+    DEFAULT_WINDOW_SECONDS as DEFAULT_CLOSING_WINDOW,
+    closing_decision,
+    closing_instruction,
+)
 from .config import (
     GROUP_CROSS_GROUP_RATIO_MAX,
     SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
     SocialConfig,
 )
 from .core_bridge import CORE_SAID_MAX, CoreBridge
-from .input_state import InputStateNotifier
+from .input_state import InputStateNotifier, wait_reason as input_wait_reason
 from .sanitize import sanitize_incoming
 from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_anchors
 from .verify import (
@@ -63,7 +70,7 @@ from .verify import (
 )
 from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
 from .style_profile import emoji_habit
-from .throttle import throttle
+from .throttle import closeout_allows, closeout_state, throttle
 from .generator import MessageGenerator
 from .persona import resolve_persona
 from .reasoning import (
@@ -99,9 +106,14 @@ from .threads import (
     thread_meta,
     thread_reason,
     loops_resolved_by,
+    loops_resolved_by_review,
+    loop_review_pending,
+    mark_followup_sent,
+    unfinished_signal,
     LOOP_LATE_HOURS,
     PROMISE_WAIT_SECONDS,
 )
+from .timeintent import parse_deadline
 
 # ─── 常量定义 ───────────────────────────────────────
 
@@ -947,6 +959,19 @@ GREET_FRESH_SECONDS = 4 * 86400.0
 # 回复窗口（12 小时）过了才 +1，实测「一直发、他一句不回」 4 天才涨到 2，太迟钝。
 COLD_SILENCE_SENT = 3
 
+# ─── 闸门原因码（v2.1.3）───────────────────────────────
+#
+# 每一个「没发出去」都要留下机器可读的码，写进状态、可回放。内存里留最近 64 条
+# 够看一个心跳周期；落盘砍到 32 条——state.json 每次全量重写，明细留太多只会让
+# 「这文件怎么这么大」变成新的排查负担。窗口固定 24 小时，与状态页「最近 24 小时」
+# 的口径一致。
+GATE_TRACE_MAX = 64
+GATE_TRACE_PERSIST = 32
+GATE_REPORT_HOURS = 24.0
+# 「TA 的话还没说完」信号的有效期。input_state 只给等待码，不负责过期；
+# 半小时后对方自己接上了，旧信号就不该继续拦着主动消息。
+UNFINISHED_WAIT_SECONDS = 1800.0
+
 # ─── 兄弟 bot 可聊、但严格防刷屏（v1.28.16）──────────────
 #
 # 多 bot 同进程部署时，兄弟 bot 的私聊消息以前被 observe 直接丢掉，于是它永远
@@ -987,6 +1012,132 @@ PRUNE_INTERVAL_SECONDS = 3600
 
 # 播种（读 AstrBot 会话库 + 应用名单）的扫描间隔（秒）
 SEED_INTERVAL_SECONDS = 1800
+
+
+def _gate_blocked(engine, code: str, text: str, **detail) -> Tuple[bool, str]:
+    """闸门记账的模块级兜底，返回 (False, text) 与 _blocked 完全一致。
+
+    为什么要这一层：老测试会把 SocialEngine 的某一个方法单独 MethodType 绑到假对象
+    （_TriggerEngine / types.SimpleNamespace）上跑，假对象上没有 _blocked / _gate_trace。
+    记账只是附加观测，不能因为它把「本来该正常拦下」变成 AttributeError，所以拿不到
+    就只回原始答案——fail-open 在这里的含义是「记账失败不影响闸门结论」。
+    """
+    fn = getattr(engine, "_blocked", None)
+    if callable(fn):
+        try:
+            return fn(code, text, **detail)
+        except Exception as exc:  # 记账出错绝不能顶掉闸门本身
+            logger.debug(f"[autonomous_social] 闸门记账失败（按原结论放行）: {exc}")
+    return False, text
+
+
+def _gate_note(engine, code: str, text: str, **detail) -> None:
+    """只记账不改变返回值的版本（三元组路径用），同样是模块级兜底。"""
+    fn = getattr(engine, "_note_blocked", None)
+    if callable(fn):
+        try:
+            fn(code, text, **detail)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 闸门记账失败（忽略）: {exc}")
+
+# ─── v2.1.5 发信链路三件（平台熔断 / 连发收口 / 投递预算）────
+#
+# 三个模块都是纯函数、可独立缺失：队友并行开发，engine 先接线后等模块。
+# 这里**按名字惰性 import**，而不是文件头 try/except 一次性绑定——模块晚到
+# 一秒（部署顺序、热重载）也不该让整轮心跳失效；拿不到就当该功能没装。
+def _opt_module(name: str):
+    """按包内名字取模块；缺失/导入出错一律返回 None（该功能不启用）。"""
+    try:
+        return importlib.import_module(f".{name}", __package__)
+    except Exception:
+        return None
+
+
+# 投递账本：最近 128 条「这条消息到底送到没有」。
+# 为什么要有它：平台熔断、连发收口、投递预算三件都需要同一份事实——
+# 上一条是发出去了还是卡住了。以前只有 proactive_log（=发过），没有「结果」，
+# 于是「连发三条对方都没收到」和「连发三条都收到了」在数据上长得一样。
+DELIVERY_LEDGER_KEY = "delivery_ledger"
+DELIVERY_LEDGER_MAX = 128
+DELIVERY_LEDGER_WINDOW = 3600.0
+
+
+# 收尾守卫的媒体判定：占位符集合与 social/closing.py 保持一致。这里只粗判「本轮有没有
+# 媒体」，真正的收尾语义全在 closing 模块里——engine 不复制一份判据，免得两边漂移。
+_MEDIA_HINT = re.compile(
+    r"\[(?:图片|语音|音频|视频|文件|合并转发|引用消息|分享卡片)[^\]]*\]"
+    r"|【(?:图片|语音|音频|视频|文件|合并转发|引用消息|分享卡片)[^】]*】"
+)
+
+
+def _event_has_media(event: Any, raw: str) -> bool:
+    """这一轮消息里有没有图/语音/文件这类「必须看一眼」的东西。
+
+    先看消息链：文本与表情之外的组件都算媒体（对方发来一张图，回一句才自然）；
+    取不到链就退回文本里的占位符（[图片]、【语音】…）。判错的代价只是「多回一句」，
+    所以拿不准时宁可判有——收尾守卫只在纯文字收尾时才允许静默。
+    """
+    try:
+        chain = event.get_messages()
+    except Exception:
+        chain = None
+    for comp in chain or ():
+        name = type(comp).__name__.casefold()
+        if "plain" in name or name in ("text", "face", "emoji"):
+            continue
+        return True
+    return bool(_MEDIA_HINT.search(str(raw or "")))
+
+
+def _closing_dialogue(conv: Any) -> Tuple[List[Dict[str, Any]], str]:
+    """把 social 会话账本转成 closing 要的正序对话，并取本轮（最后一条 in）文本。
+
+    closing 只认 dir/text/ts 三个键，账本里的其它字段原样忽略。
+    """
+    items: List[Dict[str, Any]] = []
+    current = ""
+    for entry in conv or ():
+        if not isinstance(entry, dict):
+            continue
+        direction = str(entry.get("dir") or "")
+        if direction not in ("in", "out"):
+            continue
+        text = str(entry.get("text") or "")
+        items.append({"dir": direction, "text": text, "ts": _num(entry.get("ts", 0) or 0)})
+        if direction == "in":
+            current = text
+    return items, current
+
+def _guard_dialogue(conv: Any) -> List[Dict[str, Any]]:
+    """把 social 账本转成 guards 认的对话行（role/ts/text）。
+
+    为什么要转：guards 的对话行识别只认 role/sender/is_self 这类键，social 账本
+    用的是 dir（in/out）；直接传过去每一行都会被判成「不知道是谁」，而 guards
+    对「不知道」一律不拦——自接自那道闸会静默失效，看起来接好了其实从没命中过。
+
+    这里必须用带 ts 的账本（_closing_dialogue 那条路），不能用生成侧的
+    u_copy["conversation"]：那个为了排 prompt 顺序已经把 ts 剥掉了（_strip_ts），
+    没有时间戳就算不出「上一句是不是刚说的」，闸同样失效。
+    """
+    rows: List[Dict[str, Any]] = []
+    for item in conv or ():
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("dir") or "")
+        if direction == "out":
+            role = "assistant"
+        elif direction == "in":
+            role = "user"
+        else:
+            continue
+        rows.append(
+            {
+                "role": role,
+                "text": str(item.get("text") or ""),
+                "ts": _num(item.get("ts", 0) or 0),
+            }
+        )
+    return rows
 
 
 class SocialEngine:
@@ -1139,6 +1290,16 @@ class SocialEngine:
                 str(k): int(v or 0) for k, v in _prev_blocked.items()
                 if isinstance(v, (int, float)) and not isinstance(v, bool)
             }
+        # ── 闸门原因码（v2.1.3）───────────────────────────
+        #
+        # 以前每道闸只 return 一句中文，跑完一轮一条没发出去时，机器侧只能靠
+        # `_block_category` 的子串匹配猜是哪一类——文案改一个字就掉进「其它」。
+        # 这里给每道闸一个稳定码，与中文**并列**：对外返回值不变，码只进 trace/计数。
+        self._gate_trace: deque = deque(maxlen=GATE_TRACE_MAX)
+        # 当天各码被拦下的次数，按「自然日」重置（见 `_gate_roll_day`）。
+        self._gate_counts: Dict[str, int] = {}
+        self._gate_day: str = ""
+        self._load_gate_state()
 
         # 最近一次播种/导入的结果（仅用于状态展示，不落盘）
         self._last_import_note = ""
@@ -1227,8 +1388,13 @@ class SocialEngine:
                     at = _num(item.get("at"))
                     if at <= 0:
                         # 老数据只有 due：按写侧的公式反推许下的时刻
-                        # （due = at + PROMISE_WAIT_SECONDS），而不是拿 0 当 1970 年发过去
-                        at = _num(item.get("due")) - PROMISE_WAIT_SECONDS
+                        # （due = at + PROMISE_WAIT_SECONDS），而不是拿 0 当 1970 年发过去。
+                        # v2.1.6：带时间意图的承诺（due_at）里 due 不再等于 at + 等待时长，
+                        # 按旧公式反推会算出错误时刻；有 due_at 就以它为准，没有才回落。
+                        due_at = _num(item.get("due_at"))
+                        at = due_at if due_at > 0 else (
+                            _num(item.get("due")) - PROMISE_WAIT_SECONDS
+                        )
                     if at <= 0:
                         continue
                     out.append({"text": about, "uid": str(uid),
@@ -1712,6 +1878,19 @@ class SocialEngine:
                 self.log(f"提取未完话题失败: {e}")
                 loop_text = None
 
+        # 本轮有没有图/语音/文件：收尾守卫要用（有媒体就一定得回）。群消息在
+        # 更上面已经分流走了，这里只会是私聊。
+        _has_media = _event_has_media(event, raw)
+        # 「话没说完」信号：unfinished 才产生等待码，complete/uncertain 一律空串
+        # （uncertain 照常回）。它**不新增阻塞**——只是把码挂到 u 上，由主动消息
+        # 那边读一次，见 _speak_inner 的 await_unfinished 闸门。
+        _wait_code = ""
+        try:
+            _wait_code = input_wait_reason(unfinished_signal(msg))
+        except Exception as e:
+            self.log(f"判断半截话失败（照常回）: {e}")
+            _wait_code = ""
+
         # 这一段全是「读改写同一个 user dict」，**必须在 per-(bot,uid) 锁里**。
         #
         # `_speak` 里有 LLM 调用（秒级），发送分支正是靠这把锁保证「observe 不会插进
@@ -1737,6 +1916,23 @@ class SocialEngine:
 
             # 记录/更新 umo（主动发送目标，始终跟随最近一次会话来源）
             u = self.state.user(bid, uid)
+            # 收尾守卫要的「本轮含媒体」标记：跟着最近一条入站消息走，对方下一条
+            # 是纯文字时它自然被覆盖成 False。
+            if bool(u.get("last_in_media")) != _has_media:
+                u["last_in_media"] = _has_media
+                self.state.mark_dirty()
+            # 半截话等待码：unfinished 才写，complete/uncertain 一律清空。带时间戳
+            # 是为了只在一小段时间内有效——对方半小时后又发「算了没事」，上一句的
+            # 「没说完」就不该继续拦着。
+            if _wait_code:
+                if u.get("await_unfinished") != _wait_code:
+                    u["await_unfinished"] = _wait_code
+                    u["await_unfinished_at"] = self._time()
+                    self.state.mark_dirty()
+            elif u.get("await_unfinished"):
+                u["await_unfinished"] = ""
+                u["await_unfinished_at"] = 0.0
+                self.state.mark_dirty()
             # 时间锚点同时挂成一条由头：由头池负责挑选/消费/重试/过期，u["cue"] 只留作
             # 提示词里的「你们说好的」。少了这一步，cue 永远不会被消费——消费分支要求
             # category=="cue"，而自动心跳里的 category 永远是 "anchor"/"greet"/…，
@@ -1759,7 +1955,11 @@ class SocialEngine:
             # 中间层到此为止（不再回访、也不再进注入），但**棒子交给长期层**：
             # 「对方终于答了」是这段关系里真实发生过的事，不该随账本一起消失。
             try:
-                for about in loops_resolved_by(u, msg):
+                # 用「复核版」收口：它比 loops_resolved_by 更保守——除了要能判出
+                # 「这句在收尾」，还要求这句里有明确的结果词（过了/搞定/黄了…）。
+                # 不给 confident=True：engine 这边没有强证据，宁可多留一条线索，
+                # 也不要因为对方随口一句「嗯」就把没办完的事划掉。
+                for about in loops_resolved_by_review(u, msg):
                     self._drop_loop(u, about)
                     self.state.mark_dirty()
                     self._remember_open_closed(umo, uid, about, msg)
@@ -2510,6 +2710,54 @@ class SocialEngine:
         )
         if not ok:
             return
+        # ── 群硬收口（social/throttle.py）──
+        # 群里已经连着几轮「她插话、没人理」时先闭嘴一段时间。判据是**已确认送达**
+        # 的轮次时间戳（samples 里 self=True 的 ts），不是「想发」的次数：没送出去的
+        # 那些不该把群算成热场。整段 fail-open——算不出来就照常插话。
+        if getattr(self.cfg, "group_closeout_enabled", False):
+            try:
+                _rounds = [
+                    _num(s.get("ts", 0) or 0)
+                    for s in (g.get("samples") or [])
+                    if s.get("self") and _num(s.get("ts", 0) or 0) > 0
+                ]
+                _closeout = closeout_state(
+                    _rounds,
+                    now,
+                    window_seconds=self.cfg.group_closeout_window_seconds,
+                    threshold=self.cfg.group_closeout_threshold,
+                    cooldown_seconds=self.cfg.group_closeout_cooldown_seconds,
+                )
+            except Exception as e:
+                self.log(f"群收口判定失败（照常插话）: {e}")
+                _closeout = {}
+            if isinstance(_closeout, dict) and _closeout.get("active"):
+                # 归因只决定「这条算不算在叫她」：At / 当面叫名字是直呼，其余一律
+                # 按普通插话处理（收口期间静音）。reason 用闸门码，便于状态页回放。
+                try:
+                    _attr = groupflow.attribution(
+                        latest_human,
+                        bot_id=bid,
+                        bot_names=(str(self._last_persona.get(bid, "") or ""),),
+                        known_names=tuple(speakers),
+                    )
+                    _attr_reason = str((_attr or {}).get("reason") or "")
+                except Exception:
+                    _attr_reason = ""
+                _closeout_reason = {
+                    "mention": "mention",
+                    "name_only": "direct_word",
+                }.get(_attr_reason, "flow_interject")
+                if not closeout_allows(_closeout_reason, _closeout):
+                    self._note_blocked(
+                        "closeout_active",
+                        "群里最近连着她插话没人接，先收口 "
+                        f"{int(_num(_closeout.get('remaining_seconds', 0)))} 秒",
+                        reason=_closeout_reason,
+                        recent_wakeups=int(_num(_closeout.get("recent_wakeups", 0))),
+                        until=float(_num(_closeout.get("until", 0))),
+                    )
+                    return
         group_ctx = self._build_group_ctx(bid, gid, g)
         group_ctx["now"] = now
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
@@ -4402,6 +4650,199 @@ class SocialEngine:
             del kept[:-15]
         self._m["timeline"] = kept
 
+    # ─── 闸门原因码（v2.1.3）─────────────────────────────
+    #
+    # 每个「没发出去」都要能回放：哪一刻、被哪道闸、什么码。以前只有一句中文，
+    # 机器侧只能靠 `_block_category` 做子串猜分类——文案改一个字就掉进「其它」。
+    # 这里给每道闸一个下划线小写英文码，与中文文案**并列**：对外元组形状与文案
+    # 逐字不变（老调用方和测试不受影响），码只写进 trace 与计数。
+
+    def _gate_day_of(self, ts: float) -> str:
+        """把时刻折成自然日（本地时区）。"""
+        try:
+            return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return ""
+
+    def _gate_roll_day(self, now: float) -> None:
+        """跨自然日就把计数清零。
+
+        不清的话「今天被拦了 37 次」会一直挂在那儿、跨零点也不掉，面板上的
+        「今天」就永远在撒谎。
+        """
+        day = self._gate_day_of(now)
+        if not day:
+            return
+        # 只有「确实知道上一天是哪天」时才清：_gate_day 为空说明这份计数没有
+        # 归属日期（刚启动、或读侧把坏数据跳过了），清掉等于把当天的账抹了。
+        if self._gate_day and day != self._gate_day:
+            self._gate_counts = {}
+        self._gate_day = day
+
+    def _load_gate_state(self) -> None:
+        """从 state.json 顶层接回 trace 与当天计数（读侧全容错）。
+
+        状态文件可能被手改、被旧版本写坏、被别的进程截断：任何形状不对的条目
+        都直接跳过，绝不能让插件在加载时抛——那等于整个社交功能起不来。
+        """
+        try:
+            data = getattr(self.state, "data", None)
+            if not isinstance(data, dict):
+                return
+            raw_trace = data.get("_gate_trace")
+            if isinstance(raw_trace, list):
+                kept = []
+                for row in raw_trace[-GATE_TRACE_PERSIST:]:
+                    if not isinstance(row, dict):
+                        continue
+                    code = row.get("code")
+                    if not isinstance(code, str) or not code:
+                        continue
+                    _raw_at = row.get("at")
+                    # 时间戳不是数字的条目没法放进「最近 24 小时」，也不该被
+                    # 悄悄当成 0（那会让它在窗口里恒久存在或恒久消失）。
+                    if isinstance(_raw_at, bool) or not isinstance(_raw_at, (int, float)):
+                        continue
+                    at = float(_raw_at)
+                    detail = row.get("detail")
+                    kept.append(
+                        {
+                            "code": code[:40],
+                            "text": str(row.get("text") or "")[:200],
+                            "at": at,
+                            "detail": detail if isinstance(detail, dict) else {},
+                        }
+                    )
+                self._gate_trace.extend(kept)
+            raw_counts = data.get("_gate_counts")
+            if isinstance(raw_counts, dict):
+                day = str(raw_counts.get("day") or "")
+                today = self._gate_day_of(self._time())
+                if day and day == today and isinstance(raw_counts.get("counts"), dict):
+                    self._gate_day = day
+                    clean: Dict[str, int] = {}
+                    for key, value in raw_counts["counts"].items():
+                        if not isinstance(key, str) or not key:
+                            continue
+                        try:
+                            n = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if n > 0:
+                            clean[key[:40]] = n
+                    self._gate_counts = clean
+                elif today:
+                    # 昨天那份不再冒充「今天」；trace 里的明细还留着，回放仍可用。
+                    self._gate_day = today
+        except Exception as exc:  # pragma: no cover - 状态坏掉时按空处理
+            logger.debug(f"[autonomous_social] 接回闸门原因码失败（按空处理）: {exc}")
+
+    def _persist_gate_state(self) -> None:
+        """把 trace/计数同步进 state.json 的内存数据，交给现有 flush/save 落盘。
+
+        不在这里直接写盘：`_blocked` 跑在发送路径上，每个被拦下的候选都同步
+        fsync 一次会把事件循环拖住；状态层本来就是「标脏 + 周期性 flush」。
+        """
+        try:
+            data = getattr(self.state, "data", None)
+            if not isinstance(data, dict):
+                return
+            rows = list(self._gate_trace)
+            if len(rows) > GATE_TRACE_PERSIST:
+                rows = rows[-GATE_TRACE_PERSIST:]
+            data["_gate_trace"] = rows
+            data["_gate_counts"] = {"day": self._gate_day, "counts": dict(self._gate_counts)}
+            self.state.mark_dirty()
+        except Exception as exc:  # pragma: no cover - 记账失败不影响发送判定
+            logger.debug(f"[autonomous_social] 记录闸门原因码失败: {exc}")
+
+    def _record_gate(
+        self, code: str, text: str, detail: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """记一次「被这道闸拦下」。**永不抛**：拦下这件事本身比记账重要。"""
+        try:
+            now = self._time()
+            self._gate_roll_day(now)
+            _code = str(code or "").strip()[:40] or "unspecified"
+            self._gate_trace.append(
+                {
+                    "code": _code,
+                    "text": str(text or "")[:200],
+                    "at": now,
+                    "detail": dict(detail or {}),
+                }
+            )
+            self._gate_counts[_code] = int(self._gate_counts.get(_code, 0) or 0) + 1
+            self._persist_gate_state()
+        except Exception as exc:  # pragma: no cover - fail-open
+            logger.debug(f"[autonomous_social] 记录闸门原因失败: {exc}")
+
+    def _blocked(self, code: str, text: str, **detail: Any) -> Tuple[bool, str]:
+        """记一道闸并返回 `(False, 原文案)`。
+
+        对外契约**一个字都不改**：调用点原来是 `return False, "..."`，换成
+        `return _gate_blocked(self, "码", "...")` 后返回值逐字相同，上层 `if not ok`
+        与老测试完全不受影响；码只给机器看。
+        """
+        self._record_gate(code, text, detail)
+        return False, text
+
+    def _note_blocked(self, code: str, text: str, **detail: Any) -> None:
+        """只记账、不改变返回值——给返回三元组的路径用（形状不能改）。"""
+        self._record_gate(code, text, detail)
+
+    def gate_report(self, hours: float = GATE_REPORT_HOURS) -> Dict[str, Any]:
+        """最近 N 小时「没发出去」的原因码排行（状态页/容器侧直接读）。
+
+        口径：窗口内的排行从 `_gate_trace` 数——环形缓冲只有 64 条，是**样本**
+        不是全量；`counts_today` 是当天全量计数。trace 被冲掉（刚重启、被别的
+        事件挤掉）时退回当天计数，至少不会显示成「一道闸都没拦过」。
+        """
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            hours = GATE_REPORT_HOURS
+        if not math.isfinite(hours) or hours <= 0:
+            hours = GATE_REPORT_HOURS
+        try:
+            now = self._time()
+        except Exception:  # pragma: no cover - 时间源坏掉时按 0 算窗口
+            now = 0.0
+        self._gate_roll_day(now)
+        cutoff = now - hours * 3600.0
+        top: Dict[str, int] = {}
+        window_rows: List[Dict[str, Any]] = []
+        for row in self._gate_trace:
+            try:
+                at = float(row.get("at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            # 未来时间（墙钟回拨）不算进窗口，否则「最近 24 小时」会被一条脏数据撑满。
+            if at < cutoff or at > now + 300.0:
+                continue
+            code = str(row.get("code") or "")
+            if not code:
+                continue
+            top[code] = top.get(code, 0) + 1
+            window_rows.append(row)
+        ranked = sorted(top.items(), key=lambda kv: (-kv[1], kv[0]))
+        # 只有 trace 一条都没有（刚重启、缓冲被清）时才退回当天计数；trace 里有
+        # 数据但都落在窗口外，说明「最近 N 小时确实没被拦过」，不能拿旧账充数。
+        if not ranked and not self._gate_trace and self._gate_counts:
+            ranked = sorted(
+                ((k, int(v or 0)) for k, v in self._gate_counts.items()),
+                key=lambda kv: (-kv[1], kv[0]),
+            )
+        return {
+            "window_hours": round(hours, 1),
+            "day": self._gate_day,
+            "top": [[code, int(cnt)] for code, cnt in ranked[:8]],
+            "counts_today": {k: int(v or 0) for k, v in self._gate_counts.items()},
+            "total_today": sum(int(v or 0) for v in self._gate_counts.values()),
+            "trace_size": len(self._gate_trace),
+            "recent": [dict(r) for r in window_rows[-8:]],
+        }
+
     def timeline_text(self) -> str:
         """C2：最近 24h 的决策时间线（最新在后，只取最后 10 条）。"""
         rows = self._m.get("timeline")
@@ -5315,6 +5756,54 @@ class SocialEngine:
             out.append((uid, u, hits[0][1]))
         return out
 
+    def _note_promise_deadline(
+        self, u: Dict[str, Any], promise: str, sent_ts: float
+    ) -> None:
+        """v2.1.6：承诺里带了时间意图（「下周三」「3月5号」）就按那个时刻到期。
+
+        旧口径是 state.note_promise 写死的 at + PROMISE_WAIT_SECONDS（20 小时），
+        于是「下周三给你看」会在第二天中午被兑现——不是她记性差，是插件根本没在听
+        「什么时候」。这里在**落库之后**把那一条的 due 改成解析出的绝对时刻；
+        解析不出（绝大多数承诺本来就没有时间词）就原样不动，与 v2.1.5 完全一致。
+
+        为什么改写 due 而不是另加一个字段：到点判断全在 threads.live_promises /
+        _promise_due 里，它们只认 due；写对 due 就等于所有读侧一起生效，不必去动
+        state.py 里「许下时刻 + 固定等待」的旧公式。
+
+        due_at / due_kind / due_text 一并留下，是为了排查「这次为什么提前/推后」：
+        线上只看得见 due，看不出它是写死的还是解析出来的。
+        """
+        try:
+            got = parse_deadline(
+                promise, sent_ts, tz_offset=self._tz_offset_seconds()
+            )
+        except Exception as e:      # 解析层自己兜过一次，这里再兜一层
+            self.log(f"解析承诺时间失败（{str(promise)[:20]}）: {e}")
+            return
+        at = got.get("at")
+        if not isinstance(at, (int, float)) or at <= 0:
+            return
+        about = str(promise or "").strip()
+        for item in promise_entries(u):
+            if str(item.get("about", "")).strip() != about:
+                continue
+            item["due"] = float(at)
+            item["due_at"] = float(at)
+            item["due_kind"] = str(got.get("kind") or "")
+            item["due_text"] = str(got.get("text") or "")
+            item["due_confidence"] = float(got.get("confidence") or 0.0)
+            break
+
+    def _tz_offset_seconds(self) -> Optional[int]:
+        """面板时区（分钟）折成秒；auto/认不出返回 None（解析层改用本机时区）。"""
+        try:
+            minutes = self._plugin_tz_offset()
+        except Exception:
+            return None
+        if not isinstance(minutes, int):
+            return None
+        return int(minutes) * 60
+
     def _miss_pick(
         self,
         bid: str,
@@ -6183,9 +6672,24 @@ class SocialEngine:
         for bid, uid, u, about, overdue in sorted(loops, key=lambda item: -item[4]):
             if budget.get(bid, 0) <= 0 or not pre_take(bid):
                 continue
+            # 这条线索是不是「追问过、对方还没回音」？是的话这一轮按复核语气问，
+            # 而不是当成一件新事从头问（48 小时内有效，见 threads.loop_review_pending）。
+            _review = False
+            try:
+                _review = bool(loop_review_pending(u, about, now))
+            except Exception as e:
+                self.log(f"判断追问复核失败（按新话题问）: {e}")
+                _review = False
+            if _review:
+                _gate_note(
+                    self,
+                    "followup_review",
+                    f"追问「{about[:20]}」还没回音，这一轮按复核语气问",
+                    about=str(about or "")[:40],
+                )
             jobs.append(job_of(
                 bid, uid, u, 0.0,
-                (loop_reason(about), loop_meta(about)),
+                (loop_reason(about), loop_meta(about, review=_review)),
                 f"回访「{about}」（到期 {overdue / 60:.0f} 分钟后）",
             ))
 
@@ -6483,13 +6987,23 @@ class SocialEngine:
         now = self._time()
         umo = str(u.get("umo", "") or "")
         if not umo:
-            return False, "没有可用的会话来源（umo），发不出去"
+            return _gate_blocked(self, "no_session", "没有可用的会话来源（umo），发不出去")
 
         # 发送侧熔断：平台发不出去的时候，先把消息写好再失败是纯浪费。
         # 这道闸必须开在调 LLM 之前，否则它根本挡不住任何开销。
         breaker = self.send_breaker_left(bid)
         if breaker > 0:
-            return False, f"发送侧熔断中（还剩 {int(breaker / 60)} 分钟），本轮不生成任何内容"
+            return _gate_blocked(self, 
+                "breaker_open",
+                f"发送侧熔断中（还剩 {int(breaker / 60)} 分钟），本轮不生成任何内容",
+                left_seconds=round(breaker, 1),
+            )
+
+        # v2.1.5 平台熔断：账号级拒发连续两次就停两小时。与上面那道「按角色熔断」
+        # 同理，必须开在 LLM 之前——先写一遍再失败是最贵的失败方式。
+        _plat_open, _plat_text = SocialEngine._platform_circuit(self, now)
+        if _plat_open:
+            return _gate_blocked(self, "platform_circuit", _plat_text)
 
         # 累到没力气说话：这里才是**唯一**收口。
         # 原来把这条闸加在 `gate_reason` 里，只挡住了有由头的那一路（实测 61 条里
@@ -6510,7 +7024,11 @@ class SocialEngine:
         _sc_waive_energy = _sc and SocialEngine._special_care_ignore_quiet_on(self)
         if energy < self.cfg.gate_energy_floor and not _sc_waive_energy:
             logger.debug(f"[autonomous_social] 没发（{uid}）：她太累了（精力 {energy:.0f}）")
-            return False, f"她太累了（精力 {energy:.0f}，坐不住也不想说话）"
+            return _gate_blocked(self, 
+                "too_tired",
+                f"她太累了（精力 {energy:.0f}，坐不住也不想说话）",
+                energy=round(energy, 1),
+            )
 
         # v2.0.6（issue #3）：安静时段在「唯一收口」上必须是硬闸。
         #
@@ -6521,7 +7039,11 @@ class SocialEngine:
             _q_here, _q_why = SocialEngine._quiet_state(self, bid, now)
             if _q_here:
                 logger.debug(f"[autonomous_social] 没发（{uid}）：{_q_why}")
-                return False, f"现在是安静时段（{_q_why}），不打扰"
+                return _gate_blocked(self, 
+                    "quiet_hours",
+                    f"现在是安静时段（{_q_why}），不打扰",
+                    why=str(_q_why or ""),
+                )
 
         # **兄弟 bot 的第二道闸**（v1.28.16）。
         #
@@ -6534,7 +7056,7 @@ class SocialEngine:
         if is_bot_peer:
             _peer_block = SocialEngine._bot_peer_gate_reason(self, bid, uid, u, now)
             if _peer_block:
-                return False, _peer_block
+                return _gate_blocked(self, "bot_peer_blocked", _peer_block, uid=uid)
 
         # 特别关心也**不打断正在进行的对话**（v1.28.17）：放宽的是「对方没动静 /
         # 她在睡 / 安静时段」，不是「人还在聊她插一句」。线上反馈的「接不上话、
@@ -6553,7 +7075,11 @@ class SocialEngine:
                         float(self.cfg.recent_talk_minutes) * 60.0,
                     )
                     if _seen > 0 and now - _seen < _recent:
-                        return False, "刚聊上，这会儿不插话"
+                        return _gate_blocked(self, 
+                            "just_talked",
+                            "刚聊上，这会儿不插话",
+                            seen_ago=round(now - _seen, 1),
+                        )
                 except (TypeError, ValueError):
                     pass
 
@@ -6572,7 +7098,7 @@ class SocialEngine:
         core_root = SocialEngine._read_core_root(self)
         _tier, _aff, _warmth = self._tier_of(bid, uid, u, core_root, self._time())
         if self._quiesced(u):
-            return False, "已经决定不再主动找 TA 了（等 TA 先开口）"
+            return _gate_blocked(self, "given_up", "已经决定不再主动找 TA 了（等 TA 先开口）")
 
         # 真回避：对方连着几天没开口、她这期间还在主动发 → **全面**停发，等对方先开口。
         #
@@ -6583,7 +7109,7 @@ class SocialEngine:
         # 包括 greet / cue / closer。
         _avoid = SocialEngine._avoidance_note(self, u, now)
         if _avoid and not _sc:
-            return False, _avoid
+            return _gate_blocked(self, "peer_silent_avoid", _avoid)
 
         # 上一条主动消息还悬着（发出去了、还没回）：别追着说。
         #
@@ -6598,14 +7124,38 @@ class SocialEngine:
         is_greet = category == "greet"
         has_cue = bool(live_cue(u, self._time()) if self.cfg.cue_followup else False)
         if not (is_greet or has_cue):
+            # TA 的话还没说完（「我今天去面试，那个…」）：这时候开口就是抢话。
+            # 只认 30 分钟内的新鲜信号，且同样让问候/到点由头/特别关心豁免——
+            # 半截话是「别插嘴」，不是「永远别说话」。
+            _wait = str(u.get("await_unfinished", "") or "")
+            _wait_at = _num(u.get("await_unfinished_at", 0) or 0)
+            if (
+                _wait
+                and _wait_at > 0
+                and self._time() - _wait_at <= UNFINISHED_WAIT_SECONDS
+                and not _sc
+            ):
+                return _gate_blocked(
+                    self,
+                    "await_unfinished",
+                    "TA 上一句还没说完，这会儿先不插话，等 TA 把话讲完",
+                    wait=_wait,
+                    age_seconds=round(self._time() - _wait_at, 1),
+                )
             try:
                 silent_sent = int(_num(u.get("silent_sent", 0) or 0))
             except (TypeError, ValueError):
                 silent_sent = 0
             if silent_sent >= COLD_SILENCE_SENT and not _sc:
-                return False, f"TA 一直没回、她已经主动发了 {silent_sent} 条，先等 TA 开口"
+                return _gate_blocked(self, 
+                    "pending_unanswered",
+                    f"TA 一直没回、她已经主动发了 {silent_sent} 条，先等 TA 开口",
+                    silent_sent=silent_sent,
+                )
             if str(u.get("pending_result", "") or "") == "waiting" and not _sc:
-                return False, "上一条主动发的还没回，现在再发就是追着说"
+                return _gate_blocked(self, 
+                    "awaiting_user", "上一条主动发的还没回，现在再发就是追着说"
+                )
 
         # 轻量测试桩只挂了 `_gap_left` 的旧签名（没有 special_care 关键字），
         # 这里退回旧调用——桩里本来就没有特别关心，行为与旧版一致。
@@ -6614,7 +7164,11 @@ class SocialEngine:
         except TypeError:
             gap_left = self._gap_left(u, _tier, self._time())
         if gap_left > 0 and not (self._urge_is_eager(u) or has_cue):
-            return False, f"离上一条才过 {int(gap_left / 60)} 分钟，这次先不开口"
+            return _gate_blocked(self, 
+                "cooldown",
+                f"离上一条才过 {int(gap_left / 60)} 分钟，这次先不开口",
+                gap_seconds=round(gap_left, 1),
+            )
 
         # 特别关心的日上限（v1.28.17）：放宽不等于无限发。默认 8 条/天/人，
         # 计数落在用户状态里，重启不丢。
@@ -6632,7 +7186,12 @@ class SocialEngine:
             else:
                 _sent_today = 0
             if _cap > 0 and _sent_today >= _cap:
-                return False, f"特别关心今天已经找过 TA {_sent_today} 次，剩下的明天再说"
+                return _gate_blocked(self, 
+                    "special_care_cap",
+                    f"特别关心今天已经找过 TA {_sent_today} 次，剩下的明天再说",
+                    sent_today=_sent_today,
+                    cap=_cap,
+                )
 
         # 每小时总预算（安全闸）。**念头不清零**——挡住这一轮，下一轮它还在，
         # 所以这只是「别一次涌出」，不是「今天到此为止」。
@@ -6650,9 +7209,11 @@ class SocialEngine:
             if _sc_hour_cap > 0:
                 _hour_cap = _sc_hour_cap
         if _hour_cap > 0 and self._hourly_left(bid, self._time(), cap=_hour_cap) <= 0:
-            return False, (
+            return _gate_blocked(self, 
+                "hourly_cap",
                 f"这个角色这一小时已经发过 {_hour_cap} 条，先歇着"
-                "（念头保留，下一轮继续）"
+                "（念头保留，下一轮继续）",
+                cap=_hour_cap,
             )
 
         # 这个人的上一次发送失败过：这会儿写好了也送不到。
@@ -6661,7 +7222,11 @@ class SocialEngine:
         # P2-03：统一走 `_send_fail_left`，所有发送入口（含连发补发）读同一笔账。
         fail_left = SocialEngine._send_fail_left(self, u)
         if fail_left > 0:
-            return False, f"上次发给 TA 没发出去，{int(fail_left / 60)} 分钟内不再试"
+            return _gate_blocked(self, 
+                "send_failed_recently",
+                f"上次发给 TA 没发出去，{int(fail_left / 60)} 分钟内不再试",
+                left_seconds=round(fail_left, 1),
+            )
 
         # 私聊主动内容（可能很亲密，如「我好想你」）绝不能发进群：群会话只走群聊心
         # 流，那边用群感知的口吻生成。一个群 umo 出现在 1:1 用户池里必是幽灵（观察
@@ -6670,7 +7235,11 @@ class SocialEngine:
         if history_ingest.umo_kind(umo) == "group":
             self.state.bot(bid).get("users", {}).pop(uid, None)
             self.state.mark_dirty()
-            return False, f"目标 {umo} 是群会话，不在这里发 1:1 主动消息（已清掉这条群幽灵）"
+            return _gate_blocked(self, 
+                "group_target",
+                f"目标 {umo} 是群会话，不在这里发 1:1 主动消息（已清掉这条群幽灵）",
+                umo=umo,
+            )
         user_core = None
         core_context = "没有可用的 Humanoid Core 状态。"
         try:
@@ -6838,16 +7407,64 @@ class SocialEngine:
         # 这个实例级单字段上，`batch_send_concurrency=3` 时 A 的验收失败日志与
         # `last_rejected` 可能是 B 的原文，跨用户内容串台、还会经状态页显示给主人。
         raw_generated = ""
+        # ── 收尾沉默守卫（social/closing.py）──
+        # 判定只算一次：提示词（closing_instruction）与「这条不发」的闸门必须同源，
+        # 否则会出现「提示模型别再道别、转头又把这条静默掉」这种自相矛盾。
+        # 放在生成之前算，是因为提示词生成时就要用；真正的拦截在生成之后。
+        _closing: Dict[str, Any] = {}
+        # 这一轮用过的证据卡。规划路径填、generate 路径留空；证据闸两种路径都读。
+        _cards: List[Dict[str, Any]] = []
+        # 用 getattr 兜底：老测试/第三方构造的 cfg 可能根本没有这几个字段，
+        # 缺字段就当「没开这个守卫」——少回一句是优化，不能因为它把正常回话打断。
+        if getattr(self.cfg, "closing_guard_enabled", False):
+            try:
+                _dialogue, _current_text = _closing_dialogue(u.get("conversation"))
+                _closing = closing_decision(
+                    current_text=_current_text,
+                    dialogue=_dialogue,
+                    at=now,
+                    has_media=bool(u.get("last_in_media")),
+                    window_seconds=getattr(
+                        self.cfg, "closing_guard_window_seconds", DEFAULT_CLOSING_WINDOW
+                    ),
+                    enabled=True,
+                )
+            except Exception as exc:
+                # 守卫的价值是「少回一句」，不是「保证回话」：任何意外都照常发。
+                self.log(f"收尾守卫判定失败（照常回）: {exc}")
+                _closing = {}
         # 记忆联动：装了记忆插件就先把这个人的长期记忆拉出来，揉进这次生成。
         # 检索跟着**这次的由头**走，不是空串。
         memory_note = await self._fetch_memory_note(umo, uid, query=reason)
-        if allow_veto and self.cfg.llm_gate:
+        # 工具循环拿的是「检索原始结果」：下面可能把收尾提示追加进 memory_note，
+        # 那条提示是给写作层看的临时指令，不是长期记忆。回灌给工具会让模型以为
+        # 记忆里真有这么一条，所以先留一份追加前的原始值给工具快照。
+        _memory_raw = memory_note
+        if (
+            _closing
+            and getattr(self.cfg, "closing_guard_prompt_enabled", False)
+            and not _closing.get("suppress_reply")
+        ):
             try:
-                decision = await self.generator.decide(
-                    umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                    at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
+                _closing_note = closing_instruction(_closing)
+            except Exception:
+                _closing_note = ""
+            if _closing_note:
+                # 只追加一次；memory_note 可能是空串，别留个开头的空行。
+                memory_note = f"{memory_note}\n{_closing_note}" if memory_note else _closing_note
+        if allow_veto and self.cfg.llm_gate:
+            # v2.1.4：先规划后写作。规划路径不可用（没开、模型退避、输出解析不了、
+            # 或者老版本 generator 根本没有 decide_with_plan）时原样退回 decide()，
+            # 行为与 2.1.3 一致；退路写在 _decide_proactive 里，只留一处。
+            try:
+                decision, _cards = await SocialEngine._decide_proactive(
+                    self,
+                    umo=umo, u_copy=u_copy, core_context=core_context, reason=reason,
+                    reason_meta=reason_meta, persona_prompt=persona_prompt, mind=mind,
+                    now=now, bid=bid, uid=uid, memory_note=memory_note,
                 )
             except Exception as e:
+                decision, _cards = None, []
                 if throttle.allow(f"speak.decide.{bid}"):
                     logger.warning(
                         f"[autonomous_social] LLM 调用失败（provider 取到了但请求挂了）: {type(e).__name__}: {e}"
@@ -6860,7 +7477,7 @@ class SocialEngine:
                 # 一次持续十几小时的 key 失效就够把 3 次重试预算全烧光。
                 note = "LLM 不可用（provider 取不到），本轮未发送"
                 self._last_llm_error[bid] = note
-                return False, note
+                return _gate_blocked(self, "llm_unavailable", note)
             if not decision.send:
                 self._m["last_failure"] = f"[{bid}] 模型说现在不该说：{decision.why_not[:40]}"
                 self._m["veto_total"] = int(self._m.get("veto_total", 0)) + 1
@@ -6879,13 +7496,45 @@ class SocialEngine:
                 # 这里不再另写一个没人读的 retry_at——那是 defer_cue 时代的残留。
                 self.state.mark_dirty()
                 self.state.save()
-                return False, f"想过，但觉得现在不该说：{decision.why_not}"
+                # 规划说 skip 是规划层的结论，码要与「模型写完觉得不该说」分开：
+                # 前者是「这件事现在不值得开口」，后者是「这句话不合适」；排障时
+                # 一个该去看证据卡/时间，一个该去看措辞。
+                _plan_obj = getattr(decision, "plan", None)
+                if _plan_obj is not None and str(getattr(_plan_obj, "decision", "") or "") == "skip":
+                    return _gate_blocked(self, 
+                        "plan_skipped",
+                        f"想过，但觉得现在不该说：{decision.why_not}",
+                        skip_reason=str(
+                            getattr(_plan_obj, "skip_reason", "") or decision.why_not or "other"
+                        )[:40],
+                    )
+                return _gate_blocked(self, 
+                    "model_declined",
+                    f"想过，但觉得现在不该说：{decision.why_not}",
+                    why=str(decision.why_not or "")[:80],
+                )
             parts = decision.parts
         else:
             try:
-                parts = await self.generator.generate(
-                    umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
-                    at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
+                # 生成前先确认生成器还在：开关关时 _generate_parts 内部仍走
+                # self.generator.generate(...) 这条老路；连 generate 都没有的生成器，
+                # 在这里失败比在内部再抛一次更好定位（下面 except 记 warning 并 defer）。
+                if not callable(getattr(self.generator, "generate", None)):
+                    raise RuntimeError("生成器缺少 generate 方法")
+                parts = await SocialEngine._generate_parts(
+                    self,
+                    umo=umo,
+                    target=u_copy,
+                    core_context=core_context,
+                    reason=reason,
+                    reason_meta=reason_meta,
+                    persona_prompt=persona_prompt,
+                    mind=mind,
+                    at=now,
+                    clock_offset=self._clock_offset_for(bid),
+                    memory_note=memory_note,
+                    memory_raw=_memory_raw,
+                    bid=bid,
                 )
             except Exception as e:
                 if throttle.allow(f"speak.generate.{bid}"):
@@ -6896,13 +7545,38 @@ class SocialEngine:
             if not parts:
                 note = "LLM 生成为空（provider 不可用或调用失败）"
                 self._last_llm_error[bid] = note
-                return False, note
+                return _gate_blocked(self, "generation_empty", note)
+
+        # 收尾守卫：她上一轮已经收过尾、对方这一轮也只是道别 → 这条不发。
+        # 放在生成之后：模型已经想过一遍，这里只做「要不要发」的最后裁量，
+        # 不改变生成侧任何东西（提示词那一半在上面已经用同一个 decision 加过了）。
+        if _closing.get("suppress_reply"):
+            self.log(f"收尾守卫：这一轮只是道别，静默（{_closing.get('reason')}）")
+            defer_cue()
+            return _gate_blocked(
+                self,
+                "closing_guard",
+                "这一轮只是收尾/道别，她上一条已经收过尾了，不必再补一句",
+                action=str(_closing.get("action") or "silent"),
+                reason=str(_closing.get("reason") or ""),
+            )
+
+        # 生成后自评（v2.1.5）：模型写完先自己判一次「这条到底该不该发」。
+        # 放在验收层之前：自评说「丢」就不必再走一遍规则；说「改写」则换正文
+        # 再让下面的验收重判——改写不能成为绕过验收的后门。
+        if parts:
+            _reviewed = await SocialEngine._review_draft(self, parts, decision, _cards)
+            if _reviewed is None:
+                self.log("生成后自评：这条不该发，丢掉")
+                defer_cue()
+                return _gate_blocked(self, "draft_rejected", "生成后自评认为这条不该发，丢掉")
+            parts = _reviewed
 
         # 生成期间对方可能发了新消息
         latest = self.state.user(bid, uid)
         if self._time() - _num(latest.get("last_seen", 0)) < FINAL_CHECK_GAP_SECONDS:
             defer_cue()
-            return False, "对方刚发了新消息，不插话"
+            return _gate_blocked(self, "peer_just_replied", "对方刚发了新消息，不插话")
 
         # ── 验收层 ──────────────────────────────────────────────
         # SEND/NO 协议只保证**格式**（首行是不是 SEND、有没有正文），完全不保证内容。
@@ -6995,7 +7669,9 @@ class SocialEngine:
                 anchor_mod.mark_failed(u, str(_ra.get("about")), self._time())
             self.state.mark_dirty()
             defer_cue()
-            return False, f"验收不过：{why}"
+            return _gate_blocked(self, 
+                "verify_rejected", f"验收不过：{why}", why=str(why or "")[:120]
+            )
 
         # 由头在**真的发出去**这一刻才消费。前面任何一步失败都不算——
         # 一次模型抽风不该让这个话题冷掉 7 天。
@@ -7007,7 +7683,7 @@ class SocialEngine:
             allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
         )
         if not segments:
-            return False, "拆段规划为空"
+            return _gate_blocked(self, "no_segments", "拆段规划为空")
         # 逐段验收：`parts[0]` 过了**不代表后续段也过**——模型常在结尾再补一句纯括号
         # 的内心（「（记住了 宝宝16岁…）」），拆段后那一段会**单独**发出去，看起来就是
         # 「内心独白被当成发言发了一条」。旧版只验 parts[0]，这一路完全免检。
@@ -7037,7 +7713,9 @@ class SocialEngine:
             # 对普通由头是空操作，下一轮会被重新挑中，每轮复发。
             fail_anchor()
             defer_cue()
-            return False, f"后续段验收不过：{seg_why}"
+            return _gate_blocked(self, 
+                "segment_rejected", f"后续段验收不过：{seg_why}", why=str(seg_why or "")[:120]
+            )
         # 后续段的跨用户撞车也补一道：旧版只拿 parts[0] 比，补发的段会绕过去。
         if self.cfg.cross_user_repeat_hours > 0:
             others = self.state.recent_proactive_others(
@@ -7052,14 +7730,100 @@ class SocialEngine:
                     # 同上：这件事该换一件，记一次失败，别每轮重试同一条由头。
                     fail_anchor()
                     defer_cue()
-                    return False, hit
+                    return _gate_blocked(self, "cross_user_repeat", hit, hit=str(hit or "")[:80])
+        # ── 发送前四道闸（v2.1.4）────────────────────────────────
+        # 位置：拆段与验收都过了、配额还没占。放在更早会拿半截正文判（拆段前
+        # parts 与最终发出的 segments 可能不是同一份），放在发送之后就没有意义。
+        # 拦下不消费由头：这几道说的是「这一条不能这么发」，不是「这件事不值得说」，
+        # 与 verify 失败（她驾驭不了这句话）要分开算。
+        _gate_text = "\n".join(str(s or "") for s in segments)
+        _gate_dialogue: List[Dict[str, Any]] = []
+        try:
+            _ledger_rows, _ = _closing_dialogue(u.get("conversation"))
+            _gate_dialogue = _guard_dialogue(_ledger_rows)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 对话账本转换失败（自接自闸放行）: {exc}")
+            _gate_dialogue = []
+        _gate_inflight: List[Dict[str, Any]] = []
+        _gate_now = now
+        try:
+            _gate_now = self._time()
+            for _row in self.state.recent_proactive(bid, uid, _gate_now):
+                if not isinstance(_row, dict):
+                    continue
+                _ts = _num(_row.get("ts", 0) or 0)
+                if _ts and 0 <= _gate_now - _ts <= 1800.0:
+                    # social 没有投递回执账本：最近发出去的主动消息就是「可能还在路上」
+                    # 的那批（发送成功即算 accepted），这里按 accepted 喂给闸。
+                    _gate_inflight.append(
+                        {"state": "accepted", "text": str(_row.get("text") or ""), "ts": _ts}
+                    )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 在途消息收集失败（该闸放行）: {exc}")
+            _gate_inflight = []
+        _gate_code, _gate_detail = "", ""
+        try:
+            _gate_code, _gate_detail = SocialEngine._pre_send_gate(
+                self,
+                _gate_text,
+                dialogue=_gate_dialogue,
+                inflight=_gate_inflight,
+                plan=getattr(decision, "plan", None) if decision is not None else None,
+                cards=_cards,
+                at=_gate_now,
+            )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 发前闸判定失败（照常发）: {exc}")
+            _gate_code, _gate_detail = "", ""
+        if _gate_code:
+            _gate_cn = {
+                "refusal_detected": "这条是模型/平台的拒答话术，不是她的话，不发",
+                "self_continuation": "上一句是她说的、对方没接，这条又在接自己的话，不发",
+                "duplicate_inflight": "和在途未确认的那条太像，可能重复，不发",
+                "evidence_missing": "这条引用了证据卡里没有的事（编的），不发",
+            }.get(_gate_code, "发送前闸拦下")
+            self.log(f"发前闸拦下：{_gate_code}（{_gate_detail}）")
+            return _gate_blocked(self, _gate_code, _gate_cn, detail=str(_gate_detail or "")[:120])
+        # ── v2.1.5 发信链路三件：熔断 → 收口 → 预算 ─────────────
+        # 都放在配额之前：它们拦的是「这一轮根本不该占用发送额度」的情况，
+        # 先占配额再退，会把这一小时的名额白白烧掉。
+        _plat_open, _plat_text = SocialEngine._platform_circuit(self, _gate_now)
+        if _plat_open:
+            return _gate_blocked(
+                self, "platform_circuit", _plat_text, detail=str(_plat_text or "")[:120]
+            )
+        _rhythm_code, _rhythm_text = SocialEngine._rhythm_gate(self, bid, uid, now=_gate_now)
+        if _rhythm_code:
+            _gate_note(self, _rhythm_code, _rhythm_text, uid=str(uid or "")[:64])
+            return False, _rhythm_text
+        _budget_full, _budget_text = SocialEngine._budget_gate(self, bid, uid, now=_gate_now)
+        if _budget_full:
+            return _gate_blocked(
+                self, "delivery_budget_full", _budget_text, detail=str(_budget_text or "")[:120]
+            )
         # 配额在**发送之前**占掉，且与发送之间不留 await（见 `_hourly_reserve`）。
         # 上面那道早退只是省一次 LLM，真正的闸门在这里。
         if not self._hourly_reserve(bid):
-            return False, "这个角色这一小时已经发够了，先歇着（念头保留，下一轮继续）"
+            return _gate_blocked(self, 
+                "hourly_reserve_exhausted",
+                "这个角色这一小时已经发够了，先歇着（念头保留，下一轮继续）",
+            )
         sent_ok, err, peer_unreachable = await self._send_with_retry(umo, segments[0], bid)
         if not sent_ok:
             self._hourly_refund(bid)
+            # 投递账本：失败也要记。平台明确拒发=确定没出去（not_sent）；
+            # 其余（超时/未知）按 unknown——可能已经送到，不能当成没发。
+            _delivery_state = "unknown"
+            try:
+                _ob = _opt_module("outbound")
+                if _ob is not None:
+                    _cls = _ob.classify_send_error(str(err or ""))
+                    _delivery_state = str((_cls or {}).get("state") or "unknown")
+                elif peer_unreachable:
+                    _delivery_state = "not_sent"
+            except Exception:
+                _delivery_state = "unknown"
+            SocialEngine._delivery_record(self, bid, uid, _delivery_state)
             # 发送失败是可以重试的（换一轮心跳、换个时间再来），但不该拿掉这件事
             # 本身——所以推的是 retry_at，寿命 expire_at 不动。
             self._defer_cue_only(u, reason_meta)
@@ -7112,7 +7876,11 @@ class SocialEngine:
                     u["giveup_count"] = 0
                     u["quiesced_at"] = 0.0
                     self.state.mark_dirty()
-                    return False, f"目标已不存在（非好友/已被移出群聊），已永久丢弃：{err}"
+                    return _gate_blocked(self, 
+                        "peer_gone_permanent",
+                        f"目标已不存在（非好友/已被移出群聊），已永久丢弃：{err}",
+                        err=str(err or "")[:120],
+                    )
                 self.state.block_send(
                     bid, uid, self._time() + SEND_BLOCK_HOURS * 3600.0, err
                 )
@@ -7126,9 +7894,13 @@ class SocialEngine:
                     f"[autonomous_social] {uid} 发送失败但原因在平台侧（不隔离该用户）：{err}"
                     + throttle.summary(f"send.platform.{bid}")
                 )
-            return False, f"消息写好了但发送失败：{err}"
+            return _gate_blocked(self, 
+                "send_failed", f"消息写好了但发送失败：{err}", err=str(err or "")[:120]
+            )
 
         sent_ts = self._time()
+        # 投递账本：这条发出去了。收口/预算/熔断三件都靠它判断「上一轮到底到没到」。
+        SocialEngine._delivery_record(self, bid, uid, "delivered", sent_ts)
         # 「你有多长时间没回我」——记下来，写进运行指标，主人一眼能看到
         try:
             u["reply_gap_hours"] = round(
@@ -7151,6 +7923,8 @@ class SocialEngine:
         promise = str(getattr(decision, "promise", "") or "")
         if promise:
             self.state.note_promise(u, promise, sent_ts)
+            # v2.1.6：承诺里说了时间（「下周三」）就按那个时刻到期，否则保持 20 小时
+            self._note_promise_deadline(u, promise, sent_ts)
         if category == "promise":
             # 这件已经做了，别再提醒自己
             _done_about = str((reason_meta or {}).get("about") or "").strip()
@@ -7207,6 +7981,13 @@ class SocialEngine:
             # 其余几件留着——一次只问一件，不是把整叠清空
             self._drop_loop(u, str((reason_meta or {}).get("about") or ""))
             u["loop_at"] = sent_ts
+            # 追问回执：**只在这里写**（上面发送失败的分支已经 return）。没送到
+            # 不能算「问过了」，否则 48 小时内对方没回音时会被当成「复核」而不是
+            # 「第一次问」，语气与预期全错。
+            try:
+                mark_followup_sent(u, str((reason_meta or {}).get("about") or ""), sent_ts)
+            except Exception as e:
+                self.log(f"记追问回执失败（忽略）: {e}")
         elif (category == "cue"
               or str((_a or {}).get("kind") or "") == anchors.KIND_CUE):
             # 时间锚点被当成由头说出口了：消费掉它，别让「你们说好的：…」在提示词里
@@ -7297,6 +8078,755 @@ class SocialEngine:
         if n >= AGGR_NOTE_SAMPLES and now - _num(u.get("aggr_note_at", 0) or 0) >= AGGR_NOTE_COOLDOWN:
             u["aggr_note_at"] = now
             self.state.mark_dirty()
+
+    # ─── 证据卡与发前闸（v2.1.4）────────────────────────────────
+    #
+    # 为什么放在 engine：证据卡只有这一层拿得到（Core 门面 / 契约快照 / 本地由头池），
+    # generator 只该消费；四道闸又必须在「正文定稿、还没占配额」这一瞬间判。
+    # 两层都按 fail-open 写：拿不到卡就按空卡走（规划侧会显式告诉模型「手里没证据」），
+    # 闸自己出错就放行——闸是为了少发一条假消息，不是为了让消息发不出去。
+
+    @staticmethod
+    def _card_identity(target: Any) -> Tuple[str, str]:
+        """从生成侧 target 或 role_id 里取 (bid, uid)；认不出就给空串。"""
+        if isinstance(target, str):
+            return target.strip(), ""
+        if isinstance(target, dict):
+            bid = str(target.get("bid") or target.get("_bid") or target.get("bot_id") or "")
+            uid = str(
+                target.get("uid") or target.get("_uid") or target.get("user_id") or ""
+            )
+            return bid.strip(), uid.strip()
+        return "", ""
+
+    def evidence_cards(self, target: Any, *, at: float, limit: int = 5) -> List[Dict[str, Any]]:
+        """spec §3 的读取入口：Core 证据卡 → 本地由头 → 空列表。绝不抛。
+
+        target 允许是生成侧的 u_copy，也允许直接给 role_id（bid）。取不到身份时
+        返回空列表：没有身份就无从查卡；空卡会让规划侧明确说「手里没证据」，
+        而不是逼它编一件。
+        """
+        try:
+            bid, uid = SocialEngine._card_identity(target)
+            return SocialEngine._collect_cards(self, bid, uid, at=at, limit=limit)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取证据卡失败（按空卡处理）: {exc}")
+            return []
+
+    async def _evidence_cards(
+        self, role_id: str, *, uid: str = "", at: float = 0.0, limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """一次主动里只取一次卡：规划看到的卡与证据闸校验的卡必须是同一份。
+
+        两次读取之间 Core 可能刷新（或本地由头池被别的路径动过），那会让「写的时候
+        有据可依」和「查的时候查无此据」互相打架，白白拦掉一条正常消息。
+        """
+        try:
+            key = (str(role_id or ""), str(uid or ""), float(at or 0.0))
+            if getattr(self, "_cards_cache_key", None) == key:
+                return list(getattr(self, "_cards_cache", None) or [])
+            cards = SocialEngine._collect_cards(
+                self, key[0], key[1], at=key[2], limit=limit
+            )
+            self._cards_cache_key = key
+            self._cards_cache = cards
+            return list(cards)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取证据卡失败（按空卡处理）: {exc}")
+            return []
+
+    def _collect_cards(
+        self, bid: str, uid: str, *, at: float, limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """按 spec §3 的优先级收集卡片；每一层失败都只影响这一层。
+
+        顺序：门面 opportunities/materials（core 新版本才有）→ 契约快照里的同名键
+        （门面只给了一半时的补充）→ 本地 social/anchors.py 的由头转卡（兜底）。
+        最后一种不是「退而求其次」：没有 core 的用户本来就只有本地由头，有卡可依
+        比让模型空手编要强。
+        """
+        try:
+            limit = max(1, int(limit or 5))
+        except (TypeError, ValueError):
+            limit = 5
+        cards: List[Dict[str, Any]] = []
+
+        # 1) 门面直给。名字不在 CAPABILITIES 里（旧 core 没有），所以按「方法在不在」判。
+        facade = None
+        try:
+            facade = self._core_facade()
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取门面失败（证据卡按无处理）: {exc}")
+            facade = None
+        for name in ("opportunities", "materials"):
+            fn = getattr(facade, name, None) if facade is not None else None
+            if not callable(fn):
+                continue
+            try:
+                raw_cards = fn(bid)
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 门面 {name}() 失败: {exc}")
+                continue
+            cards.extend(SocialEngine._normalize_cards(raw_cards, at=at))
+
+        # 2) 契约快照。门面没给、或只给了一半时补齐；快照读不到就当没有。
+        if len(cards) < limit:
+            user_core = None
+            try:
+                root = SocialEngine._read_core_root(self)
+                if root:
+                    user_core = self.core.load_snapshot(bid, uid, root=root)
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 读 Core 快照失败（证据卡按无处理）: {exc}")
+                user_core = None
+            if isinstance(user_core, dict):
+                block_fn = getattr(anchors, "contract_blocks", None)
+                if callable(block_fn):
+                    try:
+                        blocks = block_fn(user_core, user_core.get("contract"), now=at) or {}
+                        for name in ("opportunities", "materials"):
+                            cards.extend(
+                                SocialEngine._normalize_cards(blocks.get(name), at=at)
+                            )
+                    except Exception as exc:
+                        logger.debug(f"[autonomous_social] 契约证据卡解析失败: {exc}")
+
+        # 去重（同一张卡可能同时从门面与契约来）后截断。
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for card in cards:
+            cid = str(card.get("id") or "")
+            if cid and cid in seen:
+                continue
+            if cid:
+                seen.add(cid)
+            unique.append(card)
+        cards = unique[:limit]
+
+        # 3) 本地由头兜底。空清单是允许的：手里没事时她还可以说「就是想跟你说句话」。
+        if not cards:
+            cards = SocialEngine._cards_from_anchors(self, bid, uid, at=at, limit=limit)
+        return cards
+
+    @staticmethod
+    def _normalize_cards(raw_cards: Any, *, at: float) -> List[Dict[str, Any]]:
+        """把 core 给的卡归一成 9 键形状，并丢掉过期卡。
+
+        过期卡必须丢：模型看到一件「已经过期的事」会把它说成正在发生，比空手更假。
+        """
+        out: List[Dict[str, Any]] = []
+        if isinstance(raw_cards, dict):
+            raw_cards = [raw_cards]
+        for item in raw_cards or ():
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            detail = str(item.get("detail") or "").strip()
+            if not title and not detail:
+                continue
+            captured = _num(item.get("captured_at", 0) or 0)
+            expires = _num(item.get("expires_at", 0) or 0)
+            if expires and at and expires <= at:
+                continue
+            kind = str(item.get("kind") or "life").strip() or "life"
+            out.append(
+                {
+                    "id": str(item.get("id") or "").strip(),
+                    "kind": kind,
+                    "purpose": str(item.get("purpose") or kind).strip() or kind,
+                    "title": title,
+                    "detail": detail,
+                    "source": str(item.get("source") or "生活素材").strip() or "生活素材",
+                    "captured_at": captured or at,
+                    "expires_at": expires or (at + 6 * 3600.0 if at else 0.0),
+                    "anchor_key": str(item.get("anchor_key") or "").strip(),
+                }
+            )
+        return out
+
+    def _cards_from_anchors(
+        self, bid: str, uid: str, *, at: float, limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """本地由头转卡（spec §3 兜底）：source 固定「由头」，6 小时后过期。"""
+        if not at:
+            return []
+        try:
+            user = self.state.user(bid, uid)
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取用户状态失败（由头卡按无处理）: {exc}")
+            return []
+        if not isinstance(user, dict):
+            return []
+        try:
+            rows = anchors.live_anchors(user, at, limit=max(1, int(limit or 5)))
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 取本地由头失败（按无处理）: {exc}")
+            return []
+        cards: List[Dict[str, Any]] = []
+        for anchor in rows or ():
+            if not isinstance(anchor, dict):
+                continue
+            about = str(anchor.get("about") or "").strip()
+            if not about:
+                continue
+            stamp = _num(anchor.get("due", 0) or 0) or at
+            kind = str(anchor.get("kind") or "life").strip() or "life"
+            key = "anchor:" + about[:40]
+            cards.append(
+                {
+                    "id": key,
+                    "kind": kind,
+                    "purpose": kind,
+                    "title": about[:40],
+                    "detail": about,
+                    "source": "由头",
+                    "captured_at": stamp,
+                    "expires_at": stamp + 6 * 3600.0,
+                    "anchor_key": key,
+                }
+            )
+        return cards
+
+    def _pre_send_gate(
+        self,
+        text: str,
+        *,
+        dialogue: Any = None,
+        inflight: Any = None,
+        plan: Any = None,
+        cards: Any = None,
+        at: float = 0.0,
+    ) -> Tuple[str, str]:
+        """四道发前闸（v2.1.4）：拒答 / 自接自 / 在途重复 / 证据缺失。
+
+        Returns:
+            (原因码, 细节)；全过返回 ("", "")。
+
+        为什么每道各自 try：这四道拦的都是「宁可不发」的事故，但「闸自己坏了」不是
+        事故。任何一道抛异常都只当它没命中，后面几道照常判——fail-open 在这里的含义
+        是「闸的故障不改变发不发」，而不是「闸坏了就整条放行」。
+        """
+        try:
+            hit = guards.looks_like_refusal(text)
+            if hit:
+                return "refusal_detected", hit
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 拒答闸失败（放行）: {exc}")
+        try:
+            if guards.dangling_after_own_reply(text, dialogue, at=at):
+                return "self_continuation", "上一句是她说的、对方没接，这句又在接自己"
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 自接自闸失败（放行）: {exc}")
+        try:
+            if guards.duplicate_inflight(text, inflight, window_seconds=1800.0):
+                return "duplicate_inflight", "和在途未确认的那条太像"
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 在途重复闸失败（放行）: {exc}")
+        try:
+            facts = list(getattr(plan, "facts", None) or []) if plan is not None else []
+            if facts:
+                missing = guards.evidence_missing(facts, cards)
+                if missing:
+                    return (
+                        "evidence_missing",
+                        "%d/%d 条事实在证据卡里找不到" % (len(missing), len(facts)),
+                    )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 证据缺失闸失败（放行）: {exc}")
+        return "", ""
+
+    async def _decide_proactive(
+        self,
+        *,
+        umo: str,
+        u_copy: Dict[str, Any],
+        core_context: str,
+        reason: str,
+        reason_meta: Any,
+        persona_prompt: str,
+        mind: Any,
+        now: float,
+        bid: str,
+        uid: str,
+        memory_note: str,
+    ) -> Tuple[Any, List[Dict[str, Any]]]:
+        """主动消息的「决定」：先规划后写作，任何一环不可用就退回单次 decide。
+
+        Returns:
+            (decision, cards)。decision 为 None 表示模型侧完全不可用（与旧路径同义），
+            调用方按 llm_unavailable 处理；cards 供后面证据闸复用同一份。
+
+        为什么把退路写在这里而不是调用点：退回 decide() 是行为契约（2.1.3 一致），
+        把它散在 _speak_inner 里，以后谁加一个分支就会漏掉一条退路。
+        """
+        cards: List[Dict[str, Any]] = []
+        planning = bool(getattr(self.cfg, "planning_enabled", True))
+        decider = getattr(self.generator, "decide_with_plan", None)
+        if planning and callable(decider):
+            try:
+                cards = await SocialEngine._evidence_cards(self, bid, uid=uid, at=now)
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 证据卡获取异常（按空卡）: {exc}")
+                cards = []
+            if not cards:
+                # 只是观测：空卡不是失败，规划侧会显式告诉模型「手里没有证据」。
+                _gate_note(
+                    self, "cards_empty", "这一轮没有证据卡（Core 未提供，本地由头也空）"
+                )
+            decision = None
+            try:
+                decision = await decider(
+                    umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
+                    at=now, clock_offset=self._clock_offset_for(bid),
+                    memory_note=memory_note, cards=cards,
+                )
+            except Exception as e:
+                if throttle.allow(f"speak.plan.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social] 规划路径失败，退回单次决定: {type(e).__name__}: {e}"
+                        + throttle.summary(f"speak.plan.{bid}")
+                    )
+            if decision is not None:
+                return decision, cards
+            _gate_note(self, "plan_unavailable", "规划不可用，退回单次决定（行为与 2.1.3 一致）")
+
+        try:
+            decision = await self.generator.decide(
+                umo, u_copy, core_context, reason, reason_meta, persona_prompt, mind,
+                at=now, clock_offset=self._clock_offset_for(bid), memory_note=memory_note,
+            )
+        except Exception as e:
+            if throttle.allow(f"speak.decide.{bid}"):
+                logger.warning(
+                    f"[autonomous_social] LLM 调用失败（provider 取到了但请求挂了）: {type(e).__name__}: {e}"
+                    + throttle.summary(f"speak.decide.{bid}")
+                )
+            decision = None
+        return decision, cards
+
+    # ─── 投递账本与发信链路三件（v2.1.5）────────────────────
+    #
+    # 账本条目形状固定为 {"at","state","bid","uid"}：state 只记投递事实
+    # （delivered / not_sent / unknown），不存正文——正文在 conversation 与
+    # proactive_log 里已经有了，账本只回答一个问题：这条到底送到没有。
+
+    def _delivery_ledger(self) -> List[Dict[str, Any]]:
+        """读投递账本（只读副本，脏条目跳过）。永远不抛。"""
+        try:
+            data = getattr(self.state, "data", None)
+            if not isinstance(data, dict):
+                return []
+            rows = data.get(DELIVERY_LEDGER_KEY)
+            if not isinstance(rows, list):
+                return []
+            return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            return []
+
+    def _delivery_record(
+        self, bid: str, uid: str, state: str, at: Optional[float] = None
+    ) -> None:
+        """记一条投递结果。写失败只 debug：账本坏了不该让发送失败。"""
+        try:
+            data = getattr(self.state, "data", None)
+            if not isinstance(data, dict):
+                return
+            rows = data.get(DELIVERY_LEDGER_KEY)
+            if not isinstance(rows, list):
+                rows = []
+            try:
+                stamp = float(at if at is not None else self._time())
+            except (TypeError, ValueError):
+                stamp = 0.0
+            if not math.isfinite(stamp) or stamp <= 0:
+                stamp = 0.0
+            rows.append(
+                {
+                    "at": stamp,
+                    "state": str(state or "unknown")[:16],
+                    "bid": str(bid or ""),
+                    "uid": str(uid or ""),
+                }
+            )
+            data[DELIVERY_LEDGER_KEY] = rows[-DELIVERY_LEDGER_MAX:]
+            mark = getattr(self.state, "mark_dirty", None)
+            if callable(mark):
+                mark()
+        except Exception as exc:  # pragma: no cover - 记账失败不影响发送
+            logger.debug(f"[autonomous_social] 投递账本写入失败（忽略）: {exc}")
+
+    def _delivery_rows(
+        self, bid: str, uid: str, *, now: float, window: float = DELIVERY_LEDGER_WINDOW
+    ) -> List[Dict[str, Any]]:
+        """取这个人窗口内的投递记录（按时间升序）。
+
+        窗口默认 1 小时：连发收口看的就是「最近一小时我主动说了几次」，
+        更早的记录对当下没有意义，还会让判定越来越难放开。
+        """
+        try:
+            at_now = float(now)
+            cutoff = at_now - float(window)
+            out: List[Dict[str, Any]] = []
+            for row in self._delivery_ledger():
+                if str(row.get("bid") or "") != str(bid or ""):
+                    continue
+                if str(row.get("uid") or "") != str(uid or ""):
+                    continue
+                at = _num(row.get("at", 0) or 0)
+                # 未来时间最多容忍 5 分钟（时钟回拨），再远就是脏数据
+                if at <= 0 or at < cutoff or at > at_now + 300.0:
+                    continue
+                out.append({"at": at, "state": str(row.get("state") or "unknown")})
+            out.sort(key=lambda item: item["at"])
+            return out
+        except Exception:
+            return []
+
+    # 平台事件表：只收两类——platform_refused 的失败、以及任何一次成功。
+    # 口径与 outbound.circuit_state 一致：target_gone / unknown / other 都不进来。
+    # 放内存里（引擎实例上），重启清零即可——这是「最近十分钟」的短期事实，
+    # 不值得进 state.json，也不会因为一份脏状态让整台机器永久闭嘴。
+    def _platform_events(self) -> List[Any]:
+        rows = getattr(self, "_platform_send_events", None)
+        if not isinstance(rows, list):
+            rows = []
+            self._platform_send_events = rows
+        return rows
+
+    def _platform_event(self, ok: bool) -> None:
+        try:
+            stamp = float(self._time())
+            if not math.isfinite(stamp) or stamp <= 0:
+                return
+            rows = self._platform_events()
+            rows.append((stamp, bool(ok)))
+            if len(rows) > 32:
+                del rows[:-32]
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"[autonomous_social] 平台事件记账失败（忽略）: {exc}")
+
+    def _platform_circuit(self, now: Optional[float] = None) -> Tuple[bool, str]:
+        """平台级熔断：返回 (是否熔断中, 中文原因)。模块缺失/异常一律不熔断。"""
+        mod = _opt_module("outbound")
+        if mod is None:
+            return False, ""
+        try:
+            at = float(now if now is not None else self._time())
+            state = mod.circuit_state(self._platform_events(), at)
+            if mod.circuit_allows(state, at):
+                return False, ""
+            until = float(state.get("until") or 0.0)
+            left = max(0.0, until - at)
+            return True, (
+                f"平台连续拒发（{int(state.get('recent') or 0)} 次），"
+                f"熔断中，还要 {int(left / 60)} 分钟"
+            )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 平台熔断判定失败（按放行）: {exc}")
+            return False, ""
+
+    def _note_platform_failure(self, bid: str, err: str) -> None:
+        """失败分类 + 记账：只有平台明确拒绝才进熔断事件流。
+
+        超时/连接中断（unknown）不能进：那种失败可能已经送达，记进去会让
+        一次网络抖动把所有人一起停掉。判错的代价不对称，所以只认最窄的一类。
+        """
+        mod = _opt_module("outbound")
+        if mod is None:
+            return
+        try:
+            info = mod.classify_send_error(str(err or ""))
+        except Exception:
+            return
+        if not isinstance(info, dict) or not info.get("platform_refused"):
+            return
+        # 只有引擎上真的有事件表时才记账：老测试里的假引擎只实现了熔断相关的一小部分
+        # 方法，缺一个方法不该让「记一次失败」这条路整个炸掉（fail-open）。
+        record = getattr(self, "_platform_event", None)
+        if callable(record):
+            record(False)
+        try:
+            at = float(self._time())
+            state = mod.circuit_state(self._platform_events(), at)
+            if state.get("open") and throttle.allow(f"send.circuit.{bid or '-'}"):
+                logger.error(
+                    f"[autonomous_social][{bid or '默认'}] 平台连续拒发"
+                    f"（{int(state.get('recent') or 0)} 次），熔断 "
+                    f"{int(float(state.get('cooldown_seconds') or 0) / 3600)} 小时，"
+                    f"期间不生成任何内容：{str(err or '')[:120]}"
+                    + throttle.summary(f"send.circuit.{bid or '-'}")
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.debug(f"[autonomous_social] 平台熔断开启失败（忽略）: {exc}")
+
+    def _rhythm_gate(self, bid: str, uid: str, *, now: float) -> Tuple[str, str]:
+        """连发收口：返回 (原因码, 中文原因)，空串=放行。
+
+        两件事共用一份投递记录：
+        - closing_hold：连着主动找了好几条、对方一条没回，该收口了；
+        - burst_state：一小时内主动次数过密，先停一轮等回应。
+        round_allows 对坏 state 一律放行——判错的代价是「少说一句」，
+        但更常见的错法是数据脏了以后永远不说话，那更糟。
+        """
+        mod = _opt_module("rhythm")
+        if mod is None:
+            return "", ""
+        try:
+            rows = self._delivery_rows(bid, uid, now=now)
+            rounds = [
+                {"at": row["at"], "delivered": row["state"] == "delivered"}
+                for row in rows
+            ]
+            hold = mod.closing_hold(rounds, now)
+            if not mod.round_allows("proactive", hold):
+                return "closing_hold", (
+                    f"连着主动说了几条，收口静默中"
+                    f"（还剩 {int(float(hold.get('remaining_seconds') or 0) / 60)} 分钟）"
+                )
+            burst = mod.burst_state(rounds, now)
+            if not mod.round_allows("proactive", burst):
+                return "burst_active", (
+                    f"连发 {int(burst.get('count') or 0)} 条还没等到回应，先停一轮"
+                )
+            return "", ""
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 连发收口判定失败（按放行）: {exc}")
+            return "", ""
+
+    def _budget_gate(self, bid: str, uid: str, *, now: float) -> Tuple[bool, str]:
+        """未决投递预算：返回 (是否占满, 中文原因)。模块缺失/异常一律放行。"""
+        mod = _opt_module("budget")
+        if mod is None:
+            return False, ""
+        try:
+            rows = self._delivery_rows(bid, uid, now=now)
+            entries = [{"at": row["at"], "state": row["state"]} for row in rows]
+            occupancy = mod.occupancy(entries, now)
+            if mod.budget_allows(occupancy):
+                return False, ""
+            return True, (
+                f"未决投递已占满预算（{int(occupancy.get('occupied') or 0)}/"
+                f"{int(occupancy.get('limit') or 0)}），等回执再发"
+            )
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] 投递预算判定失败（按放行）: {exc}")
+            return False, ""
+
+    @staticmethod
+    def _normalize_tool_output(raw: Any) -> Tuple[Optional[List[str]], str]:
+        """把 generate_with_tools 的返回值归一成正文列表；认不出返回 (None, "")。"""
+        try:
+            code = ""
+            if isinstance(raw, dict):
+                if bool(raw.get("rounds_capped")) or bool(raw.get("capped")):
+                    code = "tool_round_cap"
+                raw = raw.get("parts") or raw.get("text") or raw.get("reply")
+            if isinstance(raw, str):
+                text = raw.strip()
+                return ([text], code) if text else (None, code)
+            if isinstance(raw, (list, tuple)):
+                parts = [str(item).strip() for item in raw if str(item or "").strip()]
+                return (parts, code) if parts else (None, code)
+            return None, code
+        except Exception:
+            return None, ""
+
+    async def _generate_parts(
+        self,
+        *,
+        umo: str,
+        target: Any,
+        core_context: str,
+        reason: str,
+        reason_meta: Any,
+        persona_prompt: str,
+        mind: Any,
+        at: float,
+        clock_offset: float,
+        memory_note: str,
+        memory_raw: Optional[str] = None,
+        bid: str = "",
+    ) -> Optional[List[str]]:
+        """v2.1.5：工具循环开关打开且生成器支持时走 generate_with_tools，否则走老路。
+
+        工具循环是「她先查一下记忆再开口」的降级版，默认关：先让开关能把老路
+        原样跑起来，再谈多轮工具。任何异常都退回一次普通 generate——工具查不到
+        不是不发消息的理由（fail-open）。
+        """
+        try:
+            tools_on = bool(getattr(self.cfg, "memory_tools_enabled", False))
+        except Exception:
+            tools_on = False
+        fn = getattr(self.generator, "generate_with_tools", None) if tools_on else None
+        if callable(fn):
+            # 工具要查记忆，得给它一个同步查询口；没有桥就什么都不传，让它如实
+            # 报 unknown/no_provider（见 _memory_tool_ctx 里的取舍说明）。
+            _tool_ctx = SocialEngine._memory_tool_ctx(
+                self, memory_note if memory_raw is None else memory_raw
+            )
+            try:
+                out = fn(
+                    umo,
+                    target,
+                    core_context,
+                    reason,
+                    reason_meta,
+                    persona_prompt,
+                    mind,
+                    at=at,
+                    clock_offset=clock_offset,
+                    memory_note=memory_note,
+                    memory_query=_tool_ctx.get("query"),
+                    memory_sources=_tool_ctx.get("sources"),
+                )
+                if inspect.isawaitable(out):
+                    out = await out
+                parts, code = SocialEngine._normalize_tool_output(out)
+                if code == "tool_round_cap":
+                    _gate_note(self, "tool_round_cap", "工具轮次到上限，按已有材料收口")
+                if parts:
+                    return parts
+            except Exception as exc:
+                if throttle.allow(f"speak.tools.{bid or '-'}"):
+                    logger.warning(
+                        f"[autonomous_social] 工具循环失败，退回普通生成: {exc}"
+                        + throttle.summary(f"speak.tools.{bid or '-'}")
+                    )
+        return await self.generator.generate(
+            umo,
+            target,
+            core_context,
+            reason,
+            reason_meta,
+            persona_prompt,
+            mind,
+            at=at,
+            clock_offset=clock_offset,
+            memory_note=memory_note,
+        )
+
+    def _memory_tool_ctx(self, memory_note: str):
+        """给工具循环准备「本轮记忆快照」的同步查询口（v2.1.5 接线补丁）。
+
+        工具层是同步的（tools.execute_readonly 直接调 handler），记忆桥只有
+        async compose_context，两边的节奏对不上。折中：**不在这里再检索一次**。
+        生成前已经按这次的由头检索过一轮，结果就在 memory_note 里；工具查到的
+        应该是「这一轮她手上真有的那份记忆」，而不是另开一次网络请求——那样既
+        慢，又可能拿到另一份快照，和她实际写出来的话对不上。
+
+        没装记忆桥时返回空 dict：不塞 handler、不塞 sources，工具层就会如实报
+        unknown/no_provider。宁可让它说「查不到」，也不要喂一份假的空记忆。
+        """
+        try:
+            bridge = self._memory_bridge()
+        except Exception:
+            bridge = None
+        if bridge is None:
+            return {}
+        text = str(memory_note or "").strip()
+
+        def _query(query: Any = None, limit: Any = None) -> Any:
+            # 工具层把回调抛的异常记成 unknown；这里再兜一层，异常绝不进生成链路。
+            try:
+                return text
+            except Exception:  # pragma: no cover - 兜底
+                return None
+
+        return {
+            "query": _query,
+            "sources": (
+                [
+                    {
+                        "title": "长期记忆",
+                        "detail": text[:600],
+                        "source": "memory_companion",
+                    }
+                ]
+                if text
+                else []
+            ),
+        }
+
+    async def _review_draft(
+        self, parts: Optional[List[str]], decision: Any, cards: Any
+    ) -> Optional[List[str]]:
+        """生成后自评 + 成稿事实核对：返回正文列表；drop 返回 None。
+
+        自评是生成侧最后一道自检：模型自己看一遍「这句话现在发合适吗」。
+        它只能收紧、不能放宽——改写后的正文照样要过下面的验收层。
+
+        事实核对（grounded_claims）**只记账不拦**，所以放在自评之后无条件跑一次：
+        即使自评开关关着，也想知道这一条有没有对不上证据卡的地方。
+        """
+        if not parts:
+            return parts
+        reviewed: Optional[List[str]] = parts
+        try:
+            enabled = bool(getattr(self.cfg, "draft_review_enabled", False))
+        except Exception:
+            enabled = False
+        fn = getattr(self.generator, "review_draft", None)
+        if enabled and callable(fn):
+            try:
+                result = fn(
+                    getattr(self.generator, "provider", None),
+                    "\n".join(str(part or "") for part in parts),
+                    getattr(decision, "plan", None) if decision is not None else None,
+                    cards,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, dict):
+                    verdict = str(result.get("verdict") or "ok").strip().lower()
+                    if verdict == "drop":
+                        return None
+                    if verdict == "rewrite":
+                        text = str(result.get("text") or "").strip()
+                        if text:
+                            reviewed = [text]
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 生成后自评失败（按通过）: {exc}")
+        SocialEngine._note_grounded(self, reviewed, cards)
+        return reviewed
+
+    def _note_grounded(self, parts: Optional[List[str]], cards: Any) -> None:
+        """成稿事实核对：对不上证据卡就记一笔 draft_ungrounded，**不拦消息**。
+
+        v2.1.5 之前这里只有 guards.evidence_missing（查的是规划阶段的证据），
+        generator.grounded_claims 一直没接上，等于死代码。补这一刀是为了让
+        「这句像编的」在状态页里看得见，排障时不用靠人肉比对。
+
+        为什么只记不拦：证据卡只覆盖本轮挑出来的几条素材，她自己日程里的细节
+        本来就不在卡上；按卡丢会把正常的生活叙述全判成编造，比放过一句可疑的
+        话代价大得多。所以这里只观察、只记账。
+        """
+        if not parts or not cards:
+            return
+        try:
+            mod = _opt_module("generator")
+            fn = getattr(mod, "grounded_claims", None) if mod is not None else None
+            if not callable(fn):
+                return
+            result = fn("\n".join(str(part or "") for part in parts), cards)
+            if not isinstance(result, dict):
+                return
+            if result.get("ok"):
+                return
+            try:
+                missing_text = "；".join(
+                    str(item)[:120] for item in list(result.get("missing") or [])[:3]
+                )
+            except Exception:
+                missing_text = ""
+            _gate_note(
+                self,
+                "draft_ungrounded",
+                "正文有对不上证据卡的具体事实（只记不拦）",
+                ratio=result.get("ratio"),
+                missing=missing_text,
+            )
+        except Exception as exc:  # pragma: no cover - fail-open
+            logger.debug(f"[autonomous_social] 成稿事实核对失败（放行）: {exc}")
 
     def _why_now(
         self,
@@ -7486,12 +9016,13 @@ class SocialEngine:
             (是否可以触发, 不能触发时给主人看的说明)
         """
         if not self.running:
-            return False, (
+            return _gate_blocked(self, 
+                "engine_not_running",
                 "引擎没有在运行（插件刚重载、正在停机，或后台循环已退出），不触发。"
-                "在面板里「重载」一次插件即可。"
+                "在面板里「重载」一次插件即可。",
             )
         if not self.cfg.enabled:
-            return False, "插件已停用（enabled=false），不触发。"
+            return _gate_blocked(self, "plugin_disabled", "插件已停用（enabled=false），不触发。")
         backoff = 0.0
         scope = ""
         try:
@@ -7509,10 +9040,12 @@ class SocialEngine:
         except Exception:
             backoff = 0.0
         if backoff > 0:
-            return False, (
+            return _gate_blocked(self, 
+                "llm_backoff",
                 f"模型正在失败退避中（{scope or '该模型'}，还剩 {int(backoff // 60)} 分钟），"
                 "现在触发也生成不出内容。退避结束后会自动恢复；"
-                "急用可以先在面板里检查模型配置与 key。"
+                "急用可以先在面板里检查模型配置与 key。",
+                left_seconds=round(backoff, 1),
             )
         return True, ""
 
@@ -8178,6 +9711,7 @@ class SocialEngine:
         # 每段隔几秒到几十秒。只在挑人处查表，等于给「跨过整点」留了一道缝。
         _quiet_block = SocialEngine._quiet_send_block(self, bid, target)
         if _quiet_block:
+            _gate_note(self, "quiet_send_block", _quiet_block, target=str(target or ""))
             return False, _quiet_block, False
         # V8 / P2-03 纵深防御：直接调用这个底层入口的路径也受按人冷却约束。
         # 这里**不进重试循环、不记熔断**：冷却是我们自己主动设的，再撞一次只是浪费。
@@ -8185,14 +9719,24 @@ class SocialEngine:
         if _cooldown_user is not None:
             _cool_left = SocialEngine._send_fail_left(self, _cooldown_user)
             if _cool_left > 0:
-                return False, (
-                    f"上次发给 TA 没发出去，{int(_cool_left / 60)} 分钟内不再试"
-                ), False
+                _cool_text = f"上次发给 TA 没发出去，{int(_cool_left / 60)} 分钟内不再试"
+                _gate_note(self, 
+                    "send_cooldown", _cool_text, left_seconds=round(_cool_left, 1)
+                )
+                return False, _cool_text, False
         # v2.1.2：umo 一眼不合法的，重试也没有意义（同一串字符，同一面墙）。
         # 不进重试循环、不记熔断：这是那一条会话地址写坏了，不是链路故障。
         _why_bad_umo = _bad_umo(target)
         if _why_bad_umo:
-            return False, f"这条会话地址不合法，跳过：{_why_bad_umo}", False
+            _bad_text = f"这条会话地址不合法，跳过：{_why_bad_umo}"
+            _gate_note(self, "bad_umo", _bad_text, umo=str(target or "")[:80])
+            return False, _bad_text, False
+        # v2.1.5 平台熔断：所有发送路径最终都经过这里，开在发信口上才没有漏网的
+        # （群聊、被动回复、连发补发都走这条路）。
+        _circuit_open, _circuit_text = SocialEngine._platform_circuit(self)
+        if _circuit_open:
+            _gate_note(self, "platform_circuit", _circuit_text, umo=str(target or "")[:80])
+            return False, _circuit_text, False
         last_err = ""
         peer_unreachable = False
         for attempt in range(1):
@@ -8260,6 +9804,10 @@ class SocialEngine:
         但**只在故障是全局的时候**才停：一个失效的 umo 失败三次，不该让整个角色
         停 15 分钟（线上就是这样，每轮都在熔断里空转，健康的人一条也收不到）。
         """
+        # v2.1.5：平台级拒发单独记一笔。必须在这几个 early return 之前——
+        # 「平台拒发」往往同时命中 _target_problem，放在后面就永远记不上，
+        # 熔断也就永远不会触发。
+        SocialEngine._note_platform_failure(self, bid, err)
         if peer_unreachable:
             # 平台明说「这个人发不了」：是这一个用户的事，不该把所有人一起停掉
             return
@@ -8301,6 +9849,8 @@ class SocialEngine:
             )
 
     def _note_send_ok(self, bid: str) -> None:
+        # v2.1.5：一次成功即清平台熔断——circuit_state 只看最后一次成功之后的失败。
+        SocialEngine._platform_event(self, True)
         slot = self._breaker_slot(bid)
         if slot.get("streak"):
             logger.info(
@@ -9221,6 +10771,42 @@ class SocialEngine:
             lines.append(f"预计下一轮：约 {nxt} 分钟后")
         return "\n".join(lines)
 
+    def _gate_text(self) -> str:
+        """最近 24 小时被闸门拦下的原因码排行，给 /自主社交状态 用。
+
+        为什么单独成段、不塞进 _metrics_text：那边在「后台循环还没跑过第一轮」时会
+        提前 return 一整句提示，新装的引擎永远走不到后面的段落；而原因码恰恰是排障
+        第一眼要看的东西，不能跟着指标一起被跳过。所以这里只负责拼文本，挂不挂由
+        status_text 决定。
+        展示失败一律 fail-open：返回空串，整页状态照常出，不能因为统计坏了看不到状态。
+        """
+        try:
+            gr = self.gate_report()
+        except Exception as exc:  # 展示失败不能把整页状态带崩
+            logger.debug(f"[autonomous_social] 原因码汇总失败（跳过展示）: {exc}")
+            return ""
+        if not isinstance(gr, dict):
+            return ""
+        top = gr.get("top") or []
+        if not top:
+            return ""
+        lines = []
+        win = gr.get("window_hours", GATE_REPORT_HOURS)
+        tot = int(_num(gr.get("total_today", 0)))
+        lines.append(f"最近 {win} 小时拦下的原因码（今天累计 {tot} 次）：")
+        for row in top[:8]:
+            try:
+                code, cnt = str(row[0]), int(_num(row[1]))
+            except (IndexError, TypeError, ValueError):
+                continue
+            lines.append(f"    {code}：{cnt} 次")
+        rec = gr.get("recent") or []
+        last = rec[-1] if rec and isinstance(rec[-1], dict) else {}
+        lt = str(last.get("text") or "")
+        if lt:
+            lines.append(f"  最近一条：{lt[:50]}")
+        return "\n".join(lines)
+
     def _boot_text(self) -> str:
         """「本次运行多久了」——面板顶上的时间参照物。
 
@@ -9899,6 +11485,10 @@ class SocialEngine:
         if _intimacy:
             sections.append(_intimacy)
         sections.append("【运行指标】\n" + self._metrics_text())
+        # 闸门原因码单独一段：_metrics_text 在没有心跳记录时会提前返回，塞进去就看不到了。
+        _gate = self._gate_text()
+        if _gate:
+            sections.append("【闸门原因码】\n" + _gate)
         sections.append(
             "【触发与节奏】\n"
             f"- 心跳：每 {self.cfg.heartbeat_min_minutes}~{self.cfg.heartbeat_max_minutes} 分钟一次"

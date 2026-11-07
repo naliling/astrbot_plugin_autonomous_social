@@ -5,6 +5,8 @@ v1.11.0 新增。这一层是纯逻辑（不碰 IO、不 import astrbot），可
   就无需被 @ 主动接一句。保守档——只有自己刚发过言才开窗，不主动盯整个群。
 - 破冰（icebreak）：群安静太久时主动抛个轻话题。
 - 参考库：把近期群友发言提炼成一段「这个群平时怎么说话」，注入生成，让接话不端着。
+- 归因（attribution，v1.29.0）：这条群消息到底是不是在叫她。**只有 At 才算点名**，
+  名字/第三人称只用来解释「为什么不算」——同名群名片、第三人称谈论都不会再被误判。
 
 真正调模型/发消息的接线在 engine.py，写台词在 generator.py。这里只回答
 「现在该不该接 / 该不该破冰」和「拿什么当风格参考」。
@@ -138,6 +140,240 @@ def addressed_to(text: str, known_names: List[str]) -> str:
         if body.startswith(name):
             return name
     return ""
+
+
+# ─── 严格提及归因（v1.29.0）─────────────────────────────
+#
+# `addressed_to` 只回答「开头是不是叫了某个名字」。拿它当「在叫我吗」用，会误判三类：
+#   1. 同名群名片——群里有人的名片和 bot 一样，那句其实在叫那个人；
+#   2. 第三人称谈论——「小助手刚才说…」「她刚才说…」是在**说她**，不是在叫她；
+#   3. 句中随口提到——「我觉得小助手说得对」是评论，不是点名。
+# 误判的代价很具体：她会插一句本不该接的话，群里观感就是「乱插嘴」。
+#
+# 所以归因的口径反过来——**只有 At 才算点名**。文本证据只用来解释「为什么不算」：
+# 出现名字只算 `name_only`，第三人称只算 `third_person`，两者都不构成 addressed。
+# 宁可少接一句，也别乱插一句；这与 `flow_should_consider` 的保守档是同一个取向。
+
+# reason 的取值。`mention` 刻意与 `throttle.BYPASS_REASONS` 里的同名项一致：
+# 群硬收口只放行真正的点名，归因结果可以直接当「理由」喂给 `closeout_allows`，
+# 不必在调用方再翻译一层——两处各写一份映射，迟早会漂。
+ATTR_MENTION = "mention"
+ATTR_NAME_ONLY = "name_only"
+ATTR_THIRD_PERSON = "third_person"
+ATTR_NONE = "none"
+ATTR_EMPTY = "empty"
+
+# 「@全体」的几种写法。平台给的值不统一（有的给 "all"，有的给 "@all"/"atall"），
+# 先归成同一个 `AT_ALL` 再比，免得换个适配器就漏判——漏判 @全体等于她该在的时候不在。
+AT_ALL = "all"
+_AT_ALL_ALIASES = frozenset({"all", "@all", "atall", "at_all", "everyone"})
+
+# 转述动词：名字/代词后面跟这些，说明是在**说**某人，不是在**叫**某人。
+_SPEECH_VERBS = "说|讲|提|问|聊|吐槽|觉得|认为|回复|答|喊|嚷"
+# 名字与动词之间允许出现的时间副词（「小助手刚才说」）。
+_TIME_WORDS = (
+    "刚才|刚刚|刚|之前|上次|上回|昨天|前天|今天|早上|中午|晚上|好像|又|也|还|已经|就|才"
+)
+# 分句边界：判断「名字后面这半句里有没有『你』」时用得到。
+_CLAUSE_END = "，,。.！!？?；;、~～…\n"
+
+# 第三人称代词 + 转述动词。前面的 `(?:^|(?<=[...]))` 是「句首或分句边界」，
+# 挡掉「其他」「吉他」这类词里夹着的「他」——那是在说别的，不是在转述她。
+_THIRD_PERSON_RE = re.compile(
+    rf"(?:^|(?<=[\s{_CLAUSE_END}]))(?:他|她|它|TA|ta|Ta|tA)(?:们)?\s*"
+    rf"(?:{_TIME_WORDS})?\s*(?:{_SPEECH_VERBS})"
+)
+
+
+def _iter_values(value: Any) -> List[Any]:
+    """把契约里的列表字段读成 `list`：None/单个字符串/读不出迭代的都兜住。
+
+    `at_ids` / `bot_names` / `known_names` 都是跨适配器、跨插件来的值：旧版 Core
+    可能没有新字段，调用方也可能手滑传成字符串。归因在群消息链路上，抛一次就是
+    整条消息丢掉，所以这里只认「能列出来的」，其余当空。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return []
+
+
+def _clean_ids(value: Any) -> List[str]:
+    """At 目标 id 归一化成去重后的字符串列表（保留原顺序）。"""
+    out: List[str] = []
+    for item in _iter_values(value):
+        if item is None or isinstance(item, (dict, list, tuple, set)):
+            continue
+        try:
+            text = str(item).strip()
+        except Exception:
+            continue
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _clean_names(value: Any) -> List[str]:
+    """名字归一化成去重后的字符串列表，**单字名字一律不要**。
+
+    单字名字（「小」「他」）做子串匹配等于匹配一切，比不判还糟。`addressed_to`
+    也是 `len >= 2` 这条口径，这里保持一致。按长度倒序，让「小助手」先于「助手」
+    命中，targets 里给出的是最具体的那个。
+    """
+    out: List[str] = []
+    for item in _iter_values(value):
+        if item is None or isinstance(item, (dict, list, tuple, set)):
+            continue
+        try:
+            text = str(item).strip()
+        except Exception:
+            continue
+        if len(text) < 2 or text in out:
+            continue
+        out.append(text)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _clause_of(text: str) -> str:
+    """从当前位置到下一个分句边界之前的那一段。"""
+    for index, char in enumerate(text):
+        if char in _CLAUSE_END:
+            return text[:index]
+    return text
+
+
+def _lead_trim(text: str) -> str:
+    """去掉名字后面紧跟的标点/空白（「小助手，你觉得呢」→「你觉得呢」）。"""
+    return text.lstrip(_CLAUSE_END + " \t")
+
+
+def _at_hits(ids: List[str], bot_id: Any) -> List[str]:
+    """`at_ids` 里命中 bot 的那几个，归一化成 `"all"` 或 bot_id 字符串。"""
+    try:
+        me = str(bot_id or "").strip()
+    except Exception:
+        me = ""
+    hits: List[str] = []
+    for raw in ids:
+        target = AT_ALL if raw.lower() in _AT_ALL_ALIASES else raw
+        if target == AT_ALL or (me and target == me):
+            if target not in hits:
+                hits.append(target)
+    return hits
+
+
+def _calls_by_name(body: str, names: List[str]) -> str:
+    """正文里有没有「<bot 名>你…」这种当面叫，有就返回那个名字。
+
+    这是「名字 + 你/您 在同一分句」的判据，比「名字后面紧跟你」宽一点：
+    「小助手，你倒是说说」这种中间隔了逗号的倒装也认。
+    """
+    for name in names:
+        index = body.find(name)
+        while index >= 0:
+            tail = _lead_trim(body[index + len(name) :])
+            clause = _clause_of(tail)
+            if "你" in clause or "您" in clause:
+                return name
+            index = body.find(name, index + 1)
+    return ""
+
+
+def _says_about(body: str, names: List[str]) -> str:
+    """正文里有没有「<名字>（刚才）说/讲…」这种转述，有就返回那个名字。
+
+    转述与叫人的分界线是**同一分句里有没有「你/您」**：
+      「小助手刚才说的那个」   → 转述（说她）；
+      「小助手，说说你的看法」 → 叫她（分句里有「你」）。
+    所以同一句里既出现名字又出现「说」，不能只看词序，得看有没有第二人称。
+    """
+    for name in names:
+        index = body.find(name)
+        while index >= 0:
+            tail = _lead_trim(body[index + len(name) :])
+            clause = _clause_of(tail)
+            if "你" not in clause and "您" not in clause:
+                if re.match(rf"(?:{_TIME_WORDS})?\s*(?:{_SPEECH_VERBS})", tail):
+                    return name
+            index = body.find(name, index + 1)
+    return ""
+
+
+def attribution(
+    text: str,
+    *,
+    at_ids: Any = (),
+    bot_id: Any = "",
+    bot_names: Any = (),
+    known_names: Any = (),
+) -> Dict[str, Any]:
+    """严格归因：这条群消息到底是不是在叫 bot。纯函数，不读状态、不碰 IO。
+
+    参数：
+      text         消息正文（At 组件已由适配器从正文里摘掉）
+      at_ids       本轮消息里 At 组件的目标 id 列表；`"all"` 表示 @全体
+      bot_id       bot 自己的 id（字符串或数字都行）
+      bot_names    bot 的名字/别名（「小助手」这类）
+      known_names  群里其他人的名字——用来识别「小明刚才说…」这种转述
+
+    返回 `{"addressed": bool, "reason": 码, "targets": tuple}`：
+      mention      at_ids 里有 bot_id 或 @全体 —— **唯一算点名的**
+      name_only    正文里出现 bot 的名字（含「小助手你…」这种当面叫，但不是 At）
+      third_person 正文在第三人称谈论（「他/她/它/XX 刚才说…」）
+      none         以上都不是
+      empty        没有正文，也没有 At
+
+    判定顺序就是证据强弱：At > 当面叫名字 > 第三人称转述 > 只是提到名字 > 什么都没有。
+    第三人称排在「当面叫名字」之后、单纯提到之前：同样一句「小助手刚才说」，
+    有「你」是在叫她，没「你」是在说她。
+
+    纯 @（正文为空）仍然算 mention：那是明着叫她，只是没打字；`empty` 只留给
+    「没 @、也没正文」这种真的什么信息都没有的消息。这条与「空文本 empty」的字面
+    顺序不同，是**有意**的——把 @ 判成 empty 等于让她无视一次点名。
+    """
+    ids = _clean_ids(at_ids)
+    names = _clean_names(bot_names)
+    others = _clean_names(known_names)
+    body = str(text or "").strip()
+
+    # ① At：唯一能判成点名的证据。@全体也算——她也在「全体」里。
+    hits = _at_hits(ids, bot_id)
+    if hits:
+        return {"addressed": True, "reason": ATTR_MENTION, "targets": tuple(hits)}
+
+    if not body:
+        return {"addressed": False, "reason": ATTR_EMPTY, "targets": ()}
+
+    # ② 当面叫名字（「小助手你…」）：比 At 弱，但至少不是「在说她」。
+    called = _calls_by_name(body, names)
+    if called:
+        return {"addressed": False, "reason": ATTR_NAME_ONLY, "targets": (called,)}
+
+    # ③ 第三人称转述：bot 的名字或**别人的**名字后面跟着「说/讲/提…」。
+    # 别人的名字也要认——「小明刚才说…」原来会被 `addressed_to` 当成在叫小明，
+    # 于是她以为那句话是冲着自己来的。
+    said = _says_about(body, names + others)
+    if said:
+        return {"addressed": False, "reason": ATTR_THIRD_PERSON, "targets": (said,)}
+    pronoun = _THIRD_PERSON_RE.search(body)
+    if pronoun:
+        return {
+            "addressed": False,
+            "reason": ATTR_THIRD_PERSON,
+            "targets": (pronoun.group(0).strip(),),
+        }
+
+    # ④ 只是提到名字：评论（「我觉得小助手说得对」）也落在这一类。
+    for name in names:
+        if name in body:
+            return {"addressed": False, "reason": ATTR_NAME_ONLY, "targets": (name,)}
+
+    return {"addressed": False, "reason": ATTR_NONE, "targets": ()}
 
 
 def two_person_exchange(speakers: List[str], *, lookback: int = 4) -> bool:

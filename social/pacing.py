@@ -94,6 +94,127 @@ def _word_count(text: str) -> int:
     return len([c for c in text if c.isalnum()])
 
 
+# ── 分段边界保护 ─────────────────────────────────────────────────
+#
+# 为什么需要：拆段只看「这个位置有没有标点」，不看这个位置**在什么里面**。
+# 于是「她说『好。我知道了』」被切成 \`她说「好\` / \`我知道了」\`，第二条单独看像
+# 她在自言自语；\`23:00\`、\`https://…\`、\`安装包.zip\` 被从中间切开，用户收到的
+# 是一串碎片。这类错误比不拆更难看，所以先标出「不能切」的区间，再让两处
+# 拆段逻辑绕开它们。
+
+_QUOTE_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("「", "」"), ("『", "』"), ("“", "”"), ("‘", "’"), ('"', '"'), ("'", "'"),
+)
+_BRACKET_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"), ("《", "》"), ("〈", "〉"),
+)
+
+# 这些模式命中的是一整个「不该拆开」的 token。
+# ⚠️ URL 与文件名没有照抄 \`\S+\`：\`\S\` 会把中文标点一起吞掉，
+# 「看这个 https://x.y/z。然后呢」会被整句保护起来，正常断点反而失效。
+# 这里把可吃字符限制在「非空白、非句读」上，保护范围刚好是 token 本身。
+_SPAN_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"\d+:\d+"),                       # 23:00 / 16:9
+    re.compile(r"https?://[^\s，。！？；、）)】」』]+"),
+    re.compile(
+        r"[^\s，。！？；、（）()【】「」『』]+\.(?:zip|rar|png|jpe?g|gif|pdf|docx?|xlsx?|pptx?|txt|py|json|md)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:[A-Za-z]\.){2,}"),            # U.S. / e.g. / a.m.
+    re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.[a-z]{2,6}\b"),  # example.com
+)
+
+
+def _paired_spans(text: str, pairs: Tuple[Tuple[str, str], ...]) -> List[Tuple[int, int]]:
+    """成对符号的区间；未闭合时从开符号一直保护到文末。
+
+    未闭合为什么保护到文末：模型被截断时常常只留一个 \`「\`，后面半句仍是正文，
+    此时「哪里能切」已经不可信——整条发出去，好过切成两个半截气泡。
+    """
+    spans: List[Tuple[int, int]] = []
+    index, size = 0, len(text)
+    while index < size:
+        for opener, closer in pairs:
+            if text[index] != opener:
+                continue
+            if closer == opener:
+                end = text.find(opener, index + 1)
+            else:
+                end = text.find(closer, index + 1)
+            if end < 0:
+                spans.append((index, size))
+                return spans
+            spans.append((index, end + 1))
+            index = end
+            break
+        index += 1
+    return spans
+
+
+def _merge_spans(spans: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """重叠或相接的区间合并成一个（例如「（他说『好』）」这种多层嵌套）。"""
+    merged: List[List[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(int(start), int(end)) for start, end in merged]
+
+
+def _protected_spans(text: str) -> List[Tuple[int, int]]:
+    """返回「不该被切开」的区间 [(start, end), ...]，已排序、已合并。
+
+    覆盖：成对引号与括号（未闭合保护到文末）、时间与比例、URL、文件名、
+    英文缩写里的点、域名里的点。
+    """
+    body = str(text or "")
+    if not body:
+        return []
+    spans = _paired_spans(body, _QUOTE_PAIRS) + _paired_spans(body, _BRACKET_PAIRS)
+    for pattern in _SPAN_PATTERNS:
+        spans.extend((match.start(), match.end()) for match in pattern.finditer(body))
+    return _merge_spans(spans)
+
+
+def _inside_spans(spans: Sequence[Tuple[int, int]], pos: int) -> bool:
+    """pos 是否落在某个保护区间的**内部**；贴边不算（边界正好在两端时可以切）。"""
+    return any(start < pos < end for start, end in spans)
+
+
+def _merge_protected(segments: List[str]) -> List[str]:
+    """把被保护区间切开的相邻段并回去，返回并好的段列表。
+
+    偏移按段累加：第 k 段的起点是前面所有段的长度之和。段边界落在保护区间
+    内部时，这一刀会把引号/括号/时间切开，于是把它并进上一段（可连续合并）。
+
+    合到只剩一段也照合并结果返回：保护的目的就是「宁可不拆」，退回原分段
+    等于把半截气泡又还回去。
+    """
+    segs = [seg for seg in (segments or []) if isinstance(seg, str)]
+    if len(segs) <= 1:
+        return segs
+    spans = _protected_spans("".join(segs))
+    if not spans:
+        return segs
+    merged: List[str] = []
+    current = ""
+    position = 0
+    for seg in segs:
+        start = position
+        position += len(seg)
+        if not current:
+            current = seg
+        elif _inside_spans(spans, start):
+            current += seg
+        else:
+            merged.append(current)
+            current = seg
+    if current:
+        merged.append(current)
+    return merged
+
+
 def split_segments(text: str, cfg: dict) -> List[str]:
     """按框架配置把一条文本拆成若干段。返回至少一段（拆不开就是它本身）。
 
@@ -140,7 +261,7 @@ def split_segments(text: str, cfg: dict) -> List[str]:
                     break
             if content.strip():
                 result.append(content)
-        return result if result else [body]
+        return _merge_protected(result) if result else [body]
 
     regex = str(cfg.get("regex") or _DEFAULT_REGEX)
     try:
@@ -148,7 +269,7 @@ def split_segments(text: str, cfg: dict) -> List[str]:
     except re.error:
         found = re.findall(_DEFAULT_REGEX, body, re.DOTALL | re.MULTILINE)
     result = [s.strip() for s in found if isinstance(s, str) and s.strip()]
-    return result if result else [body]
+    return _merge_protected(result) if result else [body]
 
 
 def part_interval(text: str, cfg: dict, *, rng: random.Random | None = None) -> float:
@@ -262,9 +383,11 @@ def _auto_split(text: str) -> List[str]:
         return []
     # 从中间偏后找断点：太靠前第一条太短，太靠后第二条太短
     lo, hi = int(len(body) * 0.35), int(len(body) * 0.75)
+    # 保护区间的断点不能用：在那里切就是半截引号/括号/URL（见 _protected_spans）
+    spans = _protected_spans(body)
     best = -1
     for i in range(hi, lo - 1, -1):
-        if body[i - 1] in _BREAK_CHARS:
+        if body[i - 1] in _BREAK_CHARS and not _inside_spans(spans, i):
             best = i
             break
     if best < 0:

@@ -25,6 +25,40 @@ from .history_ingest import parse_umo, umo_kind
 _Entry = Tuple[asyncio.Task, asyncio.Event]
 
 
+# ─── 对方话没说完时，「这一轮先不开口」的理由码 ────────────
+#
+# 「等她说完再回」不是一种输入状态，而是这一轮**不开口**的理由；状态页与日志要能
+# 看出「为什么没回」。判据本身在 threads.unfinished_signal（纯函数，只看那一条消息），
+# 这里只做映射，不重复判、不缓存，也不碰下面那套「正在输入」上报。
+#
+# 只有 unfinished 才给码：uncertain 的意思是「像被截断，但看不出她会不会继续」，
+# 拿一次静默去赌这个猜测，代价是对方以为没人理——照常回一句更安全（fail-open）。
+INPUT_WAIT_REASONS = {
+    "unfinished": "await_unfinished",
+}
+
+
+def wait_reason(signal: Any) -> str:
+    """半截话判断结果 → 这一轮该等的理由码；该回就返回空串。
+
+    signal 是 threads.unfinished_signal 的返回值（只读）。读不出来、state 不认识、
+    或对方其实已经说完，一律返回空串：宁可照常回一句，也不因为一个坏字段把她
+    变成永远不开口。
+    """
+    try:
+        data = signal if isinstance(signal, dict) else {}
+        state = str(data.get("state", "") or "")
+        base = INPUT_WAIT_REASONS.get(state, "")
+        if not base:
+            return ""
+        detail = str(data.get("reason", "") or "")
+        # 带上判据码（await_unfinished:explicit_marker）：日志里要能分清是「她明说
+        # 还要补充」还是「话停在半截」，这两种在排查时不是一回事。
+        return f"{base}:{detail}" if detail else base
+    except Exception:
+        return ""
+
+
 class InputStateNotifier:
     """按会话维护主动消息的「正在输入」上报。"""
 

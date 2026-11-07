@@ -670,8 +670,130 @@ def loops_resolved_by(user: Dict[str, Any], msg: str) -> List[str]:
     return out
 
 
-def loop_meta(text: str) -> Dict[str, Any]:
-    return {
+# ─── 2.1 追问过之后的第一轮：关不关交同轮模型 ──────────
+#
+# 旧版「关键词命中就关」的问题不在词表，而在**判断权**：一句话里出现「面试」和
+# 「过了」就关掉，可「面试过了初面，还要等复面」也长这样。关错一次就等于永久丢掉
+# 一件事——之后再也不会回访。参考 companion_v2 的做法：插件只负责标出「这一轮是在
+# 回那条追问」，由同轮模型看原话判 complete / edit；它看得见上下文，插件看不见。
+
+FOLLOWUP_REVIEW_WINDOW_SECONDS = 48 * 3600.0  # 追问后两天内，对方的回复才算「回这条追问」
+SURFACE_COOLDOWN_SECONDS = 3 * 86400.0        # 同一件事提过一次，三天内别再提
+MAX_CONTEXT_SURFACES = 3                       # 一件事最多被拿出来说几次
+
+# 这些词说明对方在**给结果**，而不只是提到这件事。关键词只能证明「这句在说这件事」，
+# 证明不了「这件事有结果了」——所以复核版要多这一道。
+_LOOP_RESULT_WORDS = (
+    "过了", "通过了", "没通过", "搞定", "完了", "结束", "黄了", "挂掉", "算了",
+    "出结果", "有结果", "结果", "录取", "拿到", "收到", "定下来", "没戏", "凉了",
+    "成了", "没成", "成功", "失败",
+)
+
+
+def _loop_item(
+    user: Dict[str, Any], about: str, *, migrate: bool = False
+) -> Optional[Dict[str, Any]]:
+    """按 about 找到那条**真实**的条目对象——只有改它才落得进盘。
+
+    老平铺数据（user["loop"]）在 loop_entries 里是现造的一条 dict，改它等于改完就扔。
+    migrate=True 时先按 engine._defer_loop 的既有做法把迁移结果写回 user["loops"]，
+    后面写 last_followup_at 才有地方落。
+    """
+    key = str(about or "").strip()
+    if not key:
+        return None
+    items = loop_entries(user)
+    for item in items:
+        if str(item.get("about", "")).strip() == key:
+            if migrate:
+                user["loops"] = items
+            return item
+    return None
+
+
+def loop_review_pending(user: Dict[str, Any], about: str, now: float) -> bool:
+    """这条线索这一轮该不该交模型复核：她刚追问过，而对方的回复还没看过。
+
+    窗口取 48 小时：再久对方的回复就不是「回这条追问」了，拿旧追问去套新消息，
+    只会把两件事搅在一起。窗口内每轮都复核一次是故意的——插件没有「复核已做」
+    的回执通道，少复核一次就可能把一句「算了，不弄了」当成还要继续。
+    """
+    try:
+        item = _loop_item(user, about)
+        if item is None:
+            return False
+        at = _num(now)
+        last = _num(item.get("last_followup_at"))
+        if at <= 0 or last <= 0 or at < last:
+            return False
+        if at - last > FOLLOWUP_REVIEW_WINDOW_SECONDS:
+            return False
+        # 追问之后已经复核过（有别的代码写 last_context_at 时才生效）就不必再塞提示。
+        return _num(item.get("last_context_at")) < last
+    except Exception:
+        return False
+
+
+def loop_surfaced(user: Dict[str, Any], about: str, now: float) -> bool:
+    """这件事现在拿出来提合不合适（冷却 + 次数上限；复核期例外）。
+
+    两个上限来自参考实现：同一件事三天内不提第二次，一件最多提三次——否则「回访」
+    会变成反复追问同一件事。但**复核期必须放行**：她刚追问过、对方还没回，这时
+    拦下来就成了「追问完就不管了」，比提多了更糟。
+
+    读不出来就当「不该提」：少提一次只损失一次机会，提错一次会显得没在听人说话。
+    """
+    try:
+        item = _loop_item(user, about)
+        if item is None:
+            return False
+        at = _num(now)
+        last_follow = _num(item.get("last_followup_at"))
+        last_context = _num(item.get("last_context_at"))
+        if (
+            last_follow > 0
+            and at >= last_follow
+            and at - last_follow <= FOLLOWUP_REVIEW_WINDOW_SECONDS
+            and last_context < last_follow
+        ):
+            return True
+        if int(_num(item.get("context_count"))) >= MAX_CONTEXT_SURFACES:
+            return False
+        if last_context > 0 and at >= last_context and at - last_context < SURFACE_COOLDOWN_SECONDS:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def mark_followup_sent(user: Dict[str, Any], about: str, now: float) -> None:
+    """记下「这次追问真的送到对方手上了」——**只能由调用方在回执确认送达后调**。
+
+    为什么不在发送前记：发送失败、被闸门拦下、对方根本没收到时，记了就把 48 小时
+    复核窗口白白用掉，对方之后真回了，也不会再被当成「回这条追问」。
+    找不到这条线索就安静返回：状态被并发清掉时，这里不该把整轮带走。
+    """
+    try:
+        at = _num(now)
+        if at <= 0:
+            return
+        item = _loop_item(user, about, migrate=True)
+        if item is None:
+            return
+        item["last_followup_at"] = at
+        item["followup_count"] = int(_num(item.get("followup_count"))) + 1
+    except Exception:
+        return
+
+
+def loop_meta(text: str, *, review: bool = False) -> Dict[str, Any]:
+    """回访那件事的素材。review=True 时多一条复核要求，**这里不判死**。
+
+    谁传 review：调用方先算好 `loop_review_pending(user, about, now)` 再传进来
+    （本函数只拿得到 about，看不到 last_followup_at）。窗口内每轮都会复核，
+    模型判 complete 后线索被关掉，提示自然消失——插件自己永远不替模型下结论。
+    """
+    meta: Dict[str, Any] = {
         "category": "loop",
         "intent": "followup",
         "mode": "loop",
@@ -680,6 +802,42 @@ def loop_meta(text: str) -> Dict[str, Any]:
         "style_hint": "要明确提到那件事是什么，别只说「那个呢」；问完就停",
         "about": text,
     }
+    if review:
+        meta["followup_review"] = True
+        meta["review_hint"] = (
+            "她刚主动追问过这件事，这是对方之后的回复：结合追问内容和这一轮原话判断——"
+            "明确收尾、应下、表示知道了、软拒绝、不想继续、转移话题，就判 complete 把这件事结束；"
+            "事情还有下文但状态变了（换了时间、换了说法、有了新进展），就判 edit 更新；"
+            "只有确实没答到点上才留着。别把「好的」「嗯嗯」「知道了」机械地当结束，"
+            "也别只口头带过就接着聊别的。"
+        )
+    return meta
+
+
+def loops_resolved_by_review(
+    user: Dict[str, Any], msg: str, *, confident: bool = False
+) -> List[str]:
+    """复核版：只有**确定是在收场**才关这条线索，误关一次就等于永远不再回访。
+
+    比 loops_resolved_by 多一道闸：`_closes_loop` 与关键词命中只说明「这句在说这件
+    事的结果」，还得有明确结果词（或调用方已经用模型判过 confident=True）。
+    「面试过了初面，还要等复面」没有收尾语义 → 不关。判不准就留着：多问一句比丢
+    一件事便宜。旧函数原样保留，没把握的调用点可以先用这个。
+    """
+    body = str(msg or "").strip()
+    if not body or not _closes_loop(body):
+        return []
+    if not confident and not any(word in body for word in _LOOP_RESULT_WORDS):
+        return []
+    out: List[str] = []
+    for item in loop_entries(user):
+        about = str(item.get("about", "")).strip()
+        if not about:
+            continue
+        # 待回访那件事的关键词还在对方这句里 → 这句说的是它的结果
+        if any(w in body for w in _LOOP_WORDS if w in about):
+            out.append(about)
+    return out
 
 
 def loop_reason(text: str) -> str:
@@ -805,3 +963,146 @@ def closer_meta(about: str = "", exchange: Optional[Sequence[str]] = None) -> Di
         "asked": about,
         "exchange": turns,
     }
+
+
+# ─── 5. 这条消息说完了吗 ────────────────────────────
+#
+# 对方发「跟你说个事…」的时候，她要是当完整消息回，就是抢话——人家下文还没来；
+# 可要是插件自己把两条合并、或者干脆不开口，那又变成替人做主。所以这里只**判断**：
+# 返回三态与判据，不合并、不缓存、不阻塞，等不等、怎么回交给同一轮的模型。
+# 判据参考 companion_v2 的 turn_state：判断的是「这句话说完了没有」，不是「能不能答」。
+# 「什么是日食？」问得完整，也是 complete。
+
+# 明确表示「还要补充」的说法。中英都有：有人打中文，也有人中英混着打。
+# 长词在前：短的落在长的里面时只报长的那一个（见 _marker_hits）。
+UNFINISHED_MARKERS = (
+    "我还没说完", "还没说完", "没说完呢", "我还没讲完", "还没讲完",
+    "等我补充", "等我讲完", "马上补充", "我马上补", "我接着说", "接着跟你说",
+    "先别急着回", "先别回", "先别答", "别急着回", "等一下再说", "等下我再",
+    "回头再跟你说",
+    "i'm not done", "i am not done", "not finished yet", "haven't finished",
+    "hold on", "one sec", "wait a sec", "let me finish",
+)
+
+# 整条只有起头词（去掉尾巴标点后完全相等）：话刚开了个头。
+_HEAD_ONLY = (
+    "跟你说个事", "跟你说件事", "跟你说件事儿", "跟你讲个事", "我跟你说个事",
+    "我跟你说", "我跟你讲", "问你个事", "问你件事", "告诉你个事",
+    "有个事", "有件事", "那个", "这个", "那个啥", "就是那个",
+    "我想", "我说", "就是", "其实", "对了", "然后", "但是", "不过",
+    "而且", "所以", "因为", "还有", "你猜", "你猜猜",
+)
+# 以起头词收尾：前面还有点东西，但话停在「那个」「然后」上，也是没说完。
+_HEAD_TAIL = (
+    "那个", "这个", "那个啥", "我想", "我说", "就是", "其实", "对了", "然后",
+    "但是", "不过", "而且", "所以", "因为", "还有", "你猜",
+)
+
+# 收尾的悬空标点：省略号、逗号、冒号、破折号——写到这里就是还要往下说。
+_ELLIPSIS_TAILS = ("……", "…", "...", "。。。", "。。")
+_DANGLING_TAILS = ("，", ",", "、", "：", ":", "——", "—")
+
+# 20 字以内、又以悬空标点收尾的，几乎只可能是「刚开了个头」；长句以省略号收尾
+# 更像被截断，只能给 uncertain——看不出她会不会继续，就不能替她等。
+_DANGLING_MAX_CHARS = 20
+# 4 个字以内、没有句读、也不是起头词：像只打了个头，或者被截断。
+_SHORT_MAX_CHARS = 4
+
+_PLACEHOLDER_RE = re.compile(r"^\[[^\[\]]{1,8}\]$")
+_HAS_WORD_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+_QUESTION_TAILS = ("？", "?", "吗", "么", "呢")
+_STRIP_TAIL = "。！!～~… \t\r\n"
+_PUNCT_CHARS = "，,。.！!？?；;：:、~～…—"
+
+
+def _signal(state: str, reason: str, markers: Tuple[str, ...] = ()) -> Dict[str, Any]:
+    """三态结果。reason 用稳定 ASCII 码（日志/状态页认它），markers 是命中的原文。"""
+    return {"state": state, "reason": reason, "markers": tuple(markers)}
+
+
+def _marker_hits(low: str) -> Tuple[str, ...]:
+    """命中的「还要补充」说法，去掉被更长说法包含的短词。
+
+    英文短语必须整词命中：「someone second」里也含「one sec」，不设边界就会把一句
+    正常英文判成「话没说完」。
+    """
+    hits: List[str] = []
+    for marker in UNFINISHED_MARKERS:
+        if marker.isascii():
+            found = re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", low) is not None
+        else:
+            found = marker in low
+        if found and not any(marker in hit for hit in hits):
+            hits.append(marker)
+    return tuple(hits)
+
+
+def _tail_token(text: str) -> str:
+    for token in _ELLIPSIS_TAILS + _DANGLING_TAILS:
+        if text.endswith(token):
+            return token
+    return ""
+
+
+def unfinished_signal(text: str) -> Dict[str, Any]:
+    """这条消息说完了没有：complete / unfinished / uncertain。
+
+    返回 {"state", "reason", "markers"}。**只看这一条消息**：不看历史、不猜下文，
+    也不替调用方决定等不等——那是同一轮模型的事。
+
+    判据（按优先级）：
+      - 显式「还要补充」（UNFINISHED_MARKERS）→ unfinished；
+      - 纯表情/纯标点 → 没有可判的语义，带省略号的当 uncertain，其余 complete；
+      - 问句 → complete（问得完整就是在等她答，不是在等自己补）；
+      - 20 字内以悬空标点收尾 → unfinished；更长的同款 → uncertain（像被截断）；
+      - 整条只有起头词、或以起头词收尾 → unfinished；
+      - 4 字内、无句读 → uncertain（可能是截断，也可能是「嗯」这种极短回应）。
+
+    任何异常都按 complete 放行：宁可正常回一句，也不能因为她这条消息格式怪就
+    永远不开口（fail-open）。
+    """
+    try:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return _signal("complete", "empty")
+
+        low = stripped.lower()
+        hits = _marker_hits(low)
+        if hits:
+            return _signal("unfinished", "explicit_marker", hits)
+
+        if _PLACEHOLDER_RE.match(stripped):
+            # 「[图片]」「[表情]」是素材占位，不是她打到一半的话。
+            return _signal("complete", "placeholder")
+
+        if not _HAS_WORD_RE.search(stripped):
+            # 纯表情/纯标点。只有省略号、逗号这类「还要往下写」的标点才当没说完；
+            # 表情包、单个句号都当完整——那本来就不需要接话。
+            if _tail_token(stripped) and _tail_token(stripped) in _ELLIPSIS_TAILS + _DANGLING_TAILS:
+                return _signal("uncertain", "ellipsis_only")
+            return _signal("complete", "non_verbal")
+
+        core = stripped.rstrip(_STRIP_TAIL)
+        if core.endswith(_QUESTION_TAILS):
+            return _signal("complete", "question")
+
+        tail = _tail_token(stripped)
+        if tail:
+            # 带问号的先算问句：「你知道吗…」是在问她，不是在等自己补下文。
+            if "？" in stripped or "?" in stripped:
+                return _signal("complete", "question")
+            if len(stripped) <= _DANGLING_MAX_CHARS:
+                return _signal("unfinished", "dangling_tail", (tail,))
+            return _signal("uncertain", "truncated_ellipsis", (tail,))
+
+        head = stripped.strip("…。，、,：:～~ \t")
+        if head in _HEAD_ONLY:
+            return _signal("unfinished", "dangling_head", (head,))
+        if len(head) <= 12 and any(head.endswith(word) for word in _HEAD_TAIL):
+            return _signal("unfinished", "dangling_head", (head,))
+
+        if len(stripped) <= _SHORT_MAX_CHARS and not any(ch in stripped for ch in _PUNCT_CHARS):
+            return _signal("uncertain", "short_no_punct")
+        return _signal("complete", "complete")
+    except Exception:
+        return _signal("complete", "error")

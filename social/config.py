@@ -615,6 +615,50 @@ GROUP_REF_PROMPT_MIN = 0
 GROUP_REF_PROMPT_MAX = 30
 GROUP_REF_PROMPT_DEFAULT = 8
 
+# v2.1.3：收尾沉默守卫。她在私聊里已经用「晚安」收过尾，用户又只回了句「晚安」，
+# 她再补一条同义道别就是死循环（线上复现过一整屏「晚安」）。守卫按「本轮消息是不是
+# 纯收尾词 + 窗口内她是否已强收尾」判断，命中就静默。窗口取 1800 秒：道别之后半小时内
+# 的「晚安」都还算同一场收尾。
+CLOSING_GUARD_WINDOW_MIN = 60
+CLOSING_GUARD_WINDOW_MAX = 7200
+CLOSING_GUARD_WINDOW_DEFAULT = 1800
+
+# v2.1.3：群硬收口。短时间内被反复唤醒（每轮都是 @ 她 / 引用她 / 叫到名字）说明群里
+# 已经在她身上叠加注意力，这时除了点名类理由，问题、兴趣词、冷场破冰、复读、行为猜测
+# 一律静音。阈值/窗口/冷却都从已送达轮次的时间戳重算，不落可变冷却行。
+GROUP_CLOSEOUT_WINDOW_MIN = 60
+GROUP_CLOSEOUT_WINDOW_MAX = 3600
+GROUP_CLOSEOUT_WINDOW_DEFAULT = 300
+GROUP_CLOSEOUT_THRESHOLD_MIN = 2
+GROUP_CLOSEOUT_THRESHOLD_MAX = 20
+GROUP_CLOSEOUT_THRESHOLD_DEFAULT = 3
+GROUP_CLOSEOUT_COOLDOWN_MIN = 0
+GROUP_CLOSEOUT_COOLDOWN_MAX = 86400
+GROUP_CLOSEOUT_COOLDOWN_DEFAULT = 900
+
+# v2.1.4：主动消息的三项新机制，各自一个独立开关，默认全开。
+#
+# 三项都不是「多一个功能」，而是给一条已经出过事故的路径加一道**能关掉的闸**：
+# - 规划/写作分离：以前「要不要说」和「怎么说」挤在同一次调用里，模型为了凑一句
+#   正文会自己编一件可指认的事；拆成两次之后，写作阶段只能引用证据卡里的事实。
+# - 按任务类型给 max_tokens：全库此前**从不传**这个参数，长度只在事后
+#   _truncate_at 里切，切在词中间的风险全靠边界逻辑兜着。
+# - 时间投影：模型会自己按日期换算星期、算「多久没联系」，算错就冒出
+#   「好久没见」这种它其实并不知道的话。
+#
+# 三项都 fail-open：关掉任一项就退回 2.1.3 的行为，老路径一行代码都不变。
+PLANNING_ENABLED_DEFAULT = True
+MAX_OUTPUT_TOKENS_ENABLED_DEFAULT = True
+TIME_PROJECTION_ENABLED_DEFAULT = True
+
+# v2.1.5：这两项在 engine.py 里早就被 getattr(cfg, ..., False) 读着，但配置层一直
+# 没这两个字段——getattr 的兜底是 False，于是「生成后自评一遍再发」和「先查一次
+# 记忆再开口」两条路永远是死代码。补进配置层等于给已有的实现接上电源。
+# - draft_review_enabled：自评只能收紧不能放宽（改完照样过验收层），风险低，默认开。
+# - memory_tools_enabled：每轮多一次模型调用、多一份延迟，默认关，想要的人自己开。
+DRAFT_REVIEW_ENABLED_DEFAULT = True
+MEMORY_TOOLS_ENABLED_DEFAULT = False
+
 REPLY_WINDOW_MIN = 1
 REPLY_WINDOW_MAX = 48
 # 把 6 小时后的回复也算作「回了我的主动消息」会高估回复率，进而错估关系熟细度；
@@ -1029,6 +1073,34 @@ class SocialConfig:
     # 多台 bot 同群时，群内「触发社交」默认要求消息 @ 了本 bot——哪台被 @ 就只触发哪台。
     # 关掉则退回到旧行为：群里一发指令，每台 bot 都会各自触发（只适合单台部署）。
     trigger_group_requires_at: bool = True
+
+    # v2.1.3：收尾沉默守卫（见 social/closing.py）。关掉退回旧行为：用户道晚安，她照答。
+    closing_guard_enabled: bool = True
+    closing_guard_window_seconds: int = CLOSING_GUARD_WINDOW_DEFAULT
+    # 每轮给模型的短提示（「上一轮你已经道过晚安」）。关掉只留静默判定。
+    closing_guard_prompt_enabled: bool = True
+
+    # v2.1.3：群硬收口（见 social/throttle.py）。被反复唤醒时只放行点名类理由。
+    group_closeout_enabled: bool = True
+    group_closeout_window_seconds: int = GROUP_CLOSEOUT_WINDOW_DEFAULT
+    group_closeout_threshold: int = GROUP_CLOSEOUT_THRESHOLD_DEFAULT
+    group_closeout_cooldown_seconds: int = GROUP_CLOSEOUT_COOLDOWN_DEFAULT
+
+    # v2.1.4：主动消息先规划后写作（plan → decide_with_plan，见 social/generator.py）。
+    # 关掉退回 2.1.3 的单次 decide：同一段 prompt 里既要判断要不要说、又要写出正文。
+    planning_enabled: bool = PLANNING_ENABLED_DEFAULT
+    # v2.1.4：按任务类型给 max_tokens（plan / proactive / group / chat / structured）。
+    # 关掉则完全不传这个参数，沿用 provider 自己的默认值（与 2.1.3 完全一致）。
+    max_output_tokens_enabled: bool = MAX_OUTPUT_TOKENS_ENABLED_DEFAULT
+    # v2.1.4：每次生成注入「此刻」投影块（本地时间 / 星期 / 距上次发消息多久），
+    # 防她按日期自己换算、说「好久没见」。关掉不注入。
+    time_projection_enabled: bool = TIME_PROJECTION_ENABLED_DEFAULT
+    # v2.1.5：生成后自评一次（generator.review_draft），不过就换个时机重来。
+    # 关掉则生成完直接进验收层，省一次模型调用。
+    draft_review_enabled: bool = DRAFT_REVIEW_ENABLED_DEFAULT
+    # v2.1.5：允许她先查一次记忆再开口（generator.generate_with_tools）。
+    # 会多一次模型调用，所以默认关；生成器不支持工具时自动退回普通生成。
+    memory_tools_enabled: bool = MEMORY_TOOLS_ENABLED_DEFAULT
 
     @property
     def mood_scale(self) -> float:
@@ -1569,6 +1641,55 @@ class SocialConfig:
             strict_proactive_provider=gb("strict_proactive_provider", False),
             owner_only_commands=gb("owner_only_commands", True),
             trigger_group_requires_at=gb("trigger_group_requires_at", True),
+            closing_guard_enabled=gb("closing_guard_enabled", True),
+            closing_guard_window_seconds=max(
+                CLOSING_GUARD_WINDOW_MIN,
+                min(
+                    CLOSING_GUARD_WINDOW_MAX,
+                    gi("closing_guard_window_seconds", CLOSING_GUARD_WINDOW_DEFAULT),
+                ),
+            ),
+            closing_guard_prompt_enabled=gb("closing_guard_prompt_enabled", True),
+            group_closeout_enabled=gb("group_closeout_enabled", True),
+            group_closeout_window_seconds=max(
+                GROUP_CLOSEOUT_WINDOW_MIN,
+                min(
+                    GROUP_CLOSEOUT_WINDOW_MAX,
+                    gi("group_closeout_window_seconds", GROUP_CLOSEOUT_WINDOW_DEFAULT),
+                ),
+            ),
+            group_closeout_threshold=max(
+                GROUP_CLOSEOUT_THRESHOLD_MIN,
+                min(
+                    GROUP_CLOSEOUT_THRESHOLD_MAX,
+                    gi("group_closeout_threshold", GROUP_CLOSEOUT_THRESHOLD_DEFAULT),
+                ),
+            ),
+            group_closeout_cooldown_seconds=max(
+                GROUP_CLOSEOUT_COOLDOWN_MIN,
+                min(
+                    GROUP_CLOSEOUT_COOLDOWN_MAX,
+                    gi("group_closeout_cooldown_seconds", GROUP_CLOSEOUT_COOLDOWN_DEFAULT),
+                ),
+            ),
+            # v2.1.4 三项：缺字段 / null / 认不出的值一律按 schema 默认（True）处理。
+            # 走 gb() 而不是手写 bool()，是为了让面板里填的 "false"/"0"/"off"
+            # 也能关掉——配置文件里这些值现实中就是字符串，bool("false") 会是 True。
+            planning_enabled=gb("planning_enabled", PLANNING_ENABLED_DEFAULT),
+            max_output_tokens_enabled=gb(
+                "max_output_tokens_enabled", MAX_OUTPUT_TOKENS_ENABLED_DEFAULT
+            ),
+            time_projection_enabled=gb(
+                "time_projection_enabled", TIME_PROJECTION_ENABLED_DEFAULT
+            ),
+            # v2.1.5 两项：同样走 gb()，面板里填的 "false"/"0"/"off" 也认。
+            # 注意默认值与 engine.py 的 getattr 兜底不同（那边是 False），以 schema 为准。
+            draft_review_enabled=gb(
+                "draft_review_enabled", DRAFT_REVIEW_ENABLED_DEFAULT
+            ),
+            memory_tools_enabled=gb(
+                "memory_tools_enabled", MEMORY_TOOLS_ENABLED_DEFAULT
+            ),
         )
 
     def in_quiet_hours(self, h: int) -> bool:

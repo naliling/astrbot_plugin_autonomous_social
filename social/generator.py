@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import random
 import re
@@ -34,7 +35,7 @@ from .style_profile import (
 )
 from .textutil import balance_brackets, is_quotable, short_call_name, strip_segments
 from .throttle import throttle
-from .verify import merge_lead_line, strip_echoed_label, strip_title_line
+from .verify import merge_lead_line, strip_actions, strip_echoed_label, strip_title_line
 
 from .reasoning import (
     energy_descriptor,
@@ -43,6 +44,8 @@ from .reasoning import (
     social_energy_descriptor,
     time_slot,
 )
+
+from .tools import TOOL_INSTRUCTION, execute_readonly, parse_tool_calls, tool_prompt
 
 from astrbot.api import logger
 
@@ -411,6 +414,116 @@ class Decision:
     promise: str = ""
     # 清洗前的原始模型输出。验收层要靠它分辨「模型自己写成这样」还是「清洗弄坏的」
     raw_text: str = ""
+    # v2.1.4：这条决定是哪份规划（Plan）产出的；None 表示没走规划、仍是旧的单次决定。
+    # 发送前那一层证据闸要拿 plan.facts 去和证据卡比对，所以规划必须跟着决定走到底，
+    # 不能只活在 prompt 拼接那几步里。
+    plan: Optional["Plan"] = None
+
+
+@dataclass
+class Plan:
+    """规划阶段的结果：这次要不要说、从哪一件具体的事开口（v2.1.4）。
+
+    为什么把这一步从 `decide()` 里拆出来：原来一次调用同时干三件事——判断要不要说、
+    挑说哪件事、把话写出来。模型于是总是先写出一句话，再倒推一个理由；写完只剩事后
+    正则清洗，没有任何一道能拦住「这件事其实没发生过」。真人反过来：先想起一件具体的
+    事，觉得值得说，才组织语言。
+
+    这一步只回答前两问，**不写正文**（`_plan_prompt()` 里明令禁止），写正文留给
+    `_compose(decide=True)` 那一遍。`decision` 只取 "send" / "skip"。
+    """
+
+    decision: str = "skip"
+    # 解析不出数字时给 0.5（spec §4）：这是「有多确定」，不是「有多想说」，
+    # 缺失时既不该当成 0（一律不说）也不该当成 1（一律说）。
+    confidence: float = 0.5
+    angle: str = ""
+    facts: List[str] = field(default_factory=list)
+    avoid: List[str] = field(default_factory=list)
+    skip_reason: str = ""
+    raw: str = ""
+
+
+# 规划阶段「不说」的六个固定原因。不让模型自由发挥：自由文本没法聚合，也永远比不出
+# 「这周最多的是哪一类」；而聚合正是这次要接进 2.1.3 原因码体系的东西。
+SKIP_REASONS = (
+    "insufficient_context",
+    "no_natural_opening",
+    "purpose_mismatch",
+    "repetitive",
+    "respect_user_boundary",
+    "other",
+)
+
+# 按任务类型给输出上限。以前所有调用共用 provider 默认值，像 plan 这种「只吐一个
+# JSON」的调用也被允许写满额度，等于给模型留了写正文的余地。这里给的是「希望值」：
+# `_invoke_llm()` 只在 provider 签名吃得下时才真的传，不吃就原样调用（fail-open）。
+OUTPUT_TOKENS = {
+    "plan": 320,
+    "review": 320,
+    "proactive": 384,
+    "group": 512,
+    "chat": 512,
+    "structured": 1024,
+}
+
+
+def _load_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """从模型输出里捞出第一个 JSON 对象；给不出 JSON 就返回 None。
+
+    三步依次放宽：直接解析 → 去掉 ```json 围栏再解析 → 截第一个 { 到最后一个 } 再解析。
+    只在「它其实给了 JSON、只是包了层壳」时成功，不猜、不补全。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    fenced = re.sub(r"^```[a-zA-Z0-9_-]*\s*|\s*```$", "", raw)
+    if fenced != raw:
+        candidates.append(fenced)
+    start, end = raw.find("{"), raw.rfind("}")
+    if 0 <= start < end:
+        candidates.append(raw[start:end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _confidence(value: Any) -> float:
+    """置信度收成 0.0–1.0；读不出来 / 非有限值给 0.5（spec §4），不当 0 也不当 1。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.5
+    if not math.isfinite(out):
+        return 0.5
+    return 0.0 if out < 0.0 else 1.0 if out > 1.0 else out
+
+
+def _plan_list(value: Any, item_max: int, limit: int) -> List[str]:
+    """facts / avoid 这类字符串列表：非字符串丢掉、超长截断、条数封顶。
+
+    不截断的后果是模型把整段证据复述一遍塞进 facts，写作阶段的 prompt 直接超预算；
+    而这里截断是安全的——facts 只是「可以说哪几件事」的提纲，不是原文。
+    """
+    out: List[str] = []
+    if not isinstance(value, (list, tuple)):
+        return out
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text:
+            continue
+        out.append(text[:item_max])
+        if len(out) >= limit:
+            break
+    return out
 
 
 # 文风级反重复：展示最近发出的几条
@@ -1155,6 +1268,296 @@ def _body_line(body: Dict[str, Any]) -> str:
     return "你自己身体的感觉（只是感觉，不要在消息里报告它们）：" + "；".join(parts[:3]) + "。"
 
 
+# ─── 发送前自评（v2.1.5 §5）─────────────────────────────
+#
+# 为什么值得多一次模型调用：正文是「按感觉写」的，写完之后最该问的不是「像不像她」，
+# 而是「这句现在能不能就这么发出去」。让同一个模型做一道选择题，比再加十条规则便宜也
+# 更准——规则永远漏，而这次调用只花正文额度的零头。
+#
+# 为什么是选择题而不是打分/自由评语：解析必须便宜且稳定。三个结论覆盖了真实会遇到的
+# 三种情况；自由评语一旦解析失败，等于白花一次调用还把正文卡在那里。
+REVIEW_VERDICTS = ("ok", "rewrite", "drop")
+
+# 别名表：模型常把同一件事换个词（pass/good/fix/reject）。这不是没按要求做，认了不会
+# 放过真问题；认不出来的一律按 ok（fail-open）——宁可放过一条可疑的，也不要因为解析
+# 不了就把一条本来没问题的正文拦下来。
+REVIEW_VERDICT_ALIASES: Dict[str, str] = {
+    "ok": "ok", "pass": "ok", "good": "ok", "fine": "ok", "keep": "ok", "allow": "ok",
+    "通过": "ok", "可以": "ok",
+    "rewrite": "rewrite", "fix": "rewrite", "revise": "rewrite", "edit": "rewrite",
+    "改": "rewrite", "重写": "rewrite",
+    "drop": "drop", "reject": "drop", "block": "drop", "discard": "drop", "skip": "drop",
+    "拒": "drop", "不发": "drop",
+}
+
+# 自评的输出上限：只回一个 JSON。给多了它会顺手把正文重写一遍，那不如直接让它 rewrite。
+REVIEW_MAX_TOKENS = 320
+
+# ─── 证据校验（v2.1.5 §5）───────────────────────────────
+#
+# 为什么自评之外还要单独做一遍：自评问的是「能不能发」，而模型对自己刚编出来的细节
+# 往往很自信；这一遍问的是不需要模型的问题——正文里那些具体事实（时间、地点、数字、
+# 专名），有多少能在手里的卡里找到出处。两者互补：自评管语气和场合，这里管事实。
+#
+# 覆盖率用字符二元组而不是整串匹配：卡片写「周六下午三点在图书馆」，正文写「周六三点」
+# 时整串永远对不上，二元组能对上大半。0.6 与 guards.evidence_missing 同口径。
+GROUNDED_OVERLAP = 0.6
+# 声称里至少一半能找到出处才算「有出处」。设成「一条没出处就拦」会把正常转述也拦下来
+# （卡片不会逐字复述正文）；低于一半则说明这次的具体事实大半是编的，值得拦。
+GROUNDED_MIN_RATIO = 0.5
+
+# 按句末标点/换行切句：一条消息里通常只有一两句在声称事实，其余是情绪和寒暄。
+_CLAIM_SPLIT = re.compile(r"[。！？!?；;\n]+")
+# 时间词表：这些词一出现，句子就在声称「某个时间发生了什么」，需要出处。
+_CLAIM_TIME = re.compile(
+    r"今天|昨天|前天|明天|后天|上周|这周|本周|周末|周[一二三四五六日天]|"
+    r"上午|中午|下午|傍晚|晚上|凌晨|早上|刚才|刚刚|上个月|这个月|去年|今年|"
+    r"会儿|小时|分钟|点半|点钟"
+)
+# 引号/书名号里的内容同样是「具体说法」，编一个歌名/台词和编一个时间一样要命。
+_CLAIM_QUOTED = re.compile(r"[「『《\"“”]")
+_CLAIM_DIGIT = re.compile(r"\d")
+# 归一化时去掉的标点与空白：比对的是内容，不是排版。
+_GROUND_PUNCT = re.compile(r"[\s，。！？、；：,.!?;:\-—~～…·「」『』《》\"'“”‘’（）()【】\[\]]+")
+
+
+def _claimed_facts(text: str) -> List[str]:
+    """挑出正文里「声称了具体事实」的句子。
+
+    判据故意粗：有数字、有时间词、或带引号书名号才算。粗的好处是不容易误伤情绪句
+    （「有点想你」不该被要求出处），代价是漏掉一些隐含事实——漏了只是少拦一次，
+    多拦一次却会把好正文改坏，这个方向上的偏差是有意的。
+    """
+    claims: List[str] = []
+    for raw in _CLAIM_SPLIT.split(str(text or "")):
+        segment = strip_actions(raw).strip()
+        if len(segment) < 2:
+            continue
+        # 疑问句不是声称：「你今天还加班吗」本来就是在问，不需要出处。
+        if "？" in segment or "?" in segment or segment[-1] in "吗呢么嘛":
+            continue
+        if not (
+            _CLAIM_DIGIT.search(segment)
+            or _CLAIM_TIME.search(segment)
+            or _CLAIM_QUOTED.search(segment)
+        ):
+            continue
+        claims.append(segment)
+        if len(claims) >= 8:
+            break
+    return claims
+
+
+def _ground_norm(text: str) -> str:
+    return _GROUND_PUNCT.sub("", str(text or "")).casefold()
+
+
+def _ground_bigrams(text: str) -> set:
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i:i + 2] for i in range(len(text) - 1)}
+
+
+def _ground_coverage(needle: set, hay: set) -> float:
+    """声称的二元组有多少比例出现在某张卡里。分母是声称，不是并集——卡片一长串
+    会把分母撑大，覆盖率永远上不去，等于没比。"""
+    if not needle:
+        return 1.0
+    return len(needle & hay) / len(needle)
+
+
+def _ground_hit(claim: str, corpus: List[str]) -> bool:
+    norm = _ground_norm(claim)
+    if not norm:
+        return True
+    for hay in corpus:
+        if norm in hay:
+            return True
+    needle = _ground_bigrams(norm)
+    for hay in corpus:
+        if _ground_coverage(needle, _ground_bigrams(hay)) >= GROUNDED_OVERLAP:
+            return True
+    return False
+
+
+def grounded_claims(text: str, cards: Any) -> Dict[str, Any]:
+    """核对正文里的具体事实有没有出处。
+
+    Returns:
+        {"ok": bool, "missing": [没有出处的声称], "ratio": 有出处的比例}
+
+    没有声称、没有卡、或任何异常，一律 ok=True / ratio=1.0：这个函数的职责是
+    「发现明显编造」，不是「证明每句话都对」。没有卡就没有可核对的东西，此时拦下来
+    等于让所有没有卡的消息都发不出去。
+    """
+    try:
+        claims = _claimed_facts(text)
+        if not claims:
+            return {"ok": True, "missing": [], "ratio": 1.0}
+        corpus: List[str] = []
+        for card in cards or []:
+            if isinstance(card, dict):
+                merged = " ".join(
+                    str(card.get(key) or "") for key in ("title", "detail", "source")
+                )
+            else:
+                merged = str(card or "")
+            norm = _ground_norm(merged)
+            if norm:
+                corpus.append(norm)
+        if not corpus:
+            return {"ok": True, "missing": [], "ratio": 1.0}
+        missing = [claim for claim in claims if not _ground_hit(claim, corpus)]
+        ratio = (len(claims) - len(missing)) / len(claims)
+        return {"ok": ratio >= GROUNDED_MIN_RATIO, "missing": missing, "ratio": round(ratio, 3)}
+    except Exception:  # noqa: BLE001 - 校验自己出错，绝不该拦住一条正常消息
+        return {"ok": True, "missing": [], "ratio": 1.0}
+
+
+def _review_card_lines(cards: Any) -> List[str]:
+    """卡片渲染：与 MessageGenerator._card_lines 同口径（最多 5 条、每条截 200 字）。
+    这里单独写一份，是为了让模块级函数不依赖下面才定义的类。"""
+    lines: List[str] = []
+    if isinstance(cards, dict):
+        cards = [cards]
+    if not isinstance(cards, (list, tuple)):
+        return lines
+    for card in cards[:5]:
+        if not isinstance(card, dict):
+            continue
+        title = str(card.get("title") or "").strip()
+        body = " ".join(
+            str(card.get(key) or "").strip() for key in ("detail", "source")
+        ).strip()
+        line = title
+        if body:
+            line = (line + "：" + body) if line else body
+        if line:
+            lines.append("- " + line[:200])
+    return lines
+
+
+def _review_plan_lines(plan: Any) -> List[str]:
+    """把 Plan（dataclass 或 dict）压成两三行，给自评当「本来想说什么」。"""
+    lines: List[str] = []
+    if plan is None:
+        return lines
+    if isinstance(plan, dict):
+        angle = str(plan.get("angle") or "").strip()
+        facts = plan.get("facts") or []
+        avoid = plan.get("avoid") or []
+    else:
+        angle = str(getattr(plan, "angle", "") or "").strip()
+        facts = getattr(plan, "facts", ()) or ()
+        avoid = getattr(plan, "avoid", ()) or ()
+    if angle:
+        lines.append("想说：" + angle[:120])
+    fact_lines = [str(item).strip()[:80] for item in facts if str(item).strip()][:3]
+    if fact_lines:
+        lines.append("手头的事：" + "；".join(fact_lines))
+    avoid_lines = [str(item).strip()[:40] for item in avoid if str(item).strip()][:3]
+    if avoid_lines:
+        lines.append("不要提：" + "、".join(avoid_lines))
+    return lines
+
+
+def _review_prompt(text: str, plan: Any, cards: Any) -> str:
+    """自评提示词：一道三选一的选择题，而不是「你觉得怎么样」。"""
+    lines = [
+        "你是发送前的最后一道检查。只看这条消息现在能不能原样发出去；不要重写风格，不要新增事实。",
+        "",
+        "【准备发出的消息】",
+        str(text or "").strip(),
+        "",
+    ]
+    plan_lines = _review_plan_lines(plan)
+    if plan_lines:
+        lines += ["【这次本来想说的】", *plan_lines, ""]
+    card_lines = _review_card_lines(cards)
+    if card_lines:
+        lines += ["【手里的证据卡】", *card_lines, ""]
+    else:
+        lines += [
+            "【手里的证据卡】",
+            "（这次没有卡：正文里任何具体时间、地点、数字、人名都可能是编的）",
+            "",
+        ]
+    lines += [
+        "从下面三个结论里选一个，只输出一个 JSON，不要解释：",
+        '{"verdict":"ok"}  正文可以直接发',
+        '{"verdict":"rewrite","text":"改好的正文","reason":"为什么改"}  意思对但有具体问题',
+        '{"verdict":"drop","reason":"为什么现在不该发"}  这句话现在不该发',
+        "",
+        "规则：",
+        "1. 拿不准就选 ok——拦错一条的代价比放过一条大。",
+        "2. 选 rewrite 时，改后的正文不许新增任何事实，只许删掉或弱化没有出处的部分。",
+        "3. 正文里出现证据卡找不到出处的具体事实时，必须处理（删掉或改成不确定的说法）。",
+        "4. 不要因为「不够有趣」「不够甜」就 rewrite，只有具体问题才算。",
+    ]
+    return "\n".join(lines)
+
+
+def parse_review(raw: Any) -> Optional[Dict[str, Any]]:
+    """解析自评输出；给不出可用的 verdict 就返回 None（调用方按 ok 处理）。"""
+    text = str(raw or "")
+    # 与 _parse_plan 同口径：先剥 think 块，再交给 _load_json_object 兜围栏和夹杂解释。
+    text = _THINK_BLOCK.sub("", text)
+    text = _THINK_OPEN.sub("", text)
+    text = _THINK_STRAY.sub("", text)
+    data = _load_json_object(text)
+    if not isinstance(data, dict):
+        return None
+    verdict_raw = str(data.get("verdict") or "").strip().lower()
+    verdict = REVIEW_VERDICT_ALIASES.get(verdict_raw)
+    if verdict is None:
+        return None
+    reason = str(data.get("reason") or "").strip()[:200]
+    if verdict == "rewrite":
+        new_text = str(data.get("text") or "").strip()
+        # 说 rewrite 却不给正文：这不是「改坏了」，是它其实没想改，按 ok 放行。
+        if not new_text:
+            return {"verdict": "ok", "reason": "rewrite_without_text"}
+        return {"verdict": "rewrite", "text": new_text[:600], "reason": reason}
+    return {"verdict": verdict, "reason": reason}
+
+
+async def review_draft(
+    provider: str,
+    text: str,
+    plan: Any = None,
+    cards: Any = None,
+    *,
+    call_llm: Any = None,
+    enabled: bool = True,
+    max_tokens: int = REVIEW_MAX_TOKENS,
+) -> Dict[str, Any]:
+    """生成后自评：一次受约束的选择题调用。
+
+    为什么 call_llm 由调用方注入：这里不该知道 provider 怎么调、超时多少、怎么退避；
+    那些都在 MessageGenerator 里，测试也只需要传一个假函数。
+
+    任何异常、任何解析不出来的输出，一律 {"verdict": "ok"}——自评是附加的一道检查，
+    它坏了不能连累发送。
+    """
+    if not enabled:
+        return {"verdict": "ok", "reason": "disabled"}
+    body = str(text or "").strip()
+    if not body:
+        return {"verdict": "ok", "reason": "empty_text"}
+    if not callable(call_llm):
+        return {"verdict": "ok", "reason": "no_call_llm"}
+    prompt = _review_prompt(body, plan, cards)
+    try:
+        raw = await call_llm(provider, prompt)
+    except Exception as e:  # noqa: BLE001 - fail-open
+        logger.debug(f"[autonomous_social] 自评调用失败，按 ok 放行: {e}")
+        return {"verdict": "ok", "reason": "review_call_failed"}
+    parsed = parse_review(raw)
+    if parsed is None:
+        return {"verdict": "ok", "reason": "review_unparsed"}
+    return parsed
+
+
 class MessageGenerator:
     """主动消息生成器。"""
 
@@ -1241,6 +1644,159 @@ class MessageGenerator:
             return self._split_parts(body, max_len, self.cfg, allow_emoji)
         return None
 
+    def _finish_parts(
+        self,
+        text: str,
+        max_len: int,
+        allow_emoji: bool,
+        reason: str,
+        reason_meta: Optional[Dict[str, Any]],
+    ) -> Optional[List[str]]:
+        """把模型交回的文本收成可发送段落。
+
+        抽出来是因为 generate() 与 generate_with_tools() 必须走同一套收尾：少剥一层
+        动机行，就会把「#想问他面试」当正文首行发出去。
+        """
+        body, _promise = self._strip_intent(text)
+        body = self._drop_labeled_head(body, self._label_sources(reason, reason_meta))
+        return self._split_parts(body, max_len, self.cfg, allow_emoji)
+
+    async def review_draft(
+        self,
+        provider: str,
+        text: str,
+        plan: Any = None,
+        cards: Any = None,
+        *,
+        enabled: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """发送前自评（v2.1.5 §5）。
+
+        为什么开关是参数而不是在这里读配置：模块里读配置会让「要不要多花一次调用」
+        散落在各处，调用方（引擎）才是决定这件事的人。
+
+        为什么 enabled 没给就按开启处理：调用方（engine.py 的 _review_draft）先读
+        draft_review_enabled 再决定要不要调到这里，能被调用就已经说明开关是开的；
+        这里再默认关闭一次，等于把开关二次判死、功能静默失效。只有显式 False 才跳过。
+        """
+        if enabled is None:
+            enabled = True
+        limit = max_tokens if max_tokens is not None else self._output_tokens("review")
+
+        async def _call(name: str, prompt: str) -> Optional[str]:
+            return await self._call_llm(name, prompt, max_tokens=limit)
+
+        # 裸名解析到模块级 review_draft：类属性不在方法作用域里，这里不会递归调自己。
+        return await review_draft(
+            provider, text, plan, cards, call_llm=_call, enabled=bool(enabled)
+        )
+
+    async def generate_with_tools(
+        self,
+        umo: str,
+        target: Dict[str, Any],
+        core_context: str,
+        reason: str,
+        reason_meta: Optional[Dict[str, Any]] = None,
+        persona_prompt: str = "",
+        mind: Optional[Dict[str, Any]] = None,
+        at: Optional[float] = None,
+        clock_offset: Optional[int] = None,
+        memory_note: str = "",
+        cards: Any = None,
+        memory_query: Any = None,
+        memory_sources: Any = None,
+        enabled: Optional[bool] = None,
+        legacy: Any = None,
+    ) -> Optional[List[str]]:
+        """带只读工具循环的生成（v2.1.5 §6）。
+
+        为什么关闭时完全走旧路：工具循环最多会多花一次模型调用，这个代价必须由用户
+        显式打开；开关 memory_tools_enabled 由 engine.py 读取并决定要不要调到这里。
+        enabled 为假时一次额外调用都不发，连 _compose 都不重跑，直接交给 legacy
+        （没有 legacy 就退回 generate）。
+
+        为什么 enabled 没给就按开启处理：与 review_draft 同理——engine 先看开关再调用，
+        能被调用就说明开关是开的；此处再默认关闭会让开关打开后仍走旧路（静默失效）。
+
+        为什么最多两轮：第 1 轮给工具，第 2 轮不再给、直接要求写正文。再多的轮次换来的
+        是延迟和 token，而模型的第二次查证很少真的改变要说的话。
+
+        Returns:
+            消息段落列表（1-2 条），失败返回 None
+        """
+
+        async def _legacy() -> Optional[List[str]]:
+            # 旧路：调用方给了 legacy 就用它（引擎侧的既有生成流程），否则直接 generate。
+            if callable(legacy):
+                try:
+                    out = legacy()
+                    if inspect.isawaitable(out):
+                        out = await out
+                    return out
+                except Exception as e:  # noqa: BLE001 - 回退路径失败就是没有消息
+                    logger.warning(f"[autonomous_social] 工具循环回退生成失败: {e}")
+                    return None
+            return await self.generate(
+                umo,
+                target,
+                core_context,
+                reason,
+                reason_meta,
+                persona_prompt,
+                mind,
+                at=at,
+                clock_offset=clock_offset,
+                memory_note=memory_note,
+            )
+
+        if enabled is None:
+            enabled = True
+        if not enabled:
+            return await _legacy()
+
+        try:
+            prepared = await self._compose(
+                umo, target, core_context, reason, reason_meta, persona_prompt, mind,
+                decide=False, at=at, clock_offset=clock_offset, memory_note=memory_note,
+            )
+            if prepared is None:
+                return await _legacy()
+            provider, prompt, max_len, allow_emoji = prepared
+
+            # 只有调用方真的给了能力才把它放进 ctx：没有 query 回调时，工具会回
+            # state=unknown/no_provider，模型据此知道「没查成」而不是「查了是空」。
+            ctx: Dict[str, Any] = {}
+            if memory_query is not None:
+                ctx["query"] = memory_query
+            if memory_sources is not None:
+                ctx["sources"] = memory_sources
+
+            first = await self._call_llm(provider, prompt + "\n\n" + TOOL_INSTRUCTION)
+            calls = parse_tool_calls(first or "")
+            if not calls:
+                if not first:
+                    return await _legacy()
+                return self._finish_parts(first, max_len, allow_emoji, reason, reason_meta)
+
+            results = [execute_readonly(call, ctx) for call in calls]
+            follow_up = (
+                prompt
+                + "\n\n"
+                + tool_prompt(results)
+                + "\n\n这次不要再调用工具：按上面的材料（没有材料就按你本来知道的）"
+                "直接写出要发的那条消息，不要解释过程。"
+            )
+            second = await self._call_llm(provider, follow_up)
+            if not second:
+                # 第二轮没拿到正文：宁可回退一次直生成，也不要发一条空消息。
+                return await _legacy()
+            return self._finish_parts(second, max_len, allow_emoji, reason, reason_meta)
+        except Exception as e:  # noqa: BLE001 - 工具循环坏了不能连累发送
+            logger.warning(f"[autonomous_social] 工具循环异常，回退直生成: {e}")
+            return await _legacy()
+
     async def decide(
         self,
         umo: str,
@@ -1284,6 +1840,381 @@ class MessageGenerator:
         if decision is not None:
             decision.raw_text = result_text
         return decision
+
+    async def plan(
+        self,
+        umo: str,
+        target: Dict[str, Any],
+        core_context: str,
+        reason: str,
+        reason_meta: Optional[Dict[str, Any]] = None,
+        persona_prompt: str = "",
+        mind: Optional[Dict[str, Any]] = None,
+        at: Optional[float] = None,
+        clock_offset: Optional[int] = None,
+        memory_note: str = "",
+        cards: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Plan]:
+        """先只想清楚「要不要说、从哪件事说」，**不写正文**（v2.1.4）。
+
+        `persona_prompt` 只为与 `decide()` 参数表对齐而收下：规划阶段不产出任何
+        她要说的话，人格细节留到写作那一次调用；在这里塞进去只会让「要不要说」
+        这个判断被文风细节稀释。
+
+        Args:
+            cards: 证据卡（engine.evidence_cards() 给的）。为空不是错误：手里没事时
+                照样可以说「没什么事，就是想跟你说句话」这类不依赖事实的话；
+                但绝不能编一件没发生的事——所以空清单必须显式告诉模型「没有」。
+
+        Returns:
+            Plan；没开规划、拿不到模型、退避中、调用异常、输出解析不出来都返回 None，
+            由调用方退回 `decide()`（行为与 2.1.3 完全一致）。
+        """
+        if not self._cfg_flag("planning_enabled"):
+            return None
+        provider = await self._get_provider(umo)
+        if provider is None:
+            return None
+        # 退避期内不烧 token：这一轮的调用必然失败，plan 只会再多失败一次、
+        # 多记一笔失败计数，把退避推得更长。
+        if self.llm_backoff_remaining(self._scope_of(provider)) > 0:
+            return None
+        ref = float(at) if at is not None else float(self._now())
+        prompt = self._plan_prompt(
+            target=target,
+            core_context=core_context,
+            reason=reason,
+            reason_meta=reason_meta,
+            mind=mind,
+            memory_note=memory_note,
+            cards=cards,
+            at=ref,
+            clock_offset=clock_offset,
+        )
+        try:
+            text = await self._call_llm(
+                provider, prompt, max_tokens=self._output_tokens("plan")
+            )
+        except Exception as e:
+            # fail-open：规划只是「说得更像真人」的增强，不能因为它让整轮心跳崩掉
+            logger.warning(f"[autonomous_social] 规划调用异常，退回单次决定: {e}")
+            return None
+        if not text:
+            return None
+        plan = self._parse_plan(text)
+        if plan is None and throttle.allow("plan.unparsed"):
+            logger.warning(
+                "[autonomous_social] 规划输出无法解析，退回单次决定（前 80 字）："
+                + str(text)[:80].replace("\n", " ")
+                + throttle.summary("plan.unparsed")
+            )
+        return plan
+
+    async def decide_with_plan(
+        self,
+        umo: str,
+        target: Dict[str, Any],
+        core_context: str,
+        reason: str,
+        reason_meta: Optional[Dict[str, Any]] = None,
+        persona_prompt: str = "",
+        mind: Optional[Dict[str, Any]] = None,
+        at: Optional[float] = None,
+        clock_offset: Optional[int] = None,
+        memory_note: str = "",
+        cards: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Decision]:
+        """先规划再写作，返回与 `decide()` 同形状的 Decision（v2.1.4）。
+
+        规划说 skip 就到此为止：一次模型调用都不花在写作上。说要发，才用
+        `_compose(decide=True)` 拼出写作提示词，再把【这次的说法】追加进去——
+        这一块只约束「说哪件事」，不替模型写句子；写完照样过 `_parse_decision`
+        与引擎那边的 verify 链。
+
+        Returns:
+            Decision；任何一环失败返回 None → 调用方退回 `decide()`。
+        """
+        if not self._cfg_flag("planning_enabled"):
+            return None
+        plan = await self.plan(
+            umo, target, core_context, reason, reason_meta, persona_prompt, mind,
+            at=at, clock_offset=clock_offset, memory_note=memory_note, cards=cards,
+        )
+        if plan is None:
+            return None
+        if plan.decision == "skip":
+            # why_not 直接放原因码原文而不是中文：上层拿它进 2.1.3 的 _gate_note /
+            # _blocked 体系，中文文案在那边统一写（同一个码只该有一处文案）。
+            return Decision(
+                send=False,
+                why_not=plan.skip_reason or "other",
+                raw=plan.raw,
+                plan=plan,
+            )
+        prepared = await self._compose(
+            umo, target, core_context, reason, reason_meta, persona_prompt, mind,
+            decide=True, at=at, clock_offset=clock_offset, memory_note=memory_note,
+        )
+        if prepared is None:
+            return None
+        provider, prompt, max_len, allow_emoji = prepared
+        extra: List[str] = []
+        if self._cfg_flag("time_projection_enabled"):
+            # 写作这一次才是真的会写出「好久没见」的那次调用，所以时间投影必须
+            # 在这里再给一遍；plan 阶段给过不代表写作阶段还记得。
+            extra.append(
+                self._time_projection(
+                    target,
+                    float(at) if at is not None else float(self._now()),
+                    clock_offset,
+                )
+            )
+        extra.append(self._plan_block(plan))
+        prompt = prompt + "\n\n" + "\n\n".join(extra)
+        try:
+            result_text = await self._call_llm(
+                provider, prompt, max_tokens=self._output_tokens("proactive")
+            )
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 规划后的写作调用异常: {e}")
+            return None
+        if not result_text:
+            return None
+        decision = self._parse_decision(
+            result_text, max_len, self.cfg, allow_emoji,
+            labels=self._label_sources(reason, reason_meta),
+        )
+        if decision is not None:
+            decision.raw_text = result_text
+            decision.plan = plan
+        return decision
+
+    def _plan_prompt(
+        self,
+        *,
+        target: Dict[str, Any],
+        core_context: str,
+        reason: str,
+        reason_meta: Optional[Dict[str, Any]],
+        mind: Optional[Dict[str, Any]],
+        memory_note: str,
+        cards: Optional[List[Dict[str, Any]]],
+        at: float,
+        clock_offset: Optional[int],
+    ) -> str:
+        """规划提示词：只问「要不要说 / 从哪件事说」，明令不许写正文。
+
+        与 `_compose()` 是两个方向：那一份是「已经决定要说，现在把它说出来」，
+        这一份是「先确认到底有没有话说」。混在一起的后果是模型永远有话可说——
+        它已经在写句子了，停下来比接着写难得多。
+        """
+        meta = reason_meta or {}
+        parts: List[str] = [
+            "你在决定：现在要不要主动给她发一条消息；如果要发，从哪一件具体的事开口。",
+            "",
+        ]
+        if self._cfg_flag("time_projection_enabled"):
+            parts.append(self._time_projection(target, at, clock_offset))
+            parts.append("")
+        parts.append(f"【为什么现在想起她】{reason}")
+        about = str(meta.get("about") or "").strip()
+        if about:
+            parts.append(f"具体是：{about}")
+        parts.append("")
+        card_lines = self._card_lines(cards)
+        parts.append("【你手上能指认的事】")
+        if card_lines:
+            parts.extend(card_lines)
+        else:
+            parts.append("（这次手里没有一件能指认的具体事）")
+        parts.append("")
+        state_lines: List[str] = []
+        if mind:
+            mind_text = self._format_mind(mind)
+            if mind_text:
+                state_lines.append(mind_text)
+        core_text = str(core_context or "").strip()
+        if core_text:
+            # 只取开头一段：这一步是「定要不要说」，不是写正文，不需要全部处境；
+            # 整段塞进来只会把判断稀释成一次阅读理解。
+            state_lines.append(core_text[:600])
+        note = str(memory_note or "").strip()
+        if note:
+            state_lines.append(note[:300])
+        if state_lines:
+            parts.append("【你现在的状态】")
+            parts.extend(state_lines)
+            parts.append("")
+        parts.extend([
+            "【这是主动联系，不是回复】她这会儿没在跟你说话。",
+            "- 手里有具体的事：说清是哪一件、从哪个切口说。",
+            "- 没有具体的事：直说没有。不要为了发而发，也不要现编一件。",
+            "- 只是单纯想跟她说句话，也算一个正当理由——那就直说是这个理由。",
+            "",
+            "【这次只做规划，不写正文】",
+            "不要写出你打算发出去的那句话，一个字都不要写。写出来的东西没人会看。",
+            "",
+            "只输出一个 JSON，不要代码块、不要解释：",
+            '{"decision":"send","confidence":0.8,"angle":"这次从哪儿开口（一句话）",'
+            '"facts":["只能摘自上面证据卡的事实"],"avoid":["这次不要碰的"]}',
+            "或者",
+            '{"decision":"skip","confidence":0.8,"skip_reason":"insufficient_context"}',
+            "",
+            "skip_reason 只能取：" + " / ".join(SKIP_REASONS),
+            "facts 最多 6 条、每条不超过 120 字，且每一条都必须能在上面证据卡里",
+            "原样找到；找不到就不要写。avoid 最多 6 条。",
+        ])
+        return "\n".join(parts)
+
+    def _time_projection(
+        self, target: Dict[str, Any], at: float, clock_offset: Optional[int]
+    ) -> str:
+        """时间投影块（spec §5）：把此刻与间隔算好再给，并禁止模型自己换算。
+
+        为什么不让模型自己看时间戳算：它算不对，而算错的方式恰好是「好久没见」
+        「一直没联系」这种最假的句子。间隔读不出来时必须写「不知道」——
+        编一个间隔比不给更糟。
+        """
+        now_dt = city_now(float(at), clock_offset)
+        weekday_cn = "一二三四五六日"[now_dt.weekday()]
+        period = slot_name_cn(time_slot(now_dt.hour))
+        minutes = self._minutes_since_last_sent(target, float(at))
+        gap = "不知道" if minutes is None else f"{minutes} 分钟"
+        return (
+            f"【此刻】{now_dt.strftime('%Y-%m-%d %H:%M')} 周{weekday_cn} {period}；"
+            f"距离你上次给她发消息 {gap}。\n"
+            "星期、是否周末、隔了多久，一律以上面给的为准，不要自己按日期换算，"
+            "也不要说「好久没见」「一直没联系」。"
+        )
+
+    @staticmethod
+    def _minutes_since_last_sent(
+        target: Dict[str, Any], at: float
+    ) -> Optional[int]:
+        """距离「上次给她发消息」多少分钟；读不出来返回 None（→ 文案写「不知道」）。
+
+        两个键都看：`last_sent` 是引擎记的最近一次任何发送，`last_proactive_sent`
+        只在主动路径更新。取较大的那个更接近「我上次主动开口是多久前」。
+        时间戳在未来（时钟回拨 / 状态被改坏）也当读不出来，不给出负分钟数。
+        """
+        if not isinstance(target, dict):
+            return None
+        last = 0.0
+        for key in ("last_sent", "last_proactive_sent"):
+            try:
+                value = float(target.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                last = max(last, value)
+        if last <= 0 or last > at:
+            return None
+        return int(max(0.0, at - last) // 60.0)
+
+    @staticmethod
+    def _card_lines(cards: Optional[List[Dict[str, Any]]]) -> List[str]:
+        """把证据卡渲染成编号清单，最多 5 条、每条截 200 字。
+
+        截断的理由同 facts：这一步只要「从哪件事说」，不是把整件事交给模型复述。
+        空标题也空正文的卡直接跳过，避免渲染出一行只有序号的噪声。
+        """
+        lines: List[str] = []
+        for card in list(cards or [])[:5]:
+            if not isinstance(card, dict):
+                continue
+            title = str(card.get("title") or "").strip()
+            detail = str(card.get("detail") or "").strip()
+            if not title and not detail:
+                continue
+            source = str(card.get("source") or "").strip()
+            label = f"[{source}] " if source else ""
+            body = f"{title}：{detail}" if title and detail else (title or detail)
+            lines.append(f"{len(lines) + 1}. {label}{body[:200]}")
+        return lines
+
+    @staticmethod
+    def _plan_block(plan: Plan) -> str:
+        """把规划结果写成【这次的说法】块，追加在写作提示词末尾。
+
+        它只约束「说哪件事」，不替模型写句子。facts 为空时必须明说「不要编具体
+        事件」：留空白的提示词会被模型自动填上一个事件，那正是 2.1.3 想堵的洞。
+        """
+        lines = ["【这次的说法】"]
+        if plan.angle:
+            lines.append(f"切口：{plan.angle}")
+        if plan.facts:
+            lines.append("可以说的事实（只能引用这几条，不许自己添）：")
+            lines.extend(f"- {fact}" for fact in plan.facts)
+        else:
+            lines.append("这次没有可以引用的事实：只说此刻的感受，不要编具体事件。")
+        if plan.avoid:
+            lines.append("这次不要碰：" + "；".join(plan.avoid))
+        lines.append("照着这个切口写，不要换一件事，也不要写到这里没列出的事。")
+        lines.append("现在按上面的格式写你要发的那条消息。")
+        return "\n".join(lines)
+
+    def _parse_plan(self, text: str) -> Optional[Plan]:
+        """解析规划输出。只认一个 JSON 对象；解析不出来返回 None（退回旧路径）。
+
+        宽容之处与 `_parse_decision()` 一致：推理模型的 <think> 块、```json 围栏、
+        JSON 前后的客套话都剥掉再解析——这些是模型习惯，不是它没按要求做。
+        但「说要发却既没切口也没事实」不宽容：那是没说清楚，不是可写的素材，
+        拿一个空规划去写正文等于把这次拆分的意义整个抹掉。
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        raw = _THINK_BLOCK.sub("", raw)
+        raw = _THINK_OPEN.sub("", raw)
+        raw = _THINK_STRAY.sub("", raw).strip()
+        data = _load_json_object(raw)
+        if not isinstance(data, dict):
+            return None
+        decision = str(data.get("decision") or "").strip().lower()
+        if decision not in ("send", "skip"):
+            return None
+        confidence = _confidence(data.get("confidence"))
+        angle = str(data.get("angle") or "").strip()[:200]
+        facts = _plan_list(data.get("facts"), 120, 6)
+        avoid = _plan_list(data.get("avoid"), 120, 6)
+        skip_reason = str(data.get("skip_reason") or "").strip().lower()
+        if skip_reason not in SKIP_REASONS:
+            # 模型给了个没见过的原因：归到 other，不要把一个自由发挥的字符串
+            # 当成新的原因码灌进统计里。
+            skip_reason = "other"
+        if decision == "send":
+            if not angle and not facts:
+                return None
+            skip_reason = ""
+        return Plan(
+            decision=decision,
+            confidence=confidence,
+            angle=angle,
+            facts=facts,
+            avoid=avoid,
+            skip_reason=skip_reason,
+            raw=raw,
+        )
+
+    def _cfg_flag(self, name: str, default: bool = True) -> bool:
+        """读一个布尔开关；缺字段 / 读不出来按 `default`（spec §7：三个新开关默认开）。
+
+        为什么用 getattr 兜底而不是 `self.cfg.xxx`：config.py 由另一条线同步改，
+        两边落地有先后。读不到就当默认开，本文件可以先合入而不炸，也不用等对齐。
+        """
+        try:
+            value = getattr(self.cfg, name, default)
+        except Exception:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "0", "false", "no", "off")
+        return bool(value)
+
+    def _output_tokens(self, kind: str) -> Optional[int]:
+        """这一类调用希望的上限；开关关掉返回 None（= 不干预 provider 默认值）。"""
+        if not self._cfg_flag("max_output_tokens_enabled"):
+            return None
+        return OUTPUT_TOKENS.get(kind)
 
     async def group_message(
         self,
@@ -2834,12 +3765,17 @@ class MessageGenerator:
             # `/自主社交状态` 会列出来（见 facade_status_text 旁边那条）。
         return None
 
-    async def _call_llm(self, provider: Any, prompt: str) -> Optional[str]:
+    async def _call_llm(
+        self, provider: Any, prompt: str, *, max_tokens: Optional[int] = None
+    ) -> Optional[str]:
         """调用 LLM 生成文本，兼容多种 API。全程带超时，失败会退避。
 
         Args:
             provider: LLM provider 对象
             prompt: 提示词
+            max_tokens: 输出上限。只在 provider 签名吃得下时才真的传（见
+                `_invoke_llm()`）；不吃就原样调用，绝不为这个参数让一路候选失效。
+                不做「超限了就升限重试」——那会把一次调用变成两次。
 
         Returns:
             生成的文本，失败返回 None
@@ -2847,7 +3783,7 @@ class MessageGenerator:
         tried: List[str] = []
         last_err = ""
         scope = self._scope_of(provider)
-        candidates = self._candidates(provider, prompt)
+        candidates = self._candidates(provider, prompt, max_tokens=max_tokens)
 
         for label, make in candidates:
             tried.append(label)
@@ -2904,19 +3840,27 @@ class MessageGenerator:
         self._note_llm_failure(scope, last_err)
         return None
 
-    def _candidates(self, provider: Any, prompt: str) -> List[tuple]:
+    def _candidates(
+        self, provider: Any, prompt: str, *, max_tokens: Optional[int] = None
+    ) -> List[tuple]:
         """排好序的候选调用方式：上次成功的那一路排最前，形状对不上的直接剔除。
 
         记住成功的那一路，是把「稳态下一次生成 = 一次网络请求」落到实处的关键；
         形状不对的永久剔除，是为了不出现「它不工作 → 换下一个 → 下一个也不工作 →
         一路试完」又回到五次请求的老路。
+
+        `max_tokens` 交给 `_budgeted()` 包装：每一路各自探签名，谁吃得下谁带。
         """
         pid = self._provider_id(provider)
         found: List[tuple] = []
         if pid and hasattr(self.context, "llm_generate"):
             found.append((
                 "llm_generate",
-                lambda: self.context.llm_generate(chat_provider_id=pid, prompt=prompt),
+                self._budgeted(
+                    self.context.llm_generate,
+                    kwargs={"chat_provider_id": pid, "prompt": prompt},
+                    max_tokens=max_tokens,
+                ),
             ))
         if hasattr(provider, "text_chat"):
             # 显式把「一次插件调用 = 一次 HTTP」告诉 provider。
@@ -2928,17 +3872,29 @@ class MessageGenerator:
             # 也就是一次几秒钟的抖动被记成一次 90 秒的硬故障。重试本来就该发生在心跳
             # 之间（下一轮心跳 8~15 分钟后还会来），不该叠在一个请求里。
             if self._accepts_kwarg(provider.text_chat, "request_max_retries"):
-                found.append((
-                    "text_chat",
-                    lambda: provider.text_chat(prompt=prompt, request_max_retries=1),
-                ))
+                chat_kwargs: Dict[str, Any] = {
+                    "prompt": prompt,
+                    "request_max_retries": 1,
+                }
             else:
-                found.append(("text_chat", lambda: provider.text_chat(prompt=prompt)))
+                chat_kwargs = {"prompt": prompt}
+            found.append((
+                "text_chat",
+                self._budgeted(provider.text_chat, kwargs=chat_kwargs, max_tokens=max_tokens),
+            ))
         if hasattr(provider, "chat"):
-            found.append(("chat", lambda: provider.chat(prompt)))
+            found.append((
+                "chat",
+                self._budgeted(provider.chat, (prompt,), max_tokens=max_tokens),
+            ))
         for name in ("generate", "complete", "ask"):
             if hasattr(provider, name):
-                found.append((name, lambda n=name: getattr(provider, n)(prompt)))
+                found.append((
+                    name,
+                    self._budgeted(
+                        getattr(provider, name), (prompt,), max_tokens=max_tokens
+                    ),
+                ))
         scope = self._scope_of(provider)
         bad = self._unusable.get(scope, set())
         usable = [item for item in found if item[0] not in bad]
@@ -2949,6 +3905,43 @@ class MessageGenerator:
         prefer = self._prefer.get(scope, "")
         usable.sort(key=lambda item: 0 if item[0] == prefer else 1)
         return usable
+
+    def _budgeted(
+        self,
+        func: Any,
+        args: tuple = (),
+        kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        max_tokens: Optional[int] = None,
+    ) -> Any:
+        """把一路候选包成「零参数协程工厂」，顺带决定要不要带 max_tokens。
+
+        为什么不在 `_call_llm` 里传了再收 TypeError：那里把 TypeError 当成「这一路
+        签名不对」并**永久剔除**。试探性传参一旦被拒，等于把唯一一条能用的路自己
+        拆了（`_accepts_kwarg()` 的注释讲的是同一件事，这里是它的调用侧）。
+        """
+        fixed_kwargs = dict(kwargs or {})
+        return lambda: self._invoke_llm(func, tuple(args), fixed_kwargs, max_tokens)
+
+    async def _invoke_llm(
+        self,
+        func: Any,
+        args: tuple,
+        kwargs: Dict[str, Any],
+        max_tokens: Optional[int],
+    ) -> Any:
+        """真正调用 provider 的入口：签名吃得下 max_tokens 就带，否则原样调用。
+
+        兜底的 TypeError 也要在这里吃掉：有些 provider 用装饰器包了一层，签名上说
+        吃 `**kwargs`、实际并不吃。重调一次不带参数总能成功，而让 TypeError 冒到
+        `_call_llm` 会让这一路被误判成「形状不对」永久剔除。
+        """
+        if max_tokens and self._accepts_kwarg(func, "max_tokens"):
+            try:
+                return await func(*args, **kwargs, max_tokens=max_tokens)
+            except TypeError:
+                return await func(*args, **kwargs)
+        return await func(*args, **kwargs)
 
     def _scope_of(self, provider: Any) -> str:
         """退避与调用方式的归属键。优先用 provider 的配置 id（那是 key/额度所在的
