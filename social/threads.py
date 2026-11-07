@@ -474,7 +474,13 @@ def _loop_due(
     # 而 `LOOP_MAX_HOURS = 14` 想表达的「再晚就不像记得」，在默认配置下也永远用不到
     # （2.5~5.5h 全在 14h 以内）。现在让它参与抽样本身：抽不到，就不会有那撮堆积。
     high = max(low, min(_hours(max_hours, LOOP_MAX_HOURS), low * 2.2))
-    stamp = now + random.uniform(low, min(high, 6.0 if low <= 6.0 else high)) * 3600.0
+    # 抽样上界就是 `high`，不再额外夹一个 6.0。那个 6.0 只在 low 落在 (2.727, 6]
+    # 时生效（默认 2.5 时 high=5.5 本来就更小），效果却是配置写 max_hours=8 也最晚
+    # 只问 6 小时——一个文档里没有、面板上也看不见的暗上限，样本还会堆在 6h 上
+    # （审核 P3-19）。「再晚就不像记得」该由 max_hours 表达：它已经参与 `high`，
+    # 下面还有一次 `min()` 兜底。默认 2.5/14 的抽样区间是 2.5~5.5h（low*2.2 更窄），
+    # 14 只在 min_hours ≥ 6.36 时才真正决定上界。
+    stamp = now + random.uniform(low, high) * 3600.0
     local = city_now(stamp, clock_offset_minutes)
     if local.hour < 9:
         # 凌晨到点的事留到当天上午：真人不会半夜三点问「你面试咋样了」
@@ -1078,7 +1084,10 @@ def unfinished_signal(text: str) -> Dict[str, Any]:
         if not _HAS_WORD_RE.search(stripped):
             # 纯表情/纯标点。只有省略号、逗号这类「还要往下写」的标点才当没说完；
             # 表情包、单个句号都当完整——那本来就不需要接话。
-            if _tail_token(stripped) and _tail_token(stripped) in _ELLIPSIS_TAILS + _DANGLING_TAILS:
+            # `_tail_token` 只从 `_ELLIPSIS_TAILS + _DANGLING_TAILS` 里取值，返回值
+            # 必然是这两个元组的成员——旧写法后面又判一次 `in`，那是个恒真条件，
+            # 让读的人以为还有第三种「不该当没说完」的尾巴，其实没有（审核 P3-20）。
+            if _tail_token(stripped):
                 return _signal("uncertain", "ellipsis_only")
             return _signal("complete", "non_verbal")
 

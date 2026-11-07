@@ -41,9 +41,23 @@ from typing import Any, Dict, Iterable, List
 #
 # 所以改成一条通吃：**带名字的尖括号块**一律去掉。只认「成对闭合」的——
 # 半截尖括号（`<3`、`<=`）不匹配，照常留在正文里。
+#
+# 但不能连用户粘贴的 HTML/代码一起吞：`<div>…</div>`、`<pre>代码</pre>` 也是
+# 成对闭合，旧实现无条件 sub 掉，用户发来的整段代码就没了（P2-08）。框架注入的
+# 标签名有共同形状——带 `-`/`_`/`.`/`:` 的复合名，或含大写字母（插件名/类名，
+# 如 `MemoryCompanion-Context`、`FooBarPluginContext`）；普通 HTML 标签全是
+# 小写单词。判据落在标签名上，不落在「像不像 HTML」上。
 _GENERIC_BLOCK = re.compile(
     r"<([A-Za-z][A-Za-z0-9_.:-]{2,40})\b[^>]*>.*?</\1\s*>", re.S | re.I
 )
+_FRAME_TAG_SHAPE = re.compile(r"[-_.:]|[A-Z]")
+
+
+def _strip_framework_block(m: "re.Match[str]") -> str:
+    """只删「框架形状」的成对块；普通小写 HTML 标签原样保留。"""
+    if _FRAME_TAG_SHAPE.search(m.group(1)):
+        return ""
+    return m.group(0)
 # 同理，方括号块。Core 的事实块是〔〕不是 []，但别的插件未必。
 #
 # ⚠️ **只在整行只有这一个块时才删。** `【】` 与 `〔〕` 在中文里是**正常的强调**
@@ -120,8 +134,9 @@ def sanitize_incoming(text: Any) -> str:
     # 3) 任何带名字的尖括号块。这一步是**兜底**，不是逐个记插件名：逐个记是打地鼠，
     #    这个容器里 8 个插件抢同一份 prompt，上一版清理时已经见过
     #    `<system_reminder>`，又冒出来 `<MemoryCompanion-Context>`。成对闭合是它们的
-    #    共同形状。半截尖括号（<3、<=）不匹配，照常留在正文里。
-    out = _GENERIC_BLOCK.sub("", out)
+    #    共同形状。半截尖括号（<3、<=）不匹配，照常留在正文里；普通小写 HTML 标签
+    #    （div/pre/code）也不匹配「框架形状」，用户粘贴的代码不会被吞（P2-08）。
+    out = _GENERIC_BLOCK.sub(_strip_framework_block, out)
     out = _GENERIC_BRACKET_LINE.sub("", out)
 
     out = out.replace("\r\n", "\n").replace("\r", "\n")

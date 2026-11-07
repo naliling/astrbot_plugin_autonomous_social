@@ -51,6 +51,11 @@ _SEARCH_SKIP_DIRS = {
 # 目录名里带这些词才算可能是 Core
 _SEARCH_HINTS = ("humanoid", "core")
 
+# `_as_bool` 认得的「真」写法。state.json 正常只会有 JSON 的 true/false，但手改、
+# 旧版导出、第三方写入都可能留下字符串：旧实现 `bool("false")` 是 True，于是
+# `asleep` 会被读成「正在睡」。这里只列真值，其余（含 "false"/"0"/空串）一律假。
+_BOOL_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+
 # 从 Core 拉「对方说过什么」时最多取几条。Core 那边自己也有上限，这里再卡一道：
 # 这是塞进 prompt 的素材，不是给人看的完整历史。
 CORE_SAID_MAX = 3
@@ -122,7 +127,21 @@ class CoreBridge:
         只搜 data 目录及其下级（以及进程 cwd），深度和条目数都有硬上限。
         """
         if self._search_hit:
-            return self._search_hit
+            try:
+                hit_exists = os.path.exists(self._search_hit)
+            except OSError:
+                hit_exists = False
+            if hit_exists:
+                return self._search_hit
+            # 缓存路径失效（Core 搬家/改目录名/临时目录被清）。旧实现不看文件是否
+            # 还在，直接把缓存返回给 `_resolve_path`，于是联动永久指向一个不存在的
+            # 文件，只能重载插件（P3-25）。这里清掉缓存并当场重搜一次，这一轮心跳
+            # 就能接上新位置；真找不到时下面的负缓存仍会兜住，不会每轮都扫盘。
+            logger.info(
+                f"[autonomous_social] 已定位的 Humanoid Core 状态文件不见了，重新搜索：{self._search_hit}"
+            )
+            self._search_hit = None
+            self._searched = False
         now = time.monotonic()
         # 未命中只做短期负缓存：原来 `_searched` 在搜索**之前**就置 True 且永不重试，
         # 于是 Core 后装、目录后建、或一次扫盘超限都会让联动**永久断链**（只能重载插件）。
@@ -191,6 +210,16 @@ class CoreBridge:
         # 已知路径都没命中：搜一次（结果会缓存，不会每个心跳重扫）
         return self._search_for_state()
 
+    def _forget_search_hit(self, path: Optional[str]) -> None:
+        """自动定位到的文件读失败时丢掉缓存，下一次允许重新搜索（P3-25）。
+
+        只在 `path` 正是缓存命中项时清：固定快路径（`_STATE_FILENAMES`）读失败
+        与搜索缓存无关，清掉反而会让下一轮白扫一次盘。
+        """
+        if path and self._search_hit == path:
+            self._search_hit = None
+            self._searched = False
+
     # ─── 磁盘读取 ───────────────────────────────────────
 
     def read_root(self) -> Optional[Dict[str, Any]]:
@@ -221,6 +250,9 @@ class CoreBridge:
             self._warn_once(
                 "oserror", f"[autonomous_social] Humanoid Core state.json 读取失败: {e}"
             )
+            # 文件被删/被移走时 stat 会失败：不清缓存的话，下一轮 `_resolve_path`
+            # 仍会拿到同一条失效路径，联动永远接不回来（P3-25）。
+            self._forget_search_hit(p)
             return None
 
         fingerprint = (p, stat.st_mtime_ns, stat.st_size)
@@ -239,6 +271,9 @@ class CoreBridge:
             self._warn_once(
                 "oserror", f"[autonomous_social] Humanoid Core state.json 读取失败: {e}"
             )
+            # stat 与 open 之间文件被替换/删除：同样要丢掉搜索缓存，否则下一轮
+            # 还会解析到这条已经不存在的路径（P3-25）。
+            self._forget_search_hit(p)
             return None
         except Exception as e:
             self._warn_once(
@@ -355,6 +390,43 @@ class CoreBridge:
             return int(float(contract.get("v") or 0))
         except (TypeError, ValueError, AttributeError):
             return 0
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        """把跨插件传来的布尔字段读成 bool；认不出来的值一律当 False。
+
+        旧实现是 `bool(value)`，于是 `bool("false")` / `bool("0")` 都是 True：
+        Core 把 `asleep` 导出成字符串时（手改 state.json、旧版导出、第三方写入都
+        可能），她会被判成「正在睡」，整段安静时段都不开口；`disturbed` 同理会
+        把「没被打扰」读成「被打扰」。
+
+        认不出来时偏向 False（未睡 / 未被打扰）而不是 True，是刻意选的方向：
+        `asleep` 为真会让社交层主动闭嘴，误判的代价是**消息静默**；当成未睡最多
+        多发一条（Core 自己的唤醒/安静逻辑还在）。宁可她被吵醒一次，也不能因为
+        一个脏字段永久不吭声。
+
+        认得的写法：bool 原样；数字非 0（nan/inf 不算）；字符串先 strip+lower，
+        `1/true/yes/on` 为真，纯数字字符串按数字判，其余（含 "false"/"no"/"off"/
+        空串）为假。
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                num = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            return math.isfinite(num) and num != 0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in _BOOL_TRUE_WORDS:
+                return True
+            try:
+                num = float(text)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(num) and num != 0
+        return False
 
     @staticmethod
     def _text_list(value: Any) -> List[str]:
@@ -624,11 +696,12 @@ class CoreBridge:
         hours = _num_or_none(value.get("last_sleep_hours"))
         left = _num_or_none(value.get("inertia_minutes_left"))
         return {
-            "asleep": bool(value.get("asleep")),
+            # 不能写 `bool(...)`：字符串 "false" 会被判成真（P1-02）。方向见 `_as_bool`。
+            "asleep": CoreBridge._as_bool(value.get("asleep")),
             "wake_at": wake_at,
             "inertia_until": inertia,
             "inertia_minutes_left": int(left) if left is not None else None,
-            "disturbed": bool(value.get("disturbed")),
+            "disturbed": CoreBridge._as_bool(value.get("disturbed")),
             "last_sleep_hours": hours,
         }
 
@@ -759,7 +832,7 @@ class CoreBridge:
             view["cycle"] = body.get("cycle_day")
         for key in self._CONTRACT_BODY_KEYS:
             view[key] = body.get(key)
-        view["asleep"] = bool(body.get("asleep"))
+        view["asleep"] = self._as_bool(body.get("asleep"))
         # Core 已经把能量翻成人话了（"精神不错"/"有点发沉"），比自己再翻一遍准
         view["energy_text"] = str(body.get("energy_text") or "").strip()
         view["feelings"] = contract.get("feelings") or []
@@ -782,10 +855,13 @@ class CoreBridge:
         day = contract.get("day") if isinstance(contract.get("day"), dict) else {}
         view["day"] = {
             "doing": str(day.get("doing") or ""),
-            "done": [str(x) for x in (day.get("done") or []) if str(x).strip()],
-            "next": [str(x) for x in (day.get("next") or []) if str(x).strip()],
+            # 三个列表字段都过 `_text_list`：旧实现直接迭代 `day.get(...) or []`，
+            # 契约里一旦是字符串（"整理笔记"），就会逐字符展开成 ["整","理",...]，
+            # 社交层把这些单字当「她做过的事」念出来。非列表、夹 None/dict 同理。
+            "done": self._text_list(day.get("done")),
+            "next": self._text_list(day.get("next")),
             # 她自己想做的事：社交层拿它当由头（「她今天想去那家书店」）。
-            "wants": [str(x) for x in (contract.get("wants") or []) if str(x).strip()],
+            "wants": self._text_list(contract.get("wants")),
             # 她昨晚（或白天补觉时）梦到的事：Core 2.28 起给。群主动素材与私聊
             # 由头都拿它当「她自己的生活」的一类；旧版 Core 没有这个字段 → []。
             "dreams": self._text_list(day.get("dreams")),
@@ -811,9 +887,8 @@ class CoreBridge:
         view["event"] = _event
         view["day"]["event"] = _event
         # 她手上还没做完的事：社交层拿它当由头（「还在整理那份个案笔记」）。
-        view["ongoing"] = [
-            str(x) for x in (contract.get("ongoing") or []) if str(x).strip()
-        ]
+        # 与 day.done/next/wants 同一个坑：字符串会被逐字符展开，必须走 `_text_list`。
+        view["ongoing"] = self._text_list(contract.get("ongoing"))
         view["persona"] = str(contract.get("persona") or "")
         view["holiday"] = str(contract.get("holiday") or "").strip()
         # 她自己的名字 / 人设标签、她今天穿什么（Core 2.29 起给）。

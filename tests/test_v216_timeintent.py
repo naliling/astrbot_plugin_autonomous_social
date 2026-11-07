@@ -338,28 +338,6 @@ class RobustnessTest(unittest.TestCase):
             self.assertLessEqual(conf, 1.0)
 
 
-class PromiseDueAtTest(unittest.TestCase):
-    """promise_due_at 是 engine 唯一的调用口，返回 None 表示回落旧逻辑。"""
-
-    def test_returns_float(self):
-        got = T.promise_due_at("下周三给你看那个", NOW, tz_offset=TZ)
-        self.assertIsInstance(got, float)
-        self.assertEqual(got, ts(2026, 11, 11, 20))
-
-    def test_returns_none_when_unparsed(self):
-        self.assertIsNone(T.promise_due_at("给你看那个", NOW, tz_offset=TZ))
-
-    def test_none_input(self):
-        self.assertIsNone(T.promise_due_at(None, NOW, tz_offset=TZ))
-
-    def test_nan_now(self):
-        self.assertIsNone(T.promise_due_at("明天", NAN, tz_offset=TZ))
-
-    def test_never_raises_on_garbage(self):
-        for bad in (object(), [], {}, b"\xff", 3.14):
-            self.assertIsNone(T.promise_due_at(bad, NOW, tz_offset=TZ))
-
-
 class EngineWiringTest(unittest.TestCase):
     """engine 必须真的用了这一层，否则模块白写（防死代码）。"""
 

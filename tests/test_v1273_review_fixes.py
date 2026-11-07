@@ -1315,12 +1315,16 @@ class CoreBridgeSearchRetryTest(unittest.TestCase):
         bridge._searched_at -= cb._SEARCH_RETRY_SECONDS + 1.0
         self.assertEqual(bridge._search_for_state(), path)
 
-    def test_a_hit_is_cached_permanently(self):
+    def test_a_hit_is_invalidated_when_the_file_disappears(self):
+        # v2.1.7 P3-25：命中缓存不能「永久有效」。Core 搬家/改目录名/临时目录被清
+        # 之后旧路径已经不在了，继续返回它会让联动永久指向空气，只能重载插件。
+        # 现在命中项先 stat，失败就清缓存并当场重搜（这里重搜不到 → None）。
         bridge = self._bridge()
         path = self._make_core()
         self.assertEqual(bridge._search_for_state(), path)
         os.remove(path)
-        self.assertEqual(bridge._search_for_state(), path, "命中缓存应当一直用")
+        self.assertIsNone(bridge._search_for_state(), "文件没了就不该再返回旧路径")
+        self.assertIsNone(bridge._search_hit, "失效的命中缓存应当被清掉")
 
 
 class CoreBridgeTypeToleranceTest(unittest.TestCase):

@@ -481,7 +481,9 @@ class WiringSourceTest(unittest.TestCase):
 
     def test_gates_run_before_hourly_reserve(self):
         gate_at = self.source.index("SocialEngine._pre_send_gate(")
-        reserve_at = self.source.index("if not self._hourly_reserve(bid):")
+        # v2.1.7：占配额改成「先取返回值、再判空」（名单用户还要同时占按人窗口），
+        # 这里锚定调用本身而不是某种 if 写法，钉的仍然是「闸在占配额之前」。
+        reserve_at = self.source.index("self._hourly_reserve(bid")
         self.assertLess(gate_at, reserve_at, "四道闸必须在占配额、发送之前")
 
     def test_gates_run_after_segment_verification(self):

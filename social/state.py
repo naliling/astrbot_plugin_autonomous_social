@@ -8,11 +8,15 @@ v1.7.4：
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import errno
 import json
 import math
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,6 +59,21 @@ def _safe_ts(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         return default
     return out if math.isfinite(out) else default
+
+
+def _is_number(value: Any) -> bool:
+    """是不是一个能参与数值运算的有限数。
+
+    `bool` 不算：JSON 里的 `true` 落到 message_count 上是被写坏的脏值，不是 1；
+    按「数字」收下它会让计数悄悄多一，比直接重置更糟。
+    超大整数（float 装不下）仍算数：它数学上有限，只是转换溢出，不是脏数据。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return True
 
 
 # ─── v2.1.0：跨群去重 / 反问频控用的小工具 ─────────────
@@ -140,6 +159,31 @@ TOPIC_MAX_CHARS = 6
 # 「为什么发这条」一行最多记多少字
 WHY_MAX_CHARS = 60
 
+# ─── 状态文件「读盘被占用」的退避节奏（秒）─────────────────
+#
+# 为什么需要：Windows 上杀软扫描、资源管理器索引、OneDrive 同步都会在几毫秒到几百
+# 毫秒内独占 state.json，报出来是 PermissionError / EBUSY。旧实现把它和「JSON 坏了」
+# 走同一条路——把原文件 rename 成 .unreadable.xxx，然后插件拿着空壳跑、还拒绝写盘。
+# 线上表现就是「重启一次，她把我全忘了」，而原文件其实一个字节都没坏。
+# 100/300/900ms 三次足够熬过这类瞬时占用，加起来不到 1.5 秒，只在启动或重试时付一次。
+_READ_RETRY_DELAYS = (0.1, 0.3, 0.9)
+# 这些 errno 的含义都是「文件现在被占着/暂时不让读」，过一会儿就好
+_TRANSIENT_READ_ERRNOS = frozenset(
+    (
+        errno.EACCES,  # Windows 权限/共享冲突、Linux 权限瞬时变更
+        errno.EPERM,   # 某些安全软件用 EPERM 报拒绝
+        errno.EBUSY,   # 另一个进程正打开着
+    )
+)
+# Windows 上 Python 把 ERROR_SHARING_VIOLATION(32) / ERROR_LOCK_VIOLATION(33) /
+# ERROR_ACCESS_DENIED(5) 都包成 PermissionError，但 errno 偶尔对不上，补一层 winerror。
+_TRANSIENT_READ_WINERRORS = frozenset((5, 32, 33))
+
+# 跨进程写锁文件：拿不到锁时降级成告警而不是阻塞写盘（见 _cross_process_lock）。
+# 崩溃会留下一个锁文件，超过这个年龄就认定是上一个进程的残骸，直接抢占——
+# 否则一次崩溃会让这个状态文件从此再也写不进去。
+_LOCK_STALE_SECONDS = 30.0
+
 # 长期不活跃用户会被重置的历史字段：这些是状态文件里真正占体积的部分。
 # 保留 name/umo/message_count/last_seen 与各回复统计：umo 是主动发送的唯一目标地址，
 # 回复统计驱动自适应权重，丢了会直接影响选择谁、多久发一次。
@@ -203,6 +247,22 @@ class SocialState:
         # 内存里已经是空壳，第一条新消息一标脏就会把空状态盖回磁盘。
         self._load_failed = False
         self._write_blocked_warned = False
+        # 「读盘被占用」与「文件内容坏了」必须分开：前者原文件是好的，只是这一瞬间
+        # 打不开，绝不能改名；后者才该备份留证。这个标记决定闸门要不要留一个
+        # 自动重试的口子（retry_load / flush），而不是等到重载插件。
+        self._load_deferred = False
+        self._load_error = ""
+        # 上次「我们读到/写下」的那份文件的 (mtime, size)。写盘前比对它，是为了
+        # 发现另一个进程（或人）也在改这个文件：全量重写会把对方刚写进去的更新
+        # 整份盖掉，而且不留任何痕迹，事后只能靠猜。
+        self._disk_stamp: Optional[Tuple[float, int]] = None
+        # 变更代数：mark_dirty() 每次 +1。异步写盘时快照与真正落盘之间可能隔了
+        # 几十毫秒，中间主线程又改了状态——落盘完成后只能清掉「快照那一刻」的脏标记，
+        # 否则那几十毫秒里的改动会被当成已落盘，永久丢失。
+        self._gen = 0
+        # 同进程里多个写者（心跳、发送成功、指标落盘、后台线程）串行化：
+        # tmp+replace 本身是原子的，但「谁后写谁赢」必须确定，否则旧快照会盖掉新快照。
+        self._write_lock = threading.Lock()
         # 时间源可注入：所有落盘时间戳与调用方的判断必须同源，否则「刚聊过」「超时没回」
         # 这类判断会因为两处各取一次时钟而错位；测试与仿真也需要能推进它。
         self._now = time_source or time.time
@@ -735,27 +795,52 @@ class SocialState:
 
     # ─── 加载与迁移 ──────────────────────────────────────────────
 
-    def load(self) -> None:
+    def load(self, *, allow_sleep: bool = True) -> None:
         """从磁盘加载状态。
 
-        任何一种「读不出原来那份记忆」的情况都走同一条路：备份原文件、报 error、
-        上写盘闸门。闸门未解除前拒绝写回——否则内存里已经是空壳，第一条新消息一
-        标脏就会把空状态盖回磁盘，把攒下的记忆抹干净且不留任何痕迹。
+        两种情况必须分开处理，**不能都当「记忆读不出来」**：
+
+        1. 内容真的坏了（JSON 语法错、不是 UTF-8、顶层结构不是预期形状）：
+           原文件已经是废的，挪到一边留证、报 error、上写盘闸门，等人工处理。
+        2. 文件读不出来但内容没坏（Windows 杀软扫描、OneDrive 同步、另一个进程
+           刚好打开着——表现为 PermissionError / EBUSY）：原文件是**好的**，
+           只是这一瞬间打不开。旧实现把它和坏文件走同一条路，`os.rename` 把
+           state.json 改成了 .unreadable.xxx：全部记忆从原路径消失，插件拿着
+           空壳继续跑还拒绝写盘，重启之后依然如此。线上表现就是「升级/重启一次，
+           她把我全忘了」。现在这里只记「本次没加载上」，原文件一动不动，
+           并允许后续心跳重试（`retry_load`，`flush()` 每轮也会顺手试一次）。
+
+        allow_sleep=False 是给周期重试用的：那条路径每 30 秒就会走一次，
+        在里面做 100/300/900ms 退避会把事件循环卡住；文件锁放开后一次就能读出来。
         """
+        self._load_deferred = False
+        self._load_error = ""
         try:
             if not os.path.exists(self.path):
+                # 没有文件 = 第一次跑。闸门也要清掉：上一轮可能因为「被占用」关着
+                # 闸门，而这期间文件被人删了（手动清理/换机器），再关着就永远
+                # 写不出第一份状态。
+                self._load_failed = False
+                self._disk_stamp = None
                 return
-            with open(self.path, encoding="utf-8") as f:
-                x = json.load(f)
+            x = self._read_json_with_retry(allow_sleep=allow_sleep)
         except FileNotFoundError:
+            # exists() 与 open() 之间被删掉（或正在被 os.replace 换掉）：
+            # 这不是「记忆坏了」，按「现在没有状态文件」处理，闸门放开。
+            self._load_failed = False
+            self._disk_stamp = None
             return
         except json.JSONDecodeError as e:
             self._fail_load(f"状态文件 JSON 损坏（{e}）")
             return
-        except (OSError, UnicodeDecodeError) as e:
+        except UnicodeDecodeError as e:
             # UnicodeDecodeError 是 ValueError 的子类，不会被 json.JSONDecodeError 捕获，
             # 但性质一样：原文件里的记忆读不出来，绝不能当「没有记忆」处理
-            self._fail_load(f"状态文件读不出来（{type(e).__name__}: {e}）")
+            self._fail_load(f"状态文件不是 UTF-8 文本（{e}）")
+            return
+        except OSError as e:
+            # 读不出来 ≠ 内容坏了。文件保持原样，只关闸门等重试。
+            self._defer_load(e)
             return
         except Exception as e:
             self._fail_load(f"状态文件读取时发生意外错误（{e!r}）")
@@ -772,11 +857,125 @@ class SocialState:
         # 先置不脏再迁移：_migrate 只在真的改了数据时才标脏。顺序反了的话，
         # 迁移的结果会被当成「已落盘」而丢弃，下次启动又重跑一遍
         self._dirty = False
+        # 这次是真的读到了：解除闸门（可能是上一轮 deferred 之后终于读上来的）
+        self._load_failed = False
+        self._write_blocked_warned = False
+        self._disk_stamp = self._stat_stamp()
         # 盘上非对象的 bot/user/group 条目先归一化一次（只在这一处落盘修复）
         if self._normalize_containers():
-            self._dirty = True
+            self.mark_dirty()
         self._merge_split_identities_once()
         self._migrate()
+
+    def _read_json_with_retry(self, *, allow_sleep: bool = True) -> Any:
+        """读一次状态文件；只有「被占用」这类瞬时错误才退避重试。
+
+        内容坏了（JSON/编码）重试一万次也还是坏的，那属于要备份留证的另一条路；
+        非瞬时的 OSError（磁盘错误之类）重试同样没有意义。所以这里只对
+        `_is_transient_read_error` 判真的错误重试，其余原样抛给 load() 分类。
+        """
+        delays = _READ_RETRY_DELAYS if allow_sleep else ()
+        attempt = 0
+        while True:
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError):
+                raise
+            except OSError as exc:
+                if attempt >= len(delays) or not self._is_transient_read_error(exc):
+                    raise
+                time.sleep(delays[attempt])
+                attempt += 1
+
+    @staticmethod
+    def _is_transient_read_error(exc: BaseException) -> bool:
+        """这个读盘错误是「过一会儿再来就好了」吗。
+
+        判断只针对「文件现在被占着」这一类。真坏了（内容、权限永久拒绝）不在此列：
+        对永久错误反复退避，等于每次启动白等 1.3 秒还读不出来。
+        """
+        if isinstance(exc, PermissionError):
+            return True
+        if not isinstance(exc, OSError):
+            return False
+        if getattr(exc, "errno", None) in _TRANSIENT_READ_ERRNOS:
+            return True
+        return getattr(exc, "winerror", None) in _TRANSIENT_READ_WINERRORS
+
+    def _stat_stamp(self) -> Optional[Tuple[float, int]]:
+        """盘上状态文件的 (mtime, size)；拿不到就 None（比对时按「不知道」跳过）。"""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_size)
+
+    def _defer_load(self, exc: BaseException) -> None:
+        """读盘被占用：原文件不动、不备份，只记「本次没加载上」，等心跳重试。
+
+        与 `_fail_load` 的分界见 `load()` 的注释。写盘闸门**同样要关**：
+        内存里现在是空壳，放开写等于拿空状态覆盖那份完好的记忆。
+        """
+        self.data = {"version": STATE_VERSION, "bots": {}}
+        self._dirty = False
+        self._load_failed = True
+        self._load_deferred = True
+        self._load_error = f"{type(exc).__name__}: {exc}"
+        # 每次新的占用事件都该让人看见一次「本次没加载上」
+        self._write_blocked_warned = False
+        # 状态页/排障要知道「为什么这次没加载上」，所以错误原文要留着
+        if throttle.allow("state.load_deferred", window=600.0):
+            logger.error(
+                "[autonomous_social] 状态文件读取被占用，本次未加载"
+                f"（{self._load_error}）；原文件保持不动，稍后自动重试。"
+                f"路径：{self.path}"
+                + throttle.summary("state.load_deferred")
+            )
+
+    def retry_load(self, *, allow_sleep: bool = False) -> bool:
+        """重试一次「上次因为读盘被占用而没加载上」的状态文件。返回是否加载成功。
+
+        只在 deferred 时才真的重读：
+        - 已经加载好的一律不碰——重读会把内存里还没落盘的改动丢掉；
+        - 已经判定为内容损坏（备份过）的也不碰——备份只该做一次，重试只会
+          一遍遍撞同一个坏文件，并把 .unreadable.* 越堆越多。
+
+        allow_sleep 默认 False：周期心跳每 30 秒就会调到这里，退避等待会把事件
+        循环卡住；文件锁放开之后单次尝试就能读出来。
+        """
+        if not self._load_deferred:
+            return False
+        # 占用期间插件仍会照常记账（往空壳里记），这些改动无法与盘上的旧内容合并
+        # （同一个人的计数相加会翻倍）。重载会丢掉它们，所以要留一句实话。
+        discarded = self._dirty
+        self.load(allow_sleep=allow_sleep)
+        if self._load_deferred or self._load_failed:
+            return False
+        if discarded:
+            logger.warning(
+                "[autonomous_social] 状态文件已恢复读取，但占用期间在内存里记下的"
+                f"改动（还没落盘）已被磁盘上的旧内容替换，无法合并。路径：{self.path}"
+            )
+        logger.info(
+            "[autonomous_social] 状态文件已恢复读取（之前被占用），"
+            f"本次重试加载成功：{self.path}"
+        )
+        return True
+
+    def load_status(self) -> Dict[str, Any]:
+        """加载状态摘要，供状态页/排障面板显示「记忆到底加载上没有」。
+
+        为什么不让人去翻日志：这两种失败的表现都是「她好像什么都忘了」，
+        而处理方式完全不同——被占用等一会儿自己就好了，内容损坏必须人工去
+        处理 .unreadable.* 文件。状态页上必须能一眼分开。
+        """
+        return {
+            "ok": not self._load_failed,
+            "deferred": bool(self._load_deferred),
+            "error": self._load_error,
+            "path": self.path,
+        }
 
     def _normalize_containers(self) -> bool:
         """把盘上非对象的 bot / user / group 条目归一化成对象。返回是否真的改动过。
@@ -857,7 +1056,7 @@ class SocialState:
                         moved += 1
                     users[main] = tm
             self.data["_merged_identities_v1"] = True
-            self._dirty = True
+            self.mark_dirty()
             if moved:
                 logger.info(
                     f"[autonomous_social] 已把 {moved} 条被拆开的同账号记录合并回去"
@@ -970,7 +1169,7 @@ class SocialState:
         if touched:
             # 记下清洗规模，状态页能看：这个数字不为 0 就说明之前确实录进过框架内容
             self.data["_sanitized_users"] = int(self.data.get("_sanitized_users", 0)) + touched
-            self._dirty = True
+            self.mark_dirty()
             logger.info(
                 f"[autonomous_social] 已清洗 {touched} 个用户的正文："
                 "剥掉了混进聊天记录里的框架注入内容（Humanoid Core 身体事实块、"
@@ -1004,30 +1203,89 @@ class SocialState:
         "last_spoken_question", "followup_for", "followup_at",
     )
 
+    @staticmethod
+    def _repair_fields(record: Dict[str, Any], defaults: Dict[str, Any]) -> int:
+        """按默认值的类型修一条记录里的字段，返回修了几个。就地改，不抛。
+
+        为什么必须在**加载期**做：单个字段类型坏掉（手改 state.json、旧版本写错、
+        磁盘位翻转）之后，读它的每一处都得自己挡一次——`record_incoming` 的
+        `int(u["message_count"])`、`_extract_topics` 的 `topics.insert`、
+        `reply_rate` 的 `int(...)` 都是。漏掉一处，这个用户从此**每条消息都抛
+        异常**，而且不会自愈：异常发生在 `mark_dirty()` 之前，坏值永远写不回盘。
+        与其在每个读点补 isinstance，不如在唯一入口把它修成正常值，读点照旧写。
+
+        只修「类型不对」的，不修「值不好看」的：`message_count=999999` 是数据，
+        `message_count="abc"` 才是损坏。JSON 里 `5.0` 这种整数值也按 5 收下。
+        """
+        repaired = 0
+        for key, default in defaults.items():
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(default, bool):
+                if not isinstance(value, bool):
+                    record[key] = default
+                    repaired += 1
+            elif isinstance(default, (int, float)):
+                # bool 是 int 的子类：`true` 落在 message_count 上是脏值，不是 1
+                if not _is_number(value):
+                    record[key] = default
+                    repaired += 1
+                elif isinstance(default, int):
+                    # 整数字段收下整数值的浮点（5.0），避免下次 `int()` 之外的地方
+                    # 出现 5.0 与 5 的比较/哈希差异
+                    if isinstance(value, float) and value.is_integer():
+                        record[key] = int(value)
+                        repaired += 1
+            elif isinstance(default, str):
+                if not isinstance(value, str):
+                    record[key] = default
+                    repaired += 1
+            elif isinstance(default, list):
+                if not isinstance(value, list):
+                    record[key] = list(default)
+                    repaired += 1
+            elif isinstance(default, dict):
+                if not isinstance(value, dict):
+                    record[key] = dict(default)
+                    repaired += 1
+            elif default is None:
+                # 目前只有 interest：None 或有限数都合法，其余按「没算过」重置
+                if value is not None and not _is_number(value):
+                    record[key] = None
+                    repaired += 1
+        return repaired
+
     def _migrate(self) -> None:
         """确保所有已存在的用户都有当前版本字段，清掉旧键，并洗掉被污染的正文。"""
         self._sanitize_once()
+        repaired_users = 0
+        repaired_groups = 0
         try:
             for bot in self.data.get("bots", {}).values():
                 if not isinstance(bot, dict):
                     continue
+                user_defaults = self._default_user()
                 for uid, u in bot.get("users", {}).items():
                     if not isinstance(u, dict):
                         continue
-                    for k, v in self._default_user().items():
+                    for k, v in user_defaults.items():
                         u.setdefault(k, v)
+                    repaired_users += self._repair_fields(u, user_defaults)
                     for k in self._RETIRED_USER_KEYS:
                         if k in u:
                             u.pop(k, None)
-                            self._dirty = True
+                            self.mark_dirty()
                 # v1.11.0 群会话：补齐新键（加法式，不动已有 users）
                 groups = bot.get("groups")
                 if isinstance(groups, dict):
+                    group_defaults = self._default_group()
                     for g in groups.values():
                         if not isinstance(g, dict):
                             continue
-                        for k, v in self._default_group().items():
+                        for k, v in group_defaults.items():
                             g.setdefault(k, v)
+                        repaired_groups += self._repair_fields(g, group_defaults)
                 # v1.12.0：清掉旧版历史导入误进 users 的群会话幽灵。旧版按 updated_at
                 # 取前 300 个会话再滤群，`GroupMessage` 类型不在识别表里被判 unknown
                 # 放行，群会话被当「人」导入、拿群 umo 去发主动消息。群消息在观察链路
@@ -1050,7 +1308,7 @@ class SocialState:
                             if str(u.get("source") or "") == "seed":
                                 continue
                             users.pop(uid)
-                            self._dirty = True
+                            self.mark_dirty()
         except Exception as exc:
             # 这里以前是 `except Exception: pass`：一条坏记录会废掉整条迁移链
             # （后面所有 bot 的字段补齐、退休键清理、幽灵清扫全都不跑），
@@ -1058,6 +1316,15 @@ class SocialState:
             logger.error(
                 f"[autonomous_social] 状态迁移中断（{type(exc).__name__}: {exc}），"
                 "部分字段可能没补齐，路径：" + str(self.path)
+            )
+        if repaired_users or repaired_groups:
+            # 只报数字不报正文：这些字段可能含消息内容，日志不该多一份副本
+            self.mark_dirty()
+            logger.warning(
+                f"[autonomous_social] 状态文件里有 {repaired_users} 个用户字段、"
+                f"{repaired_groups} 个群字段类型不对，已按默认值重置"
+                "（不修的话这些用户此后每条消息都会抛异常，且不会自愈）。路径："
+                + str(self.path)
             )
 
     def migrate_default_bot(self, real_bid: str) -> None:
@@ -1092,7 +1359,7 @@ class SocialState:
             bots[real_bid] = default_bot
             del bots[DEFAULT_BOT_KEY]
             self.data["_default_migrated"] = True
-            self._dirty = True
+            self.mark_dirty()
         else:
             # 目标 bid 已有数据，只合并用户（不覆盖已有用户）
             real_bot = bots[real_bid]
@@ -1108,7 +1375,7 @@ class SocialState:
                 real_bot["last_global_send"] = default_last_send
             del bots[DEFAULT_BOT_KEY]
             self.data["_default_migrated"] = True
-            self._dirty = True
+            self.mark_dirty()
 
     # ─── 过期数据清理 ───────────────────────────────────
 
@@ -1252,8 +1519,36 @@ class SocialState:
         return removed
 
     def mark_dirty(self) -> None:
-        """标记状态已变更但暂不写入磁盘。"""
+        """标记状态已变更但暂不写入磁盘。
+
+        顺带推进变更代数：异步写盘时「快照」与「落盘完成」之间隔了几十毫秒，
+        这中间主线程可能又改了状态。落盘后只能清掉快照那一刻的脏标记，
+        否则这几十毫秒里的改动会被当成已落盘而永久丢失。
+        """
         self._dirty = True
+        self._gen += 1
+
+    def _warn_write_blocked(self) -> None:
+        """闸门挡住写盘时只报一次。
+
+        这条日志会被每 30 秒一次的心跳反复撞到，不节流会把日志刷满；
+        但也不能不报——用户看到的现象是「她什么都忘了」，必须有人告诉他为什么。
+        """
+        if self._write_blocked_warned:
+            return
+        self._write_blocked_warned = True
+        if self._load_deferred:
+            # 「被占用」和「文件坏了」的处理方式完全不同，日志必须能分开
+            logger.error(
+                "[autonomous_social] 状态写入暂停：状态文件读取被占用"
+                f"（{self._load_error}），本次没加载上，继续写会拿空状态覆盖原文件。"
+                f"原文件保持不动，稍后自动重试。路径：{self.path}"
+            )
+            return
+        logger.error(
+            f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
+            f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
+        )
 
     def save(self) -> None:
         """立即写入磁盘（原子操作）。
@@ -1262,14 +1557,12 @@ class SocialState:
         抛出去会让人看到「以为没发其实发了」——消息平台已经收到了，状态却因为
         一个存档问题没记上，整轮心跳还被异常打断。写盘闸门本身已经由 flush()
         在前面挡着，这里报一声就够了。
+
+        这个方法把「序列化 + 写盘 + fsync」整套同步跑完。事件循环上要避免
+        整段阻塞时用 `save_async()`（序列化仍在当前线程，只有写盘进工作线程）。
         """
         if self._load_failed:
-            if not self._write_blocked_warned:
-                self._write_blocked_warned = True
-                logger.error(
-                    f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
-                    f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
-                )
+            self._warn_write_blocked()
             return
         try:
             self._write()
@@ -1287,13 +1580,13 @@ class SocialState:
         Returns:
             True 表示执行了写入，False 表示没有变更、写入被闸门拦下、或写入失败
         """
+        # 上次因为「文件被占用」没加载上：这里是心跳里最稳定的重试点。
+        # 必须放在闸门判断**之前**——否则闸门一关就再也没有第二次机会，
+        # 只能等用户手动重载插件，而那正是这次要修掉的事。
+        if self._load_deferred:
+            self.retry_load()
         if self._load_failed:
-            if not self._write_blocked_warned:
-                self._write_blocked_warned = True
-                logger.error(
-                    f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
-                    f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
-                )
+            self._warn_write_blocked()
             return False
         if self._dirty:
             try:
@@ -1312,51 +1605,220 @@ class SocialState:
                 return False
         return False
 
-    def _write(self) -> None:
-        """原子写入状态到磁盘。
+    # ─── 异步写盘 ────────────────────────────────────────
+    #
+    # 为什么要有这一套：`save()`/`flush()` 把「全量序列化 + 写 tmp + fsync +
+    # replace」整套同步跑完。用户数上千时一次 dumps 就是上百毫秒，机械盘/网络盘上
+    # fsync 还能再拖几十毫秒，而这些都跑在事件循环线程上——整轮心跳里所有人的消息
+    # 处理都被这一下卡住，表现是回复变慢、心跳周期被拉长。
+    #
+    # 拆法：序列化留在调用方线程（它要读 self.data，挪进工作线程反而会和主线程的
+    # 修改打架），只把「写 tmp + fsync + replace」交给工作线程。同步的 save()/flush()
+    # 原样保留——调用点很多，行为不能变。
+
+    def snapshot(self) -> Optional[Tuple[str, int]]:
+        """取一份「状态快照」：(序列化好的文本, 变更代数)。被闸门拦下返回 None。"""
+        if self._load_failed:
+            self._warn_write_blocked()
+            return None
+        try:
+            return (self._dump(), self._gen)
+        except Exception as e:
+            if throttle.allow("state.snapshot_failed"):
+                logger.error(
+                    f"[autonomous_social] 状态快照序列化失败: {e}"
+                    + throttle.summary("state.snapshot_failed")
+                )
+            return None
+
+    def write_snapshot(self, snapshot: Tuple[str, int]) -> bool:
+        """把 snapshot() 的结果写盘，返回是否成功。**可以在工作线程里调用。**"""
+        payload, gen = snapshot
+        with self._write_lock:
+            try:
+                self._write_payload(payload)
+            except Exception as e:
+                if throttle.allow("state.write_failed"):
+                    logger.error(
+                        f"[autonomous_social] 状态写盘失败（稍后重试）: {e}"
+                        + throttle.summary("state.write_failed")
+                    )
+                return False
+            # 只有「从快照到现在没人再改」才清脏标记：否则这几十毫秒里的改动
+            # 会被当成已落盘，永久丢失
+            if self._gen == gen:
+                self._dirty = False
+            return True
+
+    async def flush_async(self) -> bool:
+        """flush() 的异步版：序列化在事件循环，写盘丢给工作线程。
+
+        返回值语义与 flush() 一致（是否执行了写入）。
+        """
+        if self._load_deferred:
+            self.retry_load()
+        if self._load_failed:
+            self._warn_write_blocked()
+            return False
+        if not self._dirty:
+            return False
+        snap = self.snapshot()
+        if snap is None:
+            return False
+        return await asyncio.to_thread(self.write_snapshot, snap)
+
+    async def save_async(self) -> bool:
+        """save() 的异步版（不看脏标记，调用方明确要求落盘时用）。"""
+        if self._load_failed:
+            self._warn_write_blocked()
+            return False
+        snap = self.snapshot()
+        if snap is None:
+            return False
+        return await asyncio.to_thread(self.write_snapshot, snap)
+
+    def _dump(self) -> str:
+        """把状态序列化成落盘用的文本。
 
         紧凑格式：这份文件每次保存都要全量序列化，indent=2 在用户数上千时
         会把单次 dumps 拖到上百毫秒，而它跑在事件循环上。不加缩进后体积约降四分
         之一、序列化快 3 倍。格式变更不影响读取（json.load 不关心缩进）。
         """
-        dir_path = os.path.dirname(self.path)
-        os.makedirs(dir_path, exist_ok=True)
+        return json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
 
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="social_", suffix=".tmp", dir=dir_path
-        )
+    def _write(self) -> None:
+        """同步写盘：序列化 + 写盘。行为与以前完全一致。"""
+        payload = self._dump()
+        with self._write_lock:
+            self._write_payload(payload)
+
+    @contextlib.contextmanager
+    def _cross_process_lock(self):
+        """尽力而为的跨进程写锁（`<state>.lock`，O_EXCL 创建）。
+
+        为什么需要：两个 AstrBot 实例（或一个实例 + 手工脚本）同时写这份文件时，
+        全量重写会让后写的那个把前一个刚写进去的更新整份盖掉，双方都不报错。
+        锁只保证「同一时刻只有一个人在写」。拿不到锁**不阻塞**——发送与结算链路
+        都建立在「状态能写下去」上，为了一个锁把整轮心跳卡死更糟，所以降级成
+        告警：让「你是不是开了两个实例」这件事至少能被看见，而不是静默覆盖。
+
+        锁文件在进程崩溃后会残留，超过 `_LOCK_STALE_SECONDS` 就认定是残骸并抢占，
+        否则一次崩溃会让这个状态文件从此再也写不进去。
+        """
+        lock_path = self.path + ".lock"
+        held = False
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, separators=(",", ":"))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self.path)
-            # fsync 文件只保证**内容**落盘；os.replace 这个目录项变更没有 fsync 目录
-            # 就仍在页缓存里，断电时可能出现「新数据在盘上但目录项还指向旧 inode」，
-            # 甚至整个 state.json 消失（只留 social_*.tmp）。对一个全量重写、丢了就丢
-            # 全部用户历史的状态文件，这是唯一一处能造成整文件损失的窗口。
-            # Windows 上目录 fsync 不可用（os.open 直接失败），必须容错。
-            try:
-                dfd = os.open(dir_path, os.O_RDONLY)
-            except OSError:
-                dfd = -1
-            if dfd >= 0:
+            for attempt in (0, 1):
                 try:
-                    os.fsync(dfd)
+                    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    if attempt == 0 and self._lock_is_stale(lock_path):
+                        with contextlib.suppress(OSError):
+                            os.remove(lock_path)
+                        continue
+                    break
+                except OSError:
+                    # 目录不可写之类：锁本身拿不到，但写盘大概率也会失败，
+                    # 让真正的写盘错误去报错，这里不抢戏
+                    break
+                try:
+                    os.write(fd, str(os.getpid()).encode("ascii"))
                 except OSError:
                     pass
                 finally:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                held = True
+                break
+            if not held and throttle.allow("state.lock_busy", window=600.0):
+                logger.warning(
+                    "[autonomous_social] 状态文件写锁被占用（可能是另一个实例在写），"
+                    "本次仍会写入，但可能覆盖对方的更新；请确认只有一个实例在跑。"
+                    f"路径：{lock_path}"
+                    + throttle.summary("state.lock_busy")
+                )
+            yield
+        finally:
+            if held:
+                with contextlib.suppress(OSError):
+                    os.remove(lock_path)
+
+    @staticmethod
+    def _lock_is_stale(lock_path: str) -> bool:
+        """锁文件是不是上一个进程崩溃留下的残骸（按 mtime 判断）。"""
+        try:
+            return time.time() - os.stat(lock_path).st_mtime > _LOCK_STALE_SECONDS
+        except OSError:
+            return False
+
+    def _check_external_change(self) -> None:
+        """写盘前比对盘上文件的 (mtime, size)：不是我们上次写的那份就告警。
+
+        为什么只告警、不阻止写：这个插件的主链路（发送、结算、心跳）都建立在
+        「状态写下去」上，锁住写盘会让整轮心跳空转；而另一个写者是谁我们并不知道
+        （手改、备份还原、第二个实例）。所以先让人看见，由人决定怎么处理。
+
+        为什么不告警就无法排障：全量重写是静默覆盖——用户改了 state.json 里的
+        配置、或者第二个实例刚写入新用户，都会被下一次心跳整份抹掉，日志里
+        一个字节都不会有。
+        """
+        stamp = self._stat_stamp()
+        if stamp is None or self._disk_stamp is None or stamp == self._disk_stamp:
+            return
+        if throttle.allow("state.external_change", window=600.0):
+            logger.warning(
+                "[autonomous_social] 状态文件在本次加载后被外部改动过"
+                f"（上次 {self._disk_stamp} → 现在 {stamp}），"
+                "本次写盘会以内存里的版本为准覆盖它。"
+                "如果同时开了两个实例，请只保留一个，否则会互相丢更新。"
+                + throttle.summary("state.external_change")
+            )
+
+    def _write_payload(self, payload: str) -> None:
+        """把已序列化好的文本原子写到磁盘（调用方负责 `_write_lock`）。"""
+        dir_path = os.path.dirname(self.path) or "."
+        os.makedirs(dir_path, exist_ok=True)
+
+        with self._cross_process_lock():
+            self._check_external_change()
+            fd, tmp_path = tempfile.mkstemp(
+                prefix="social_", suffix=".tmp", dir=dir_path
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, self.path)
+                # fsync 文件只保证**内容**落盘；os.replace 这个目录项变更没有 fsync 目录
+                # 就仍在页缓存里，断电时可能出现「新数据在盘上但目录项还指向旧 inode」，
+                # 甚至整个 state.json 消失（只留 social_*.tmp）。对一个全量重写、丢了就丢
+                # 全部用户历史的状态文件，这是唯一一处能造成整文件损失的窗口。
+                # Windows 上目录 fsync 不可用（os.open 直接失败），必须容错。
+                try:
+                    dfd = os.open(dir_path, os.O_RDONLY)
+                except OSError:
+                    dfd = -1
+                if dfd >= 0:
                     try:
-                        os.close(dfd)
+                        os.fsync(dfd)
                     except OSError:
                         pass
-        finally:
-            # 清理临时文件
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                    finally:
+                        try:
+                            os.close(dfd)
+                        except OSError:
+                            pass
+            finally:
+                # 清理临时文件
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        # 这份文件现在是「我们写的」：记下指纹，下次写盘前比对才不会把自己的写入
+        # 当成外部改动（否则每次写都会报一次假的「被别人改了」）
+        self._disk_stamp = self._stat_stamp()
 
     # ─── 消息记录 ───────────────────────────────────────
 
@@ -1593,7 +2055,7 @@ class SocialState:
         merged = dict(current) if isinstance(current, dict) else {}
         merged.update(metrics)
         self.data["_runtime"] = merged
-        self._dirty = True
+        self.mark_dirty()
 
     @staticmethod
     def note_promise(u: Dict[str, Any], promise: Optional[str], ts: float) -> None:
@@ -1823,7 +2285,14 @@ class SocialState:
             pending = []
         # 已经进会话历史的条目不再需要临时注入，顺手丢掉，状态不会越攒越大
         pending = [m for m in pending if isinstance(m, dict) and not m.get("in_history")]
-        pending.append({"text": str(text or ""), "ts": ts, "in_history": False})
+        # 关掉「保存消息正文」时**不能**把原文塞进这里。这条路径原来完全不受开关
+        # 约束：`conversation` 与 `proactive_log` 都按 store_text 写空串了，只有这里
+        # 还留着完整原文（`str(text or "")` 连截断都没有），而它同样会落进 state.json。
+        # 关掉开关的用户以为「她说过的话不落盘」，实际整段原文还躺在盘上。
+        # 不追加的代价是：这条主动消息在用户回话前不会被临时注入进 prompt——
+        # 但那本来就是「没有正文可注入」，宁可少注入一次，也不能偷偷留正文。
+        if store_text:
+            pending.append({"text": str(text or ""), "ts": ts, "in_history": False})
         del pending[:-PENDING_PROACTIVE_KEEP]
         u["pending_proactive_context"] = pending
 
@@ -2049,7 +2518,18 @@ class SocialState:
         不能跟着消息数无界增长。`topic_seen_at` 留一倍余量，被 `topics` 挤出去的
         话题时间戳由末尾那段一起收。
         """
-        topics = u.setdefault("topics", [])
+        topics = u.get("topics")
+        if not isinstance(topics, list):
+            topics = []
+            u["topics"] = topics
+        else:
+            # 列表本身没问题、元素被手改坏的情况（`["塞尔达", 42]`）也要挡住：
+            # 下面 `t.lower()` 会抛 AttributeError，而这个函数在每一条用户消息上
+            # 都会跑——一个人坏了就等于这个用户此后每条消息都炸。非字符串话题本来
+            # 也参与不了匹配，直接丢掉，不要为了保住一个脏值把整条链路搞挂。
+            cleaned = [t for t in topics if isinstance(t, str)]
+            if len(cleaned) != len(topics):
+                topics[:] = cleaned
         seen = u.get("topic_seen_at")
         if not isinstance(seen, dict):
             seen = {}

@@ -740,10 +740,20 @@ def _read_cache_get(key: Tuple[str, str, str, int], bridge: Any) -> Optional[str
 
 
 def _read_cache_put(key: Tuple[str, str, str, int], bridge: Any, text: str) -> None:
-    if len(_READ_CACHE) >= _READ_CACHE_MAX_ENTRIES:
-        # 读缓存只是省一次检索，丢一批没有任何副作用。
-        for stale_key in list(_READ_CACHE)[: max(1, len(_READ_CACHE) // 2)]:
-            _READ_CACHE.pop(stale_key, None)
+    if key not in _READ_CACHE and len(_READ_CACHE) >= _READ_CACHE_MAX_ENTRIES:
+        # 先清已经过期的：读缓存只活 60 秒，满仓时里面往往有一批过期条目。
+        # 旧实现直接砍「插入序的前一半」，一次批量写就把刚存进去的热条目
+        # 一起踢掉，下一轮同一份记忆又要重新检索（P3-26）。
+        now = _now()
+        for stale_key, (expires_at, _cached_bridge, _text) in list(_READ_CACHE.items()):
+            if now >= expires_at:
+                _READ_CACHE.pop(stale_key, None)
+        # 清完还满，就按插入序淘汰最旧的一条，不再一次清一半。
+        while len(_READ_CACHE) >= _READ_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(_READ_CACHE), None)
+            if oldest_key is None:
+                break
+            _READ_CACHE.pop(oldest_key, None)
     _READ_CACHE[key] = (_now() + READ_CACHE_TTL_SECONDS, bridge, text)
 
 

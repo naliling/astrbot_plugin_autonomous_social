@@ -62,12 +62,23 @@ _DAY_PERIOD_WORDS: Dict[str, Tuple[int, int]] = {
     "明早": (1, 9), "明晚": (1, 20),
     "今早": (0, 9), "今晚": (0, 20),
 }
-# 这些词明确指「今天」：算出来的时刻已经过了，就顺延半小时而不是推到明天
-_EXPLICIT_TODAY = ("今天", "今日", "今儿", "今早", "今晚")
+# 这些词明确指「今天」：算出来的时刻已经过了，就顺延半小时而不是推到明天。
+# 「今天晚上/今天早上」这类复合词也必须进来：它们由 `_DAY_PERIOD_WORDS` 整体命中，
+# 拿到的 day_hit 是整词而不是「今天」。旧实现只列了「今天/今早/今晚」，于是
+# 21:00 说「今晚8点」给半小时缓冲，说「今天晚上8点」却推到明天 20:00（P2-05）。
+_EXPLICIT_TODAY = (
+    "今天", "今日", "今儿", "今早", "今晚", "今天早上", "今天晚上",
+)
 # 「N 点」「N 点半」
 _CLOCK = re.compile(
     r"(?P<h>\d{1,2}|[一二三四五六七八九十]+)\s*(?:点|时)(?P<half>半)?"
 )
+# 「一点」的上下文判据：中文里「一点」大多不是钟点（快一点/一点小事/第一点/
+# 这一点）。旧实现见到「一点」就按凌晨 1 点算，confidence 还有 0.7，于是
+# 「再等我一点」会被当成承诺在 01:00 兑现（P2-07）。真正的钟点会带「半/钟/
+# 整/左右」或前面不是程度词，所以按前后各一个字否决。
+_CLOCK_ONE_BEFORE = set("快慢多少大小好坏差早晚近远高低长短再稍微有第这那哪每点了太更挺")
+_CLOCK_ONE_AFTER = set("儿点小时事也都吧啊嘛的不没")
 # 模糊说法：不精确，但比「20 小时后」贴近说话人本意。
 _VAGUE: Tuple[Tuple[str, float], ...] = (
     ("一会儿", 30 * 60.0), ("一会", 30 * 60.0), ("待会儿", 60 * 60.0),
@@ -115,6 +126,30 @@ def _cn_to_int(text: str) -> Optional[int]:
             return None
         total = total * 10 + val
     return total
+
+
+def _clock_is_non_time(src: str, m: Any) -> bool:
+    """判断 `_CLOCK` 命中的「一点/1点」是不是程度或数量词，而不是钟点。"""
+    if m.group("h") not in ("一", "1"):
+        return False
+    # 「一点半/一点钟/一点整/一点左右/一点零五」是明确的钟点，不否决
+    after = src[m.end():m.end() + 1]
+    if m.group("half") or after in ("钟", "整", "左", "零"):
+        return False
+    start = m.start()
+    before = src[start - 1] if start > 0 else ""
+    # 「一点」落在句尾/标点前时，中文里几乎都是「一点点」的意思（再等我一点 /
+    # 好一点 / 慢一点），不是凌晨 1 点。真正指 1 点会带时段词（「晚上一点」）、
+    # 日期词（「明天一点」）或「了/钟」（「一点了」），这些上下文出现时照常认。
+    if after == "" or after in "，。！？；、,.!?;~～…\n":
+        has_context = (
+            any(word in src for word, _hour in _PERIODS)
+            or any(word in src for word, _off in _DAY_WORDS)
+            or any(word in src for word in _DAY_PERIOD_WORDS)
+        )
+        if not has_context:
+            return True
+    return before in _CLOCK_ONE_BEFORE or after in _CLOCK_ONE_AFTER
 
 
 def _local_dt(now: float, tz_offset: Optional[float]) -> datetime:
@@ -219,17 +254,39 @@ def _parse(text: Any, now: float, tz_offset: Optional[float]) -> Dict[str, Any]:
     clock_h: Optional[int] = None
     clock_m = 0
     clock_hit = ""
-    m = _CLOCK.search(src)
-    if m:
+    # 钟点跨日：「晚上12点」是次日 0 点，「晚上1点」是次日凌晨 1 点。
+    # 旧实现只做「时段 >= 12 就给小于 12 的钟点 +12」，于是 12 点留在中午、
+    # 1 点被加成 13 点（P2-06）。跨日偏移单独记下来，由各日期分支加进 target_day，
+    # 不能在这里直接改 base，否则「周三晚上12点」的星期判断会错位。
+    clock_day_roll = 0
+    for m in _CLOCK.finditer(src):
         hh = _cn_to_int(m.group("h"))
-        if hh is not None and 0 <= hh <= 24:
-            clock_h = hh % 24 if hh == 24 else hh
-            clock_m = 30 if m.group("half") else 0
-            clock_hit = m.group(0)
-            # 「下午三点」「晚上八点」：钟点小于 12 时按时段补 12 小时。
-            # 不补的话「下午3点」会被当成凌晨三点，承诺提前半天兑现。
-            if period_hour is not None and period_hour >= 12 and 0 < clock_h < 12:
+        if hh is None or not (0 <= hh <= 24):
+            continue
+        if _clock_is_non_time(src, m):
+            # 「一点小事」「快一点」「第一点」不是时间：跳过，继续找后面真正的钟点
+            continue
+        clock_h = hh % 24 if hh == 24 else hh
+        clock_m = 30 if m.group("half") else 0
+        clock_hit = m.group(0)
+        break
+
+    if clock_h is not None and period_hour is not None:
+        if period_hour >= 18 or period_hour <= 5:
+            # 傍晚/晚上/夜里/凌晨：12 点=午夜，1~5 点=凌晨，不再一律 +12
+            if clock_h == 12:
+                clock_h = 0
+                clock_day_roll = 1
+            elif 1 <= clock_h <= 5:
+                # 白天/傍晚说的「晚上1点」指次日凌晨；凌晨 0~6 点说的指当天
+                if base.hour >= 12:
+                    clock_day_roll = 1
+            elif 6 <= clock_h <= 11:
                 clock_h += 12
+        elif period_hour >= 12 and 0 < clock_h < 12:
+            # 「下午三点」「中午十二点」：下午/中午的钟点小于 12 时补 12 小时。
+            # 不补的话「下午3点」会被当成凌晨三点，承诺提前半天兑现。
+            clock_h += 12
 
     # ③ 绝对日期（3月5号）：没有年份，今年这天过了就算明年
     m = _ABS_DATE.search(src)
@@ -251,6 +308,10 @@ def _parse(text: Any, now: float, tz_offset: Optional[float]) -> Dict[str, Any]:
                     target = target.replace(year=year + 1)
                 except ValueError:      # 2月29号 → 次年不是闰年
                     return _result(None, "none", m.group(0), 0.0)
+            # 「3月5号晚上12点」= 3月6号 0 点：跨日要在日期定下来之后再加，
+            # 否则会被上面的「今年已过 → 明年」判断当成另一天。
+            if clock_day_roll:
+                target += timedelta(days=clock_day_roll)
             return _result(
                 _checked(_to_epoch(target, tz_offset), now_f),
                 "absolute_date", m.group(0), 0.9,
@@ -268,7 +329,10 @@ def _parse(text: Any, now: float, tz_offset: Optional[float]) -> Dict[str, Any]:
             hour = clock_h if clock_h is not None else (
                 period_hour if period_hour is not None else _DEFAULT_HOUR
             )
-            target = _at_hour(target_day, hour, clock_m)
+            # 跨日偏移必须在「是否已过」判断之前加：周三 23:00 说「周三晚上1点」，
+            # 指的是周四凌晨 1 点（还没到），先加一天才是对的；反过来先判过去再加 7 天
+            # 会算成下周四。
+            target = _at_hour(target_day + timedelta(days=clock_day_roll), hour, clock_m)
             # 不带前缀的「周三」说在周四：指的是**刚过去的**周三，但承诺不能落到
             # 过去，所以顺延到下周同一天；带「这/本」前缀同理（那是这一周的那天）。
             if target < base:
@@ -283,7 +347,9 @@ def _parse(text: Any, now: float, tz_offset: Optional[float]) -> Dict[str, Any]:
     if m:
         pre = m.group("pre") or ""
         week_start = base - timedelta(days=base.weekday())
-        offset_weeks = 1 if pre.startswith("下下") else (1 if "下" in pre else 0)
+        # 「下下周末」是两周后，不是一周后。星期分支（第 266 行）一直写的是 2，
+        # 周末分支旧实现漏了这个 2，于是「下下周末」的承诺早一周兑现（P2-04）。
+        offset_weeks = 2 if pre.startswith("下下") else (1 if "下" in pre else 0)
         target = _at_hour(
             week_start + timedelta(days=offset_weeks * 7 + 5), _DEFAULT_HOUR, 0
         )
@@ -305,7 +371,7 @@ def _parse(text: Any, now: float, tz_offset: Optional[float]) -> Dict[str, Any]:
         hour = clock_h if clock_h is not None else (
             period_hour if period_hour is not None else _DEFAULT_HOUR
         )
-        target = _at_hour(target_day, hour, clock_m)
+        target = _at_hour(target_day + timedelta(days=clock_day_roll), hour, clock_m)
         if target <= base:
             if day_hit in _EXPLICIT_TODAY:
                 # 「今天」说在 21:00：今天确实还没过完，给半小时缓冲而不是推到明天
@@ -350,16 +416,4 @@ def _checked(at: float, now: float) -> Optional[float]:
     return at
 
 
-def promise_due_at(
-    promise: Any, now: float, *, tz_offset: Optional[float] = None
-) -> Optional[float]:
-    """承诺文本 → 该兑现的绝对时刻；没认出时间说法返回 None。
 
-    调用方（engine 的承诺写入路径）拿到 None 就保持 state 里的默认
-    at + PROMISE_WAIT_SECONDS，行为与 v2.1.5 完全一致。
-    """
-    got = parse_deadline(promise, now, tz_offset=tz_offset)
-    at = got.get("at")
-    if isinstance(at, bool):
-        return None
-    return float(at) if isinstance(at, (int, float)) and at > 0 else None

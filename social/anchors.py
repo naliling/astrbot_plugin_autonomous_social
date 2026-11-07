@@ -737,7 +737,16 @@ def _derive_from_state(
     if _wake:
         offer(_wake, KIND_WAKE)
 
-    doing = _short(day.get("doing") or activity.get("schedule_event"), 12)
+    # `day.doing` 与 `activity.schedule_event` 都是外部契约字段：`3`、`True` 这类
+    # 脏数据会被 `_s` 翻成 "3" / "True"，拼出「正在3」这种不是人话的由头
+    # （审核 P3-16）。相邻的 `day.done` 早就只认 str（见下面那圈循环），
+    # 这里补齐同一道门：非字符串就退回 `activity.schedule_event`，两边都不是
+    # 字符串就当没有。
+    doing = ""
+    for _candidate in (day.get("doing"), activity.get("schedule_event")):
+        if isinstance(_candidate, str) and _candidate.strip():
+            doing = _short(_candidate, 12)
+            break
     # 「忙手里的活」「忙自己的事」这种 doing 是空话：拼成「正在忙手里的活」等于没说，
     # 而模型拿到这种由头只会顺着编一句更空的。真实记录里这类由头出现过 11 次
     # （「刚忙完忙自己的事」×5、「刚忙完醒神」×6）。
@@ -1816,6 +1825,20 @@ _RETIRED_NOTE = {
 }
 
 
+# `about` 是对方原话，而 `anchor_sentence` 把它拼进「开口原因：{lead}\n{material}」——
+# 一句给定事实。单个换行就够让后半句从第 0 列开始，和插件自己写的指令行长得
+# 一模一样，模型分不出哪句该照做（审核 P1-06 ③）。提示词侧 `_quote_text` 还有
+# 一道兜底，但源头就不该把换行递过去：面板、日志、别的调用方同样读 `about`。
+# 这里只压平不截断——长度归提示词侧的上限管，在这儿截会把「要说哪件事」吃掉。
+_SENTENCE_BREAK = re.compile(r"[\r\n\u2028\u2029\u202a-\u202e\u200b-\u200f\ufeff]+")
+_FLAT_SPACES = re.compile(r"[ \t\u3000]{2,}")
+
+
+def _flat(text: Any) -> str:
+    """把一段外部文本压成单行（只压平空白与行分隔符，不截断）。"""
+    return _FLAT_SPACES.sub(" ", _SENTENCE_BREAK.sub(" ", _s(text))).strip()
+
+
 def anchor_sentence(a: Dict[str, Any]) -> str:
     """把一条由头写成提示词里的一句「给定事实」。
 
@@ -1823,7 +1846,7 @@ def anchor_sentence(a: Dict[str, Any]) -> str:
     写一句话。之前让模型自己回答「你有什么由头」，得到的必然是
     「想表达此刻的孤独」这种关于说话而不是关于内容的句子。
     """
-    about = _s(a.get("about")) or "一件事"
+    about = _flat(a.get("about")) or "一件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
     lead = _REASON_BY_KIND.get(kind, _REASON_BY_KIND[KIND_DERIVED])
     if kind == KIND_CUE:
@@ -1844,7 +1867,9 @@ def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
     找话题——之前让它自己回答「你有什么由头」，得到的必然是关于说话而不是
     关于内容的句子。
     """
-    about = _s(a.get("about")) or "这件事"
+    # 同一个 `about` 也进 `msg_type_desc`（「就那件事说句话：{about}」），
+    # 换行在那句里同样是伪造指令行的入口，所以两处都走 `_flat`。
+    about = _flat(a.get("about")) or "这件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
     retired = _s(a.get("retired"))
     mode = {

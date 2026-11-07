@@ -128,7 +128,7 @@ _SPAN_PATTERNS: Tuple[re.Pattern, ...] = (
 def _paired_spans(text: str, pairs: Tuple[Tuple[str, str], ...]) -> List[Tuple[int, int]]:
     """成对符号的区间；未闭合时从开符号一直保护到文末。
 
-    未闭合为什么保护到文末：模型被截断时常常只留一个 \`「\`，后面半句仍是正文，
+    未闭合为什么保护到文末：模型被截断时常常只留一个 `「`，后面半句仍是正文，
     此时「哪里能切」已经不可信——整条发出去，好过切成两个半截气泡。
     """
     spans: List[Tuple[int, int]] = []
@@ -351,10 +351,16 @@ def plan_segments(
         return [], []
     if len(segs) == 1:
         out, waits = plan_parts(segs[0], umo, context, allow_burst=allow_burst)
+        # 自动拆两条也必须服从框架的分段开关。plan_parts 在框架没开分段时
+        # 已经退回整条（out 只有一段），旧实现只看 len(out)==1 就继续
+        # _auto_split，等于把「框架没开」又拆开了——正是 P2-02 说的
+        # 「面板写跟随框架、实际照样连发」。
         if allow_burst and len(out) == 1:
-            auto = _auto_split(out[0])
-            if auto:
-                return auto, [random.uniform(2.0, 4.0) for _ in auto[1:]]
+            cfg = read_segmented_reply(context, umo)
+            if bool(cfg.get("enable", False)):
+                auto = _auto_split(out[0])
+                if auto:
+                    return auto, [random.uniform(2.0, 4.0) for _ in auto[1:]]
         return out, waits
     if not allow_burst:
         return ["\n".join(segs)], []

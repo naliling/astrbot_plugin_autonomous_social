@@ -311,15 +311,19 @@ def _decide(
         # 本轮不是纯收尾，永远不该被静默；证据留着给 closing_instruction 用。
         return {**evidence, "reason": "not_a_closing"}
     if assistant is None:
-        return {**base, "reason": "no_role_reply"}
+        return {**evidence, "reason": "no_role_reply"}
     if delta is None:
-        return {**base, "reason": "history_time_unknown"}
+        return {**evidence, "reason": "history_time_unknown"}
+    # 这四个异常分支原来返回 {**base}，把上面刚收集的证据（categories、
+    # last_reply_at、双方是否已收尾）全丢了，closing_instruction 拿到的是
+    # 「什么都没发生」——而它恰恰要靠这些证据决定要不要补一句（P3-23）。
     if delta < 0:
-        return {**base, "reason": "history_after_input",
-                "last_reply_at": _epoch(assistant.get("ts"))}
+        # 这两条分支的 evidence 里没有 last_reply_at（上面的 update 只在
+        # 0<=delta<=window 时才填），所以要把角色回复时刻单独带上——
+        # 旧实现只给了它、丢了 categories，改过来时不能反过来丢这个。
+        return {**evidence, "last_reply_at": role_at, "reason": "history_after_input"}
     if delta > window:
-        return {**base, "reason": "outside_window",
-                "last_reply_at": _epoch(assistant.get("ts"))}
+        return {**evidence, "last_reply_at": role_at, "reason": "outside_window"}
     if role_closed_flag:
         return {**evidence, "suppress_reply": True, "action": "silent",
                 "reason": "role_already_closed"}

@@ -59,6 +59,23 @@ _ASKING_MARK = re.compile(r"[?？]")
 _ELLIPSIS = re.compile(r"…|\.{3,}")
 _EXCLAIM = re.compile(r"[！!]")
 _PERIOD = re.compile(r"[。\.]")
+
+# URL、文件名、小数里的半角点不是句尾：`_SENTENCE_SPLIT` 与 `_PERIOD` 把半角点
+# 当句号，于是「3.5 小时」「github.com」「main.py」都被切成两句，句长统计与
+# 「习惯用句号收尾」的结论一起失真（P3-22）。切分/统计前先把这些整段换成
+# **等长**占位符：占位符不匹配任何标点，长度又不变，所以「平均几个字」的口径
+# 不受影响；URL 里的 `?`/`!` 也一并挡住，不会冒充问句/感叹句。
+_PROTECTED_TOKEN = re.compile(
+    r"https?://\S+"
+    r"|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+"
+    r"|(?<=\d)\.(?=\d)"
+)
+_MASK_CHAR = "\u0000"
+
+
+def _mask_protected(text: str) -> str:
+    """把 URL/文件名/小数换成等长占位符，只用于统计，不写回正文。"""
+    return _PROTECTED_TOKEN.sub(lambda m: _MASK_CHAR * len(m.group(0)), str(text or ""))
 _WAVE = re.compile(r"[~～]")
 # `_EMOJI`（emoji + 变体选择符）由 `social/emoji.py` 统一提供：这份字符类原本在
 # `style_profile` / `generator` / `groupflow` 各抄了一份逐字节相同的正则，
@@ -110,7 +127,8 @@ def _stat_line(label: str, texts: Sequence[str]) -> str:
     questions = 0
     sentences = 0
     for t in texts:
-        parts = [p.strip() for p in _SENTENCE_SPLIT.split(t) if p.strip()]
+        safe = _mask_protected(t)
+        parts = [p.strip() for p in _SENTENCE_SPLIT.split(safe) if p.strip()]
         # 与 `reasoning._ASKING`（`[?？]|[吗]$`）同口径：问号任意位置都算，
         # 语气词只认句尾的「吗/嘛」。「走吧 / 我忙着呢 / 好吧」三个都不该命中。
         #
@@ -118,8 +136,9 @@ def _stat_line(label: str, texts: Sequence[str]) -> str:
         # 当边界**吃掉**了，逐段判会让「你几点回来？我等你」里的问号凭空消失
         # （段落变成「你几点回来」「我等你」，问号谁都看不到）。
         # 计数同样按整条算并夹在句数以内，避免一个问句被算成两处提问。
-        n_marks = len([m for m in _QUESTION_TAIL.finditer(t)]) + len(
-            [m for m in _ASKING_MARK.finditer(t)]
+        # `safe` 是屏蔽过 URL 的版本：URL 里的 `?` 不算提问（P3-22）。
+        n_marks = len([m for m in _QUESTION_TAIL.finditer(safe)]) + len(
+            [m for m in _ASKING_MARK.finditer(safe)]
         )
         if n_marks:
             questions += min(n_marks, max(1, len(parts)))
@@ -164,7 +183,8 @@ def _habit_line(label: str, texts: Sequence[str]) -> str:
     n = len(texts)
     found = []
     def rate(pat) -> float:
-        return sum(1 for t in texts if pat.search(t)) / n
+        # 先屏蔽 URL/文件名/小数：它们里面的 `.`/`!`/`…` 不是标点习惯（P3-22）
+        return sum(1 for t in texts if pat.search(_mask_protected(t))) / n
     if rate(_ELLIPSIS) >= 0.3:
         found.append("爱用省略号")
     if rate(_EXCLAIM) >= 0.3:
@@ -283,7 +303,10 @@ def _length_stats(texts: Sequence[str]) -> tuple:
         return 0, 0
     lengths: List[int] = []
     for t in texts:
-        parts = [p.strip() for p in _SENTENCE_SPLIT.split(t) if p.strip()]
+        # 与 `_stat_line` 同口径：先屏蔽 URL/文件名/小数里的点，否则「3.5 小时」
+        # 会被拆成「3」「5 小时」两截，平均句长被算小（P3-22）。占位符等长，
+        # 屏蔽不影响 `len(p)`。
+        parts = [p.strip() for p in _SENTENCE_SPLIT.split(_mask_protected(t)) if p.strip()]
         lengths.extend(len(p) for p in parts)
     if not lengths:
         return 0, 0

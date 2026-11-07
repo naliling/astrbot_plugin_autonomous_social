@@ -639,6 +639,11 @@ class _IcebreakEngine:
         self.sent.append(text)
         return True, "", False
 
+    async def _persist_state(self):
+        # v2.1.7：engine 侧把同步 state.save() 换成了快照式落盘（P2-20），
+        # 这个 fake 不落盘，给个空实现即可；断言仍只看「发没发」。
+        return True
+
     def _schedule_group_burst(self, *_args, **_kwargs):
         pass
 
