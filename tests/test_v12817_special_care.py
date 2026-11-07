@@ -114,6 +114,12 @@ def _engine(clock: _Clock | None = None, **cfg) -> SocialEngine:
     )
     for key, value in cfg.items():
         setattr(eng.cfg, key, value)
+    # 间隔抖动（v2.1.8）在 tests/test_v218_gap_jitter.py 里单独覆盖；这里要断言
+    # 精确秒数，除非用例自己指定，否则显式关掉。
+    if "gap_jitter_low" not in cfg:
+        eng.cfg.gap_jitter_low = 0.0
+    if "gap_jitter_high" not in cfg:
+        eng.cfg.gap_jitter_high = 0.0
     return eng
 
 

@@ -1,14 +1,10 @@
-<p align="center">
-  <img src="logo.png" alt="自主拟人伴侣 logo" width="140" />
-</p>
-
 # 自主拟人伴侣
 
 > **她攒够了念头，会先开口。**
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.1.6-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.2.0-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E5%BE%AE%E4%BF%A1%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -148,7 +144,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 
 ### 全部配置项
 
-> 下表与 `_conf_schema.json` 同源，共 128 项；面板里看到的默认值与这里一致。
+> 下表与 `_conf_schema.json` 同源，共 130 项；面板里看到的默认值与这里一致。
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -173,7 +169,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `followup_max_minutes` | `70` | 【未完话题】超过这么久就别接了，像隔半天重新打招呼 |
 | `followup_cooldown_minutes` | `30` | 【未完话题】两次接话之间的最短间隔（同一段沉默只会接一次，这是跨段护栏） |
 | `continue_enabled` | `true` | 【接话】她说完、对方就没声了：过一阵接一句，或问一句「你干啥去了」。这不是另起话题，也不是追问那件事——是「话说完了，人走了」 |
-| `continue_after_minutes` | `90` | 【接话】她上一条说完之后至少隔这么久才接话。太短像盯着人看，太长这场话就凉了 |
+| `continue_after_minutes` | `25` | 【接话】她上一条说完之后至少隔这么久才接话。刚聊热就冷下来时按这个值顺延，太短像盯着人看，太长这场话就凉了 |
 | `continue_window_hours` | `8` | 【接话】接话窗口最长多少小时，超过就当这场话已经过去了，不再接 |
 | `silent_giveup_days` | `0` | 【回避】对方连续这么多天一句话没说、她这期间主动发过、也一直没人回，就全面停发（早安晚安也算），等对方先开口才恢复。0=关闭。**2.0.8 起默认 0（关闭）**：出差/考试/生病都会被算成「不回话」，而且没有自动恢复出口，一旦触发就再也不会开口 |
 | `loop_enabled` | `true` | 【回访】记住对方提过、没说结果的事，过几小时问后来 |
@@ -242,7 +238,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `social_energy_threshold` | `20` | 社交能量低于此值念头涨得极慢（需 Core） |
 | `adaptive_reply_rate` | `true` | 把「对方接不接话」算进在意度 |
 | `reply_window_hours` | `2` | 多久内回话算「接住了」（回复率统计口径） |
-| `greeting_enabled` | `true` | 【问候】按「距上次说上话多久」触发，不绑日历。手上没新事时安静本身就是理由——「你好久没理我了」也算由头 |
+| `greeting_enabled` | `true` | 【问候】按「距上次说上话多久」触发，不绑日历。手上没新事时安静本身就是理由——「好一阵没你消息了」也算由头 |
 | `greeting_morning_start` | `7` | 【早晚问候】早安窗口开始（小时） |
 | `greeting_morning_end` | `11` | 【早晚问候】早安窗口结束（小时） |
 | `greeting_midday_start` | `12` | 午间问候开始（小时） |
@@ -254,6 +250,8 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `user_cooldown_minutes` | `30` | 【护栏】同一个人两次被主动联系的最短间隔（每人独立，互不排队） |
 | `min_gap_minutes` | `30` | **中等关系的人**两条主动消息的最小间隔（分钟）。关系很熟的 30 分钟、关系一般的隔 1~2 天。防扎堆另有 `hourly_sends_cap` 那道安全闸 |
 | `max_gap_minutes` | `1440` | 按关系档位缩放后的最小间隔最高到多少分钟（上限）。关系淡的人本身要隔 720 分钟，默认 1440（一天）会把它卡死；想让这类人隔更久，调到 2880 或更大（最多 10080，即 7 天） |
+| `gap_jitter_low` | `0.75` | 间隔抖动的下限倍数。主动消息的间隔会在这个倍数与上限之间按「每一轮」随机取一个（基准 60 分钟 × 0.75 = 最短 45 分钟）。填 0 关闭抖动，回到固定间隔 |
+| `gap_jitter_high` | `1.75` | 间隔抖动的上限倍数（基准 60 分钟 × 1.75 = 最长 105 分钟）。与下限一起决定随机范围；下限必须小于上限，否则按关闭处理 |
 | `miss_affection_min` | `42` | 「念想」通道的好感门槛。对陌生人说「想你了」很怪，所以门要高 |
 | `miss_daily_cap` | `3` | 每天最多几条「念想」。这一类不受「刚聊过」阻断，所以单独限次 |
 | `hourly_sends_cap` | `24` | 每小时最多主动联系几人（按角色）。**安全闸不是节奏**：180 人同时攒满时防一次涌出，撞上限念头保留不清零。设 0 关闭 |

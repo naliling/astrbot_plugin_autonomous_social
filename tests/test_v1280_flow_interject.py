@@ -148,7 +148,11 @@ class FlowInterjectGateTest(unittest.TestCase):
         self.assertTrue(ok, why)
 
     def test_other_hard_gates_still_apply(self):
-        """语境放开了，不代表刷屏/窗口/睡眠这些闸也放开。"""
+        """语境放开了，不代表刷屏/窗口这些闸也放开。
+
+        v2.1.8：睡眠闸已按用户要求移除（睡着也能迷糊接话），所以不再列在
+        「仍该拦」的集合里，改为下面的正向断言。
+        """
         note = groupflow.flow_context_note(["阿哲", "小鱼", "阿哲"], "")
         cases = {
             "min_gap": (_gate(_group(flow_last_reply_at=NOW - 10),
@@ -159,13 +163,15 @@ class FlowInterjectGateTest(unittest.TestCase):
             "hourly": (_gate(_group(), context_note=note, hourly_cap=6,
                              hour_count=6), "上限"),
             "quiet": (_gate(_group(), context_note=note, is_quiet=True), "安静"),
-            "asleep": (_gate(_group(), context_note=note, asleep=True), "睡"),
         }
         for label, (result, want) in cases.items():
             with self.subTest(gate=label):
                 ok, why = result
                 self.assertFalse(ok, f"{label} 这道闸没拦住")
                 self.assertIn(want, why)
+        # 反过来：其余闸都满足时，asleep 本身不该再构成拦截。
+        ok, why = _gate(_group(), context_note=note, asleep=True)
+        self.assertTrue(ok, why)
 
 
 class FlowPromptContextTest(unittest.TestCase):

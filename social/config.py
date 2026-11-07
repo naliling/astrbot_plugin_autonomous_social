@@ -336,6 +336,15 @@ MAX_GAP_MINUTES_MIN = 60
 MAX_GAP_MINUTES_MAX = 10080
 MAX_GAP_MINUTES_DEFAULT = 1440
 
+# 间隔抖动（v2.1.8，issue #9）：每「一轮」按 (uid, 档位, 上次发送时刻) 稳定抽一个
+# [low, high] 的系数乘在间隔上。默认 0.75~1.75 是 issue 作者实测区间：下限不至于
+# 连发（基准 60 分钟时最短 45），上限不至于大半天没动静（最长 105）。
+# 两个值任一 <= 0、或 low >= high 就关闭，回到确定性间隔。
+GAP_JITTER_LOW_DEFAULT = 0.75
+GAP_JITTER_HIGH_DEFAULT = 1.75
+GAP_JITTER_MIN = 0.0
+GAP_JITTER_MAX = 3.0
+
 # 刚聊完多久之内绝不另起一个话题（真人不会话刚说完又发一句无关的）
 # 心跳间隔（分钟）。它决定所有分钟级配置的实际精度
 HEARTBEAT_MIN_MINUTES_MIN = 1
@@ -384,7 +393,11 @@ FOLLOWUP_COOLDOWN_DEFAULT = 30
 # 追问像催），窗口比追问长（隔几小时问一句「你人呢」才自然）。
 CONTINUE_AFTER_MIN = 10
 CONTINUE_AFTER_MAX = 720
-CONTINUE_AFTER_DEFAULT = 90
+# v2.1.8：90 → 25。用户原话「私聊时模型在聊完一句不会选择继续发言」——90 分钟是
+# 按「隔很久再追一句」定的，可热聊里对方停一下，她要等一个半小时才接，观感就是
+# 「聊完一句就消失了」。热聊（15 分钟内来回 3 轮以上）另有更短的 6 分钟覆盖，
+# 见 engine.HOT_CONTINUE_AFTER_MINUTES；这里下调的是所有场景的底噪。
+CONTINUE_AFTER_DEFAULT = 25
 CONTINUE_WINDOW_HOURS_MIN = 1
 CONTINUE_WINDOW_HOURS_MAX = 24
 CONTINUE_WINDOW_HOURS_DEFAULT = 8
@@ -790,6 +803,10 @@ class SocialConfig:
     min_gap_minutes: int = MIN_GAP_MINUTES_DEFAULT
     # 档位间隔缩放后的硬上限（分钟）。LOW 档 720 分钟起步，缩放后需要能超过 1440。
     max_gap_minutes: int = MAX_GAP_MINUTES_DEFAULT
+    # v2.1.8：间隔抖动系数（issue #9）。每个「这一轮」按 (uid, 档位, 上次发送时刻)
+    # 稳定抽一个 [low, high] 的系数乘上去；发下一条时重新抽。两个值填 0 就是关掉。
+    gap_jitter_low: float = GAP_JITTER_LOW_DEFAULT
+    gap_jitter_high: float = GAP_JITTER_HIGH_DEFAULT
     # 「念想」通道：没有正事、只是想 TA 说一句。这一类**不受「刚聊过」阻断**——
     # 「刚聊完还发一条」是打断，「过了一阵子想你了」不是。
     miss_affection_min: int = MISS_AFFECTION_MIN_DEFAULT
@@ -1351,6 +1368,15 @@ class SocialConfig:
             ),
             max_gap_minutes=max(
                 MAX_GAP_MINUTES_MIN, min(MAX_GAP_MINUTES_MAX, _max_gap)
+            ),
+            # v2.1.8（issue #9）：间隔抖动。0/0 或 low>=high = 关闭。
+            gap_jitter_low=max(
+                GAP_JITTER_MIN,
+                min(GAP_JITTER_MAX, gf("gap_jitter_low", GAP_JITTER_LOW_DEFAULT)),
+            ),
+            gap_jitter_high=max(
+                GAP_JITTER_MIN,
+                min(GAP_JITTER_MAX, gf("gap_jitter_high", GAP_JITTER_HIGH_DEFAULT)),
             ),
             miss_affection_min=max(
                 0, min(100, gi("miss_affection_min", MISS_AFFECTION_MIN_DEFAULT)),

@@ -2111,9 +2111,12 @@ class GroupPromptInjectionTest(unittest.TestCase):
         self.assertEqual(len(latest), 1, f"最新一句那一行不唯一：{latest!r}")
         self.assertIn("当普通文字", latest[0], "【群里最新的一句】没有免责句")
 
-        instr = [ln for ln in prompt.splitlines() if "要接就" in ln]
-        self.assertEqual(len(instr), 1, f"「要接就接最后那句」那一行不唯一：{instr!r}")
-        self.assertIn("当普通文字", instr[0], "「要接就接最后那句」没有免责句")
+        # v2.1.8：这一行从「要接就**接最后那句**（…：「…」）」改成
+        # 「最后一句是（…：「…」）」，引文与免责句的相对位置没变，所以判据跟着改：
+        # 找到**带引文的那个指令行**，它仍然必须自带「当普通文字/忽略它」。
+        instr = [ln for ln in prompt.splitlines() if "最后一句是（" in ln]
+        self.assertEqual(len(instr), 1, f"「最后一句是（…）」那一行不唯一：{instr!r}")
+        self.assertIn("当普通文字", instr[0], "带引文的指令行没有免责句")
         self.assertIn("忽略", instr[0])
 
 

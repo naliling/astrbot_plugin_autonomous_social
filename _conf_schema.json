@@ -270,9 +270,9 @@
     "continue_after_minutes": {
         "type": "int",
         "description": "接话前至少等多久（分钟）",
-        "hint": "她上一条说完之后，隔这么久才允许接话。太短像盯着人看，太长这场话就凉了。",
+        "hint": "她上一条说完之后，隔这么久才允许接话。太短像盯着人看，太长这场话就凉了。刚聊热就冷下来时按这个值顺延，不再等满默认间隔。",
         "obvious_hint": true,
-        "default": 90,
+        "default": 25,
         "min": 10,
         "max": 720,
         "slider": {
@@ -1226,6 +1226,36 @@
             "min": 60,
             "max": 10080,
             "step": 60
+        },
+        "collapsed": true
+    },
+    "gap_jitter_low": {
+        "type": "float",
+        "description": "间隔抖动下限（倍数）",
+        "hint": "主动消息的间隔会在这个倍数和「间隔抖动上限」之间随机取一个。0.75 表示基准 60 分钟最短 45 分钟；填 0 就关掉抖动、回到固定间隔。",
+        "obvious_hint": true,
+        "default": 0.75,
+        "min": 0,
+        "max": 3,
+        "slider": {
+            "min": 0,
+            "max": 3,
+            "step": 0.05
+        },
+        "collapsed": true
+    },
+    "gap_jitter_high": {
+        "type": "float",
+        "description": "间隔抖动上限（倍数）",
+        "hint": "和「间隔抖动下限」一起决定随机范围。1.75 表示基准 60 分钟最长 105 分钟。两个值都填 0 就关闭；下限必须小于上限，否则按关闭处理。",
+        "obvious_hint": true,
+        "default": 1.75,
+        "min": 0,
+        "max": 3,
+        "slider": {
+            "min": 0,
+            "max": 3,
+            "step": 0.05
         },
         "collapsed": true
     },

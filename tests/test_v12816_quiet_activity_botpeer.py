@@ -520,8 +520,9 @@ class FlowActivityGateTest(unittest.TestCase):
     def test_activity_never_opens_a_new_path(self):
         """只抑制：activity=1.0 判 False 的状态，任何 activity 都必须还是 False。"""
         # (群状态覆盖, 闸门参数覆盖)：每一条在默认 activity=1.0 下都必须被拦。
+        # v2.1.8：`asleep=True` 不再是「坏状态」——睡眠闸已按用户要求移除，
+        # 睡着时只剩活跃度门槛（engine 侧另加 30 分钟 drowsy 节流）。
         broken_states = [
-            ({}, dict(asleep=True)),
             ({}, dict(is_quiet=True)),
             ({}, dict(interject_enabled=False, context_note="群里现在是 A 和 B 在来回聊")),
             ({"flow_last_reply_at": NOW - 1},

@@ -63,6 +63,10 @@ class _Engine(SocialEngine):
     """只借 `_gap_left`，绕开整个引擎的构造（它只用 self.cfg）。"""
 
     def __init__(self, **overrides) -> None:
+        # 这些用例测的是「档位缩放 + 上限夹取」本身的精确秒数；间隔抖动是另一层
+        # （v2.1.8，见 tests/test_v218_gap_jitter.py），这里显式关掉。
+        overrides.setdefault("gap_jitter_low", 0)
+        overrides.setdefault("gap_jitter_high", 0)
         self.cfg = SocialConfig.from_astrbot(dict(overrides))
 
 

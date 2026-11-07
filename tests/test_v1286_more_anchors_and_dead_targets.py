@@ -246,21 +246,23 @@ class WakeCueTest(unittest.TestCase):
 class BodyCueTest(unittest.TestCase):
     """体感：饿 / 困 / 不舒服 / 欠觉。跨阈值才说。"""
 
+    # v2.1.8（issue #4）：这批措辞整体改温和了（「饿得有点受不了」→「有点饿了」
+    # 等），断言跟着换。判据没变：仍然只看阈值，仍然最多两条。
     def test_hunger_above_threshold(self):
-        self.assertIn("饿得有点受不了", anchors._body_cue(_body(hunger=85.0)))
+        self.assertIn("有点饿了", anchors._body_cue(_body(hunger=85.0)))
 
     def test_hunger_below_threshold_is_silent(self):
-        self.assertNotIn("饿得有点受不了", anchors._body_cue(_body(hunger=40.0)))
+        self.assertNotIn("有点饿了", anchors._body_cue(_body(hunger=40.0)))
         self.assertEqual(anchors._body_cue(_body(hunger=40.0)), [])
 
     def test_sleep_pressure_above_threshold(self):
-        self.assertIn("困得睁不开眼", anchors._body_cue(_body(sleep_pressure=80.0)))
+        self.assertIn("困意有些上来了", anchors._body_cue(_body(sleep_pressure=80.0)))
 
     def test_discomfort_above_threshold(self):
-        self.assertIn("身上不太得劲", anchors._body_cue(_body(discomfort=70.0)))
+        self.assertIn("身上有些乏", anchors._body_cue(_body(discomfort=70.0)))
 
     def test_sleep_debt_above_threshold(self):
-        self.assertIn("欠了一屁股觉", anchors._body_cue(_body(sleep_debt=8.0)))
+        self.assertIn("有点缺觉", anchors._body_cue(_body(sleep_debt=8.0)))
 
     def test_at_most_two(self):
         got = anchors._body_cue(_body(hunger=90.0, sleep_pressure=90.0,

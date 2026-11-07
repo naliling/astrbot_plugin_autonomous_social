@@ -668,7 +668,12 @@ class _RangeEngine:
 # ─── 其它回归 ──────────────────────────────────────────────────────
 
 class TestGroupQuietHours(unittest.TestCase):
-    """群心流是事件驱动的，安静时段与睡眠闸门漏了就等于深夜照样插话。"""
+    """群心流是事件驱动的：安静时段漏了就等于深夜照样插话。
+
+    v2.1.8 起「她正在睡觉」不再是硬闸——用户原话「群聊心流就不该有在睡觉必须不能
+    接话的，谁说不能迷迷糊糊的」。睡着只跳过安静时段这一道，engine 侧另有 30 分钟
+    drowsy 节流，见 `tests/test_v218_engine.py`。
+    """
 
     NOW = 1_700_000_000.0
 
@@ -688,13 +693,14 @@ class TestGroupQuietHours(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("安静", why)
 
-    def test_asleep_blocks(self):
+    def test_asleep_alone_no_longer_blocks(self):
+        # v2.1.8：睡着不再是一道硬闸（用户要的是「迷糊着也能接一句」）；
+        # 安静时段仍在，但 asleep 会跳过它。旧断言「asleep=True 必被拦」已过时。
         ok, why = groupflow.flow_should_consider(
             self._group(), self.NOW, max_replies=3, min_gap_seconds=45,
             hourly_cap=6, hour_count=0, ignored_exit=2, asleep=True,
         )
-        self.assertFalse(ok)
-        self.assertIn("睡", why)
+        self.assertTrue(ok, why)
 
     def test_normal_case_still_passes(self):
         ok, _why = groupflow.flow_should_consider(
@@ -1751,7 +1757,12 @@ class TestTriggerPacing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.clock = 1_700_000_000.0
-        self.engine = _FakeEngine(clock_ref=lambda: self.clock)
+        # 间隔抖动（v2.1.8）在 tests/test_v218_gap_jitter.py 里单独覆盖；这一组测
+        # 的是档位与「被冷落拉远」的确定性关系，所以显式关掉抖动。
+        self.engine = _FakeEngine(
+            clock_ref=lambda: self.clock,
+            cfg=SocialConfig(gap_jitter_low=0.0, gap_jitter_high=0.0),
+        )
 
     def test_min_gap_is_per_tier(self):
         """档位越高近得越理所当然——她常聊的那个人本来就该被多找一点。
@@ -3904,7 +3915,11 @@ class TestGroupOpenerPrompts(unittest.TestCase):
 
     def test_topic_mode_is_framed_as_starting_a_topic(self):
         p, _ = self._gen()._compose_group("topic", {}, "人设", 40)
-        self.assertIn("想开个新话头", p)
+        # v2.1.8：lead 从「你自己想开个新话头，跟大家聊点什么」改成
+        # 「起个话头，但不要提问——说一件自己真在做的小事」。判据不变：
+        # topic 模式仍然被框成「开一个新话头」，只是不再教它用问句。
+        self.assertIn("起个话头", p)
+        self.assertIn("不要提问", p)
 
     def test_group_boundary_forbids_starting_intimate_topics(self):
         p, _ = self._gen()._compose_group(

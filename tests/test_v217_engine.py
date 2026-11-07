@@ -321,19 +321,25 @@ class SpecialCareHourlyTest(unittest.TestCase):
 
 
 class ZeroMeansOffTest(unittest.TestCase):
-    """P2-09 / P2-10：0 是「关掉」，不是「没配」——私聊与群聊必须同一口径。"""
+    """P2-09 / P2-10：0 是「关掉」，不是「没配」；群上下文在 v2.1.8 是例外。
 
-    def test_group_context_inject_zero_injects_nothing(self):
+    为什么例外：用户反馈「群聊接不上话」——群聊上下文只给 5 条（0 更是 0 条），
+    她根本不知道刚才在聊什么。所以群路径改成「至少 12 条」，0 不再等于不注入；
+    私聊的 0=关 仍然不变（见 `_generation_conversation`）。
+    """
+
+    def test_group_context_inject_zero_still_gets_twelve(self):
         eng = _engine(context_inject_count=0)
-        g = {"samples": [{"name": "A", "text": "hi"}, {"name": "B", "text": "yo"}]}
-        self.assertEqual(eng._build_group_ctx("b1", "g1", g)["recent"], [])
+        g = {"samples": [{"name": "A", "text": f"m{i}"} for i in range(20)]}
+        recent = eng._build_group_ctx("b1", "g1", g)["recent"]
+        self.assertEqual(len(recent), 12)
+        self.assertEqual(recent[-1]["text"], "m19")
 
-    def test_group_context_inject_one_keeps_only_the_last(self):
-        eng = _engine(context_inject_count=1)
-        g = {"samples": [{"name": "A", "text": "hi"}, {"name": "B", "text": "yo"}]}
+    def test_group_context_keeps_the_larger_user_window(self):
+        eng = _engine(context_inject_count=20)
+        g = {"samples": [{"name": "A", "text": f"m{i}"} for i in range(30)]}
         self.assertEqual(
-            [r["text"] for r in eng._build_group_ctx("b1", "g1", g)["recent"]],
-            ["yo"],
+            len(eng._build_group_ctx("b1", "g1", g)["recent"]), 20,
         )
 
     def test_miss_affection_min_zero_disables_the_floor(self):

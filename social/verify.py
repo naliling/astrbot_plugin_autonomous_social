@@ -58,6 +58,25 @@ _CONTENT_CHAR = re.compile(
     r"\U0001F000-\U0001FAFF\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]"
 )
 
+# ── 短句豁免 ─────────────────────────────────────────────────
+# 这两张表解决的是同一个投诉：「发东西都没过脑子，根本不是在讲话的样子」。
+#
+# 旧实现只拒「去掉标点后 ≤2 个字」的正文，不看这句话是什么类型。于是
+# 「早安」「晚安」「嗯」「那我先睡了」这些**本来就该短**的话全被判空泛，
+# 模型为了过检只能把两字问候扩写成「早上好呀，新的一天也要元气满满哦」——
+# 那才是真正的机器人腔。长短不是判据，场景才是。
+#
+# 反过来，197 条记录里「只剩两个字的空泛」确实存在，所以豁免只给这几类：
+# 问候、随口招呼、应和、报个到、收个尾。其它类型（分享、回应、念想……）
+# 照旧两字门槛，别把这条豁免当万能通行证。
+SHORT_OK_TYPES = frozenset({"greeting", "casual_hello", "react_time", "check_in", "closer"})
+
+# 问候按天去重用的字面表：这些句子一天说一次是作息，说两次才是复读。
+# 不按 `_bigrams` 判——两三个字的句子二元组几乎只有它自己，
+# 判据对它们没有分辨率（「早安」和「晚安」在旧判据下都只是「一条短问候」）。
+_GREETING_TEXTS = frozenset({"早安", "早", "晚安", "醒了", "醒啦", "在吗", "早呀", "晚安啦"})
+
+
 # ── 「关于说话」的判据 ────────────────────────────────────────
 # 关键不是「开头是不是 想/要」，而是**这句话有多大比例在描述说话这个动作**。
 # 语料里泄漏的写法五花八门：
@@ -227,14 +246,25 @@ def _check_structure(text: str) -> Optional[str]:
     return None
 
 
-def _check_thin(text: str, called: str = "", allow_short: bool = False) -> Optional[str]:
+def _check_thin(
+    text: str,
+    called: str = "",
+    allow_short: bool = False,
+    msg_type: str = "",
+) -> Optional[str]:
     """空泛：去掉括号与标点之后几乎不剩字。
 
     `allow_short` 给群心流开：「嗯」「哈哈」这类短应和是群聊常态，不该一律拦下。
+    `msg_type` 给 `SHORT_OK_TYPES` 那几类开：问候/应和/报到/收尾本来就该短，
+    对它们只拦「一个字都没有」，不判空泛（理由见常量处的注释）。
     """
     body = _PUNCT_ONLY.sub("", strip_actions(text)).strip()
     if not body:
         return None                       # 已由 _check_structure 拦
+    if msg_type in SHORT_OK_TYPES:
+        # 只有「正文彻底空掉」才算问题；而那种情况 `_check_structure`
+        # 在上面已经拦掉了，这里不必重复判。
+        return None
     if len(body) <= 2 and not allow_short:
         if called and called in body:
             return None
@@ -242,7 +272,36 @@ def _check_thin(text: str, called: str = "", allow_short: bool = False) -> Optio
     return None
 
 
-def _check_repeat(text: str, recent: Sequence[str], threshold: float = 0.72) -> Optional[str]:
+def _greeting_repeat_exempt(text: str, recent: Sequence[str], msg_type: str) -> bool:
+    """这一条是不是「今天第一次说」的问候。
+
+    问候的二元组没有分辨率：「早安」「晚安」「在吗」的骨架各自就那两个字，
+    窗口里只要有过任意一条短问候，`_check_repeat` 就可能在 0.72 上误判。
+    实测模型一天里发两三次问候是正常作息，不是复读——把「晚安」判成
+    复读「早安」，它只能换个更绕的说法，越换越不像人。
+    所以问候类按「同一句当天只发一次」处理：窗口里没有同一句才豁免，
+    有同一句说明确实在重复，照常交给下面的重合度判据。
+
+    窗口数据用现成的 `recent`：它没有时间戳，只能把「在窗口里」当作
+    「20 小时内」；调用方给的本来就是最近若干条消息，够用且不新增状态。
+    """
+    if msg_type not in SHORT_OK_TYPES:
+        return False
+    body = _PUNCT_ONLY.sub("", strip_actions(text)).strip()
+    if body not in _GREETING_TEXTS:
+        return False
+    for old in recent or []:
+        if _PUNCT_ONLY.sub("", strip_actions(_s(old))).strip() == body:
+            return False
+    return True
+
+
+def _check_repeat(
+    text: str,
+    recent: Sequence[str],
+    threshold: float = 0.72,
+    msg_type: str = "",
+) -> Optional[str]:
     """与最近发过的太像。
 
     判据是**字符二元组重合度**，不是逐字相同——复读的措辞每次都不同
@@ -250,6 +309,8 @@ def _check_repeat(text: str, recent: Sequence[str], threshold: float = 0.72) -> 
     """
     cur = _bigrams(strip_actions(text))
     if not cur:
+        return None
+    if _greeting_repeat_exempt(text, recent, msg_type):
         return None
     for old in list(recent or [])[-12:]:
         old_text = _s(old)
@@ -771,12 +832,15 @@ def verify_message(
     called: str = "",
     require_about_peer: bool = False,
     allow_short: bool = False,
+    msg_type: str = "",
 ) -> Tuple[bool, str]:
     """验收一条即将发出的消息。返回 (通过, 原因)。
 
     `require_about_peer` 只给「念想」通道开：那一类本来就是「闲下来想起一个人」，
     整条却没有第二人称就说明它在讲自己——那正是 197 条记录里最扎手的问题。
     `allow_short` 只给群心流开：群里「嗯」「哈哈」这类短应和是常态。
+    `msg_type` 由调用方给出这条消息的类型（greeting/closer/...）：`SHORT_OK_TYPES`
+    里的类型按场景放宽空泛与复读判据，默认空串 = 老行为，不影响既有调用方。
     """
     if not _s(text):
         return False, "空消息"
@@ -786,10 +850,10 @@ def verify_message(
     reason = _check_intent_leak(text)
     if reason:
         return False, reason
-    reason = _check_thin(text, called, allow_short=allow_short)
+    reason = _check_thin(text, called, allow_short=allow_short, msg_type=msg_type)
     if reason:
         return False, reason
-    reason = _check_repeat(text, recent)
+    reason = _check_repeat(text, recent, msg_type=msg_type)
     if reason:
         return False, reason
     reason = _check_action_repeat(text, recent)

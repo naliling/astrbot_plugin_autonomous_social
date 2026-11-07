@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import inspect
 import json
@@ -1036,6 +1037,33 @@ BOT_PEER_DAILY_CAP = 1                  # 每天最多主动找它 1 次
 # 所以重启的后果最多是少接一句，不会凭空多开口。
 GROUP_ACTIVITY_KEEP_SECONDS = 1800.0
 
+# ─── v2.1.8 群聊发言质量 ───────────────────────────────────────
+#
+# 用户原话三句：「群聊接不上话」「破冰全是低质询问」「群聊心流就不该有在睡觉必须
+# 不能接话的，谁说不能迷迷糊糊的」。下面这几个常量就是这三句的量化口径。
+#
+# 群上下文窗口：旧实现直接把 context_inject_count（默认 5）当条数，用户配 0 时群路径
+# 还被 max(1, … or 5) 强塞 5 条；5 条消息在活跃群里只够看半分钟前的事，模型当然接不上。
+# 群路径至少 12 条，用户配得更大就听用户的；上限 40 防 token 爆炸（一条群消息几百字时
+# 40 条已经上万 token）。
+GROUP_CONTEXT_INJECT_DEFAULT = 12
+GROUP_CONTEXT_INJECT_MIN = 4
+GROUP_CONTEXT_INJECT_MAX = 40
+
+# 睡着时的群心流（drowsy）：不再硬拦，但比清醒时窄得多——同一个群 30 分钟最多一条，
+# 且群活跃度要到 0.6（清醒时门槛是 groupflow.FLOW_ACTIVITY_MIN，约 0.15）。
+# 30 分钟的依据：迷糊着接一句是「半梦半醒听到热闹搭个腔」，连着接三条就是刷屏。
+FLOW_DROWSY_GAP_SECONDS = 1800.0
+FLOW_DROWSY_ACTIVITY_MIN = 0.6
+
+# 热聊续话（v2.1.8）：continue 的默认起点由 config 下调到 25 分钟，但刚聊热的那一小段
+# 还要更短——15 分钟内来回各 3 轮、最后一句是她说的，6 分钟后就可以接。
+# 用户原话「私聊时模型在聊完一句不会选择继续发言」：等她按 90 分钟（旧默认）想起来，
+# 对方早走了。
+HOT_CONTINUE_WINDOW_MINUTES = 15
+HOT_CONTINUE_MIN_TURNS = 3
+HOT_CONTINUE_AFTER_MINUTES = 6
+
 # 连发补发间隔不再用插件自己的常量：拆段与间隔都跟 AstrBot 每个 Bot 的
 # 「分段回复」设置走（见 social/pacing.py）。下面这两个旧常量已无引用。
 
@@ -1187,6 +1215,53 @@ def _guard_dialogue(conv: Any) -> List[Dict[str, Any]]:
             }
         )
     return rows
+
+
+def _gap_jitter_factor(
+    cfg: Any, u: Dict[str, Any], tier: str, special_care: bool
+) -> float:
+    """这一轮的间隔抖动系数（v2.1.8，issue #9）。
+
+    为什么按「轮」抽，而不是每次调用现抽：`_gap_left` 一轮里会被问候判定、
+    `_min_gap_left`、面板显示、投放决策各调一次。每次现抽的话，面板上的
+    「还剩多久」会来回跳；而且一轮里多次抽签等价于取最小值——实际间隔会比
+    配置的区间更早、更不可控，等于把随机变成了「提前」。
+
+    这里用 (uid, 档位, 上次发送时刻, 是否特别关心) 做稳定哈希：同一轮里所有
+    调用拿到同一个系数，发完一条 `last_sent` 变了，下一轮自动换一个。重启、
+    多进程看到的结果也一致。
+
+    `gap_jitter_low`/`gap_jitter_high` 任一 <= 0、或 low >= high 时返回 1.0
+    （关闭，回到确定性间隔）。
+    """
+    try:
+        low = float(getattr(cfg, "gap_jitter_low", 0.0))
+        high = float(getattr(cfg, "gap_jitter_high", 0.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return 1.0
+    if low <= 0.0 or high <= 0.0 or high <= low:
+        return 1.0
+    low = max(0.2, min(3.0, low))
+    high = max(0.2, min(3.0, high))
+    if high <= low:
+        return 1.0
+    try:
+        last = int(_num(u.get("last_sent", 0) or 0))
+    except (TypeError, ValueError):
+        last = 0
+    seed = "|".join(
+        (
+            str(u.get("__uid", "") or ""),
+            str(tier or ""),
+            "sc" if special_care else "t",
+            str(last),
+        )
+    )
+    digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).digest()
+    ratio = int.from_bytes(digest, "big") / float(1 << 64)
+    return low + (high - low) * ratio
 
 
 class SocialEngine:
@@ -2580,6 +2655,22 @@ class SocialEngine:
             # 抛穿——那会让一条群消息直接丢掉当前观察。
             return 1.0
 
+    def _flow_drowsy_gap_ok(self, group: Dict[str, Any], now: float) -> bool:
+        """drowsy 心流的额外节流：同一个群 30 分钟内最多接一条。
+
+        v2.1.8 放开「睡着不接话」之后，只靠 groupflow 的活跃度门槛不够：活跃群里
+        每来一条消息都满足 0.6，她会半梦半醒连刷三条。这里单独记一个
+        `drowsy_last_reply_at`，与清醒时的 flow_last_reply_at 分开——不能共用，
+        否则迷糊着接一句会把清醒后的正常接话也一起冷却掉。
+        """
+        try:
+            last = float(group.get("drowsy_last_reply_at", 0) or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if last <= 0:
+            return True
+        return (now - last) >= FLOW_DROWSY_GAP_SECONDS
+
     async def _observe_group(self, event: Any, msg: str) -> None:
         """观察一条群消息：进参考库、刷 last_seen；如果心流窗口开着且值得接，派一个后台任务去接。
 
@@ -2666,6 +2757,12 @@ class SocialEngine:
         if not groupflow.flow_prefilter(msg, is_command=False):
             return
         is_quiet, asleep = _person_flow_state(self, bid, now)
+        # v2.1.8：睡着不再直接拦（用户原话「谁说不能迷迷糊糊的」），但同一个群
+        # 30 分钟只许接一条——否则活跃群里她会半梦半醒连刷。清醒后这条记录
+        # 不影响正常接话（与 flow_last_reply_at 分开记）。
+        if asleep and not self._flow_drowsy_gap_ok(g, now):
+            self.log(f"群 {gid} 心流本轮不接：迷糊着，离上一条 drowsy 不到 {int(FLOW_DROWSY_GAP_SECONDS // 60)} 分钟")
+            return
         # 上一波「插了没人理」的账要能随时间作废，否则这个群会被**永久**钉在退出阈值上：
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
@@ -2699,7 +2796,9 @@ class SocialEngine:
             # 同上：尝试也要节流，别让每条群消息都重打一次 LLM。
             attempt_gap_seconds=self._flow_attempt_gap(),
             # v1.28.16：群活跃度只做抑制（低于门槛就不硬接），不因高分放行任何东西。
+            # v2.1.8：睡着时门槛抬到 0.6——迷糊着判断力差，群里不够热闹就别硬接。
             activity=self._group_activity(bid, gid, now),
+            activity_min=FLOW_DROWSY_ACTIVITY_MIN if asleep else 0.0,
         )
         if not ok:
             self.log(f"群 {gid} 心流本轮不接：{why}")
@@ -2745,18 +2844,22 @@ class SocialEngine:
 
     @staticmethod
     def _verify_all_segments(segments, *, recent, called, allow_short=False,
-                             require_about_peer=False):
+                             require_about_peer=False, msg_type=""):
         """逐段过验收，返回 (不过的那段正文, 原因)；全过返回 ("", "")。
 
         `parts[0]` 只是模型输出的第一段；`plan_segments` 拆出来的后续段以前一律
         免检直接补发，动机泄漏/括号截断/复读都可能从那里进群（或单独发给对方）。
         验收要盖住**每一条真正发出去的段**。
+
+        v2.1.8：`msg_type` 透传给 `verify_message`。问候/道别/短应和这几类本来
+        就该短，旧验收按「普通消息」判空泛，把「早安」「晚安」也打回，重生成又
+        生成一遍同样的短句——线上表现为这类消息大量发不出去。
         """
         for text in segments:
             body = str(text or "")
             passed, reason = verify_message(
                 body, recent=recent, called=called, allow_short=allow_short,
-                require_about_peer=require_about_peer,
+                require_about_peer=require_about_peer, msg_type=str(msg_type or ""),
             )
             if not passed:
                 return body, reason
@@ -2777,6 +2880,10 @@ class SocialEngine:
         if not umo:
             return
         is_quiet, asleep = _person_flow_state(self, bid, now)
+        # v2.1.8：生成前重校也要过 drowsy 节流——_observe_group 过闸到真正生成之间
+        # 可能已经有另一条 drowsy 发出去了（群消息密时尤其如此）。
+        if asleep and not self._flow_drowsy_gap_ok(g, now):
+            return
         # 上一波「插了没人理」的账要能随时间作废，否则这个群会被**永久**钉在退出阈值上：
         # 计数只由「新开窗」或「被 @」清零，而不再插话就永远不会新开窗。
         # 放在这里而不是闸门里 —— `flow_should_consider` 是纯函数，改状态得留在状态层。
@@ -2816,6 +2923,7 @@ class SocialEngine:
             attempt_gap_seconds=self._flow_attempt_gap(),
             # 生成前重校（v1.28.16）：这几秒里群里可能已经安静下来了，也重新算一次。
             activity=self._group_activity(bid, gid, now),
+            activity_min=FLOW_DROWSY_ACTIVITY_MIN if asleep else 0.0,
         )
         if not ok:
             return
@@ -2871,6 +2979,9 @@ class SocialEngine:
         group_ctx["now"] = now
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
         group_ctx["context_note"] = context_note
+        # v2.1.8：把「迷迷糊糊」告诉生成侧。提示词由 generator 侧接（不在本次 scope），
+        # 这里只负责把状态放进 ctx；拿不到该键的旧生成器会自然忽略。
+        group_ctx["drowsy"] = bool(asleep)
         if context_note:
             self.log(f"群 {gid} 心流：{context_note}；交给模型判断要不要插")
         try:
@@ -2926,6 +3037,10 @@ class SocialEngine:
             int(getattr(self.cfg, "group_topic_max_segments", 0) or 0),
             int(getattr(self.cfg, "max_message_length", 0) or 0),
         )
+        # v2.1.8：drowsy 不连发。迷糊着接一句是「半梦半醒搭个腔」，拆成三段弹幕
+        # 既不像人也不礼貌；用户要的是「可以迷迷糊糊地接」，不是「睡着也能刷屏」。
+        if asleep and segments:
+            segments, waits = segments[:1], []
         # v2.1.0：跨群措辞去重（心流版）。线上最刺眼的那一套——16:40 五个群先后
         # 收到「蹄子揣着热水杯窝沙发上 / 刚睡醒端着牛奶挪到客厅」——日志里 mode
         # 全是「心流连发补充」，不是起话头，所以只拦 _icebreak 盖不住主证据。
@@ -2970,6 +3085,10 @@ class SocialEngine:
                 segments, waits = kept_segments, kept_waits
         bad_text, flow_why = self._verify_all_segments(
             segments, recent=own_recent_texts, called=called, allow_short=True,
+            # v2.1.8：接话不是「主动找话题」，属于群里的即时应和。旧实现把它按
+            # 普通消息验收，短应和（「哈哈」「确实」）常被判空泛打回。msg_type 只
+            # 放宽这一类场景的判据，其余检查照旧。
+            msg_type="react_time",
         )
         if bad_text:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
@@ -3031,6 +3150,13 @@ class SocialEngine:
             self.state.group(bid, gid)["fail_count"] = 0
         except Exception as exc:
             logger.debug(f"[autonomous_social] 清群 {gid} 发送失败计数失败: {exc}")
+        if asleep:
+            # v2.1.8：drowsy 的 30 分钟节流只记真正发出去的那一条（失败/验收不过
+            # 不算），否则模型偶尔抽风一次就白白占掉半小时的迷糊额度。
+            try:
+                self.state.group(bid, gid)["drowsy_last_reply_at"] = sent_ts
+            except Exception as exc:
+                logger.debug(f"[autonomous_social] 记群 {gid} drowsy 时间失败: {exc}")
         self.state.note_flow_reply(
             bid, gid, sent_ts, segments[0],
             sample_cap=self.cfg.group_ref_sample_size,
@@ -3055,15 +3181,19 @@ class SocialEngine:
     def _build_group_ctx(self, bid: str, gid: str, g: Dict[str, Any]) -> Dict[str, Any]:
         """给生成侧凑群上下文：风格参考 + 最近几条群友发言 + 上一句心流接的话。"""
         samples = g.get("samples", []) or []
-        # P2-09：与私聊侧 `_generation_conversation` 同口径——0 就是「不注入」。
-        # 旧写法 `max(1, int(... or 5))` 把「关掉」当成「没配」：用户填 0，私聊不注入、
-        # 群聊却硬塞 5 条；填 1 也会被抬到至少 1 条。而且 `samples[-0:]` 等于整段列表，
-        # 所以 0 必须单独走空列表，不能只靠切片。
+        # v2.1.8：群聊接不上话。旧实现直接把 context_inject_count（默认 5）当条数，
+        # 5 条消息在活跃群里只够看半分钟前的事，模型当然接不上；用户配 0 时群路径
+        # 更被旧的 max(1, … or 5) 强塞 5 条。群路径至少给 12 条，用户配得更大就听
+        # 用户的；上限 40 防 token 爆炸（一条群消息几百字时 40 条已经上万 token）。
         try:
-            n = int(getattr(self.cfg, "context_inject_count", 5) or 0)
+            _cfg_n = int(getattr(self.cfg, "context_inject_count", 5) or 0)
         except (TypeError, ValueError):
-            n = 5
-        recent = [] if n <= 0 else [
+            _cfg_n = 5
+        n = max(
+            GROUP_CONTEXT_INJECT_MIN,
+            min(GROUP_CONTEXT_INJECT_MAX, max(_cfg_n, GROUP_CONTEXT_INJECT_DEFAULT)),
+        )
+        recent = [
             {
                 "name": str(s.get("name", "") or ""),
                 "text": str(s.get("text", "") or ""),
@@ -3102,6 +3232,20 @@ class SocialEngine:
                 continue
             latest = {"name": str(s.get("name", "") or ""), "text": text}
             break
+        # v2.1.8：最后一条是不是在叫某个群友。生成侧据此决定「这条接话要不要顺着
+        # 那个人说」——以前 ctx 里只有 speakers 列表，模型得自己从上下文猜谁在被叫。
+        # 用 groupflow 现成的判定（与心流语境提示同一套），没有则 None。
+        _speakers = [
+            str(s.get("name", "") or "").strip()
+            for s in samples
+            if not s.get("self") and str(s.get("name", "") or "").strip()
+        ]
+        addressed = ""
+        if latest:
+            try:
+                addressed = groupflow.addressed_to(str(latest.get("text", "") or ""), _speakers)
+            except Exception:
+                addressed = ""
         return {
             "recent": recent,
             "style_ref": style_ref,
@@ -3112,6 +3256,8 @@ class SocialEngine:
             "last_flow_text": str(g.get("last_flow_reply_text", "") or ""),
             "own_recent": own_recent,
             "latest": latest,
+            # v2.1.8：最后一条在叫谁（昵称），没叫则 None。生成侧接话时可顺着这个人。
+            "addressed": addressed or None,
             "group_name": str(g.get("name", "") or ""),
             # G3：近期在群里说过话的人名（供「自然地点一下某个人」）。
             "members": groupflow.member_names(samples) if self.cfg.group_mention_member else [],
@@ -3194,7 +3340,14 @@ class SocialEngine:
                 due = self._icebreak_pick(bid, now)
                 if not due:
                     continue
-                due.sort(key=lambda item: _num(item[1].get("last_seen", 0) or 0))
+                # v2.2.0：按「最久没被尝试过」优先，其次才按冷场时长。只看 last_seen
+                # 时，失败过的那一个群永远排第一，别的冷群永远轮不上（饿死）。
+                due.sort(
+                    key=lambda item: (
+                        _num(item[1].get("icebreak_try_at", 0) or 0),
+                        _num(item[1].get("last_seen", 0) or 0),
+                    )
+                )
                 gid, g = due[0]
                 await self._icebreak(bid, gid, g, now)
             except Exception as e:
@@ -3296,8 +3449,13 @@ class SocialEngine:
                 due = self._group_topic_pick(bid, now)
                 if not due:
                     continue
-                # 静得最久的那个群优先
-                due.sort(key=lambda item: _num(item[1].get("last_bot_spoke", 0) or 0))
+                # v2.2.0：同上——先按「最久没被尝试过」，其次按她自己多久没在群里开口。
+                due.sort(
+                    key=lambda item: (
+                        _num(item[1].get("topic_try_at", 0) or 0),
+                        _num(item[1].get("last_bot_spoke", 0) or 0),
+                    )
+                )
                 gid, g = due[0]
                 await self._icebreak(bid, gid, g, now, mode="topic")
             except Exception as e:
@@ -3364,52 +3522,88 @@ class SocialEngine:
             # 也不要拿剩下的话硬编一句——用户说的「假」，一半就是硬编出来的。
             self.log(f"群 {gid} 起话头：素材都刚在别的群用过，这次不硬编")
             return False
-        # v2.1.0：反问频控。最近三条里问句过半，就要求这条不许问（提示词侧见
-        # generator._compose_group；发送前还有一道硬闸，见下面 no_question 判定）。
-        group_ctx["no_question"] = self.state.question_pressure(bid, 3) >= 0.6
+        # v2.1.8：破冰/起话头默认**不许提问**。用户原话「破冰全是低质询问」——
+        # 线上破冰一水儿「你们今天都干嘛呢」「有人吗」，把「找话题」做成了查岗。
+        # 只留一个小口：最近 5 条里一条问句都没有（没有问句惯性），且素材里有
+        # 具体计划（想/打算/准备/要去）——这种时候顺着计划问一句才自然。
+        _q_pressure = self.state.question_pressure(bid, 5)
+        _q_plan = any(
+            _kw in str(group_ctx.get("topic_hint") or "")
+            for _kw in ("想", "打算", "准备", "要去")
+        )
+        group_ctx["no_question"] = not (_q_pressure == 0.0 and _q_plan)
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
         except Exception as e:
             self.log(f"群 {gid} 解析人格失败: {e}")
             persona_prompt = ""
+        # v2.1.8：问句硬闸从「一次丢弃」改成「重生成」。提示词写了 no_question，
+        # 模型仍可能无视；心跳一轮只挑一个群，一次就放弃太浪费。生成器没有 seed
+        # 参数，重试靠采样差异换一条（上限 2 次，共 3 次生成）；仍是问句就本次不发
+        # ——用户要的是「别问」，不是「换个问法再问」。
+        # v2.2.0：**尝试**也要落账（不论后面发不发得出去）。四条失败路径（模型决定
+        # 不说 / 三次仍是问句 / 跨群撞车 / 验收打回）原来一个时间戳都不写，于是冷群
+        # 一旦 due 就永久 due，每轮心跳重复生成，`due[0]` 还永久占着不让别的群轮上。
         try:
-            parts = await self.generator.group_message(
-                umo, mode, group_ctx, persona_prompt,
-                at=now, clock_offset=self._clock_offset_for(bid),
+            self.state.note_proactive_attempt(bid, gid, now, mode)
+        except Exception as _att_exc:
+            logger.debug(
+                f"[autonomous_social] 记群 {gid} 主动尝试时间失败: {_att_exc}"
             )
-        except Exception as e:
-            if throttle.allow(f"{mode}.generate.{bid}"):
-                logger.warning(
-                    f"[autonomous_social] 群{'破冰' if mode == 'icebreak' else '起话头'}生成失败: {e}"
-                    + throttle.summary(f"{mode}.generate.{bid}")
+        segments: List[str] = []
+        waits: List[float] = []
+        for _q_try in range(3):
+            try:
+                parts = await self.generator.group_message(
+                    umo, mode, group_ctx, persona_prompt,
+                    at=now, clock_offset=self._clock_offset_for(bid),
                 )
-            return False
-        if not parts:
-            # 模型判断这次没有值得分享的事（S2：没话说就不发）。**不消耗今天的额度**
-            # ——用户要的是「没有能说的就不发」，不是「把额度用掉也不发」；
-            # 也不该生成一句占位内容。
-            self.log(
-                f"群 {gid} {'破冰' if mode == 'icebreak' else '起话头'}："
-                "模型决定这次不说，不占今天的次数"
+            except Exception as e:
+                if throttle.allow(f"{mode}.generate.{bid}"):
+                    logger.warning(
+                        f"[autonomous_social] 群{'破冰' if mode == 'icebreak' else '起话头'}生成失败: {e}"
+                        + throttle.summary(f"{mode}.generate.{bid}")
+                    )
+                return False
+            if not parts:
+                # 模型判断这次没有值得分享的事（S2：没话说就不发）。**不消耗今天的额度**
+                # ——用户要的是「没有能说的就不发」，不是「把额度用掉也不发」；
+                # 也不该生成一句占位内容。
+                self.log(
+                    f"群 {gid} {'破冰' if mode == 'icebreak' else '起话头'}："
+                    "模型决定这次不说，不占今天的次数"
+                )
+                return False
+            # ── 验收层（与私聊侧、心流同一套）──────────────────────
+            # 破冰以前也是裸发：模型写出动机泄漏、括号截断、复读（连着几天同一句）
+            # 都会直接进群。判不过就不发——宁可不破冰，不可抛一句废话头。
+            # 先拆段再逐段验，后续补发的段不再免检。
+            segments, waits = pacing.plan_segments(
+                parts, umo, self.context,
+                allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
             )
-            return False
-        # ── 验收层（与私聊侧、心流同一套）──────────────────────
-        # 破冰以前也是裸发：模型写出动机泄漏、括号截断、复读（连着几天同一句）
-        # 都会直接进群。判不过就不发——宁可不破冰，不可抛一句废话头。
-        # 先拆段再逐段验，后续补发的段不再免检。
-        segments, waits = pacing.plan_segments(
-            parts, umo, self.context,
-            allow_burst=bool(getattr(self.cfg, "allow_burst", False)),
-        )
-        if not segments:
-            return False
-        # v2.1.0：连发收敛。线上有单个群一分钟连发 4 条的记录（7 个群发过 4 条），
-        # 「想到什么分两条发」是真人的动作，四段碎句不是——那是把一句话拆成弹幕。
-        segments, waits = _cap_group_segments(
-            segments, waits,
-            int(getattr(self.cfg, "group_topic_max_segments", 0) or 0),
-            int(getattr(self.cfg, "max_message_length", 0) or 0),
-        )
+            if not segments:
+                return False
+            # v2.1.0：连发收敛。线上有单个群一分钟连发 4 条的记录（7 个群发过 4 条），
+            # 「想到什么分两条发」是真人的动作，四段碎句不是——那是把一句话拆成弹幕。
+            segments, waits = _cap_group_segments(
+                segments, waits,
+                int(getattr(self.cfg, "group_topic_max_segments", 0) or 0),
+                int(getattr(self.cfg, "max_message_length", 0) or 0),
+            )
+            if not (
+                group_ctx.get("no_question")
+                and any(_is_question_text(seg) for seg in segments)
+            ):
+                break
+            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
+            self.log(
+                f"群 {gid} 第 {_q_try + 1} 次生成仍是问句（no_question），重生成："
+                f"{segments[0][:80]}"
+            )
+            if _q_try >= 2:
+                self.log(f"群 {gid} 连续 3 次仍是问句，本次不发")
+                return False
         # v2.1.0：措辞级跨群去重。群路径原来只跟**本群**的近期发言比
         # （own_recent），同一句话换个群就能再说一遍——线上「刚睡醒」16:40 进了
         # 群 639447524、17:01 又进群 651574768；「你们今天都干嘛呢？❤️」17:01 和
@@ -3433,16 +3627,6 @@ class SocialEngine:
                             f"群 {gid} 跨群撞车，未发送：{hit}｜原文：{seg[:80]}"
                         )
                         return False
-        # v2.1.0：反问硬闸。提示词里已经写了「这条不要提问」，模型不一定听——
-        # 问句本来是她这轮被要求避开的形态，真写出来就不发，别把查岗式收尾发进群。
-        if group_ctx.get("no_question") and any(
-            _is_question_text(seg) for seg in segments
-        ):
-            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
-            self.log(
-                f"群 {gid} 这条仍是问句（最近问句过多），未发送：{segments[0][:80]}"
-            )
-            return False
         try:
             bad_text, ice_why = self._verify_all_segments(
                 segments,
@@ -3875,6 +4059,15 @@ class SocialEngine:
         block = brief.get("user") if isinstance(brief, dict) else {}
         if not isinstance(block, dict):
             block = {}
+        # v2.2.0：Core v3 的三态。`known=False`（还没建档）或
+        # `affection_source="config_default"` 都表示「下面那些数字只是配置初始值」，
+        # 不是关于这个人的事实（hc humanoid/api.py:34-35、892-897）。
+        # 老 Core（v2 及更早）没有 `known` 字段 → 默认按已知处理，行为不变。
+        user_known = block.get("known")
+        if user_known is None:
+            user_known = True
+        if str(block.get("affection_source") or "") == "config_default":
+            user_known = False
         if isinstance(brief, dict):
             # 整份 brief 留给生成侧（身份/穿搭等以后直接用，不必再问一次门面）
             u_copy["_brief"] = brief
@@ -3921,10 +4114,12 @@ class SocialEngine:
             u_copy["_name_source"] = name_source
 
         # ── 好感：门面现算，文件里的可能是几小时前落盘的 ──
-        affection = _brief_float(block.get("affection"))
+        # 未建档时跳过这几项，让生成侧退回本地 interest 混合值（旧行为），
+        # 而不是把配置里的 50 当「她对他有多少好感」。
+        affection = _brief_float(block.get("affection")) if user_known else None
         if affection is not None:
             u_copy["_affection"] = affection
-        base_affection = _brief_float(block.get("base_affection"))
+        base_affection = _brief_float(block.get("base_affection")) if user_known else None
         if base_affection is not None:
             u_copy["_affection_base"] = base_affection
         # 她对 TA 的情绪标签（Core 情绪分析出的短标签）：拿不到就不出这一句
@@ -3942,7 +4137,7 @@ class SocialEngine:
 
         # 在意程度：老字段 `_attention` 是 care 那一个数（生成侧按 float 读），
         # 门面给的是整块 {care, focus, spare}——单值照旧写 `_attention`，整块另存。
-        attention = block.get("attention")
+        attention = block.get("attention") if user_known else None
         if isinstance(attention, dict):
             care = _brief_float(attention.get("care"))
             if care is not None:
@@ -3970,13 +4165,13 @@ class SocialEngine:
             u_copy["_her_name"] = her_name
 
         # 简单字段：有就给，没有就保持旧逻辑算出来的值
-        known_days = _brief_float(block.get("known_days"))
+        known_days = _brief_float(block.get("known_days")) if user_known else None
         if known_days is not None:
             u_copy["_known_days"] = known_days
         last_interaction = _brief_float(block.get("last_interaction"))
         if last_interaction is not None:
             u_copy["_last_interaction"] = last_interaction
-        libido = _brief_float(block.get("libido"))
+        libido = _brief_float(block.get("libido")) if user_known else None
         if libido is not None:
             u_copy["_libido"] = libido
 
@@ -4526,6 +4721,15 @@ class SocialEngine:
         本地日界切段（与它同一套 city_now/city_epoch 换算），跨零点的窗口从前一天
         起算——23–7 这种窗口不能在日界处被截成两段，否则交集会算漏。
         """
+        # v2.2.0：start == end 表示**未启用**，不是「跨零点的 24 小时窗口」。缺这道
+        # 守卫时 `b <= a` 分支会把窗口当成整天，于是 `_quiet_intersection_seconds` 算
+        # 出的交集吞掉 Core 的整个夜窗，`_extend_continue_window` 里那句「按安静时段
+        # 顺延」静默失效（`clock.quiet_overlap_seconds` 早就这么判了）。
+        try:
+            if abs(float(start_hour) - float(end_hour)) < 1e-9:
+                return []
+        except (TypeError, ValueError):
+            return []
         try:
             first = city_now(start_ts, offset)
         except (TypeError, ValueError, OSError, OverflowError):
@@ -5286,6 +5490,45 @@ class SocialEngine:
         """这一段对话里最后一个人说话的时刻。沉默从这一刻算起。"""
         return max(_num(u.get("last_seen", 0) or 0), _num(u.get("last_spoken", 0) or 0))
 
+    def _own_style_texts(self, bid: str, uid: str, now: float, limit: int = 4) -> List[str]:
+        """她最近几条**真实回复**（conversation 里 dir=="out"），供生成侧对齐口吻。
+
+        v2.1.8「声音统一」：人格设定回答的是「她是谁」，但像不像她还取决于最近几条
+        回复的句长、语气词、标点习惯。主动消息与正常聊天用的是同一个模型，却经常
+        串味（聊天里短短一句，主动消息里一段排比）。这里给她最近 4 条出站原话当锚。
+
+        排除 `recent_proactive` 里的原文：那是主动消息，不是「聊天里的她」；拿它当
+        风格参考会把上一轮的毛病固化下来。倒序取最近的，重复句只留一条。
+        """
+        try:
+            u = self.state.user(bid, uid)
+            conv = u.get("conversation") if isinstance(u, dict) else None
+        except Exception:
+            return []
+        if not isinstance(conv, list):
+            return []
+        try:
+            proactive = {
+                str(e.get("text", "") or "").strip()
+                for e in self.state.recent_proactive(bid, uid, now)
+                if isinstance(e, dict)
+            }
+        except Exception:
+            proactive = set()
+        out: List[str] = []
+        for item in reversed(conv):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("dir", "") or "") != "out":
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if not text or text in proactive or text in out:
+                continue
+            out.append(text)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
     def _thread_windows(self) -> Tuple[float, float, float, float, float, float]:
         """六个时间窗：(能追问, 能问在吗, 最长追到多久, 之前多久内得有过话,
         接话起点, 接话窗口)。
@@ -5315,6 +5558,69 @@ class SocialEngine:
             continue_after = continue_max = 0.0
         return probe, presence, ceiling, context, continue_after, continue_max
 
+    def _hot_continue_after(self, u: Dict[str, Any], now: float) -> float:
+        """热聊里的接话起点（秒）：刚聊热的那一段，6 分钟后就能接；否则 0。
+
+        用户原话「私聊时模型在聊完一句不会选择继续发言」。config 的默认起点已经
+        从 90 分钟下调到 25 分钟，但对「15 分钟内你一句我一句各 3 轮」这种明显
+        还在聊的状态仍然太久：对方停一下去倒水，她等 25 分钟才接，观感就是
+        「聊完一句人就没了」。
+
+        判据刻意保守：必须**来回各 3 轮**且**最后一句是她说的**。只有她单方面
+        刷屏不算热聊（那更像她追着对方说）；最后一句是对方的，说明球在对方手上，
+        该等对方开口而不是抢话。
+        """
+        if not bool(getattr(self.cfg, "continue_enabled", False)):
+            return 0.0
+        conv = u.get("conversation") if isinstance(u, dict) else None
+        if not isinstance(conv, list):
+            return 0.0
+        window = HOT_CONTINUE_WINDOW_MINUTES * 60.0
+        inbound = 0
+        outbound = 0
+        last_dir = ""
+        last_ts = 0.0
+        for item in conv:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0 or now - ts > window:
+                continue
+            d = str(item.get("dir", "") or "")
+            if d == "in":
+                inbound += 1
+            elif d == "out":
+                outbound += 1
+            else:
+                continue
+            # 用 >=：同一秒里可能有两条（她连发两段），后一条才是「最后一句」。
+            if ts >= last_ts:
+                last_ts = ts
+                last_dir = d
+        if inbound < HOT_CONTINUE_MIN_TURNS or outbound < HOT_CONTINUE_MIN_TURNS:
+            return 0.0
+        if last_dir != "out":
+            return 0.0
+        return HOT_CONTINUE_AFTER_MINUTES * 60.0
+
+    @staticmethod
+    def _continue_topic(u: Dict[str, Any]) -> str:
+        """continue 的「上一次聊到的事」：优先对方最后一句，没有就用她最后一句。
+
+        以前 `about` 一律取 `last_message`；对方没留过话（或只有一条「嗯」）时
+        动机是空的，模型只能泛泛来一句「在吗」。换成两句里更具体的那句。
+        """
+        if not isinstance(u, dict):
+            return ""
+        peer = str(u.get("last_message", "") or "").strip()
+        if peer:
+            return peer[:200]
+        her = str(u.get("last_spoken_text", "") or "").strip()
+        return her[:200]
+
     def _thread_pick(
         self,
         bid: str,
@@ -5342,6 +5648,15 @@ class SocialEngine:
                 continue
             if self.state.is_send_blocked(bid, uid, now):
                 continue
+            # v2.1.8：热聊续话的按人覆盖。continue 起点默认已降到 25 分钟，但
+            # 「15 分钟内来回各 3 轮、最后一句是她说的」这种明显还在聊的状态，
+            # 6 分钟就该能接——比全局窗口更早，但不短于 6 分钟，避免她追着说。
+            _cont_after = continue_after
+            _hot_after = self._hot_continue_after(u, now)
+            if _hot_after > 0:
+                _cont_after = (
+                    min(continue_after, _hot_after) if continue_after > 0 else _hot_after
+                )
             # 先用**原窗口**判一次：绝大多数人连候选都不是，这一步就够了。
             kind, reason = thread_reason(
                 u,
@@ -5351,7 +5666,7 @@ class SocialEngine:
                 max_seconds=ceiling,
                 context_seconds=context,
                 presence_floor_seconds=presence,
-                continue_after_seconds=continue_after,
+                continue_after_seconds=_cont_after,
                 continue_max_seconds=continue_max,
             )
             # v2.0.6（issue #3 建议二）：continue 的窗口被安静时段吃掉多久就还回多久。
@@ -5377,7 +5692,7 @@ class SocialEngine:
                         max_seconds=ceiling,
                         context_seconds=context,
                         presence_floor_seconds=presence,
-                        continue_after_seconds=continue_after,
+                        continue_after_seconds=_cont_after,
                         continue_max_seconds=_extended,
                     )
             if not kind:
@@ -5732,6 +6047,10 @@ class SocialEngine:
         warmth = (aff - base) if (aff is not None and base is not None) else None
         return tier, aff, warmth
 
+    def _gap_jitter(self, u: Dict[str, Any], tier: str, special_care: bool) -> float:
+        """这一轮的间隔抖动系数。实现见模块级 `_gap_jitter_factor`。"""
+        return _gap_jitter_factor(self.cfg, u, tier, special_care)
+
     def _gap_left(
         self,
         u: Dict[str, Any],
@@ -5759,6 +6078,8 @@ class SocialEngine:
                 except (TypeError, ValueError):
                     minutes = 20.0
                 minutes = min(max(minutes, 1.0), 1440.0)
+                minutes *= _gap_jitter_factor(self.cfg, u, tier, True)
+                minutes = min(max(minutes, 1.0), 1440.0)
                 return max(0.0, minutes * 60.0 - (now - last))
             try:
                 base = float(self.cfg.min_gap_minutes)
@@ -5767,6 +6088,9 @@ class SocialEngine:
             table = anchors.TIER_MIN_GAP_MINUTES
             mid = float(table.get(anchors.TIER_MID, 60.0)) or 60.0
             minutes = float(table.get(tier, mid)) * (max(0.0, base) / mid)
+            # v2.1.8（issue #9）：间隔按「这一轮」抖一次，避免整点闹钟感。
+            # 抖动放在上限夹取之前，`max_gap_minutes` 仍然是硬上限。
+            minutes *= _gap_jitter_factor(self.cfg, u, tier, False)
             # 上限可配（v2.0.5）：LOW 档本身就是 720 分钟，缩放后写死的 1440（一天）
             # 几乎总把它夹住，等于用户根本调不动「关系淡的人隔多久」。
             try:
@@ -6934,9 +7258,15 @@ class SocialEngine:
         for bid, uid, u, kind, reason, gap in sorted(threads, key=lambda item: item[5]):
             if budget.get(bid, 0) <= 0 or not pre_take(bid):
                 continue
+            _about = str(u.get("last_message", "") or "")
+            if kind == "continue":
+                # v2.1.8：continue 的动机要指向「上一次聊到的事」。对方没留过话
+                # 时取她最后一句；以前一律 last_message，空的时候模型只能泛泛
+                # 来一句「在吗」——用户说的「聊完一句就不会继续」有一半是这个。
+                _about = SocialEngine._continue_topic(u) or _about
             meta = thread_meta(
                 kind,
-                about=str(u.get("last_message", "") or ""),
+                about=_about,
                 asked=str(u.get("last_spoken_text", "") or ""),
                 # continue 用得到：沉默 20 分钟和沉默 5 小时是两种说法（接话 vs 问人去哪了）
                 silence_minutes=gap / 60.0,
@@ -7617,6 +7947,10 @@ class SocialEngine:
             for e in recent_pro
             if str(e.get("text", "") or "").strip()
         ]
+        # v2.1.8：把「她平时怎么说话」也带上。人格设定是「她是谁」，真正决定像不像
+        # 她的是最近几条真实回复的句长、语气词、标点。主动消息与正常聊天常串味，
+        # 这里给她 4 条最近的出站原话当锚（见 _own_style_texts 的排除规则）。
+        u_copy["_own_style"] = SocialEngine._own_style_texts(self, bid, uid, now)
 
         # **上一条主动消息有没有被接住**（v1.28.1）。
         #
@@ -7875,6 +8209,9 @@ class SocialEngine:
             recent=[e.get("text", "") for e in self.state.recent_proactive(bid, uid, self._time())],
             called=str(self._last_persona.get(bid, "") or ""),
             require_about_peer=require_about_peer,
+            # v2.1.8：问候/道别这类本来就该短，按普通消息判空泛会全打回。
+            # 类型由 reason_meta 给出（greeting/closer/...），没有就空串=老行为。
+            msg_type=str((reason_meta or {}).get("msg_type", "") or ""),
         )
         # ── 完整性：分享类消息不能只剩半句（v2.1.2）──────────────
         #
@@ -7983,6 +8320,9 @@ class SocialEngine:
             segments, recent=_recent,
             called=str(self._last_persona.get(bid, "") or ""),
             require_about_peer=require_about_peer,
+            # v2.1.8：同上——后续段也要带类型，否则第一段按问候放行、第二段
+            # 又被按普通消息判空泛，等于白放宽。
+            msg_type=str((reason_meta or {}).get("msg_type", "") or ""),
         )
         if bad_seg:
             self._m["last_failure"] = f"[{bid}] 后续段验收不过：{seg_why}"
@@ -9202,8 +9542,15 @@ class SocialEngine:
             # 与上一条不同：这次不是「对方那句悬着」，而是**她说完之后**对方消失。
             # 带上沉默时长，主人一眼能看出这是接话而不是又在追问同一件事。
             _mins = int(_num((reason_meta or {}).get("silence_minutes", 0) or 0))
+            # v2.1.8：热聊顺延（`_hot_continue_after`）会把起点从配置的 25 分钟压到
+            # 6 分钟。面板上如果只说「TA 6 分钟没声了」，主人会以为配置没生效；这里
+            # 用现成的 silence_minutes 与配置比一下就能标出来，不需要新字段。
+            _normal_after = float(getattr(self.cfg, "continue_after_minutes", 0) or 0)
+            _hot = bool(_mins) and _normal_after > 0 and _mins < _normal_after
+            _tail = "（热聊顺延）" if _hot else ""
             bits.append(
-                f"她说完之后 TA {_mins} 分钟没声了" if _mins else "她说完之后 TA 就没声了"
+                f"她说完之后 TA {_mins} 分钟没声了{_tail}" if _mins
+                else "她说完之后 TA 就没声了"
             )
         elif u.get("last_ignored_at"):
             bits.append("之前被冷落过，这次主动一点")

@@ -549,12 +549,18 @@ def flow_should_consider(
     interject_gap_seconds: float = 0.0,
     attempt_gap_seconds: float = 0.0,
     activity: float = 1.0,
+    activity_min: float = 0.0,
 ) -> Tuple[bool, str]:
     """心流闸门：现在这个群该不该考虑主动接话。返回 (是否可接, 不可接的原因)。
 
     比另起话题的闸门更宽（追热聊本来就发生在刚聊完），但有几道防刷屏/防尬聊的硬闸：
-    - 安静时段 / 她正在睡觉——私聊侧五道闸都查了这两项，只有群心流漏了，而它又是
-      事件驱动的（群消息一到就走，不经过心跳），于是深夜群里有人说话她照样插一句；
+    - 安静时段——私聊侧五道闸都查了这项，只有群心流漏了，而它又是事件驱动的
+      （群消息一到就走，不经过心跳），于是深夜群里有人说话她照样插一句；
+    - 她正在睡觉（v2.1.8 起不再硬拦）——用户原话「群聊心流就不该有在睡觉必须不能
+      接话的，谁说不能迷迷糊糊的」。睡着时只跳过「安静时段」这一道，其余硬闸照旧；
+      但要求群比清醒时更热（`activity_min`，engine 传 0.6），而且 engine 侧另加
+      「同一个群 30 分钟最多一条 drowsy」的节流——迷糊着接一句是可爱的，连着接
+      三条就是刷屏；
     - 关注窗口没开（bot 最近没在这个群说过话）——保守档的核心；
     - 自己刚在主链路说完话后的冷却期（`flow_hold_until`）——不然「被 @ 回一句」后马上又接，
       观感是同一个她在连续刷屏；
@@ -563,15 +569,14 @@ def flow_should_consider(
     - 连续插话没人接，已经到退出阈值；
     - **群活跃度**（v1.28.16，`activity`）：只做抑制——低于 `FLOW_ACTIVITY_MIN`
       说明群里刚安静下来，别硬接。默认 1.0 时与旧行为逐字等价；
+      睡着时门槛由 `activity_min` 抬高（engine 传 0.6），见上一条；
       **分数高不构成任何新的开口理由**；
     - **语境**（v1.28.0）：两人对聊、或这句话在叫某个群友时，**不再硬拦**——用户
       明确说「能不能插嘴看模型」。这里只保留两道护栏：`interject_enabled=False`
       退回旧语义（这种场合一律不插）；刚插过话时别人还在对聊就先缓一缓，别在她
       上一句刚落、语境已过时的时候又扎进去。
     """
-    if asleep:
-        return False, "她正在睡觉"
-    if is_quiet:
+    if is_quiet and not asleep:
         return False, "现在是安静时段"
     if _f(group.get("blocked_until", 0)) > now:
         return False, "发送隔离中（被踢/会话失效）"
@@ -612,7 +617,16 @@ def flow_should_consider(
         # nan/inf 是「算不出来」，按不抑制处理（与字段没给同一个口径）；
         # 注意 nan < 0.15 本身就恒假，这里显式写出来只是别让读代码的人误会。
         act = 1.0
-    if act < FLOW_ACTIVITY_MIN:
+    # v2.1.8：睡着时门槛更高（engine 传 0.6）。不是「睡着更该说话」，而是反过来的：
+    # 迷糊时判断力差，群里不够热闹就别硬接；热闹到值得插一句时，迷糊着说一句反而自然。
+    try:
+        _extra_min = float(activity_min or 0.0)
+    except (TypeError, ValueError):
+        _extra_min = 0.0
+    _act_min = max(FLOW_ACTIVITY_MIN, _extra_min)
+    if act < _act_min:
+        if asleep and _act_min > FLOW_ACTIVITY_MIN:
+            return False, "群里不够热闹，迷糊着就不硬接了"
         return False, "群里刚安静下来，不硬接"
     # 语境：她要看这个群**现在在干什么**，而不只是「这一条消息过不过关」。
     # 放在配额检查之后：配额是「她还能不能开口」，语境是「这会儿该不该开口」，
@@ -670,11 +684,18 @@ def icebreak_due(
     # 守卫的两半：`group_topic_due` 会读 `icebreak_at` 避免「刚破完冰又起话头」，
     # 反过来这里也得看「刚起完话头又去破冰」——「刚说过话」是同一件事，取两者较晚者。
     # （原来只读 `last_bot_spoke`，那条会被 `open_flow` 刷新，起话头后未必挡得住破冰。）
+    # v2.2.0：`*_try_at` 也要算进来——失败路径（模型决定不说 / 三次仍是问句 /
+    # 跨群撞车 / 验收打回）原来一个时间戳都不写，于是冷群一旦 due 就永久 due，
+    # 每轮心跳都重新生成一次，`due[0]` 还永久占着不让别的群轮上。冷却下限 10 分钟，
+    # 保证「试过之后」下一轮就轮到别的群。
     last_proactive = max(
         _f(group.get("icebreak_at", 0)),
         _f(group.get("topic_at", 0)),
+        _f(group.get("icebreak_try_at", 0)),
+        _f(group.get("topic_try_at", 0)),
     )
-    if now - max(last_proactive, _f(group.get("last_bot_spoke", 0))) < idle_hours * 3600.0:
+    cooldown = max(600.0, idle_hours * 1800.0)
+    if now - max(last_proactive, _f(group.get("last_bot_spoke", 0))) < cooldown:
         return False
     # 今天破冰次数上限
     if str(group.get("icebreak_day", "") or "") == today:
@@ -913,11 +934,17 @@ def group_topic_due(
         return False
     if now - last_seen > max(1, stale_days) * 86400.0:
         return False
-    gap = max(1.0, _f(gap_hours)) * 3600.0
-    if now - _f(group.get("last_bot_spoke", 0)) < gap:
-        return False
-    # 刚破过冰就别又起话头——那是同一件事连着做两遍。
-    if now - _f(group.get("icebreak_at", 0)) < gap:
+    # v2.2.0：与破冰同一套冷却——把「试过」（topic_try_at / icebreak_try_at）也算进
+    # 来，失败之后下一轮就轮到别的群，不再每轮心跳重打一次模型。冷却下限 10 分钟。
+    cooldown = max(600.0, max(1.0, _f(gap_hours)) * 1800.0)
+    last_proactive = max(
+        _f(group.get("last_bot_spoke", 0)),
+        _f(group.get("icebreak_at", 0)),
+        _f(group.get("topic_at", 0)),
+        _f(group.get("icebreak_try_at", 0)),
+        _f(group.get("topic_try_at", 0)),
+    )
+    if now - last_proactive < cooldown:
         return False
     if str(group.get("topic_day", "") or "") == today:
         if _i(group.get("topic_count_day", 0)) >= max(1, daily_cap):

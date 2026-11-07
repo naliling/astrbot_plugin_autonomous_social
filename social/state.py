@@ -472,6 +472,12 @@ class SocialState:
             "topic_day": "",         # G1：最近主动起话头的日期
             "topic_count_day": 0,
             "topic_at": 0.0,
+            # 最近一次**尝试过**破冰 / 起话头（不论发没发出去）。与 icebreak_at/topic_at
+            # 分开：那两个只在成功发送时更新，于是「模型决定不说」「三次仍是问句」
+            # 这类失败完全不碰节流——一个冷群一旦 due 就永久 due，每轮心跳都重新
+            # 生成，`due[0]` 还永久占着不让别的冷群轮上（v2.2.0 修）。
+            "icebreak_try_at": 0.0,
+            "topic_try_at": 0.0,
             "samples": [],           # 参考库：近期群友发言 [{ts, name, text}]（去重、限长）
             "blocked_until": 0.0,    # 发送失败（被踢/会话失效）隔离
             "blocked_reason": "",
@@ -615,6 +621,29 @@ class SocialState:
         """
         g = self.group(bid, gid)
         g["flow_last_attempt_at"] = now
+        self.mark_dirty()
+
+    def note_proactive_attempt(
+        self, bid: str, gid: str, now: float, mode: str = "icebreak"
+    ) -> None:
+        """记一次破冰 / 起话头**尝试**（不论成没成）。
+
+        为什么需要它：`note_icebreak` / `note_group_topic` 只在**成功发送**时调用，
+        于是「模型决定不说」「连续三次仍是问句」「跨群撞车」「验收打回」这四条失败
+        路径完全不碰任何时间戳——一个冷群一旦 due 就永久 due，每轮心跳都重新生成
+        （每轮最多 3 次 LLM），`due[0]` 也永远被它占着，其它冷群永远轮不到。
+
+        这个时间戳**只用于节流**（`groupflow.icebreak_due` / `group_topic_due` 的
+        冷却闸 + `_run_icebreaks` / `_run_group_topics` 的轮转排序），不计入：
+        · `icebreak_count_day` / `topic_count_day`（那是「今天真发出去几次」）
+        · `icebreak_at` / `topic_at`（那是「上次真开口是什么时候」）
+        三者都保持「只算真正发出去的」，语义不混（与 `note_flow_attempt` 同一套理由）。
+        """
+        g = self.group(bid, gid)
+        if str(mode or "") == "topic":
+            g["topic_try_at"] = now
+        else:
+            g["icebreak_try_at"] = now
         self.mark_dirty()
 
     def note_flow_reply(        self,

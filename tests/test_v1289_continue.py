@@ -320,7 +320,9 @@ class ThreadWindowsTest(unittest.TestCase):
         self.assertEqual(presence, 30 * 60.0)
         self.assertEqual(ceiling, 70 * 60.0)
         self.assertEqual(context, 70 * 60.0)
-        self.assertEqual(cont_after, 90 * 60.0)
+        # v2.1.8：默认起点从 90 分钟下调到 25 分钟——用户原话「私聊时模型在聊完
+        # 一句不会选择继续发言」，90 分钟等得太久；热聊另有 6 分钟覆盖。
+        self.assertEqual(cont_after, 25 * 60.0)
         self.assertEqual(cont_max, 8 * 3600.0)
 
     def test_disabled_gives_zero(self):
@@ -617,13 +619,15 @@ class ContinueConfigTest(unittest.TestCase):
     def test_defaults(self):
         cfg = SocialConfig()
         self.assertTrue(cfg.continue_enabled)
-        self.assertEqual(cfg.continue_after_minutes, 90)
+        self.assertEqual(cfg.continue_after_minutes, 25)
         self.assertEqual(cfg.continue_window_hours, 8)
-        self.assertEqual(CONTINUE_AFTER_DEFAULT, 90)
+        self.assertEqual(CONTINUE_AFTER_DEFAULT, 25)
         self.assertEqual(CONTINUE_WINDOW_HOURS_DEFAULT, 8)
         from_empty = SocialConfig.from_astrbot({})
         self.assertTrue(from_empty.continue_enabled)
-        self.assertEqual(from_empty.continue_after_minutes, 90)
+        # `from_astrbot({})` 走的是 `_conf_schema.json` 里的 default，不是 config.py
+        # 的常量；两处都必须是 25，否则「面板显示的值」和「真正生效的值」会分叉。
+        self.assertEqual(from_empty.continue_after_minutes, 25)
         self.assertEqual(from_empty.continue_window_hours, 8)
 
     def test_range_constants_match_the_schema(self):
@@ -662,7 +666,7 @@ class ContinueStatusTextTest(unittest.TestCase):
     def test_status_line_is_on(self):
         text = _engine()._continue_status_text()
         self.assertIn("接话", text)
-        self.assertIn("90", text)
+        self.assertIn("25", text)
         self.assertIn("8", text)
 
     def test_status_line_is_off(self):
