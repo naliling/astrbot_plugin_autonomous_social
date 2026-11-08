@@ -1056,6 +1056,61 @@ GROUP_CONTEXT_INJECT_MAX = 40
 FLOW_DROWSY_GAP_SECONDS = 1800.0
 FLOW_DROWSY_ACTIVITY_MIN = 0.6
 
+# v2.2.1：群里没人叫她的时候，插话里出现「你/您」几乎一定是在回应某一句具体的话。
+# 线上被投诉的那几条全是这个形状（「那你先扛得住我四蹄踩」「这胃口是真不小」）——
+# 她没被叫，却在跟某一个人对话，观感就是「别人没叫她，她像被叫了一样」。
+# 「你们」是对全场说的，放行。
+_SIDEWAYS_YOU_RE = re.compile(r"您|(?<!你)你(?!们)")
+# 整条只是附和：这种话不带任何新东西，群里读起来就是「接了个不存在的话」。
+_PURE_ECHO_RE = re.compile(
+    r"^\s*(?:确实|是啊|对的|真的|哈哈+|笑死|绝了|好家伙|可以可以|是这样的|那可不)"
+    r"[\s，,。.！!~～…·]*$"
+)
+# v2.2.2：插话必须带一件她自己的具体事，要么不发。用户原话是「插话里必须带一件
+# 她自己的具体事，要么不发」「必须保质量」——群里的插话应该是「她正在过的日子」
+# 顺带说一句，不是对别人话题的点评。所以判据两条同时满足才算过：
+# ①整条里有第一人称（我/咱/俺）；②有一个具体的动作或物件（躺着、烧水、杯子、
+# 沙发、翅膀……）。只有评价、没有她自己的事 → 不发。
+_SELF_MARKERS = ("我", "咱", "俺")
+_FLOW_SELF_ANCHOR_WORDS = frozenset("""
+睡 醒 躺 坐 站 趴 蜷 窝 眯 发呆 打盹 伸懒腰 打哈欠 出门 回家 下楼 上楼 散步
+走 跑 爬 蹲 靠 抱 摸 拍 敲 按 翻 拎 端 夹 塞 洗 晾 收 擦 扫 煮 烧 泡 冲 倒
+喝 吃 咽 嚼 啃 舔 闻 看 听 盯 写 画 读 唱 弹 练 开 关 吹 裹 盖 披 穿 换 揉 晒
+水 茶 咖啡 牛奶 面 饭 粥 蛋 汤 杯 壶 碗 盘 锅 手机 耳机 书 本子 笔 纸
+窗 阳台 厨房 客厅 卧室 沙发 床 被子 枕头 毯子 外套 毛巾 药 闹钟
+翅膀 蹄子 尾巴 耳朵 头发 爪子 毛 角 蹄
+""".split())
+
+
+def _flow_personal_detail_issue(text) -> str:
+    """v2.2.2：整条插话里必须有一件她自己的具体事。返回空串表示通过。"""
+    body = str(text or "")
+    if not any(marker in body for marker in _SELF_MARKERS):
+        return "没带她自己的具体事（整条没提她自己）"
+    if not any(word in body for word in _FLOW_SELF_ANCHOR_WORDS):
+        return "没带她自己的具体事（只有评价，没有她此刻在做什么）"
+    return ""
+
+
+def _flow_quality_issue(segments) -> str:
+    """v2.2.1：群心流插话的质量闸。返回空串表示可以发，否则是拒发原因。
+
+    用户原话是「那不应该加质量吗」——不砍量，改质量：插话是补充这件事，
+    不是跟某一个人对话，也不是整条只是附和。
+    """
+    for seg in segments or []:
+        body = str(seg or "")
+        if _SIDEWAYS_YOU_RE.search(body):
+            return "在对某个人说话，不是补充话题"
+        if _PURE_ECHO_RE.match(body):
+            return "整条只是附和"
+    joined = "".join(str(seg or "") for seg in segments or [])
+    if joined.strip():
+        detail = _flow_personal_detail_issue(joined)
+        if detail:
+            return detail
+    return ""
+
 # 热聊续话（v2.1.8）：continue 的默认起点由 config 下调到 25 分钟，但刚聊热的那一小段
 # 还要更短——15 分钟内来回各 3 轮、最后一句是她说的，6 分钟后就可以接。
 # 用户原话「私聊时模型在聊完一句不会选择继续发言」：等她按 90 分钟（旧默认）想起来，
@@ -2778,6 +2833,15 @@ class SocialEngine:
             if not s.get("self") and str(s.get("name", "") or "").strip()
         ]
         addressed = groupflow.addressed_to(msg, speakers)
+        # v2.2.1：这句话开头如果叫了某个群友的名字，那它是在叫**那个人**，不是在叫她。
+        # 以前这里只把这件事写成提示词里的一句「最后一句像是说给 X 的」，模型照样
+        # 把它当提问接过去，群里就出现「别人没叫她，她却像被叫了一样」的插话
+        # （用户原话：「别人没叫他搞得好像别人叫他了一样」）。
+        # `speakers` 是从 samples 里剔掉她自己之后取的名字，所以 addressed 非空
+        # 就一定是别人，不可能是她的名字——这里硬拦是安全的。
+        if addressed:
+            self.log(f"群 {gid} 心流本轮不接：这句话在叫 {addressed}，不是在叫她")
+            return
         context_note = groupflow.flow_context_note(speakers, addressed)
         ok, why = groupflow.flow_should_consider(
             g, now,
@@ -2904,9 +2968,13 @@ class SocialEngine:
                 continue
             latest_human = str(sample.get("text", "") or "")
             break
-        context_note = groupflow.flow_context_note(
-            speakers, groupflow.addressed_to(latest_human, speakers)
-        )
+        _addressed = groupflow.addressed_to(latest_human, speakers)
+        # v2.2.1：与 `_observe_group` 同一道闸——这句话开头叫的是别人，就不是在叫她，
+        # 不接。生成前这几秒群里可能刚换了说话对象，所以这里要重算一次。
+        if _addressed:
+            self.log(f"群 {gid} 心流本轮不接：这句话在叫 {_addressed}，不是在叫她")
+            return
+        context_note = groupflow.flow_context_note(speakers, _addressed)
         ok, why = groupflow.flow_should_consider(
             g, now,
             max_replies=self.cfg.flow_max_replies_per_window,
@@ -3100,6 +3168,14 @@ class SocialEngine:
                     + throttle.summary(f"flow.rejected.{bid}")
                 )
             self.log(f"群 {gid} 心流验收不过（{flow_why}），不发")
+            return
+        # v2.2.1：插话是「补充这件事」，不是「跟某个人对话」。判定抽成模块级函数，
+        # 便于单独回归（tests/test_v221_flow_quality.py）。
+        _flow_issue = _flow_quality_issue(segments)
+        if _flow_issue:
+            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
+            self._m["last_rejected"] = str(segments[0] if segments else "")[:200]
+            self.log(f"群 {gid} 心流验收不过（{_flow_issue}），不发")
             return
         _send_res = await self._send_with_retry(umo, segments[0], bid)
         ok_send, err, peer_unreachable = _send_res
@@ -6807,6 +6883,18 @@ class SocialEngine:
                         f"档位={kind}），本轮 {len(bots)} 个角色的候选全部不尝试。"
                         f"这是连续第 {n} 个空转轮。"
                     )
+            # 熔断早退也必须落盘。`last_heartbeat` 是在 try_once 开头写进内存的，
+            # 而落盘只发生在下面的结算段/发送段——熔断期间每轮都从这里裸 return，
+            # 于是 `_runtime`（心跳/轮次/闸门计数）和 humanoid_signals.json 的 mtime
+            # 全部冻住（实测 19:55:43 起 3.5 小时不动），Core 侧还会按 ttl 把社交层
+            # 判成死的（humanoid\link.py 走 _stale_fallback）。
+            # 指标要能说话，恰恰是在她什么都没发的时候。
+            self._m["last_settled"] = now
+            self._persist_metrics()
+            try:
+                self._beat_signals()
+            except Exception as e:
+                self.log(f"写回社交信号失败: {e}")
             return
 
         # 每个角色只读一次 Core 状态（P2-12：on 模式下不读文件，返回 None）

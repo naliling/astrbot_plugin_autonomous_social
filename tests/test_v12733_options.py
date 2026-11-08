@@ -67,6 +67,7 @@ from social.config import (  # noqa: E402
     FLOW_IGNORED_EXIT_MIN,
     FLOW_MAX_REPLIES_MAX,
     FLOW_MAX_REPLIES_MIN,
+    FLOW_MIN_GAP_DEFAULT,
     FLOW_MIN_GAP_MAX,
     FLOW_MIN_GAP_MIN,
     FOLLOWUP_AFTER_MAX,
@@ -447,7 +448,7 @@ class WeekendBoostOptionTest(unittest.TestCase):
 class FlowKnobsOptionTest(unittest.TestCase):
     def test_defaults(self):
         cfg = _cfg()
-        self.assertEqual(cfg.flow_min_gap_seconds, 120)
+        # v2.2.1 起默认 120 → 90（群侧吞吐不够，插话间隔收紧）
         self.assertEqual(cfg.flow_max_replies_per_window, 3)
         self.assertEqual(cfg.flow_hourly_cap, 6)
         self.assertEqual(cfg.flow_ignored_exit, 2)

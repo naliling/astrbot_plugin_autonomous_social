@@ -460,9 +460,9 @@
     "group_topic_gap_hours": {
         "type": "float",
         "description": "群内起话头间隔（小时）",
-        "hint": "她在同一个群里静了这么久之后，才考虑主动起话头。推荐8小时。",
+        "hint": "她在同一个群里静了这么久之后，才考虑主动起话头。推荐2.5小时。",
         "obvious_hint": true,
-        "default": 8.0,
+        "default": 2.5,
         "min": 1.0,
         "max": 72.0,
         "slider": {
@@ -581,9 +581,9 @@
     "flow_min_gap_seconds": {
         "type": "int",
         "description": "群聊插话间隔（秒）",
-        "hint": "两次插话最少间隔多久。45 秒太短，群友看她像一直在说话",
+        "hint": "两次插话最少间隔多久。45 秒太短，群友看她像一直在说话；推荐 90 秒",
         "obvious_hint": true,
-        "default": 120,
+        "default": 90,
         "min": 10,
         "max": 600,
         "slider": {
@@ -656,9 +656,9 @@
     "group_idle_hours": {
         "type": "float",
         "description": "破冰冷场时长（小时）",
-        "hint": "群安静多久才考虑破冰。推荐6小时。",
+        "hint": "群安静多久才考虑破冰。推荐1小时。",
         "obvious_hint": true,
-        "default": 6.0,
+        "default": 1.0,
         "min": 1.0,
         "max": 240.0,
         "slider": {

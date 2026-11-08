@@ -544,7 +544,7 @@ FLOW_MIN_GAP_MIN = 10
 FLOW_MIN_GAP_MAX = 600
 # 两条心流接话之间的最小间隔（秒）。45 → 120：45 秒在群里几乎等于没有间隔，
 # 同一个人前一秒接一句、后一分钟再次插一句，群友看到的就是「bot 一直在说话」。
-FLOW_MIN_GAP_DEFAULT = 120
+FLOW_MIN_GAP_DEFAULT = 90
 # 主链路回复后的冷却期（秒）。拉长的理由：45 秒的 min_gap 配上 8 分钟的窗口，
 # 「被@回完→群里有人接话→马上再插一句」几乎必然发生，观感变成她在连续说话。
 FLOW_HOLD_MIN = 0
@@ -569,7 +569,7 @@ FLOW_IGNORED_EXIT_DEFAULT = 2
 # 冷场破冰：群安静超过这么久（小时）才考虑主动抛个轻话题
 GROUP_IDLE_HOURS_MIN = 1.0
 GROUP_IDLE_HOURS_MAX = 240.0
-GROUP_IDLE_HOURS_DEFAULT = 6.0
+GROUP_IDLE_HOURS_DEFAULT = 1.0
 
 # 每群每天最多破冰几次
 ICEBREAK_DAILY_CAP_MIN = 1
@@ -580,7 +580,7 @@ ICEBREAK_DAILY_CAP_DEFAULT = 2
 # 以及每群每天最多几次。比破冰宽松（不用等群彻底冷掉），但仍旧保守。
 GROUP_TOPIC_GAP_HOURS_MIN = 1.0
 GROUP_TOPIC_GAP_HOURS_MAX = 72.0
-GROUP_TOPIC_GAP_HOURS_DEFAULT = 8.0
+GROUP_TOPIC_GAP_HOURS_DEFAULT = 2.5
 GROUP_TOPIC_DAILY_CAP_MIN = 1
 GROUP_TOPIC_DAILY_CAP_MAX = 5
 GROUP_TOPIC_DAILY_CAP_DEFAULT = 1
@@ -702,6 +702,11 @@ LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "cross_user_repeat_hours": {2.0},
     "silent_giveup_days": {3},
     "special_care_min_affection": {85},
+    # v2.2.1：群主动的三个节奏默认值收紧了。原来的 6 小时冷场 / 8 小时间隔 / 120 秒
+    # 插话间隔是按「一个人几个群」调的；线上 71 个群轮一圈要六天，群侧永远轮不到。
+    "group_idle_hours": {6.0},
+    "group_topic_gap_hours": {8.0},
+    "flow_min_gap_seconds": {120},
     "max_message_length": {200, 60},
     "reply_window_hours": {6},
     "urge_refill_hours": {8, 4, 3, 2},
@@ -1762,6 +1767,9 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     "special_care_min_affection": SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
     "group_daily_total_cap": GROUP_DAILY_TOTAL_CAP_DEFAULT,
     "special_care_hourly_cap": SPECIAL_CARE_HOURLY_CAP_DEFAULT,
+    "group_idle_hours": GROUP_IDLE_HOURS_DEFAULT,
+    "group_topic_gap_hours": GROUP_TOPIC_GAP_HOURS_DEFAULT,
+    "flow_min_gap_seconds": FLOW_MIN_GAP_DEFAULT,
 }
 
 

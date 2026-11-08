@@ -936,7 +936,8 @@ def group_topic_due(
         return False
     # v2.2.0：与破冰同一套冷却——把「试过」（topic_try_at / icebreak_try_at）也算进
     # 来，失败之后下一轮就轮到别的群，不再每轮心跳重打一次模型。冷却下限 10 分钟。
-    cooldown = max(600.0, max(1.0, _f(gap_hours)) * 1800.0)
+    # 单位修正：gap_hours 是「小时」（schema：群内起话头间隔），不是半小时。
+    cooldown = max(600.0, max(1.0, _f(gap_hours)) * 3600.0)
     last_proactive = max(
         _f(group.get("last_bot_spoke", 0)),
         _f(group.get("icebreak_at", 0)),

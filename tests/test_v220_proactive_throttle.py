@@ -250,8 +250,15 @@ class CooldownTest(unittest.TestCase):
         self.assertFalse(self._topic(self._g(topic_try_at=NOW - 60)))
 
     def test_topic_due_again_after_cooldown(self):
-        self.assertFalse(self._topic(self._g(topic_try_at=NOW - 1799)))
-        self.assertTrue(self._topic(self._g(topic_try_at=NOW - 1801)))
+        # gap_hours 的单位是「小时」（见 _conf_schema.json）：1 小时 → 冷却 3600 秒。
+        # 旧代码这里乘的是 1800，把「小时」当成了「半小时」，用户设 8 小时实际只冷却 4 小时。
+        self.assertFalse(self._topic(self._g(topic_try_at=NOW - 3599)))
+        self.assertTrue(self._topic(self._g(topic_try_at=NOW - 3601)))
+
+    def test_topic_gap_hours_means_hours(self):
+        """面板写「群内起话头间隔（小时）」，8 就该是 8 小时，不是 4 小时。"""
+        self.assertFalse(self._topic(self._g(topic_try_at=NOW - 7 * HOUR), gap_hours=8.0))
+        self.assertTrue(self._topic(self._g(topic_try_at=NOW - 8 * HOUR - 1), gap_hours=8.0))
 
     def test_try_timestamp_of_the_other_channel_also_counts(self):
         """破冰与起话头是「同一件事」：一边试过，另一边也该退避。"""
