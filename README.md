@@ -4,7 +4,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.2.1-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.2.2-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E5%BE%AE%E4%BF%A1%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
