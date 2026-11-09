@@ -366,9 +366,20 @@ class PreSendGateTest(unittest.TestCase):
     def test_evidence_missing(self):
         plan = SimpleNamespace(facts=["她今天去拔牙了"])
         cards = [_card(title="面包店", detail="楼下新开的面包店")]
-        code, detail = self.eng._pre_send_gate("拔牙疼不疼", plan=plan, cards=cards, at=NOW)
+        code, detail = self.eng._pre_send_gate(
+            "她今天去拔牙了，说有点怕", plan=plan, cards=cards, at=NOW
+        )
         self.assertEqual("evidence_missing", code)
         self.assertIn("1/1", detail)
+
+    def test_evidence_fact_not_written_is_not_blocked(self):
+        # v2.2.3：提纲里列了卡外的事，正文压根没提 → 不算「这条引用了卡外的事」。
+        plan = SimpleNamespace(facts=["她今天去拔牙了"])
+        cards = [_card(title="面包店", detail="楼下新开的面包店")]
+        self.assertEqual(
+            ("", ""),
+            self.eng._pre_send_gate("楼下新开了一家面包店", plan=plan, cards=cards, at=NOW),
+        )
 
     def test_evidence_present_passes(self):
         plan = SimpleNamespace(facts=["她今天去拔牙了"])

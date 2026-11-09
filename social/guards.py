@@ -336,6 +336,44 @@ _CARD_TITLE_KEYS = ("title", "name", "label")
 _CARD_DETAIL_KEYS = ("detail", "text", "body", "content", "summary")
 
 
+EVIDENCE_SAID_RATIO = 0.34
+
+
+def evidence_in_text(facts, text) -> list:
+    """返回 facts 里**真的出现在正文里**的那些（发前闸的正文级复核）。
+
+    为什么需要（v2.2.3）：`plan.facts` 是规划阶段的提纲——模型自己列的「这轮可以
+    说哪几件事」，不是正文。提纲里写了卡外的一件小事、正文压根没提，原来的闸也会
+    把整条消息判掉。实测每轮 18~23 条这样白丢，私聊数量掉到个位数。
+
+    判据与 `evidence_missing` 同源（子串，或字符二元组覆盖率 ≥ 0.34），只是方向
+    反过来：提纲里的事没写进正文，就不算「这条引用了卡外的事」。
+    空 fact 不报；空正文按「都说了」处理（fail-closed 到闸那一侧，宁可拦）。
+    """
+    try:
+        body = _normalize(_text_of(text))
+        facts = list(facts or ())
+        if not facts:
+            return []
+        if not body:
+            return facts
+        said: List[Any] = []
+        body_grams = _bigrams(body)
+        for fact in facts:
+            normalized = _normalize(_text_of(fact))
+            if not normalized:
+                continue
+            if normalized in body:
+                said.append(fact)
+                continue
+            grams = _bigrams(normalized)
+            if grams and _coverage(grams, body_grams) >= EVIDENCE_SAID_RATIO:
+                said.append(fact)
+        return said
+    except Exception:
+        return list(facts or ())
+
+
 def evidence_missing(facts, cards) -> list:
     """返回 facts 里**在证据卡中找不到**的那些（原样返回，便于写进原因码）。
 

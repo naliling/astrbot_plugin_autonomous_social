@@ -9186,10 +9186,14 @@ class SocialEngine:
             facts = list(getattr(plan, "facts", None) or []) if plan is not None else []
             if facts:
                 missing = guards.evidence_missing(facts, cards)
-                if missing:
+                # v2.2.3：只拦「卡外的事真的写进了正文」的。facts 是规划提纲——
+                # 提纲里提了一件卡外的事、正文压根没写，不该把整条消息作废。
+                # 实测每轮 18~23 条这样白丢，私聊数量被压到个位数。
+                said = guards.evidence_in_text(missing, text) if missing else []
+                if said:
                     return (
                         "evidence_missing",
-                        "%d/%d 条事实在证据卡里找不到" % (len(missing), len(facts)),
+                        "%d/%d 条事实在证据卡里找不到" % (len(said), len(facts)),
                     )
         except Exception as exc:
             logger.debug(f"[autonomous_social] 证据缺失闸失败（放行）: {exc}")

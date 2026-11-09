@@ -1777,6 +1777,11 @@ class MessageGenerator:
         # 按 provider 存是关键：签名是否匹配是 per-provider-class 的属性，
         # 拿裸方法名存会让 A 的失败把 B 的正确用法一起剔掉，B 每条消息多打 2~4 次。
         self._unusable: Dict[str, set] = {}
+        # v2.2.3：结构性不可用的 provider（对象身上一个可调用的方法都没有）。
+        # 它不是「这次调用失败了」，而是「这条路在这个进程里根本走不通」：
+        # 记成瞬时失败会让引擎整轮熔断，实测 4 小时里因此空转 285 次、
+        # 每次「暂停调用 15 分钟」，整晚只发出个位数主动消息。
+        self._dead_providers: set = set()
 
     async def generate(
         self,
@@ -4037,6 +4042,10 @@ class MessageGenerator:
                 logger.debug(f"[autonomous_social] 取专供模型 {pid!r} 失败: {exc}")
                 continue
             if provider is not None:
+                if self._scope_of(provider) in self._dead_providers:
+                    # 这个对象没有任何调用方法（见 `_call_llm`）：换下一个专供模型，
+                    # 而不是每轮再撞一次同一堵墙。
+                    continue
                 return provider
             # 找不到不刷 warning：心跳一轮刷 N 行没有新信息，`_get_provider`
             # 的调用方已经有「本轮不发」的日志了。真要看配没配对，
@@ -4104,13 +4113,20 @@ class MessageGenerator:
             self._unusable.setdefault(scope, set()).add(label)
 
         if not candidates:
+            # v2.2.3：这个 provider 对象上一个可调用的方法都没有——不是「这次失败了」，
+            # 是「这条路在这个进程里根本走不通」。原来这里走 `_note_llm_failure`，
+            # 连续三次就把整轮熔断（实测 4 小时空转 285 次、每次暂停 15 分钟）。
+            # 现在只标死、不记失败、不立熔断，下一次直接换下一个专供模型。
+            self._dead_providers.add(scope)
             if throttle.allow("llm.no_method"):
-                logger.error(
+                logger.warning(
                     "[autonomous_social] LLM provider 无可用调用方法"
-                    "（llm_generate/text_chat/chat/generate/complete/ask 都没有），无法生成消息。"
+                    "（llm_generate/text_chat/chat/generate/complete/ask 都没有），"
+                    f"已把这个 provider 记为不可用（{scope}），本次不生成。"
                     + throttle.summary("llm.no_method")
                 )
-        elif throttle.allow(f"llm.failed.{scope}"):
+            return None
+        if throttle.allow(f"llm.failed.{scope}"):
             logger.error(
                 f"[autonomous_social] LLM 调用失败，已尝试 {tried}，最后错误：{last_err}"
                 + throttle.summary(f"llm.failed.{scope}")

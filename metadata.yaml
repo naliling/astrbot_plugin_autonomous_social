@@ -12,7 +12,7 @@ desc: |
 
   装了「人形化核心伴侣」能读她的身体与生活，装了「我会牢牢记住你」能按由头读记忆；
   关系足够近时也会想要更靠近一些（默认克制，更进一步的场景由 Core 侧开关决定）。
-version: "2.2.2"
+version: "2.2.3"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.24.2"
