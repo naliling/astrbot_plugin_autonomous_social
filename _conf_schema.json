@@ -1214,6 +1214,21 @@
         },
         "collapsed": true
     },
+    "proactive_min_gap_minutes": {
+        "type": "int",
+        "description": "所有主动消息共用的硬最小间隔（分钟）",
+        "hint": "不管由头多硬、多想说，同一个人两条主动消息之间至少隔这么久。默认 10 分钟；填 1 就是只防秒级连发。",
+        "obvious_hint": true,
+        "default": 10,
+        "min": 1,
+        "max": 1440,
+        "slider": {
+            "min": 1,
+            "max": 1440,
+            "step": 1
+        },
+        "collapsed": true
+    },
     "max_gap_minutes": {
         "type": "int",
         "description": "档位间隔上限（分钟）",

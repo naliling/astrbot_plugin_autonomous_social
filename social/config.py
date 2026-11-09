@@ -330,6 +330,10 @@ MISS_DAILY_CAP_DEFAULT = 3
 # 两条主动消息的最小间隔（分钟）默认值与范围；
 MIN_GAP_MINUTES_DEFAULT = 30
 MIN_GAP_MAX = 720
+# v2.2.6：所有主动开口共用的**硬**最小间隔（分钟）。`min_gap_minutes` 会被
+# 「到点由头 / 很想说」整条豁免（实测同一人 7 秒内收到两条），这一条不豁免。
+PROACTIVE_MIN_GAP_DEFAULT = 10
+PROACTIVE_MIN_GAP_MAX = 1440
 # 档位间隔按 min_gap 等比缩放后的硬上限（分钟）。LOW 档本身就是 720，
 # 缩放后很容易顶到上限；以前写死 1440（一天），LOW 几乎永远被它卡死。
 MAX_GAP_MINUTES_MIN = 60
@@ -808,6 +812,8 @@ class SocialConfig:
     min_gap_minutes: int = MIN_GAP_MINUTES_DEFAULT
     # 档位间隔缩放后的硬上限（分钟）。LOW 档 720 分钟起步，缩放后需要能超过 1440。
     max_gap_minutes: int = MAX_GAP_MINUTES_DEFAULT
+    # v2.2.6：不管由头多硬、多想说，两条主动主发之间至少隔这么久。
+    proactive_min_gap_minutes: int = PROACTIVE_MIN_GAP_DEFAULT
     # v2.1.8：间隔抖动系数（issue #9）。每个「这一轮」按 (uid, 档位, 上次发送时刻)
     # 稳定抽一个 [low, high] 的系数乘上去；发下一条时重新抽。两个值填 0 就是关掉。
     gap_jitter_low: float = GAP_JITTER_LOW_DEFAULT
@@ -1427,6 +1433,13 @@ class SocialConfig:
             max_gap_minutes=max(
                 MAX_GAP_MINUTES_MIN, min(MAX_GAP_MINUTES_MAX, _max_gap)
             ),
+            proactive_min_gap_minutes=max(
+                1,
+                min(
+                    PROACTIVE_MIN_GAP_MAX,
+                    gi("proactive_min_gap_minutes", PROACTIVE_MIN_GAP_DEFAULT),
+                ),
+            ),
             # v2.1.8（issue #9）：间隔抖动。0/0 或 low>=high = 关闭。
             gap_jitter_low=max(
                 GAP_JITTER_MIN,
@@ -1797,6 +1810,7 @@ class SocialConfig:
 _NEW_DEFAULTS: Dict[str, Any] = {
     "user_cooldown_minutes": USER_COOLDOWN_DEFAULT,
     "min_gap_minutes": MIN_GAP_MINUTES_DEFAULT,
+    "proactive_min_gap_minutes": PROACTIVE_MIN_GAP_DEFAULT,
     "miss_affection_min": MISS_AFFECTION_MIN_DEFAULT,
     "miss_daily_cap": MISS_DAILY_CAP_DEFAULT,
     "hourly_sends_cap": HOURLY_SENDS_CAP_DEFAULT,

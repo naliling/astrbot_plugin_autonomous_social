@@ -3039,6 +3039,64 @@ class SocialEngine:
         text = str(reason or "")
         return text.startswith("空泛") or text.startswith("整条只有一行标题")
 
+    # v2.2.6：主段不能是碎片——只有称呼、半句（以「因为」收尾）、或指着「那句」的指代。
+    _LEAD_TAIL_WORDS = (
+        "因为", "所以", "但是", "然后", "而且", "不过", "要是", "如果",
+        "虽然", "其实", "就是", "或者", "还有", "结果", "于是", "然后呢",
+    )
+    # 以这些指代收尾的主段在指前文，单独发出去就是没头没尾的一句。
+    _DANGLING_REFS = (
+        "那句", "这句", "那句话", "这句话", "那一句", "这一句", "那句呢", "这句呢",
+    )
+    # 称呼后面常跟的语气词，判「只有称呼」时一并去掉。
+    _NAME_PARTICLES = "啊呀呢哦啦吧嘛嘿诶诶"
+
+    @staticmethod
+    def _lead_body(text: str) -> str:
+        """主段去掉动作描写与标点后的正文，用来判「是不是碎片」。"""
+        body = strip_actions(str(text or "")).strip()
+        return re.sub(r"[\s，,。.!！?？~～…、；;：:\"'“”‘’()（）\[\]【】]", "", body)
+
+    @staticmethod
+    def _incomplete_lead(text: str, names: Tuple[str, ...] = ()) -> bool:
+        """这段能不能单独当主段发出去（v2.2.6）。
+
+        模型常把称呼单独写成第一段（「小阔耐」），拆段后它就是一条只有称呼的
+        消息；也有以「因为」收尾的半句，或指着前文「那句」的指代。这类段不能
+        单独发——能并进下一段就并，只有一段就这轮不发。
+
+        只认「正文就是这个人自己的称呼」，不按字数一刀切：两三个字的「晚安」
+        是能独立发的。
+        """
+        body = SocialEngine._lead_body(text)
+        if not body:
+            return True
+        for name in names or ():
+            clean = SocialEngine._lead_body(name)
+            if clean and (
+                body == clean
+                or body.rstrip(SocialEngine._NAME_PARTICLES) == clean
+            ):
+                return True
+        if body.endswith(SocialEngine._LEAD_TAIL_WORDS):
+            return True
+        return body.endswith(SocialEngine._DANGLING_REFS)
+
+    @staticmethod
+    def _merge_incomplete_lead(
+        segments: List[str], waits: List[float], names: Tuple[str, ...] = ()
+    ) -> Tuple[List[str], List[float], str]:
+        """主段不能独立成句时并进下一段；只有一段则返回原因、这轮不发。"""
+        segs = [str(s or "") for s in (segments or [])]
+        ws = list(waits or [])
+        if not segs or not SocialEngine._incomplete_lead(segs[0], names):
+            return segs, ws, ""
+        if len(segs) >= 2:
+            merged = [segs[0] + segs[1]] + segs[2:]
+            return merged, ws[1:], ""
+        body = SocialEngine._lead_body(segs[0])
+        return segs, ws, f"主段「{body[:12]}」不能单独开口"
+
     @staticmethod
     def _verify_all_segments(segments, *, recent, called, allow_short=False,
                              require_about_peer=False, msg_type=""):
@@ -6367,6 +6425,30 @@ class SocialEngine:
         except Exception:
             return 0.0
 
+    def _hard_gap_left(self, u: Dict[str, Any], now: float) -> float:
+        """所有主动主发共用的**硬**最小间隔（v2.2.6）。
+
+        `_gap_left` 的结果会被 `has_cue` / `_urge_is_eager` 整条豁免——实测同一人
+        7 秒内收到两条主动消息（2026-11-10 03:36 日志：3668864235 间隔 10.7 秒、
+        1746126258 间隔 7.3 秒）。这条闸不看由头、不看「多想说」，只看上一次
+        主动主发：刚发过就得等。补发（count_proactive=False）不更新 `last_sent`，
+        所以不会自己挡住自己。
+        """
+        try:
+            last = _num(u.get("last_sent", 0) or 0)
+            if last <= 0:
+                return 0.0
+            try:
+                minutes = float(getattr(self.cfg, "proactive_min_gap_minutes", 10))
+            except (TypeError, ValueError):
+                minutes = 10.0
+            if not math.isfinite(minutes):
+                minutes = 10.0
+            minutes = min(max(minutes, 1.0), 1440.0)
+            return max(0.0, minutes * 60.0 - (now - last))
+        except Exception:
+            return 0.0
+
     def _greet_pick(
         self,
         bid: str,
@@ -8043,6 +8125,15 @@ class SocialEngine:
                 f"离上一条才过 {int(gap_left / 60)} 分钟，这次先不开口",
                 gap_seconds=round(gap_left, 1),
             )
+        # v2.2.6：上面那条冷却会被「到点由头 / 很想说」整条豁免，实测同一人
+        # 7 秒内收到两条。这里补一道**不豁免**的硬下限：刚发过就得等，不管什么由头。
+        _hard_left = SocialEngine._hard_gap_left(self, u, self._time())
+        if _hard_left > 0:
+            return _gate_blocked(self, 
+                "proactive_min_gap",
+                f"离上一条才过 {int(_hard_left / 60)} 分钟（最短间隔），这次先不开口",
+                gap_seconds=round(_hard_left, 1),
+            )
 
         # 特别关心的日上限（v1.28.17）：放宽不等于无限发。默认 8 条/天/人，
         # 计数落在用户状态里，重启不丢。
@@ -8580,6 +8671,25 @@ class SocialEngine:
         )
         if not segments:
             return _gate_blocked(self, "no_segments", "拆段规划为空")
+        # v2.2.6：主段不能独立成句（只有称呼 / 以「因为」收尾）时，能并进下一段就并；
+        # 只有一段就这轮不发——不消费由头，下一轮还能换个说法。
+        _lead_names = tuple(
+            str(x or "").strip()
+            for x in (
+                u.get("_pet_name"),
+                u.get("_call_name"),
+                u.get("_nickname"),
+                self._last_persona.get(bid, ""),
+            )
+            if str(x or "").strip()
+        )
+        segments, waits, _lead_why = SocialEngine._merge_incomplete_lead(
+            segments, waits, _lead_names
+        )
+        if _lead_why:
+            return _gate_blocked(self, 
+                "short_main", _lead_why, why=str(segments[0])[:60] if segments else ""
+            )
         # 逐段验收：`parts[0]` 过了**不代表后续段也过**——模型常在结尾再补一句纯括号
         # 的内心（「（记住了 宝宝16岁…）」），拆段后那一段会**单独**发出去，看起来就是
         # 「内心独白被当成发言发了一条」。旧版只验 parts[0]，这一路完全免检。

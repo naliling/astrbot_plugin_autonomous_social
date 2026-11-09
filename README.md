@@ -4,7 +4,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.2.5-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.2.6-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -144,7 +144,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 
 ### 全部配置项
 
-> 下表与 `_conf_schema.json` 同源，共 130 项；面板里看到的默认值与这里一致。
+> 下表与 `_conf_schema.json` 同源，共 131 项；面板里看到的默认值与这里一致。
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -249,6 +249,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `max_sends_per_round` | `8` | 【护栏】一轮心跳里一个角色最多主动联系几个不同的人（防刷屏总闸）。每轮 LLM 尝试次数 = 这个数 × 4（`ATTEMPT_PER_SEND`，否决与验收打回也算一次尝试）。一个人一轮里最多说 2 件不同的事，所以实际发出的条数会比这个数多一点。2.0.8 起 3→8：实测 893 个候选只试了 14 次、96.3% 被丢弃，等于让排序决定一切 |
 | `user_cooldown_minutes` | `30` | 【护栏】同一个人两次被主动联系的最短间隔（每人独立，互不排队） |
 | `min_gap_minutes` | `30` | **中等关系的人**两条主动消息的最小间隔（分钟）。关系很熟的 30 分钟、关系一般的隔 1~2 天。防扎堆另有 `hourly_sends_cap` 那道安全闸 |
+| `proactive_min_gap_minutes` | `10` | 【护栏】所有人共用的硬最小间隔（分钟）：由头再硬、「很想说」也挡，同一个人两条主动消息之间至少隔这么久。填 1 只防秒级连发 |
 | `max_gap_minutes` | `1440` | 按关系档位缩放后的最小间隔最高到多少分钟（上限）。关系淡的人本身要隔 720 分钟，默认 1440（一天）会把它卡死；想让这类人隔更久，调到 2880 或更大（最多 10080，即 7 天） |
 | `gap_jitter_low` | `0.75` | 间隔抖动的下限倍数。主动消息的间隔会在这个倍数与上限之间按「每一轮」随机取一个（基准 60 分钟 × 0.75 = 最短 45 分钟）。填 0 关闭抖动，回到固定间隔 |
 | `gap_jitter_high` | `1.75` | 间隔抖动的上限倍数（基准 60 分钟 × 1.75 = 最长 105 分钟）。与下限一起决定随机范围；下限必须小于上限，否则按关闭处理 |

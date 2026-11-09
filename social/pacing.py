@@ -42,6 +42,10 @@ from typing import Any, List, Optional, Sequence, Tuple
 # 拆段上限。框架本身不限段数，这里保留上限是防模型把一条拆成十几段刷屏；
 # 4 比原来的 3 多一格，因为框架用户自己可能把阈值调得很宽。
 MAX_PARTS = 4
+# 两段之间最长等多久（秒）。框架允许 `log_base < 1`（线上有 0.9 / 1.1），
+# 插件把 base 夹到 1.01 后 `ln(wc+1)/ln(1.01) ≈ 100×ln(wc+1)`，一条 15 字的分段
+# 要等 4 分钟——实测补发间隔 84 秒 / 221 秒。补发是同一条消息的后续段，不该隔几分钟。
+MAX_PART_INTERVAL = 30.0
 
 
 def _cap_parts(segments: List[str], limit: int = MAX_PARTS) -> List[str]:
@@ -281,10 +285,15 @@ def part_interval(text: str, cfg: dict, *, rng: random.Random | None = None) -> 
             base = float(cfg.get("log_base", 2.6) or 2.6)
         except (TypeError, ValueError):
             base = 2.6
-        base = max(1.01, min(10.0, base))
+        # v2.2.6：AstrBot 对 log_base<=1（或非有限值）是整条换回 2.6，不是夹紧。
+        # 插件原来夹到 1.01，ln 的分母趋零，同一条消息的后续段被拖到上百秒。
+        if not math.isfinite(base) or base <= 1.0:
+            base = 2.6
+        base = min(10.0, base)
         wc = _word_count(text)
         i = math.log(wc + 1, base)
-        return rnd.uniform(i, i + 0.5)
+        # 再封一道顶：万一算出分钟级，也别让后续段拖太久。
+        return min(MAX_PART_INTERVAL, rnd.uniform(i, i + 0.5))
     interval = cfg.get("interval") or "1.5,3.5"
     try:
         if isinstance(interval, str):
