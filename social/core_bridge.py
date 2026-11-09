@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -84,6 +85,48 @@ CONTRACT_EXPECTED_CAPABILITIES = (
 )
 #: 契约结构标识前缀（Core 2.28.x 起导出 schema="humanoid.contract/2"）。
 CONTRACT_SCHEMA_PREFIX = "humanoid.contract/"
+
+
+# ── 设备类素材过滤（v2.2.2）────────────────────────────────────
+# 为什么：Core 的日程/生活素材里会出现「躺着刷手机」「屏幕的光照在脸上」，
+# 社交层原样喂给模型，模型照着写，而验收层（`social/verify.py` 的 `_WALL_DEVICE`）
+# 把「手机/屏幕」判成打破第四面墙——写一条丢一条。素材侧先不给这类片段，
+# 比让模型写完再整条丢掉便宜。只过滤文本素材，不动数值字段。
+_DEVICE_WORDS = re.compile(
+    r"手机|屏幕|电脑|平板|键盘|鼠标|充电器|打字|对话框|聊天框"
+)
+
+
+def _scrub_device_material(view: Dict[str, Any]) -> Dict[str, Any]:
+    """把设备类生活片段从素材视图里摘掉（原地改，返回同一个 view）。
+
+    `day.doing` 命中就清空（由头派生会退回别的源），列表类字段按条过滤，
+    `event` 命中就整块作废——宁可这一轮少一个由头，也不让模型顺着写设备。
+    """
+    if not isinstance(view, dict):
+        return view
+    day = view.get("day")
+    if isinstance(day, dict):
+        for key in ("done", "next", "wants", "dreams"):
+            items = day.get(key)
+            if isinstance(items, list):
+                day[key] = [
+                    x for x in items
+                    if not _DEVICE_WORDS.search(str(x or ""))
+                ]
+        if _DEVICE_WORDS.search(str(day.get("doing") or "")):
+            day["doing"] = ""
+        ev = day.get("event")
+        if isinstance(ev, dict) and _DEVICE_WORDS.search(str(ev.get("phrase") or "")):
+            day["event"] = {}
+            view["event"] = {}
+    ongoing = view.get("ongoing")
+    if isinstance(ongoing, list):
+        view["ongoing"] = [
+            x for x in ongoing
+            if not _DEVICE_WORDS.search(str(x or ""))
+        ]
+    return view
 
 
 class CoreBridge:
@@ -905,7 +948,8 @@ class CoreBridge:
             # 契约太旧（P2-10）：清掉「此刻状态」，别把几天前的 day.doing/wake 当现在。
             # 身份/身体标量/情绪等「最近已知值」保留，消费方本来就有不知道的兜底。
             self._neutralize_stale_contract(view)
-        return view
+        # 素材里不带设备类片段（见 `_DEVICE_WORDS` 的说明）。
+        return _scrub_device_material(view)
 
     def load_snapshot(
         self,
