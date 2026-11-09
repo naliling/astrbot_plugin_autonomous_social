@@ -273,10 +273,10 @@ class NoQuestionTest(unittest.TestCase):
         self.assertIs(stub.calls[0]["no_question"], True)
 
     def test_question_output_is_regenerated_then_sent(self):
-        stub = _icebreak_stub([["你们今天都干嘛呢？"], ["早啊，今天风挺大"]])
+        stub = _icebreak_stub([["你们今天都干嘛呢？"], ["早啊，我刚把窗户推开，风挺大"]])
         self.assertTrue(_run_icebreak(stub))
         self.assertEqual(len(stub.calls), 2, "第一次是问句，应该重生成一次")
-        self.assertEqual(stub.sent, ["早啊，今天风挺大"])
+        self.assertEqual(stub.sent, ["早啊，我刚把窗户推开，风挺大"])
 
     def test_three_questions_means_silence_not_a_reworded_question(self):
         stub = _icebreak_stub([["你们今天都干嘛呢？"]])

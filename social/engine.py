@@ -1157,10 +1157,50 @@ def _flow_quality_issue(segments) -> str:
             return detail
     return ""
 
+
+# v2.2.2：破冰/起话头的「具体」词表。判的是「有没有一件落地的事」，
+# 不是「有没有『我』」——模型常把第一人称省掉（「下午去银行回来路上买了花」），
+# 硬要「我」会误杀；而「早啊，今天风挺大」这种空话一个词都命中不了。
+# 这张表**只给群主动消息用**，心流那条仍走 `_FLOW_SELF_ANCHOR_WORDS`。
+_GROUP_CONCRETE_WORDS = tuple(_FLOW_SELF_ANCHOR_WORDS) + (
+    "买", "银行", "路", "花", "饭", "菜", "超市", "公交", "地铁", "回家", "回来",
+    "出门", "路过", "街", "店", "手机", "电脑", "书", "衣服", "洗", "晾", "收拾",
+    "做饭", "吃饭", "茶", "咖啡", "窗", "门", "灯", "光", "影",
+    "声音", "楼下", "屋里", "朋友", "工作", "写", "看", "听", "练", "学", "醒",
+    "站", "坐", "走", "跑", "爬", "翻", "擦", "拖", "扫", "煮", "烧", "倒", "端",
+    "拿", "放", "抱", "背", "穿", "脱", "换", "开", "关", "推", "拉", "挪", "钻",
+    "凉", "热", "冷", "空", "懒", "闷", "亮", "暗", "斜", "落", "湿", "响",
+)
+
+
+def _group_proactive_issue(segments) -> str:
+    """v2.2.2：破冰 / 起话头的质量闸。返回空串表示可以发，否则是拒发原因。
+
+    心流那条路早就有这道闸，破冰和起话头却只过 `_verify_all_segments`
+    （只查动机泄漏、复读、问句），于是「今天天气不错」这种纯评价照样能进群。
+    这两条路本来就更该说「她自己的事」——提示词要的就是这个，闸得跟上。
+    括号里的动作（「（把翅膀拢了拢）」）也算她自己的事，所以不强制出现「我」。
+    """
+    joined = "".join(str(seg or "") for seg in segments or [])
+    if not joined.strip():
+        return "整条是空的"
+    if _PURE_ECHO_RE.match(joined):
+        return "整条只是附和"
+    if _SIDEWAYS_YOU_RE.search(joined):
+        return "在对某个人说话，不是在跟群里说"
+    if not any(word in joined for word in _GROUP_CONCRETE_WORDS):
+        return "没有一件具体的、她自己的事（只有一句空话）"
+    return ""
+
 # 热聊续话（v2.1.8）：continue 的默认起点由 config 下调到 25 分钟，但刚聊热的那一小段
 # 还要更短——15 分钟内来回各 3 轮、最后一句是她说的，6 分钟后就可以接。
 # 用户原话「私聊时模型在聊完一句不会选择继续发言」：等她按 90 分钟（旧默认）想起来，
 # 对方早走了。
+# v2.2.2：睡着的时候，群侧原来是一条都不发（`groupflow.icebreak_due` 第一行
+# 直接 return False），她睡 11 小时那一段群里就完全没声音。真人睡着也会梦话、
+# 也会半夜在群里冒一句，所以按低概率把「睡着」当「醒着」处理一次。
+ASLEEP_PROACTIVE_CHANCE = 0.15
+
 HOT_CONTINUE_WINDOW_MINUTES = 15
 HOT_CONTINUE_MIN_TURNS = 3
 HOT_CONTINUE_AFTER_MINUTES = 6
@@ -3441,6 +3481,12 @@ class SocialEngine:
             )
             if worth:
                 weather_used = weather
+        if not life and not holiday and not weather_used:
+            # 没有 Core（或 Core 还没给出任何东西）时，节日和天气同样是空的：
+            # 原来这里直接返回空串，起话头一句话都起不来。用时间本身兜底。
+            life = groupflow.local_materials(now)
+            if life:
+                self.log(f"群 {gid} 没有 Core 素材，改用本地兜底素材")
         return (
             groupflow.topic_materials(
                 life=life, holiday=holiday, weather=weather_used
@@ -3539,6 +3585,8 @@ class SocialEngine:
         # `_flow_person_state`）。原来这里只查 quiet，漏了 asleep：深夜群里有人说话，
         # 她照样去破冰——而「别在人家睡着时把人叫醒闲聊」正是这道闸要挡的事。
         is_quiet, asleep = _person_flow_state(self, bid, now)
+        if asleep and random.random() < ASLEEP_PROACTIVE_CHANCE:
+            asleep = False
         today = dt.strftime("%Y-%m-%d")
         if self._group_daily_exhausted(bid, today):
             return []
@@ -3594,6 +3642,8 @@ class SocialEngine:
         dt = self._moment_of(bid, now)
         # 同上：起话头也要看她是不是在睡，不然半夜群里冒一句「今天怎么样」。
         is_quiet, asleep = _person_flow_state(self, bid, now)
+        if asleep and random.random() < ASLEEP_PROACTIVE_CHANCE:
+            asleep = False
         today = dt.strftime("%Y-%m-%d")
         if self._group_daily_exhausted(bid, today):
             return []
@@ -3774,6 +3824,12 @@ class SocialEngine:
                     f"原文：{str(bad_text)[:120]!r}"
                     + throttle.summary(f"icebreak.rejected.{bid}")
                 )
+            return False
+        _gp_issue = _group_proactive_issue(segments)
+        if _gp_issue:
+            self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
+            self._m["last_rejected"] = str(segments[0])[:200]
+            self.log(f"群 {gid} 破冰/话头验收不过（{_gp_issue}），不发")
             return False
         _send_res = await self._send_with_retry(umo, segments[0], bid)
         ok_send, err, peer_unreachable = _send_res

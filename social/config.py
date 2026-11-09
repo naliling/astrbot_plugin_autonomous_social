@@ -594,7 +594,7 @@ GROUP_TOPIC_DEDUP_HOURS_DEFAULT = 6.0
 # v2.1.2：每个角色**在所有群里**一天最多主动说几条（破冰 + 起话头 + 心流都算）。
 # 每群各自的额度只管单群，59 个群 × 2 就是一天 118 条——线上 11-06 群发 68 条、
 # 私聊 13 条，群聊把私聊挤没了，而主人以为「她不太找我」。
-GROUP_DAILY_TOTAL_CAP_DEFAULT = 12
+GROUP_DAILY_TOTAL_CAP_DEFAULT = 20
 GROUP_DAILY_TOTAL_CAP_MAX = 100
 
 # v2.1.2：特别关心的**独立**小时配额。特别关心已经绕过「TA 没开口」「没回就停」，

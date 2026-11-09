@@ -569,7 +569,10 @@ class GroupTopicHintTest(unittest.TestCase):
         for body in ({}, None, {"day": None}, {"holiday": "", "weather": {}}):
             with self.subTest(body=body):
                 text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
-                self.assertEqual(text, "")
+                # v2.2.2：没有 Core 素材时不再返回空串（那样起话头一句话都起不来），
+                # 改用本地时间兜底。
+                self.assertTrue(text, "没有 Core 时应该用本地兜底素材")
+                self.assertTrue(_life, "兜底素材要一并返回给 _icebreak 记账")
                 self.assertEqual(weather, "")
 
     def test_body_raising_is_tolerated(self):
@@ -579,7 +582,10 @@ class GroupTopicHintTest(unittest.TestCase):
 
         engine = _HintEngine({})
         engine.core = _Boom()
-        self.assertEqual(engine._group_topic_hint("b", "g", {}, NOW), ("", "", []))
+        text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
+        self.assertTrue(text, "Core 抛异常也要有兜底素材")
+        self.assertTrue(life)
+        self.assertEqual(weather, "")
 
 
 class _FakeGenerator:

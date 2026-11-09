@@ -189,7 +189,7 @@ class AttemptRecordedOnFailureTest(unittest.TestCase):
     def test_success_still_records_both_attempt_and_send(self):
         """对照组：成功时 try_at 与 icebreak_at 一起更新，额度才 +1。"""
         eng = _engine()
-        stub = _stub_icebreak(eng, [["早啊，今天风挺大"]])
+        stub = _stub_icebreak(eng, [["早啊，我刚把窗户推开，风挺大"]])
         self.assertTrue(_run_icebreak(stub))
         g = eng.state.group("b1", "g1")
         self.assertEqual(float(g.get("icebreak_try_at", 0) or 0), NOW)

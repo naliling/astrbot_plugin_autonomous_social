@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import random
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 # emoji 与变体选择符的字符类只有一份，在 `social/emoji.py`；
@@ -876,6 +877,45 @@ def topic_materials(
     if weather:
         lines.append(f"- {outside_lead(weather)}")
     return "\n".join(lines)
+
+
+def local_materials(now: float, *, count: int = 2) -> List[str]:
+    """没有 Core 时的兜底素材：拿「现在几点」当材料。
+
+    原来没有 Core 时七个素材源全灭，节日和天气也来自 Core，
+    `topic_materials` 拿到三个空参数就返回空串——起话头一句话都起不来。
+    这里只用不会错的事实（此刻是几点）编一两条她自己的小场景，
+    保证插件脱离 Core 也能开口。
+    """
+    try:
+        hour = int(time.localtime(float(now)).tm_hour)
+    except (TypeError, ValueError, OSError):
+        return []
+    buckets = (
+        ((5, 8), ("这会儿天刚亮，屋里还有点凉", "刚醒，眼睛还没完全睁开")),
+        ((8, 11), ("上午的光从窗缝里斜进来，落在地板上", "刚把杯子洗了，手还是湿的")),
+        ((11, 13), ("中午了，肚子有点空", "午饭刚咽下去，人有点懒")),
+        ((13, 17), ("下午这会儿最闷，坐着坐着就走神", "窗外有人走来走去，声音断断续续")),
+        ((17, 19), ("天开始暗了，屋里还没开灯", "傍晚的风从窗缝里钻进来")),
+        ((19, 23), ("这会儿屋里就我这儿还亮着灯", "晚上安静下来，能听见自己翻身的动静")),
+    )
+    lines: List[str] = []
+    for (lo, hi), texts in buckets:
+        if lo <= hour < hi:
+            lines = list(texts)
+            break
+    if not lines:
+        lines = ["夜深了，还没睡", "这时候连楼下都没声音了"]
+    try:
+        offset = int(float(now) // 86400) % len(lines)
+    except (TypeError, ValueError):
+        offset = 0
+    rotated = lines[offset:] + lines[:offset]
+    try:
+        want = max(1, int(count or 1))
+    except (TypeError, ValueError):
+        want = 1
+    return rotated[:want]
 
 
 def icebreak_topics(holiday: str, weather: str) -> str:
