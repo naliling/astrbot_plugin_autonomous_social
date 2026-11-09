@@ -411,6 +411,34 @@ SEND_FAIL_COOLDOWN_MAX = 28800.0     # 翻倍到 8 小时封顶
 SEND_FAIL_PLATFORM_COOLDOWN = 1800.0
 SEND_FAIL_PLATFORM_MAX = 43200.0     # 12 小时封顶
 
+# v2.2.4：有些平台根本不该主动找人。
+# WebChat 是 AstrBot 面板里的调试会话（umo 形如 `webchat!<用户名>!<会话UUID>`）：
+# 用户本来就在面板里敲字，插件主动去敲他没有意义；更糟的是每次开新会话 UUID 都变，
+# 会被当成一个新「用户」反复建档，把候选池撑大、把每轮的尝试配额吃光。
+PROACTIVE_SKIP_PLATFORMS = frozenset({"webchat"})
+
+
+def _event_umo(event: Any) -> str:
+    """取事件里的统一消息来源，取不到返回空串。"""
+    try:
+        return str(getattr(event, "unified_msg_origin", "") or "")
+    except Exception:
+        return ""
+
+
+def _umo_platform(umo: Any) -> str:
+    """取 umo 的平台段：`aiocqhttp:private:1` → aiocqhttp，`webchat!u!uuid` → webchat。"""
+    head = str(umo or "").strip()
+    for sep in (":", "!"):
+        if sep in head:
+            head = head.split(sep, 1)[0]
+    return head.strip().lower()
+
+
+def _platform_skipped(umo: Any) -> bool:
+    """这个会话地址所在的平台是不是「不该主动发消息」的那种。"""
+    return _umo_platform(umo) in PROACTIVE_SKIP_PLATFORMS
+
 # 手动触发最多试几个候选：第一个发不出去就换下一个（回退）
 TRIGGER_CANDIDATE_LIMIT = 3
 
@@ -2080,6 +2108,10 @@ class SocialEngine:
         # F1/F2：指令（含被剪掉 `/` 的）与非聊天消息不入观察账本。
         if _looks_like_command(event, raw, msg):
             return
+        # v2.2.4：WebChat 不进账本——面板里的调试会话不该被主动找，
+        # 而且它的 umo 每开一个新会话就换一个 UUID，会被当成一堆新用户。
+        if _platform_skipped(_event_umo(event)):
+            return
 
         # 群消息走群聊心流那条路（与私聊主动各自独立开关），不进 per-user 记录。
         # 注意：private_only 只管私聊侧；群聊侧由 group_* 开关控制。
@@ -2311,6 +2343,8 @@ class SocialEngine:
         走 record_outgoing 记账，不经过这里（context.send_message 不进 respond 阶段）。
         """
         if not self.cfg.enabled or not self.cfg.track_own_replies:
+            return
+        if _platform_skipped(_event_umo(event)):
             return
         text = self._spoken_text(event)
         if not text:
@@ -2843,6 +2877,8 @@ class SocialEngine:
             umo = str(getattr(event, "unified_msg_origin", "") or "")
         except Exception:
             pass
+        if _platform_skipped(umo):
+            return
         group_name = ""
         try:
             group_name = str(getattr(event, "get_group_name", lambda: "")() or "")
@@ -2991,6 +3027,17 @@ class SocialEngine:
             await self._flow_reply_inner(bid, gid, trigger_ts)
         finally:
             self._flow_inflight.discard((bid, gid))
+
+    @staticmethod
+    def _is_degenerate_segment(reason: str) -> bool:
+        """这段是模型多吐的一句废话（纯称呼/只有标题），不是「她驾驭不了这句话」。
+
+        v2.2.4：这类段以前会让**整条消息**作废——实测一夜 36 次（
+        「空泛（正文只有 '笨凝'）」8 次、「整条只有一行标题、没有正文」22 次等）。
+        一句话不值得让整条作废：丢掉坏段、剩下的照发。
+        """
+        text = str(reason or "")
+        return text.startswith("空泛") or text.startswith("整条只有一行标题")
 
     @staticmethod
     def _verify_all_segments(segments, *, recent, called, allow_short=False,
@@ -7782,6 +7829,9 @@ class SocialEngine:
         umo = str(u.get("umo", "") or "")
         if not umo:
             return _gate_blocked(self, "no_session", "没有可用的会话来源（umo），发不出去")
+        # v2.2.4：WebChat 不主动发消息（面板里本来就会说话，主动敲他没意义）。
+        if _platform_skipped(umo):
+            return _gate_blocked(self, "platform_skipped", "这个平台不主动发消息")
 
         # 发送侧熔断：平台发不出去的时候，先把消息写好再失败是纯浪费。
         # 这道闸必须开在调 LLM 之前，否则它根本挡不住任何开销。
@@ -8506,14 +8556,44 @@ class SocialEngine:
             e.get("text", "")
             for e in self.state.recent_proactive(bid, uid, self._time())
         ]
-        bad_seg, seg_why = self._verify_all_segments(
-            segments, recent=_recent,
-            called=str(self._last_persona.get(bid, "") or ""),
-            require_about_peer=require_about_peer,
-            # v2.1.8：同上——后续段也要带类型，否则第一段按问候放行、第二段
-            # 又被按普通消息判空泛，等于白放宽。
-            msg_type=str((reason_meta or {}).get("msg_type", "") or ""),
-        )
+        # v2.2.4：`require_about_peer` 是「整条」的规则，不是每段的规则。
+        # 原来逐段套用：一条消息分两段，只要有一段是纯自述（「我刚把窗关严实」），
+        # 整条就按「没有指向对方」作废——实测一夜 9 条都栽在这里。
+        _called = str(self._last_persona.get(bid, "") or "")
+        _mtype = str((reason_meta or {}).get("msg_type", "") or "")
+        bad_seg, seg_why = "", ""
+        if require_about_peer:
+            _joined = "\n".join(str(s or "") for s in segments)
+            bad_seg, seg_why = self._verify_all_segments(
+                [_joined], recent=_recent, called=_called,
+                require_about_peer=True, msg_type=_mtype,
+            )
+        # v2.2.4：退化的后续段（纯称呼/只有标题）丢掉继续发，不整条作废。
+        if not bad_seg:
+            _kept: List[str] = []
+            for _seg in segments:
+                _seg_bad, _why = self._verify_all_segments(
+                    [_seg], recent=_recent, called=_called,
+                    require_about_peer=False, msg_type=_mtype,
+                )
+                if not _seg_bad:
+                    _kept.append(_seg)
+                    continue
+                if _kept and SocialEngine._is_degenerate_segment(_why):
+                    logger.info(
+                        f"[autonomous_social][{bid}] 丢掉退化段（{_why}），"
+                        f"其余照发：{str(_seg)[:40]!r}"
+                    )
+                    continue
+                bad_seg, seg_why = _seg, _why
+                break
+            if not bad_seg:
+                if not _kept:
+                    bad_seg = segments[0] if segments else ""
+                    seg_why = "拆段后没有可发的段"
+                else:
+                    segments = _kept
+                    waits = waits[: max(0, len(_kept) - 1)]
         if bad_seg:
             self._m["last_failure"] = f"[{bid}] 后续段验收不过：{seg_why}"
             self._m["last_rejected"] = str(bad_seg)[:200]

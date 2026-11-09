@@ -376,7 +376,7 @@ class DeadProviderTest(unittest.TestCase):
         provider = types.SimpleNamespace()  # 什么方法都没有
         asyncio.run(g._call_llm(provider, "hi"))
         self.assertEqual({}, g.llm_circuit_state())
-        self.assertIn(g._scope_of(provider), g._dead_providers)
+        self.assertIn(g._scope_of(provider), g._dead_until)
 
     def test_dead_provider_is_skipped_when_picking(self) -> None:
         import asyncio
@@ -385,7 +385,7 @@ class DeadProviderTest(unittest.TestCase):
         g = _gen(clock)
         dead = types.SimpleNamespace()
         alive = types.SimpleNamespace(text_chat=lambda **kw: None)
-        g._dead_providers.add(g._scope_of(dead))
+        g._dead_until[g._scope_of(dead)] = clock.t + 600.0
         g._designated_configured = lambda: True  # type: ignore[assignment]
         g.cfg = types.SimpleNamespace(proactive_provider_ids=("dead", "alive"))
         g.context = types.SimpleNamespace(

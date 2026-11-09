@@ -93,6 +93,11 @@ LLM_BACKOFF_MAX_SECONDS = 900.0
 # 恢复后最多一个心跳就能重新说话。探活失败会重新立熔断，`since` 从探活那刻算起。
 LLM_CIRCUIT_PROBE_SECONDS = 900.0
 
+# v2.2.4：结构性不可用的 provider 只跳过这么久，到点再试一次。
+# 永久记死（v2.2.3 的写法）会让「三个专供模型都进过黑名单」变成整轮静默，
+# 直到重载插件才恢复——比原来「15 分钟探活」的慢自愈更糟。
+DEAD_PROVIDER_TTL = 600.0
+
 # provider 明确说了「换一种调用方式也一样会失败」的错。匹配到就立刻停手。
 _FATAL_LLM_MARKERS = (
     "401", "403", "invalid api key", "incorrect api key", "unauthorized",
@@ -1781,7 +1786,10 @@ class MessageGenerator:
         # 它不是「这次调用失败了」，而是「这条路在这个进程里根本走不通」：
         # 记成瞬时失败会让引擎整轮熔断，实测 4 小时里因此空转 285 次、
         # 每次「暂停调用 15 分钟」，整晚只发出个位数主动消息。
-        self._dead_providers: set = set()
+        # v2.2.4：改成带 TTL 的跳过表（键 → 解禁时刻）。永久记死会让
+        # 三个专供模型全死之后整轮只打「LLM 不可用（provider 取不到）」，
+        # 直到重载插件才恢复。
+        self._dead_until: Dict[str, float] = {}
 
     async def generate(
         self,
@@ -3834,13 +3842,22 @@ class MessageGenerator:
         if provider is not None:
             return provider
         if self._designated_configured() and self._can_resolve_by_id():
-            if self._strict_designated():
+            if self._strict_designated() and not self._designated_temporarily_dead():
                 # 严格模式：配了专供却一个都没拿到 → 本轮不发。
                 logger.debug(
                     "[autonomous_social] 配了主动专用模型但一个都没取到，"
                     "严格模式（strict_proactive_provider=true）：本轮不主动开口"
                 )
                 return None
+            if self._strict_designated():
+                # v2.2.4：只是「暂时都不可用」（TTL 黑名单，到点自愈），不是配错。
+                # 严格模式也不该整轮静默——回退会话模型，至少把话说了。
+                if throttle.allow("provider.designated.temporary"):
+                    logger.warning(
+                        "[autonomous_social] 专供模型暂时都不可用（TTL 内跳过），"
+                        "本轮回退跟随当前会话的模型"
+                        + throttle.summary("provider.designated.temporary")
+                    )
             # 默认模式：回退会话默认模型。必须让用户看见一次——选错 ID 时状态页
             # 一直正常、主动消息却全是「会话默认模型」写的，不提示就无从发现。
             # 用 throttle 去重：心跳一轮一次、限流时更频繁，每次打 warning 会刷屏。
@@ -3928,6 +3945,36 @@ class MessageGenerator:
         except Exception:
             ids = []
         return " → ".join(ids) if ids else "（空）"
+
+    def _designated_temporarily_dead(self) -> bool:
+        """配了专供、按 ID 也都能取到，但全都在 TTL 黑名单里。
+
+        v2.2.4：这种情况和「ID 配错了」不是一回事——TTL 到点会自愈，不该让
+        `strict_proactive_provider` 把整轮心跳静默掉。实测 11-10 凌晨：三个专供
+        模型进黑名单后，每轮只打一句「LLM 不可用（provider 取不到），本轮未发送」，
+        一直静默到重载插件。判断标准：至少解析到一个对象，且每个都还没解禁。
+        """
+        if not (self._designated_configured() and self._can_resolve_by_id()):
+            return False
+        getter = getattr(self.context, "get_provider_by_id", None)
+        manager = getattr(self.context, "provider_manager", None)
+        inst_map = getattr(manager, "inst_map", None) if manager is not None else None
+        resolved = 0
+        for pid in getattr(self.cfg, "proactive_provider_ids", ()) or ():
+            try:
+                if callable(getter):
+                    provider = getter(pid)
+                else:
+                    provider = (inst_map or {}).get(pid)
+            except Exception:
+                continue
+            if provider is None:
+                continue
+            resolved += 1
+            left = float(self._dead_until.get(self._scope_of(provider), 0.0) or 0.0) - self._now()
+            if left <= 0:
+                return False
+        return resolved > 0
 
     def proactive_provider_health(self) -> Dict[str, Any]:
         """主动消息专用模型的体检结果（给 engine 状态页用，**不抛异常**）。
@@ -4042,9 +4089,11 @@ class MessageGenerator:
                 logger.debug(f"[autonomous_social] 取专供模型 {pid!r} 失败: {exc}")
                 continue
             if provider is not None:
-                if self._scope_of(provider) in self._dead_providers:
+                _scope = self._scope_of(provider)
+                _dead_left = float(self._dead_until.get(_scope, 0.0) or 0.0) - self._now()
+                if _dead_left > 0:
                     # 这个对象没有任何调用方法（见 `_call_llm`）：换下一个专供模型，
-                    # 而不是每轮再撞一次同一堵墙。
+                    # 而不是每轮再撞一次同一堵墙。TTL 到点后放它再试一次。
                     continue
                 return provider
             # 找不到不刷 warning：心跳一轮刷 N 行没有新信息，`_get_provider`
@@ -4067,6 +4116,18 @@ class MessageGenerator:
         Returns:
             生成的文本，失败返回 None
         """
+        # v2.2.4：`review_draft` 那条路一直传 `getattr(self.generator, "provider", None)`
+        # ——MessageGenerator 上根本没有 `provider` 属性，于是每次都拿 None 去调，
+        # `_candidates` 必然为空，日志里「LLM provider 无可用调用方法」全是同一个
+        # `obj<id(None)>`，而「生成后自评」这道闸从来没真正跑过。
+        # 这里补一次解析：能取到专供就用专供，取不到就返回 None（由调用方按 ok 放行）。
+        if provider is None or isinstance(provider, str):
+            _resolved = await self._get_designated_provider()
+            if _resolved is None:
+                _resolved = await self._get_provider("")
+            if _resolved is None:
+                return None
+            provider = _resolved
         tried: List[str] = []
         last_err = ""
         scope = self._scope_of(provider)
@@ -4117,7 +4178,10 @@ class MessageGenerator:
             # 是「这条路在这个进程里根本走不通」。原来这里走 `_note_llm_failure`，
             # 连续三次就把整轮熔断（实测 4 小时空转 285 次、每次暂停 15 分钟）。
             # 现在只标死、不记失败、不立熔断，下一次直接换下一个专供模型。
-            self._dead_providers.add(scope)
+            if provider is not None:
+                # 只记具体对象。`provider is None` 是自评那条路传进来的（见下），
+                # 记它只会让 `obj<id(None)>` 永久躺在表里，日志里所有告警都同一个 obj。
+                self._dead_until[scope] = self._now() + DEAD_PROVIDER_TTL
             if throttle.allow("llm.no_method"):
                 logger.warning(
                     "[autonomous_social] LLM provider 无可用调用方法"
