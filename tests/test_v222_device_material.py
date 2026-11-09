@@ -1,4 +1,4 @@
-"""v2.2.2 补丁：Core 素材里的设备类片段不许进生成提示词。
+﻿"""v2.2.2 补丁：Core 素材里的设备类片段不许进生成提示词。
 
 背景（2026-11-09 实测）：Core 的生活素材写着「躺着刷手机」「屏幕的光照在脸上」，
 社交层原样喂给模型 → 模型照着写 → 验收层 `verify.py` 的 `_WALL_DEVICE` 判成
@@ -82,6 +82,10 @@ class ScrubUnitTest(unittest.TestCase):
         for bad in ({}, {"day": None}, {"day": {"done": "手机"}}, {"ongoing": "手机"}, None):
             _scrub_device_material(bad)  # 不抛就算过
 
+    def test_message_semantics_count_as_devices(self):
+        # v2.2.3：日程里「给姐姐编辑消息」「回消息」会让模型补出手机与打字。
+        for text in ("翅膀托着手边的东西给姐姐编辑消息", "把没回的消息翻出来", "戴着耳机听了一会儿"):
+            self.assertIsNotNone(_DEVICE_WORDS.search(text), text)
     def test_device_words_cover_the_verifier_list(self):
         for word in ("手机", "屏幕", "电脑", "平板", "键盘", "鼠标", "充电器", "打字"):
             self.assertTrue(_DEVICE_WORDS.search(word), word)
