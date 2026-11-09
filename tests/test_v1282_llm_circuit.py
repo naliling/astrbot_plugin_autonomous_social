@@ -167,14 +167,55 @@ class CircuitStateTest(unittest.TestCase):
         """退避窗口过了但还没成功过一次：仍然算坏着。
 
         否则退避一过就又整轮重试，熔断只挡了一轮——正是本次要修的那个 bug。
+        （只推进到探活上限以内；超过上限必须撤，见
+        `test_circuit_probes_after_max_down_time`。）
         """
         clock = _Clock()
         g = _gen(clock)
         g._note_llm_failure("gemini", "429 rate limit", fatal=True)
-        clock.advance(3600.0)  # 退避封顶 30 分钟，早过了
+        clock.advance(600.0)  # rate 档退避基数正好 10 分钟，此刻刚过
         self.assertEqual(g.llm_backoff_remaining("gemini"), 0.0)
         st = g.llm_circuit_state()
         self.assertIn("gemini", st, "退避过了就把熔断撤了，下一轮照样白打一次请求")
+
+    def test_circuit_probes_after_max_down_time(self) -> None:
+        """熔断必须有上限：到点撤掉，否则「熔断→不发→永不成功→永不撤」死锁。
+
+        线上实测：01:20 立熔断，连续 596 分钟 32 个空转轮没恢复，整晚只发出 1 条。
+        """
+        from social.generator import LLM_CIRCUIT_PROBE_SECONDS
+
+        clock = _Clock()
+        g = _gen(clock)
+        g._note_llm_failure("gemini", "429 rate limit", fatal=True)
+        self.assertIn("gemini", g.llm_circuit_state())
+
+        clock.advance(LLM_CIRCUIT_PROBE_SECONDS - 1.0)
+        self.assertIn("gemini", g.llm_circuit_state(), "没到上限就撤，熔断形同虚设")
+
+        clock.advance(2.0)
+        self.assertEqual(
+            g.llm_circuit_state(), {}, "熔断到点没撤，插件会一直停摆下去"
+        )
+        self.assertEqual(
+            g.llm_backoff_remaining("gemini"), 0.0, "探活轮仍被退避挡着，等于没探活"
+        )
+
+    def test_probe_does_not_leave_stale_round_counter(self) -> None:
+        """探活撤销后空转轮计数要归零，否则重新坏起来时日志降频会算错。"""
+        from social.generator import LLM_CIRCUIT_PROBE_SECONDS
+
+        clock = _Clock()
+        g = _gen(clock)
+        g._note_llm_failure("gemini", "429 rate limit", fatal=True)
+        g.llm_circuit_note_round("gemini")
+        g.llm_circuit_note_round("gemini")
+        clock.advance(LLM_CIRCUIT_PROBE_SECONDS + 1.0)
+        self.assertEqual(g.llm_circuit_state(), {})
+        g._note_llm_failure("gemini", "429 rate limit", fatal=True)
+        self.assertEqual(
+            g.llm_circuit_note_round("gemini"), 1, "探活后计数没归零，新一轮从 3 开始"
+        )
 
     def test_circuit_is_per_scope(self) -> None:
         """A 的 key 坏掉不能把 B 一起停掉。"""

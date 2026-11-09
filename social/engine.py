@@ -1092,6 +1092,49 @@ def _flow_personal_detail_issue(text) -> str:
     return ""
 
 
+_LEAD_CLAUSE_RE = re.compile(r"[，,。！!？?；;\n]")
+# 开口的语气词与「评论腔」起手：剥掉之后再看首句是不是她自己的事。
+_LEAD_STRIP = (
+    "哈哈", "嘿嘿", "嗯", "哦", "噢", "诶", "哎", "唔",
+    "看起来", "听起来", "说起来", "说实话", "讲真", "话说", "其实",
+    "确实", "不过", "反正", "感觉",
+)
+
+
+def _flow_lead_issue(text) -> str:
+    """v2.2.2：插话的首句必须是她自己，不能上来就接别人的话。返回空串表示通过。
+
+    用户投诉的原话是「别人没叫他搞得好像别人叫他了一样」。当晚真正发出去的是
+    「三个也够了，别折腾了，我再眯会儿……」——整条含「我」也含「眯」，只按
+    「有没有她自己的事」判是拦不住的：它的问题在**开口就在回应**，在替那场
+    「留几个 AI」的讨论下结论。
+
+    所以单独判首句：第一个停顿之前的小句里，必须有第一人称，或一件具体的
+    动作/物件。上来就评价别人聊的事（「三个也够了」「和弦转换卡住太正常了」
+    「看起来今天挺冷」）一律不发。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    lead = _LEAD_CLAUSE_RE.split(body, 1)[0]
+    changed = True
+    while changed:
+        changed = False
+        lead = lead.strip()
+        for word in _LEAD_STRIP:
+            if lead.startswith(word):
+                lead = lead[len(word):]
+                changed = True
+    lead = lead.strip()
+    if not lead:
+        return ""
+    if any(marker in lead for marker in _SELF_MARKERS):
+        return ""
+    if any(word in lead for word in _FLOW_SELF_ANCHOR_WORDS):
+        return ""
+    return "开口就是在接别人的话（首句没有她自己），不发"
+
+
 def _flow_quality_issue(segments) -> str:
     """v2.2.1：群心流插话的质量闸。返回空串表示可以发，否则是拒发原因。
 
@@ -1106,6 +1149,9 @@ def _flow_quality_issue(segments) -> str:
             return "整条只是附和"
     joined = "".join(str(seg or "") for seg in segments or [])
     if joined.strip():
+        lead = _flow_lead_issue(joined)
+        if lead:
+            return lead
         detail = _flow_personal_detail_issue(joined)
         if detail:
             return detail

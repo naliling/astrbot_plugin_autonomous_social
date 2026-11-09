@@ -53,7 +53,11 @@ def _install_stub():
 _install_stub()
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from social.engine import _flow_personal_detail_issue, _flow_quality_issue  # noqa: E402
+from social.engine import (  # noqa: E402
+    _flow_lead_issue,
+    _flow_personal_detail_issue,
+    _flow_quality_issue,
+)
 
 
 class SidewaysTalkTest(unittest.TestCase):
@@ -131,6 +135,44 @@ class PersonalDetailTest(unittest.TestCase):
         self.assertIn("没提她自己", _flow_personal_detail_issue("和弦转换卡住了"))
         self.assertIn(
             "只有评价", _flow_personal_detail_issue("我也觉得这事儿挺麻烦的")
+        )
+
+
+class LeadMustBeHerselfTest(unittest.TestCase):
+    """v2.2.2：首句必须是她自己，不能上来就接别人的话。
+
+    这条是用户投诉原文的直接回归：那条消息含「我」也含「眯」，只按「有没有她
+    自己的事」判是拦不住的，问题在开口就在回应那场讨论。
+    """
+
+    def test_the_reported_message_is_rejected(self):
+        # 2026-11-08 22:28:45 群 927366557 真发出去的那条。
+        text = "三个也够了，别折腾了，我再眯会儿……"
+        reason = _flow_quality_issue([text])
+        self.assertTrue(reason, "用户投诉的原句还能发出去，等于没修")
+        self.assertIn("开口", reason)
+
+    def test_comment_opener_is_rejected(self):
+        for text in (
+            "看起来今天确实挺冷的",
+            "说实话这事儿也挺麻烦的",
+            "嗯，那就这样吧",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_flow_quality_issue([text]))
+
+    def test_herself_first_is_fine(self):
+        for text in (
+            "（用翅膀把杯子挪正）人品值刷得比茉莉香还密，我蹄子夹不住杯沿❤️",
+            "说实话我刚把水烧上，等会儿泡点东西喝",
+            "侧躺久了换个姿势，我尾巴压麻了",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(_flow_quality_issue([text]), "")
+
+    def test_reason_is_readable(self):
+        self.assertIn(
+            "开口就是在接别人的话", _flow_lead_issue("三个也够了，别折腾了")
         )
 
 

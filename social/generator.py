@@ -80,6 +80,18 @@ LLM_RATE_BACKOFF_MAX_SECONDS = 1800.0
 # （原本担心的「请求放大」并没有回来），而恢复后最多一个心跳就能重新说话。
 LLM_BACKOFF_BASE_SECONDS = 60.0
 LLM_BACKOFF_MAX_SECONDS = 900.0
+# 熔断最长活多久：到点必须放一轮过去探活。
+#
+# 为什么要有上限：熔断一立，`try_once` 开头就整轮 return（不收集候选、不生成）；
+# 而撤熔断的唯一路径是 `_note_llm_ok`——那需要**一次成功的调用**。熔断中根本不发
+# 请求，于是「坏了 → 不发 → 永远不成功 → 永远不撤」构成死锁，除非别的事件驱动
+# 路径恰好用同一个 provider 对象调通一次。
+#
+# 实测（2026-11-09）：01:20 一个 provider 连败 3 次立起熔断，之后连续 596 分钟
+# 32 个空转轮都没恢复，一整晚只发出 1 条主动消息。用户看到的就是「插件哑了」。
+# 上限取 15 分钟 ≈ 一个心跳间隔：持续坏着时每个心跳仍只白打一次（和退避封顶一致），
+# 恢复后最多一个心跳就能重新说话。探活失败会重新立熔断，`since` 从探活那刻算起。
+LLM_CIRCUIT_PROBE_SECONDS = 900.0
 
 # provider 明确说了「换一种调用方式也一样会失败」的错。匹配到就立刻停手。
 _FATAL_LLM_MARKERS = (
@@ -4338,7 +4350,24 @@ class MessageGenerator:
         """
         now = self._now()
         out: Dict[str, Dict[str, Any]] = {}
-        for scope, since in self._llm_down_since.items():
+        for scope, since in list(self._llm_down_since.items()):
+            down_for = max(0.0, now - float(since))
+            if down_for >= LLM_CIRCUIT_PROBE_SECONDS:
+                # 熔断到点了：撤掉它，让下一轮真的去调一次。
+                # 不这么做就是死锁——熔断中不发请求，不发请求就永远没有 `_note_llm_ok`。
+                # 探活失败会重新立（`since` 从探活那刻算起，`down_for` 重新计时），
+                # 所以最坏情况是「每 15 分钟白打一次请求」，而不是永久静默。
+                self._llm_down_since.pop(scope, None)
+                self._llm_down_kind.pop(scope, None)
+                self._llm_down_rounds.pop(scope, None)
+                self._llm_skip_until[scope] = 0.0
+                if throttle.allow(f"llm.probe.{scope}", window=300.0):
+                    logger.info(
+                        f"[autonomous_social][{scope}] LLM 熔断已满 "
+                        f"{int(down_for // 60)} 分钟，放一轮探活"
+                        + throttle.summary(f"llm.probe.{scope}")
+                    )
+                continue
             if self._llm_skip_until.get(scope, 0.0) <= now:
                 # 退避已过但没撤：只可能是还没轮到一次成功调用。仍算坏着，
                 # 否则退避一过就又整轮重试，等于熔断只挡了一轮。
@@ -4346,7 +4375,7 @@ class MessageGenerator:
             out[scope] = {
                 "kind": self._llm_down_kind.get(scope, "transient"),
                 "since": float(since),
-                "down_for": max(0.0, now - float(since)),
+                "down_for": down_for,
                 "streak": int(self._llm_fail_streak.get(scope, 0)),
                 "backoff_left": max(0.0, self._llm_skip_until.get(scope, 0.0) - now),
             }
