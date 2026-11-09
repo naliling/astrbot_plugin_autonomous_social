@@ -4,7 +4,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.2.4-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.2.5-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -258,7 +258,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `cross_user_repeat_ratio` | `0.88` | 同角色**发给别人的**消息和这条重合度超线就不发。跟防复读是两回事：Core 的日程是角色级的，同一句话对所有人逐字相同，真实记录里 1 小时 41 分内有 12 个不同的人分别收到它 |
 | `cross_user_repeat_hours` | `0.5` | 跨用户撞车回看多久（小时）。设 0 关闭。2.0.8 起 2.0→0.5：撞车要撞在**同一时段**才像群发，2 小时窗口把正常的重复也拦了（实测拦了 57 次） |
 | `special_care_enabled` | `true` | 【特别关心】总开关：名单/自动认定的人放宽主动消息限制 |
-| `special_care_uids` | `[]` | 【特别关心】名单，逐条 `uid` 或 `平台:uid`。名单里的人不被档位间隔、安静时段、睡眠和「没回就停」挡 |
+| `special_care_uids` | `[]` | 【特别关心】名单，逐条 `uid`、`平台:uid`，可加专属称谓 `uid:称谓` / `平台:uid:称谓`（两段式只认纯数字 uid，非数字 uid 请用三段）。名单里的人不被档位间隔、安静时段、睡眠和「没回就停」挡；配了称谓的私聊主动消息会这么叫 |
 | `special_care_auto` | `true` | 【特别关心】读 Core 关系数据自动认定（好感 + 对话轮数），认定一次后落盘 |
 | `special_care_min_affection` | `55` | 【特别关心】自动认定的好感门槛（55 是 Core 的中性起点，85 等于只有手动塞满好感的号够得到） |
 | `special_care_min_turns` | `100` | 【特别关心】自动认定的对话轮数门槛；Core 没给轮数时改用消息条数 |

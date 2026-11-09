@@ -1346,12 +1346,16 @@ def _bond_line(target: Dict[str, Any]) -> str:
     * `_nickname`  —— Core「认定」过的称呼（`auto_nickname` 校验很严，含数字/emoji/
       装饰的名片一律不认，所以大多数用户没有）；
     * `_call_name` —— 真正能叫出口的称呼（Core 认定 → Core 名片名 → 本地账本名片名）；
-    * `_name_source` —— `nickname` / `display_name` / `local`，决定这里给哪种措辞。
+    * `_name_source` —— `nickname` / `display_name` / `local`，决定这里给哪种措辞；
+    * `_pet_name`   —— 特别关心名单里配的专属称谓（`uid:称谓` / `平台:uid:称谓`），
+      优先级最高；只由引擎在私聊主动消息链路写入。
 
     没有名字时**明说别编**：以前整句不出，模型就自己给 TA 起个名字，或者干脆不叫
     ——用户原话就是「主动消息从 core 那拿不到名称，以至于根本不会叫人」。
     """
     bits: List[str] = []
+    # v2.2.5：特别关心名单里配的专属称谓优先级最高——用户点名要她这么叫。
+    pet_name = short_call_name(_name_text(target.get("_pet_name")))
     nickname = _name_text(target.get("_nickname"))
     raw_name = _name_text(target.get("_call_name")) or nickname
     source = _name_text(target.get("_name_source"))
@@ -1360,10 +1364,12 @@ def _bond_line(target: Dict[str, Any]) -> str:
     nick_short = short_call_name(nickname)
     # v1.28.13：**她一直叫的那个称呼优先**。名片名可能是「^0^」这种念不出口的字符串，
     # 以前它排在昵称前面被拿去叫，结果主动消息里既不叫名字、又不像在找人。
-    if nick_short:
+    if pet_name:
+        call_name = pet_name
+    elif nick_short:
         call_name = nick_short
     if call_name:
-        if nick_short:
+        if pet_name or nick_short:
             bits.append(f"你一直叫TA「{call_name}」")
         elif source == "nickname":
             bits.append(f"你一直叫TA「{call_name}」")

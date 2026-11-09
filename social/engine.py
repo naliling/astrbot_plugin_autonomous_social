@@ -4271,6 +4271,8 @@ class SocialEngine:
         brief: Optional[Dict[str, Any]],
         user_core: Optional[Dict[str, Any]],
         u: Dict[str, Any],
+        cfg: Any = None,
+        uid: Any = "",
     ) -> None:
         """把门面 brief 的用户块合并进生成目标：**门面优先，state.json / 本地账本兜底**。
 
@@ -4278,6 +4280,8 @@ class SocialEngine:
         跳过那一个，不抛——这条路径是加分项，坏掉时必须退回 v1.28.8 的旧行为。
         `_nickname` 保持旧语义：只放 **Core 认定** 的称呼（生成侧据此区分措辞），
         可用的称呼统一放 `_call_name`，来源放 `_name_source`。
+        `cfg` / `uid` 可选（老测试只传前四个参数）：给了就读特别关心名单里的专属称谓，
+        写进独立的 `_pet_name`，由生成侧最高优先使用。
         """
         snap = user_core if isinstance(user_core, dict) else {}
         local = u if isinstance(u, dict) else {}
@@ -4337,6 +4341,11 @@ class SocialEngine:
         if call_name:
             u_copy["_call_name"] = call_name
             u_copy["_name_source"] = name_source
+        # v2.2.5：特别关心名单里的专属称谓。单独放 `_pet_name`，不覆盖 `_nickname`
+        # （那个字段的契约是「Core 认定的称呼」）；生成侧 `_bond_line` 最高优先用它。
+        pet_name = SocialEngine._special_care_call_name(cfg, uid, local)
+        if pet_name:
+            u_copy["_pet_name"] = pet_name
 
         # ── 好感：门面现算，文件里的可能是几小时前落盘的 ──
         # 未建档时跳过这几项，让生成侧退回本地 interest 混合值（旧行为），
@@ -6099,6 +6108,27 @@ class SocialEngine:
             if puid.strip() == target and plat.strip() and umo.startswith(plat.strip() + ":"):
                 return True
         return False
+
+    @staticmethod
+    def _special_care_call_name(
+        cfg: Any, uid: Any, u: Optional[Dict[str, Any]]
+    ) -> str:
+        """配置里给这个人配的专属称谓；群聊 / 关总开关 / 配置读坏时一律不生效。
+
+        群聊隔离是显式判断，不依赖调用点：这条链路目前只跑私聊主动消息，但以后
+        若有人复用 `_apply_core_brief`，也不能把「只该私下叫的称谓」带进群里。
+        """
+        try:
+            if cfg is None or not getattr(cfg, "special_care_enabled", True):
+                return ""
+            umo = str((u or {}).get("umo", "") or "")
+            if "groupmessage" in umo.lower():
+                return ""
+            plat = umo.split(":", 1)[0] if umo else ""
+            name = cfg.special_care_call_name(uid, plat)
+            return str(name or "").strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _snapshot_turns(snap: Optional[Dict[str, Any]]) -> int:
@@ -8167,7 +8197,9 @@ class SocialEngine:
         brief = SocialEngine._core_brief(
             self, bid, uid, user_name=_brief_text(u.get("name"))
         )
-        SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
+        SocialEngine._apply_core_brief(
+            u_copy, brief, user_core, u, cfg=getattr(self, "cfg", None), uid=uid
+        )
         # P2-13：门面 brief 的 her/outfit/persona_framing/holiday/routine（没有文件
         # 快照时再加 day/weather）真正进「背景状态」提示词，而不是只写不读。
         core_context = SocialEngine._core_context_with_brief(
@@ -10497,7 +10529,9 @@ class SocialEngine:
             brief = SocialEngine._core_brief(
                 self, bid, uid, user_name=_brief_text(u.get("name"))
             )
-            SocialEngine._apply_core_brief(u_copy, brief, user_core, u)
+            SocialEngine._apply_core_brief(
+                u_copy, brief, user_core, u, cfg=getattr(self, "cfg", None), uid=uid
+            )
             # P2-13：预览必须与真实发送看到同一份背景状态（brief 派生行也在内）。
             core_context = SocialEngine._core_context_with_brief(
                 core_context, brief, include_day=not bool(user_core)

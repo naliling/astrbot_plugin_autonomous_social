@@ -1185,26 +1185,79 @@ class SocialConfig:
                 return level
         return ""
 
-    def special_care_entries(self) -> set:
-        """特别关心名单归一成集合。
+    def special_care_parsed_entries(self) -> List[Tuple[str, str, str]]:
+        """特别关心名单解析成 (平台, uid, 专属称谓)。
 
-        条目可以是纯 uid（"100000001"），也可以是 "平台:uid"（"aiocqhttp:100000001"）。
-        列表里手填时允许逗号/分号/中文逗号分隔，和面板上其它名单一个写法。
+        支持四种写法（中英文冒号都认，逗号/分号/中文逗号分隔，和面板上其它名单一个写法）：
+
+        * ``uid``            —— 通用，任何平台都认；
+        * ``平台:uid``       —— 只认这个平台（会话地址的第一段，如 aiocqhttp）；
+        * ``uid:称谓``       —— 通用 + 专属称谓；
+        * ``平台:uid:称谓``  —— 平台专属 + 专属称谓。
+
+        两段式靠「左边是不是纯数字」区分 ``uid:称谓`` 和 ``平台:uid``：QQ 号这类 uid 是
+        纯数字，而平台名不会是纯数字。非数字 uid（微信 / QQ 官方 openid）想配称谓请写
+        三段式，否则会被当成 ``平台:uid``。坏条目跳过、不抛——这是热路径上的配置，
+        不能因为一行手误把主动消息全停。
         """
         raw = self.special_care_uids
         if isinstance(raw, str):
-            items = raw.replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+            items = [raw]
         elif isinstance(raw, (list, tuple, set)):
-            items = []
-            for item in raw:
-                if item is None:
-                    continue
-                items.extend(
-                    str(item).replace("，", ",").replace("；", ",").replace(";", ",").split(",")
-                )
+            items = [str(x) for x in raw if x is not None]
         else:
-            items = [raw] if raw is not None else []
-        return {str(x).strip() for x in items if str(x).strip()}
+            items = [str(raw)] if raw is not None else []
+        out: List[Tuple[str, str, str]] = []
+        for item in items:
+            for chunk in (
+                item.replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+            ):
+                chunk = chunk.replace("：", ":").strip()
+                if not chunk:
+                    continue
+                parts = [p.strip() for p in chunk.split(":")]
+                if len(parts) == 1:
+                    plat, who, call = "", parts[0], ""
+                elif len(parts) == 2:
+                    left, right = parts
+                    if left.isdigit() and right and not right.isdigit():
+                        plat, who, call = "", left, right
+                    else:
+                        plat, who, call = left, right, ""
+                else:
+                    plat, who, call = parts[0], parts[1], ":".join(parts[2:]).strip()
+                if not who:
+                    continue
+                out.append((plat, who, call))
+        return out
+
+    def special_care_entries(self) -> set:
+        """特别关心名单归一成集合（"uid" 或 "平台:uid"），称谓不参与判定。
+
+        保持旧签名与旧返回形态：``_special_care_manual`` 等闸门只关心是谁。
+        """
+        entries = set()
+        for plat, uid, _call in self.special_care_parsed_entries():
+            entries.add(f"{plat}:{uid}" if plat else uid)
+        return entries
+
+    def special_care_call_name(self, uid: Any, platform: Any = "") -> str:
+        """这个人在这个平台上的专属称谓；平台专属优先于通用，没配返回 ""。"""
+        target = str(uid or "").strip()
+        if not target:
+            return ""
+        plat = str(platform or "").strip().lower()
+        generic = ""
+        for entry_plat, entry_uid, call in self.special_care_parsed_entries():
+            if entry_uid != target or not call:
+                continue
+            if not entry_plat:
+                if not generic:
+                    generic = call
+                continue
+            if plat and entry_plat.lower() == plat:
+                return call
+        return generic
 
     def allowed_trigger_uid_set(self) -> set:
         """解析 allowed_trigger_uids 为去重后的集合。
