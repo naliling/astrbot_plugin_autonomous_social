@@ -957,11 +957,47 @@ _PREACHY = re.compile(
     r"别(?:再)?(?:问|管|吵|闹|想|猜|打听|刨根问底|胡思乱想|一惊一乍|自作多情|瞎想|乱猜)"
     r"|别[^，。！？、,.!?;]{0,6}了"
     r"|少(?:自作多情|来这套|管闲事|废话|装)"
+    # v2.2.10：线上真有一条「少在这装可怜了」——`少` 后面跟的是地点/对象再跟动词，
+    # 上面那支漏了。这里只认**小句开头**的「少…了/吧」，避免「多少/减少/很少」误伤。
+    r"|(?:(?<=[，,、；;：:。！？!?\s])|^)少[^，。！？、,.!?;]{0,6}(?:了|吧)"
     r"|不(?:许|准)[^，。！？、,.!?;]{0,6}(?:了|吧)?"
     r"|算你(?:老实|识相|识趣)"
     r"|问(?:这个|这些|这么多)?(?:干嘛|干什么)"
     r"|多管闲事|大惊小怪|一惊一乍|胡思乱想|自作多情"
 )
+
+
+# 句内的**祈使否定小句**：`，别闹` / `酥牧别胡思乱想` / `不许碰翅根`。
+# v2.2.10：清理时只剪掉这一小段，不整句删——线上 22:39:53 那条
+# 「（嘟囔着拱了拱）没睡透，别闹。上次冷落我可还记着仇呢，不给我补偿可别想我理你。」
+# 被整句删光，结果是**她这一轮一句话没说**，比说教更糟。
+_PREACHY_CLAUSE_LEFT = "，,、；;：:"
+_PREACHY_CLAUSE_END = "。！？!?，,、；;…"
+
+
+def _strip_preachy_clauses(sentence: str) -> str:
+    """把句内「别…/不许…/少…」这类小句剪掉，保留同一句里别的内容。
+
+    从右往左剪（位置不会错乱）；左边界取句首或最近的逗号/顿号/分号，
+    右边界取最近的句末或分隔标点。剪完可能只剩称呼（「酥牧。」），
+    调用方按残余长度决定要不要丢这一句。
+    """
+    text = str(sentence or "")
+    hits = list(_PREACHY.finditer(text))
+    for m in reversed(hits):
+        start = m.start()
+        left = 0
+        for sep in _PREACHY_CLAUSE_LEFT:
+            idx = text.rfind(sep, 0, start)
+            if idx + 1 > left:
+                left = idx + 1
+        end = len(text)
+        for i in range(m.end(), len(text)):
+            if text[i] in _PREACHY_CLAUSE_END:
+                end = i + (1 if text[i] in "。！？!?…" else 0)
+                break
+        text = text[:left] + text[end:]
+    return text
 
 
 def _preachy_hits(text: str) -> int:
@@ -1080,9 +1116,34 @@ def tidy_outgoing_text(
     if _preachy_hits(body):
         olds = [str(o or "") for o in list(recent or [])[-5:]]
         if sum(1 for o in olds if _preachy_hits(o)) >= 2:
-            pieces = re.split(r"(?<=[。！？!?])", body)
-            kept = [p for p in pieces if p.strip() and not _preachy_hits(p)]
-            body = "".join(kept)
+            # v2.2.10：**剪小句，不整句删**。整句删会把回复删空（线上真发生过：
+            # 「没睡透，别闹。…可别想我理你。」→ 空 → 这一轮她一个字没说）。
+            # 先按句末标点切，句内剪掉「，别…」这类祈使小句；剪完只剩括号动作/
+            # 标点的句子才丢；全丢光就保留原文（宁可带点脾气，也不能不吭声）。
+            kept: list = []
+            for piece in re.split(r"(?<=[。！？!?])", body):
+                if not piece.strip():
+                    continue
+                if _preachy_hits(piece):
+                    piece = _strip_preachy_clauses(piece)
+                    piece = re.sub(r"[，,、；;]\s*(?=[。！？!?]|$)", "", piece)
+                    piece = re.sub(r"[，,、；;]{2,}", "，", piece).strip()
+                    residual = strip_actions(piece).strip(
+                        "，。！？!?…~～、；;：: 　"
+                    )
+                    # 剪完只剩称呼（「酥牧。」）或虚词（「了。」）→ 这一句整句不要。
+                    if len(residual) < 3:
+                        continue
+                kept.append(piece)
+            # 剪掉中间的小句后，前后两截会直接粘在一起（「没睡透上次冷落我…」），
+            # 补个逗号才是人话；前一截已经有句末标点就不补。
+            buf = ""
+            for piece in kept:
+                if buf and not buf.rstrip().endswith(tuple("。！？!?…，,、；;：:")):
+                    buf = buf.rstrip() + "，"
+                buf += piece
+            joined = buf.strip()
+            body = joined or body
     body = re.sub(r"[ \t]{2,}", " ", body).strip()
     return body
 

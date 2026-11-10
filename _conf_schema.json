@@ -444,6 +444,20 @@
         "obvious_hint": true,
         "default": true
     },
+    "allow_private_chat": {
+        "type": "bool",
+        "description": "允许私聊",
+        "hint": "总开关，默认开。关掉后她不在私聊里主动说话（续话、追话、念想、追发全部停），群聊侧不受影响。和下面的「允许群聊」一起用：只允许私聊 = 关群聊；只允许群聊 = 关私聊；两个都开 = 全开。",
+        "obvious_hint": true,
+        "default": true
+    },
+    "allow_group_chat": {
+        "type": "bool",
+        "description": "允许群聊",
+        "hint": "总开关，默认开。关掉后群聊侧全部停（心流接话、冷场破冰、起话头、群连发），私聊侧不受影响。和上面的「允许私聊」放在一起配。",
+        "obvious_hint": true,
+        "default": true
+    },
     "group_flow_enabled": {
         "type": "bool",
         "description": "群聊主动接话",

@@ -69,6 +69,7 @@ from .verify import (
     _check_cross_user_action,
     _jaccard,
     _opening_repeat_issue,
+    opening_head,
     strip_actions,
     tidy_outgoing_text,
     verify_message,
@@ -940,6 +941,79 @@ def _same_event(a: Any, b: Any, bigram_ratio: float = GROUP_SEGMENT_DUP_RATIO) -
     return False
 
 
+# 碎片段：短、且没有句末落点。线上真机（22:18:52–22:18:57）四条连发：
+#   「窗边伸了个懒腰」「眼睛闭了会儿」「骨头都松了。你刚才那句来抱抱」「还暖着呢。…」
+# 前两条就是被拆出来的半截话——一段话被拆成弹幕，读起来像她喘不上气。
+FRAGMENT_MIN_CHARS = 8
+_FRAGMENT_TAIL = ("。", "！", "？", "…", "~", "～", "!", "?", ".", "”", "’", "」", "』")
+# 问句/邀约本身就是完整的一句（「你要不要也来」「来抱抱」），不该被当碎片吞进上一句。
+_FRAGMENT_SELF_CONTAINED = re.compile(
+    r"要不要|有没有|是不是|好不好|行不行|好吗|行吗|吗|吧|啊|呀|嘛|么|？|\?"
+)
+
+
+def _is_fragment(seg: Any) -> bool:
+    """这一段是不是「没说完就被拆出来」的碎片。
+
+    纯括号动作段（「（尾巴甩了甩）」）不算碎片——那是刻意的动作描写，本来就能独立发。
+    问句/邀约也不算：短句邀约在聊天里是完整的一句。
+    """
+    raw = str(seg or "").strip()
+    if not raw:
+        return False
+    body = strip_actions(raw).strip()
+    if not body:
+        return False
+    if len(body) >= FRAGMENT_MIN_CHARS:
+        return False
+    if _FRAGMENT_SELF_CONTAINED.search(body):
+        return False
+    return not body.endswith(_FRAGMENT_TAIL)
+
+
+def _merge_fragments(
+    segments: List[str], waits: List[float]
+) -> Tuple[List[str], List[float]]:
+    """把「没说完的碎片段」并进下一段（v2.2.10）。
+
+    只在**同一轮拆段**内部合并，不改发送时机：碎片不是「多发了一条」，是
+    「一条话被切成了两半」。并进去用「，」连接；下一段不存在就并进上一段。
+    """
+    segs = [str(s or "").strip() for s in (segments or [])]
+    ws = [float(w or 0.0) for w in (waits or [])]
+    if len(segs) < 2:
+        return segs, ws
+    merged = list(segs)
+    mw = list(ws)
+    while len(mw) < len(merged):
+        mw.append(0.0)
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        # 末尾的碎片没有「下一段」可并，并进上一段。
+        if _is_fragment(merged[-1]):
+            head = merged[-2].rstrip()
+            sep = "" if head.endswith(("，", "、", ",", "；", ";", "：", ":")) else "，"
+            merged[-2] = head + sep + merged[-1].lstrip()
+            merged.pop()
+            if mw:
+                mw.pop()
+            changed = True
+            continue
+        for idx in range(len(merged) - 1):
+            if not _is_fragment(merged[idx]):
+                continue
+            head = merged[idx].rstrip()
+            sep = "" if head.endswith(("，", "、", ",", "；", ";", "：", ":")) else "，"
+            merged[idx] = head + sep + merged[idx + 1].lstrip()
+            del merged[idx + 1]
+            if idx + 1 < len(mw):
+                del mw[idx + 1]
+            changed = True
+            break
+    return merged, mw[: max(0, len(merged) - 1)]
+
+
 def _cap_group_segments(
     segments: List[str], waits: List[float], cap: int, hard_len: int = 0
 ) -> Tuple[List[str], List[float]]:
@@ -950,6 +1024,12 @@ def _cap_group_segments(
     合并后若超过单条长度上限（hard_len > 0 时）就只丢多余的段，不硬拼成超长一条。
     """
     segs = [str(s or "") for s in (segments or [])]
+    # v2.2.10：先把「没说完就被拆出来」的碎片并回相邻段，再谈去重和 cap——
+    # 碎片不是重复，是同一句话被切成了两半（真机 22:18 那四条连发）。
+    try:
+        segs, waits = _merge_fragments(segs, waits)
+    except Exception:
+        pass
     # v2.2.7 / issue #3：先去掉「同一件事的第二段」，再谈 cap。
     #
     # 线上 17 秒 4 条全是「我刚睡醒」：破冰 + 破冰 + 起话头 + 连发补充，四个入口
@@ -1300,6 +1380,33 @@ def _species_safe(engine: Any, bid: str) -> str:
         return str(engine._species_of(bid) or "")
     except Exception:
         return ""
+
+
+def _private_gate(engine: Any) -> bool:
+    """私聊总开关（v2.2.10）：`allow_private_chat`。
+
+    用 getattr 取而不是直接 self._private_allowed()——测试里的最小替身没有这个方法，
+    直接点会 AttributeError 把整条路炸掉。替身按「开」处理：替身测的是别的行为，
+    不该因为总开关缺席而全红。
+    """
+    fn = getattr(engine, "_private_allowed", None)
+    if fn is None:
+        return True
+    try:
+        return bool(fn())
+    except Exception:
+        return True
+
+
+def _group_gate(engine: Any) -> bool:
+    """群聊总开关（v2.2.10）：`allow_group_chat`。语义同 `_private_gate`。"""
+    fn = getattr(engine, "_group_allowed", None)
+    if fn is None:
+        return True
+    try:
+        return bool(fn())
+    except Exception:
+        return True
 
 
 def _group_proactive_issue(
@@ -2709,17 +2816,67 @@ class SocialEngine:
         except Exception:
             return []
 
-    def tidy_outgoing(self, text: str, bid: str, context: Any = ()) -> str:
-        """主链路出口改写：删占位符、修物种、去掉说教句、去掉没由头的「也」。
+    def _recent_own_texts(self, bid: str, uid: str, count: int = 5) -> List[str]:
+        """最近几条**她自己发出去**的聊天原话（旧→新）。
+
+        说教闸原来只看 `recent_spoken_texts`——那是本进程内存里的，插件一重载就
+        空了，也不含重启前说过的话。这里补一条从 state.json 会话历史读的路，
+        重载后立刻就知道「最近是不是已经在连着管对方」。
+        """
+        try:
+            u = self.state.user(bid, uid)
+            conv = u.get("conversation") if isinstance(u, dict) else None
+        except Exception:
+            return []
+        if not isinstance(conv, list):
+            return []
+        out: List[str] = []
+        for item in reversed(conv):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("dir", "") or "") != "out":
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if text and text not in out:
+                out.append(text)
+            if len(out) >= max(1, int(count)):
+                break
+        out.reverse()
+        return out
+
+    def tidy_outgoing(
+        self, text: str, bid: str, context: Any = (), uid: str = ""
+    ) -> str:
+        """主链路出口改写：删占位符、修物种、剪说教小句、去掉没由头的「也」。
 
         `context` 是**对方刚说的那句话**（`event.message_str`）：只有它里面出现
         「爱你/想你/喜欢你…」这类由头，这条才允许保留「我也爱你」。
+        `uid` 是对方 ID：用来把 state.json 会话历史里最近的出站原话并进说教闸的
+        recent（v2.2.10——内存缓冲一重载就空，重载后等于没有上下文）。
         返回改写后的正文；不需要改时原样返回；全被删空返回空串（调用方据此
         决定是否整条不发）。异常一律原样返回——出口改写坏了不该让消息发不出去。
         """
         try:
             species = _species_safe(self, bid)
             recent = self.recent_spoken_texts(5)
+            if uid:
+                merged: List[str] = []
+                for t in self._recent_own_texts(bid, str(uid), 5) + recent:
+                    if t and t not in merged:
+                        merged.append(t)
+                recent = merged[-5:]
+            # v2.2.10：普通回复的「刚」开头先**只统计不改写**——用户要的是先看数据，
+            # 攒够样本再决定出口要不要做句式轮换。
+            try:
+                self._spoken_total = int(getattr(self, "_spoken_total", 0)) + 1
+                if opening_head(text) == "刚":
+                    self._gang_head_hits = int(getattr(self, "_gang_head_hits", 0)) + 1
+                    logger.info(
+                        f"[autonomous_social][{bid}] 出口「刚」开头累计 "
+                        f"{self._gang_head_hits}/{self._spoken_total}：{str(text or '')[:30]}"
+                    )
+            except Exception:
+                pass
             ctx = context if isinstance(context, (list, tuple)) else ([context] if context else [])
             return tidy_outgoing_text(
                 text, species=species, recent=recent, context=ctx
@@ -3203,6 +3360,8 @@ class SocialEngine:
     async def _flow_reply(self, bid: str, gid: str, trigger_ts: float) -> None:
         """包一层 in-flight 释放：无论生成/发送成不成功、中途抛不抛，都把
         该群的在途标记拿掉，让后续消息能重新触发（此时计数/min_gap 已落账）。"""
+        if not _group_gate(self):
+            return
         try:
             await self._flow_reply_inner(bid, gid, trigger_ts)
         finally:
@@ -3890,6 +4049,8 @@ class SocialEngine:
         不该掀翻整轮心跳——异常逃到 `run()` 会触发崩溃退避（30s→30min），
         而且每轮复发，表现就是**所有角色一起永久安静**。
         """
+        if not _group_gate(self):
+            return
         for bid in bots:
             try:
                 due = self._icebreak_pick(bid, now)
@@ -4001,6 +4162,8 @@ class SocialEngine:
         与 `_run_icebreaks` 同样按角色隔离：这条 await 在 `try_once` 末尾，
         异常逃出去就是整轮丢失 + 崩溃退避，而且每轮复发。
         """
+        if not _group_gate(self):
+            return
         for bid in bots:
             try:
                 due = self._group_topic_pick(bid, now)
@@ -4058,6 +4221,9 @@ class SocialEngine:
         两种走同一套生成/验收/发送/落账，差别只在提示词的框（群已经安静了一阵 vs
         她自己想开个新话头）。
         """
+        if not _group_gate(self):
+            self.log(f"群 {gid} 主动发言已关闭（allow_group_chat=false），跳过")
+            return False
         umo = str(g.get("umo", "") or "")
         if not umo:
             return False
@@ -8196,6 +8362,27 @@ class SocialEngine:
             today = ""
         return bot_peer_block_reason(u, now, today)
 
+    def _private_allowed(self) -> bool:
+        """私聊侧总开关（`allow_private_chat`，默认开）。
+
+        关掉后她不在私聊里主动说话：主动消息、续话、追话、念想、私聊连发全部停。
+        取不到配置按开处理——旧配置没有这个键时行为不变。
+        """
+        try:
+            return bool(getattr(self.cfg, "allow_private_chat", True))
+        except Exception:
+            return True
+
+    def _group_allowed(self) -> bool:
+        """群聊侧总开关（`allow_group_chat`，默认开）。
+
+        关掉后群聊侧全部停：心流接话、冷场破冰、起话头、群连发。
+        """
+        try:
+            return bool(getattr(self.cfg, "allow_group_chat", True))
+        except Exception:
+            return True
+
     async def _speak(
         self,
         bid: str,
@@ -8214,6 +8401,9 @@ class SocialEngine:
         退出（发出、模型否决、验收拦下、发送失败、抛异常）都停掉。
         真正的逻辑在 `_speak_inner`。
         """
+        # v2.2.10：私聊总开关。关掉就整条路不生成（不是发出去再拦）。
+        if not _private_gate(self):
+            return False, "私聊主动已关闭（allow_private_chat=false）"
         umo = str(u.get("umo", "") or "")
         try:
             return await self._speak_inner(
@@ -9027,6 +9217,12 @@ class SocialEngine:
             return _gate_blocked(self, 
                 "short_main", _lead_why, why=str(segments[0])[:60] if segments else ""
             )
+        # v2.2.10：碎片段并回相邻段。真机 22:18:52–22:18:57 那四条连发里
+        # 「窗边伸了个懒腰」「眼睛闭了会儿」就是同一句话被切成两半发出去。
+        try:
+            segments, waits = _merge_fragments(segments, waits)
+        except Exception:
+            pass
         # 逐段验收：`parts[0]` 过了**不代表后续段也过**——模型常在结尾再补一句纯括号
         # 的内心（「（记住了 宝宝16岁…）」），拆段后那一段会**单独**发出去，看起来就是
         # 「内心独白被当成发言发了一条」。旧版只验 parts[0]，这一路完全免检。
@@ -11641,6 +11837,8 @@ class SocialEngine:
         隔多久由 `pacing.part_interval`（框架同款算法）算好；对方回了话就停——TA 已经
         接上了，再把剩下的旧话发过去就是答非所问。
         """
+        if not _private_gate(self):
+            return
         try:
             for idx, text in enumerate(rest):
                 wait = waits[idx] if idx < len(waits) else random.uniform(1.5, 3.5)
@@ -11727,6 +11925,8 @@ class SocialEngine:
         **群里有人新说话就停**：连发是同一个念头的拆分，群里别人插话后继续补旧句，
         观感就是“她不管别人说什么，自己一口气发一堆”——私聊侧早就有这道闸，群侧漏了。
         """
+        if not _group_gate(self):
+            return
         try:
             for idx, text in enumerate(rest):
                 wait = waits[idx] if idx < len(waits) else random.uniform(1.5, 3.5)

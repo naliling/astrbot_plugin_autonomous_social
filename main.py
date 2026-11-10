@@ -348,6 +348,11 @@ class AutonomousSocial(Star):
                 context = str(getattr(event, "message_str", "") or "")
             except Exception:
                 context = ""
+            # v2.2.10：说教闸的 recent 要从会话历史取（内存缓冲一重载就空）。
+            try:
+                uid = str(event.get_sender_id() or "")
+            except Exception:
+                uid = ""
             changed = False
             new_chain: list = []
             for comp in chain:
@@ -355,7 +360,7 @@ class AutonomousSocial(Star):
                 if not isinstance(text, str):
                     new_chain.append(comp)
                     continue
-                cleaned = engine.tidy_outgoing(text, bid, context)
+                cleaned = engine.tidy_outgoing(text, bid, context, uid)
                 if cleaned == text:
                     new_chain.append(comp)
                     continue

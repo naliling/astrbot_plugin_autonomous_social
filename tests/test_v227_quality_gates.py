@@ -396,5 +396,141 @@ class EchoAlsoTest(unittest.TestCase):
         self.assertIn("别用「也」接", src, "主动消息提示词没有禁止「也」")
 
 
+class FragmentMergeTest(unittest.TestCase):
+    """没说完就被拆出来的碎片段要并回相邻段（v2.2.10）。
+
+    真机样本（22:18:52–22:18:57）四条连发：
+      「窗边伸了个懒腰」「眼睛闭了会儿」「骨头都松了。你刚才那句来抱抱」「还暖着呢。…」
+    前两条是同一句话被切成两半。
+    """
+
+    def test_short_fragment_merged_into_next(self):
+        segs, waits = engine_mod._merge_fragments(
+            ["窗边伸了个懒腰", "眼睛闭了会儿。你刚才那句来抱抱"], [1.2]
+        )
+        self.assertEqual(len(segs), 1, f"碎片没并进去：{segs!r}")
+        self.assertIn("窗边伸了个懒腰", segs[0])
+        self.assertIn("眼睛闭了会儿", segs[0])
+        self.assertEqual(waits, [], "并成一段后不该还留着段间隔")
+
+    def test_complete_sentence_not_merged(self):
+        segs, _ = engine_mod._merge_fragments(
+            ["我下午在阳台晒了会儿太阳。", "你要不要也来"], [1.0]
+        )
+        self.assertEqual(len(segs), 2, f"完整句子不该被并：{segs!r}")
+
+    def test_pure_action_segment_kept(self):
+        # 纯括号动作段是刻意的动作描写，本来就能独立发，不算碎片。
+        segs, _ = engine_mod._merge_fragments(
+            ["（尾巴甩了甩）", "我才没有想你。"], [1.0]
+        )
+        self.assertEqual(len(segs), 2, f"纯动作段被误并：{segs!r}")
+
+    def test_last_fragment_merged_into_previous(self):
+        segs, _ = engine_mod._merge_fragments(
+            ["骨头都松了。", "还暖着呢"], [1.0]
+        )
+        self.assertEqual(len(segs), 1, f"末段碎片没并进上一段：{segs!r}")
+        self.assertIn("还暖着呢", segs[0])
+
+
+class PreachyClauseTrimTest(unittest.TestCase):
+    """说教只剪小句，不整句删、更不能把整条删空（v2.2.10）。
+
+    线上 22:39:53 的清理日志：「主链路回复清理后为空，这条不发：
+    '（嘟囔着拱了拱）没睡透，别闹。上次冷落我可还记着仇呢，不给我补偿可别想我理你。'」
+    ——她那一轮一个字没说，比说教更糟。
+    """
+
+    _RECENT = ["酥牧别刨根问底了。", "酥牧别再吵我了。"]
+
+    def test_clause_trimmed_sentence_kept(self):
+        got = verify_mod.tidy_outgoing_text(
+            "（嘟囔着拱了拱）没睡透，别闹。", recent=self._RECENT
+        )
+        self.assertNotIn("别闹", got, f"祈使小句没剪掉：{got!r}")
+        self.assertIn("没睡透", got, f"把正经内容一起删了：{got!r}")
+        self.assertTrue(got.strip(), "整条被删空了")
+
+    def test_whole_message_never_emptied(self):
+        got = verify_mod.tidy_outgoing_text(
+            "少自作多情了。酥牧别胡思乱想。", recent=self._RECENT
+        )
+        self.assertTrue(
+            got.strip(), "整条全被删空——宁可带点脾气也不能让她这轮不吭声"
+        )
+
+    def test_name_only_residue_dropped(self):
+        got = verify_mod.tidy_outgoing_text(
+            "酥牧别胡思乱想。我正忙着收桌上的旧票据呢。", recent=self._RECENT
+        )
+        self.assertNotIn("别胡思乱想", got, f"祈使小句没剪掉：{got!r}")
+        self.assertIn("旧票据", got, f"同一条里别的内容被误删：{got!r}")
+
+
+class ChannelSwitchTest(unittest.TestCase):
+    """v2.2.10：私聊 / 群聊总开关（`allow_private_chat` / `allow_group_chat`）。
+
+    用户要的是「只允许私聊 / 只允许群聊 / 全开」三种组合，两个默认值都为开，
+    两个开关放在同一处（配置面板相邻两项）。原来群侧没有任何总开关，私聊也没有；
+    这次两边补齐，且**每个发送入口都要真的早退**——只加配置项不加闸，面板上关掉
+    也照样发，等于假开关。
+    """
+
+    def _engine(self, **cfg):
+        eng = object.__new__(engine_mod.SocialEngine)
+        eng.cfg = types.SimpleNamespace(**cfg)
+        return eng
+
+    def test_defaults_are_on(self):
+        eng = self._engine(allow_private_chat=True, allow_group_chat=True)
+        self.assertTrue(eng._private_allowed())
+        self.assertTrue(eng._group_allowed())
+
+    def test_missing_keys_default_to_on(self):
+        eng = self._engine()
+        self.assertTrue(eng._private_allowed(), "旧配置没这个键时必须按开处理")
+        self.assertTrue(eng._group_allowed(), "旧配置没这个键时必须按开处理")
+
+    def test_private_off_does_not_touch_group(self):
+        eng = self._engine(allow_private_chat=False, allow_group_chat=True)
+        self.assertFalse(eng._private_allowed())
+        self.assertTrue(eng._group_allowed(), "关私聊不该顺手把群聊也关掉")
+
+    def test_group_off_does_not_touch_private(self):
+        eng = self._engine(allow_private_chat=True, allow_group_chat=False)
+        self.assertFalse(eng._group_allowed())
+        self.assertTrue(eng._private_allowed(), "关群聊不该顺手把私聊也关掉")
+
+    def test_schema_has_both_switches_default_true(self):
+        import json
+
+        schema = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        for key in ("allow_private_chat", "allow_group_chat"):
+            self.assertIn(key, schema, f"schema 缺 {key}")
+            self.assertIs(schema[key]["default"], True, key)
+            self.assertEqual(schema[key]["type"], "bool", key)
+
+    def test_every_group_entry_gated(self):
+        import inspect
+
+        for name in (
+            "_flow_reply",
+            "_run_icebreaks",
+            "_run_group_topics",
+            "_icebreak",
+            "_send_group_burst_followup",
+        ):
+            src = inspect.getsource(getattr(engine_mod.SocialEngine, name))
+            self.assertIn("_group_gate(self)", src, f"{name} 没有查群聊总开关")
+
+    def test_every_private_entry_gated(self):
+        import inspect
+
+        for name in ("_speak", "_send_burst_followup"):
+            src = inspect.getsource(getattr(engine_mod.SocialEngine, name))
+            self.assertIn("_private_gate(self)", src, f"{name} 没有查私聊总开关")
+
+
 if __name__ == "__main__":
     unittest.main()

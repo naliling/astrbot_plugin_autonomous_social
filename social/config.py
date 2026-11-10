@@ -1060,6 +1060,15 @@ class SocialConfig:
     greeting_night_end: int = GREETING_NIGHT_END_DEFAULT
 
     # 群聊主动（v1.11.0）：心流主动回复 / 发言参考库 / 冷场破冰，各自独立开关
+    # ─── 私聊 / 群聊总开关（v2.2.10）───
+    # 两个开关放在一起、默认都开（= 全开）。组合：
+    #   只允许私聊 = allow_private_chat=True,  allow_group_chat=False
+    #   只允许群聊 = allow_private_chat=False, allow_group_chat=True
+    #   全开       = 两个都 True（默认）
+    # 它们管的是**主动行为**（主动消息/续话/追话/念想 与 群心流/破冰/起话头/群连发），
+    # 不管 AstrBot 主链路回不回话；`private_only` 是旧的历史导入开关，语义不同。
+    allow_private_chat: bool = True
+    allow_group_chat: bool = True
     group_flow_enabled: bool = True
     group_icebreak_enabled: bool = True
     group_ref_lib_enabled: bool = True
@@ -1606,6 +1615,8 @@ class SocialConfig:
             greeting_night_end=max(
                 HOUR_MIN + 1, min(HOUR_MAX + 1, gi("greeting_night_end", GREETING_NIGHT_END_DEFAULT))
             ),
+            allow_private_chat=gb("allow_private_chat", True),
+            allow_group_chat=gb("allow_group_chat", True),
             group_flow_enabled=gb("group_flow_enabled", True),
             group_icebreak_enabled=gb("group_icebreak_enabled", True),
             group_ref_lib_enabled=gb("group_ref_lib_enabled", True),
