@@ -145,8 +145,9 @@ class SchemaContractTest(unittest.TestCase):
         for key in NEW_KEYS:
             self.assertIs(SCHEMA[key]["default"], getattr(SocialConfig(), key), key)
 
-    def test_schema_key_count_is_130(self):
-        self.assertEqual(len(SCHEMA), 131)
+    def test_schema_key_count_is_132(self):
+        # v2.2.7：新增 decorate_outgoing（出口改写），131 → 132。
+        self.assertEqual(len(SCHEMA), 132)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -232,7 +233,8 @@ class ReadmeTest(unittest.TestCase):
 
     def test_count_line_matches_schema(self):
         self.assertEqual(_readme_count(), len(SCHEMA))
-        self.assertEqual(_readme_count(), 131)
+        # v2.2.7：新增 decorate_outgoing，README 的「共 N 项」跟着 131 → 132。
+        self.assertEqual(_readme_count(), 132)
 
 
 class EngineWiringTest(unittest.TestCase):

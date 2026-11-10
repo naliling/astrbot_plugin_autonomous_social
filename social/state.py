@@ -2419,9 +2419,18 @@ class SocialState:
         self.mark_dirty()
 
     def life_used_elsewhere(
-        self, bid: str, line: str, gid: str, now: float, hours: float = 6.0
+        self, bid: str, line: str, gid: str, now: float, hours: float = 6.0,
+        same_group: bool = False,
     ) -> bool:
-        """这条素材最近是不是已经给**别的群**用过了。"""
+        """这条素材最近是不是已经用过了。
+
+        `same_group=False`（旧行为）：只算**别的群**用过的——防止同一件事在五个群
+        各播一遍。
+
+        `same_group=True`（v2.2.7 / issue #2）：**本群**用过也算。线上「旧票据」
+        在同一个群 15:22 说了两遍、15:45 又说两遍，正是旧判据 `gid != 本群`
+        把同群重复全部放行的结果。同一个群里，同一件事六小时内说第二遍就是复读。
+        """
         key = _norm_life_key(line)
         if not key:
             return False
@@ -2434,9 +2443,59 @@ class SocialState:
                 continue
             if _safe_ts(r.get("ts")) < cutoff:
                 continue
+            if same_group:
+                return True
             if str(r.get("gid", "")) != str(gid):
                 return True
         return False
+
+    def anchor_used_for(
+        self, bid: str, uid: str, about: str, now: float, hours: float = 12.0
+    ) -> bool:
+        """这个由头最近是不是已经派给**这个人**了（v2.2.7 / issue #13）。
+
+        旧逻辑只看「是不是发给过别人」（`anchor_recent_users` + `uid not in _used_by`），
+        于是同一个人可以连着收到同一件事：「外头才5度 + 上午去超市 + 硬邦邦」
+        在 85 秒内说了两遍，第二遍还换了个比喻。
+        """
+        want = str(about or "").strip()
+        if not want:
+            return False
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        u = (self.bot(bid).get("users") or {}).get(str(uid)) or {}
+        for e in (u.get("proactive_log") or []):
+            if not isinstance(e, dict):
+                continue
+            if _safe_ts(e.get("ts")) < cutoff:
+                continue
+            if str(e.get("about") or "").strip() == want:
+                return True
+        return False
+
+    def life_lines_used_in_group(
+        self, bid: str, gid: str, now: float, hours: float = 6.0
+    ) -> List[str]:
+        """最近**在这个群**用过的生活素材（归一化后的键）。
+
+        v2.2.7 / issue #2：素材层已经按同群去重剔过一遍，但模型仍可能把「旧票据」
+        换个说法再讲一次。这道取数给发送前的质量闸用：生成的正文如果和本群刚用过
+        的素材高度重合，就是同一件事又讲了一遍。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        used = self.bot(bid).get("life_used")
+        out: List[str] = []
+        if not isinstance(used, dict):
+            return out
+        for key, rows in used.items():
+            for r in (rows or []):
+                if not isinstance(r, dict):
+                    continue
+                if _safe_ts(r.get("ts")) < cutoff:
+                    continue
+                if str(r.get("gid", "")) == str(gid):
+                    out.append(str(key))
+                    break
+        return out
 
     def recent_group_self_others(
         self, bid: str, gid: str, now: float, hours: float = 2.0

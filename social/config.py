@@ -618,6 +618,12 @@ GROUP_TOPIC_MAX_SEGMENTS_DEFAULT = 2
 # 用户把私聊阈值调得更严就跟着更严，但不会比 0.6 更宽。
 GROUP_CROSS_GROUP_RATIO_MAX = 0.6
 
+# v2.2.7（issue #3）：同一条连发里，两段**说的是同一件事**就合并成一段。
+# 判据是字符二元组重合度：0.45 能抓住「刚醒，睡0小时，趴床上赖着」与
+# 「（趴在床上把翅膀摊开）才睡0小时就醒了」这种换了说法的重复，又不会把
+# 「先说了水壶，又说了窗外」这种两件不同的事误并。
+GROUP_SEGMENT_DUP_RATIO = 0.45
+
 # 超过这么多天没在某个群见到任何消息，就当已经不在这个群了（被踢/退群/群解散）：
 # 不再对它破冰，并在清理时丢掉它的样本。心流本身只由实时群消息驱动，被踢自然就停。
 GROUP_STALE_DAYS_MIN = 1
@@ -872,6 +878,10 @@ class SocialConfig:
 
     # 是否把 bot 在主链路里自己说的话也记进对话账本（追问判定的地基）
     track_own_replies: bool = True
+
+    # v2.2.7：普通对话回复发出前的确定性清理（占位符/物种用词/连着的说教句）。
+    # 默认开——线上被投诉的那几句全部来自普通回复，而那条链本来没有任何闸。
+    decorate_outgoing: bool = True
 
     # 主动发出的消息要不要追加进 AstrBot 的会话历史（WebUI 可见、别的插件读得到）
     persist_proactive_history: bool = True
@@ -1731,6 +1741,7 @@ class SocialConfig:
                 min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
             track_own_replies=gb("track_own_replies", True),
+            decorate_outgoing=gb("decorate_outgoing", True),
             persist_proactive_history=gb("persist_proactive_history", True),
             use_core_clock=gb("use_core_clock", True),
             use_core_facade=facade_mode,

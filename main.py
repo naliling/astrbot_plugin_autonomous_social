@@ -91,6 +91,46 @@ if on_llm_request is None:
 else:
     HOOK_LLM_REQUEST = True
 
+# on_decorating_result 钩子：发送前最后一道确定性清理（v2.2.7）。
+# 主动消息那条链有完整验收，普通对话回复却一道闸都没有——线上被投诉的说教句、
+# 「手还有点僵」、「(Model response will be rendered here)」原文，全部来自普通回复
+# （state.json 里 src=chat）。普通回复的提示词不在本插件手里，所以这里只做
+# **不改语义**的三件事：删占位符、蹄类把身体部位的「手」改「蹄子」、已经在连着
+# 纠正对方时删掉那条里继续纠正对方的句子。
+on_decorating_result = None
+try:
+    from astrbot.api.event.filter import on_decorating_result  # type: ignore[assignment]
+except Exception:
+    try:
+        from astrbot.api.event import filter as _filter_mod3  # type: ignore[assignment]
+        on_decorating_result = getattr(_filter_mod3, "on_decorating_result", None)
+    except Exception as _e:
+        logger.info(
+            f"[autonomous_social] 未找到 on_decorating_result 钩子（{_e}），"
+            "主链路回复不做发送前清理"
+        )
+        on_decorating_result = None
+
+if on_decorating_result is None:
+    def on_decorating_result(_func=None, **_kwargs):
+        if _func is not None:
+            return _func
+
+        def _decorator(func):
+            return func
+
+        return _decorator
+
+    HOOK_DECORATE_RESULT = False
+else:
+    HOOK_DECORATE_RESULT = True
+
+# 消息组件：改链要用 Plain 重建。拿不到就整条放弃清理（不影响发送）。
+try:
+    from astrbot.api.message_components import Plain  # type: ignore[assignment]
+except Exception:
+    Plain = None  # type: ignore[assignment,misc]
+
 # ProviderRequest：用于类型提示，拿不到就用 Any
 try:
     from astrbot.api.provider import ProviderRequest  # type: ignore[assignment]
@@ -272,6 +312,65 @@ class AutonomousSocial(Star):
             await self._engine.note_spoken(event)
         except Exception as exc:
             logger.warning(f"[autonomous_social] 记录已发送消息失败: {exc}")
+
+    @on_decorating_result()
+    async def tidy_outgoing(self, event: AstrMessageEvent):
+        """发送前清理普通对话回复（v2.2.7，默认开启）。
+
+        只改文本、不改语义：删模板占位符、蹄类把身体部位的「手」改「蹄子」、
+        已经在连着纠正对方时删掉这条里继续纠正对方的句子。清理后整条为空就
+        `clear_result()`——宁可这一轮不回，也不把「(Model response will be
+        rendered here)」发出去。
+        """
+        if self._engine is None or Plain is None:
+            return
+        try:
+            engine = self._engine
+            cfg = getattr(engine, "cfg", None)
+            if cfg is None or not getattr(cfg, "enabled", False):
+                return
+            if not getattr(cfg, "decorate_outgoing", True):
+                return
+            result = event.get_result()
+            if result is None:
+                return
+            chain = list(getattr(result, "chain", None) or [])
+            if not chain:
+                return
+            bid = engine._get_bot_id(event)
+            if not bid:
+                return
+            changed = False
+            new_chain: list = []
+            for comp in chain:
+                text = getattr(comp, "text", None)
+                if not isinstance(text, str):
+                    new_chain.append(comp)
+                    continue
+                cleaned = engine.tidy_outgoing(text, bid)
+                if cleaned == text:
+                    new_chain.append(comp)
+                    continue
+                changed = True
+                if cleaned.strip():
+                    try:
+                        new_chain.append(Plain(cleaned))
+                    except Exception:
+                        comp.text = cleaned
+                        new_chain.append(comp)
+                else:
+                    logger.info(
+                        f"[autonomous_social][{bid}] 主链路回复清理后为空，"
+                        f"这条不发：{text[:40]!r}"
+                    )
+            if not changed:
+                return
+            if not new_chain:
+                event.clear_result()
+                return
+            result.chain = new_chain
+        except Exception as exc:
+            logger.warning(f"[autonomous_social] 发送前清理失败，原样发送: {exc}")
 
     @on_llm_request()
     async def inject_proactive_context(

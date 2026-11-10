@@ -379,6 +379,14 @@
         "default": true,
         "collapsed": true
     },
+    "decorate_outgoing": {
+        "type": "bool",
+        "description": "普通回复发送前清理",
+        "hint": "开启后，普通对话回复发出前会删掉模板占位符（如 (Model response will be rendered here)）、把蹄类角色身体部位的「手」改成「蹄子」、在连着纠正对方时删掉继续纠正的那句。只改文本不改语义；清理后整条为空则这一轮不发。默认开启。",
+        "obvious_hint": true,
+        "default": true,
+        "collapsed": true
+    },
     "persist_proactive_history": {
         "type": "bool",
         "description": "主动消息写入会话历史",

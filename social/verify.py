@@ -825,6 +825,207 @@ def _check_pressure(text: str) -> str:
     return "把自己的不安推给对方（催回+计较没回）"
 
 
+# ─── 占位符残留（v2.2.7 / issue #11）────────────────────────────
+#
+# 线上真实事故：`04:55:48` 一条消息原样发出了
+# `(Model response will be rendered here)`。
+#
+# 这串不是插件生成的——全仓 grep 无命中，它是上游/前端模板里的占位文字被模型
+# 或转发链当成正文吐了出来。但**发出去就是插件的事**：用户看到的是一个括号里
+# 写着「模型回复将在此处渲染」的消息。
+#
+# 旧实现 `sanitize.looks_like_framework_only()` 只认「整条都是框架块」，
+# 这条一旦混在正常句子里（`今天好累 (Model response will be rendered here)`）
+# 就 `framework_only=False` 直接放行。所以这里改成**子串级**兜底。
+_PLACEHOLDER_RESIDUE = re.compile(
+    r"model\s+response\s+will\s+be\s+rendered\s+here"
+    r"|will\s+be\s+rendered\s+here"
+    r"|rendered\s+here"
+    r"|模型(?:的)?回复(?:将|会)?(?:在)?此(?:处|地)渲染"
+    r"|回复将(?:在)?此处(?:渲染|显示)"
+    r"|\{\{\s*(?:response|reply|content|message)\s*\}\}",
+    re.I,
+)
+
+
+# ─── 开头轮换（v2.2.7 / issue #1）────────────────────────────────
+#
+# 线上真实数据：破冰 27 条里 15 条以「刚」开头（「刚用魔法烧了壶水」
+# 「刚用蹄子夹着杯子泡茶，洒了半桌」「刚醒，睡0小时」…）。
+#
+# 这不是模型懒：生成侧提示词写着「说一件你刚做完的小事」，模型把「刚做完」
+# 读成了「以刚字开头」——**提示词教的句式，模型照抄了**。
+#
+# 私聊侧早就有这道闸（`generator.py:2934` 的「你最近开头用过：…这几个这次都
+# 别用了」），群聊侧一直没有。这里补上，判据是**统计**不是禁词：
+# 最近 6 条里同一个开头字出现 ≥3 次，才禁这一个字，不是永久禁用。
+_OPENING_TRIM = " \t\r\n（(【[「『\"'·—…,，。.、!！?？~～；;：:"
+
+
+def opening_head(text: str) -> str:
+    """一条消息的「开头字」：剥掉括号动作与标点后的第一个字。
+
+    `（趴在床上把翅膀摊开）才睡0小时就醒了` → `才`
+    `刚用蹄子夹着杯子泡茶` → `刚`
+    """
+    body = strip_actions(str(text or "")).strip()
+    body = body.lstrip(_OPENING_TRIM)
+    return body[:1]
+
+
+def _opening_repeat_issue(
+    text: str, openings: Sequence[str], window: int = 6, limit: int = 3
+) -> Optional[str]:
+    """这条的开头字在最近几条里已经用滥了。"""
+    heads = [opening_head(o) for o in list(openings or [])[-window:]]
+    heads = [h for h in heads if h]
+    cur = opening_head(text)
+    if not cur or not heads:
+        return None
+    hit = heads.count(cur)
+    if hit >= limit:
+        return (
+            f"开头重复（最近 {len(heads)} 条里 {hit} 条以「{cur}」开头，换个说法起头）"
+        )
+    return None
+
+
+def _check_placeholder_residue(text: str) -> Optional[str]:
+    """正文（含括号内）混进了模板占位符——无条件拒。"""
+    hit = _PLACEHOLDER_RESIDUE.search(str(text or ""))
+    if hit:
+        return f"占位符残留（「{hit.group(0)[:32]}」不是她能说的话）"
+    return None
+
+
+# ─── 物种/身体一致（v2.2.7 / issue #10）──────────────────────────
+#
+# 线上真实样本：露娜是**蹄类**，却说出「我刚醒手还有点僵」。
+#
+# 为什么放在验收层而不是只靠提示词：物种信息（`brief["her"]["species"]`）
+# 已经注入了提示词，模型照样写「手」——这类错误是**概率性的**，提示词权重再高
+# 也会漏。而它是硬事实错误，发出去立刻穿帮，属于必须拦的一类。
+#
+# 只对**明确蹄类/兽类**角色生效：物种为空（旧 Core、没配物种）时不查，
+# 避免把「人手」当错。词表也刻意只认**身体部位用法**，不认「手机/手套/顺手/
+# 手艺」这类构词——`顺手把杯子放下` 是蹄子也说得通的人话。
+_HOOF_SPECIES = re.compile(
+    r"马|鹿|羊|牛|驴|驼|麒麟|独角兽|半人马|人马|蹄|兽|龙|狼|狐|猫|犬|兔|鸟|鹰|羽"
+)
+_HAND_BODY = re.compile(
+    # 「手还有点僵」「手冷」「手抖」「手冻得发僵」——身体状态。
+    # 中间只允许程度/时态小词，不允许任意字：否则「顺手把凉水倒了」这种
+    # 蹄子也说得通的人话会被误判成「手」。
+    r"手(?:(?:还|都|也|好|很|太|有点|有些|一点儿?|发|冻得|凉得|僵得)){0,3}"
+    r"(?:僵|冷|冰|凉|抖|酸|疼|痛|麻|湿|软|硬|热|暖|脏)"
+    # 「抬起手」「搓了搓手」「捧着…手」
+    r"|(?:抬起|举起|伸出|摊开|握着|攥着|搓|揉|捧|捏|拍|摸|吹|甩)(?:了)?(?:双|一只|两只|两)?手"
+    # 明确的身体部位词
+    r"|手(?:心|背|掌|指|腕|肘|臂)"
+    r"|(?:双|两只|一只|左|右)手",
+)
+
+
+def _check_species(text: str, species: str = "") -> Optional[str]:
+    """蹄类/兽类角色不许出现「手」这类人形身体部位。
+
+    `species` 为空或非蹄类时一律放行——宁可不查，也不要把正常说法判死。
+    """
+    sp = _s(species).strip()
+    if not sp or not _HOOF_SPECIES.search(sp):
+        return None
+    hit = _HAND_BODY.search(str(text or ""))
+    if hit:
+        return (
+            f"身体不一致（她是{sp}，没有「{hit.group(0)}」这种东西）"
+        )
+    return None
+
+
+# ─── 说教/连续纠正对方（v2.2.7 / issue #6）───────────────────────
+#
+# 线上真实样本（娜莉灵对同一个人 6 条里 4 条）：
+#   「酥牧别刨根问底了」「酥牧别再吵我了」「酥牧问这个干嘛」
+#   「酥牧别胡思乱想」「酥牧别一惊一乍的」「少自作多情了」「算你老实」
+#
+# 单看一句都像角色在逗弄，**连着看就是在管对方**：你问多了、你烦、你想错了、
+# 你大惊小怪。用户原话是「自以为是」。
+#
+# 所以判据不是禁词，是**频次**：最近 5 条里已经有 2 条在纠正对方，
+# 这一条又想纠正 → 拒。偶尔一句「别闹」是情趣，连着五句是训话。
+_PREACHY = re.compile(
+    r"别(?:再)?(?:问|管|吵|闹|想|猜|打听|刨根问底|胡思乱想|一惊一乍|自作多情|瞎想|乱猜)"
+    r"|别[^，。！？、,.!?;]{0,6}了"
+    r"|少(?:自作多情|来这套|管闲事|废话|装)"
+    r"|不(?:许|准)[^，。！？、,.!?;]{0,6}(?:了|吧)?"
+    r"|算你(?:老实|识相|识趣)"
+    r"|问(?:这个|这些|这么多)?(?:干嘛|干什么)"
+    r"|多管闲事|大惊小怪|一惊一乍|胡思乱想|自作多情"
+)
+
+
+def _preachy_hits(text: str) -> int:
+    """这条里有几处「在纠正/指挥对方」。"""
+    return len(_PREACHY.findall(str(text or "")))
+
+
+def _check_preachy(text: str, recent: Sequence[str], window: int = 5, limit: int = 2) -> Optional[str]:
+    """最近几条已经连续在纠正对方，这条还来 → 拒。
+
+    `limit=2`：窗口里已有 2 条在管对方，就说明进入「说教模式」了。
+    一条都不拦——单句逗弄是人物性格，不是毛病。
+    """
+    olds = [str(o or "") for o in list(recent or [])[-window:]]
+    if sum(1 for o in olds if _preachy_hits(o)) < limit:
+        return None
+    if _preachy_hits(text) <= 0:
+        return None
+    return "又在纠正对方（最近几条已经连着在管 TA 了，换成回应 TA 或说自己的事）"
+
+
+def tidy_outgoing_text(
+    text: str, *, species: str = "", recent: Sequence[str] = ()
+) -> str:
+    """主链路回复的**确定性清理**（`on_decorating_result` 用，v2.2.7）。
+
+    主动消息那条链有完整验收，普通对话回复却一道闸都没有——线上被投诉的说教句、
+    「手还有点僵」、占位符原文，全部来自普通回复（`state.json` 里 `src=chat`）。
+    但普通回复的提示词不在本插件手里（由人设/主链路决定），所以这里只做**不改语义**
+    的三件事：
+
+    1. 删掉模板占位符（「(Model response will be rendered here)」）；
+    2. 蹄类角色把身体部位的「手」改成「蹄子」；
+    3. 最近已经在连着纠正对方时，删掉这条里继续纠正对方的那几句。
+
+    改不动就原样返回；删空了返回空串，由调用方决定这条不发。
+    """
+    body = str(text or "")
+    if not body.strip():
+        return body
+    body = _PLACEHOLDER_RESIDUE.sub("", body)
+    sp = _s(species).strip()
+    if sp and _HOOF_SPECIES.search(sp):
+        for old, new in (
+            ("双手", "两只蹄子"),
+            ("两只手", "两只蹄子"),
+            ("一只手", "一只蹄子"),
+            ("左手", "左蹄"),
+            ("右手", "右蹄"),
+        ):
+            body = body.replace(old, new)
+        body = _HAND_BODY.sub(
+            lambda m: m.group(0).replace("手", "蹄子", 1), body
+        )
+    if _preachy_hits(body):
+        olds = [str(o or "") for o in list(recent or [])[-5:]]
+        if sum(1 for o in olds if _preachy_hits(o)) >= 2:
+            pieces = re.split(r"(?<=[。！？!?])", body)
+            kept = [p for p in pieces if p.strip() and not _preachy_hits(p)]
+            body = "".join(kept)
+    body = re.sub(r"[ \t]{2,}", " ", body).strip()
+    return body
+
+
 def verify_message(
     text: str,
     *,
@@ -833,6 +1034,7 @@ def verify_message(
     require_about_peer: bool = False,
     allow_short: bool = False,
     msg_type: str = "",
+    species: str = "",
 ) -> Tuple[bool, str]:
     """验收一条即将发出的消息。返回 (通过, 原因)。
 
@@ -862,6 +1064,10 @@ def verify_message(
     reason = _check_protocol_residue(text)
     if reason:
         return False, reason
+    # v2.2.7 / issue #11：占位符子串级兜底（旧实现只认整条框架块）。
+    reason = _check_placeholder_residue(text)
+    if reason:
+        return False, reason
     reason = _check_pressure(text)
     if reason:
         return False, reason
@@ -872,7 +1078,15 @@ def verify_message(
     reason = _check_ultimatum(text)
     if reason:
         return False, reason
+    # v2.2.7 / issue #6：连续纠正对方（「别…」「少…」「算你…」）。
+    reason = _check_preachy(text, recent)
+    if reason:
+        return False, reason
     reason = _check_wall(text)
+    if reason:
+        return False, reason
+    # v2.2.7 / issue #10：物种与身体部位一致性（蹄类不许说「手」）。
+    reason = _check_species(text, species)
     if reason:
         return False, reason
     # 剥掉标题行之后**还是**标题样子的，说明整条只有一句标题没有正文。

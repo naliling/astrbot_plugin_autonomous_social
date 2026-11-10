@@ -55,6 +55,7 @@ from .closing import (
 )
 from .config import (
     GROUP_CROSS_GROUP_RATIO_MAX,
+    GROUP_SEGMENT_DUP_RATIO,
     SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
     SocialConfig,
 )
@@ -67,7 +68,9 @@ from .verify import (
     _check_cross_user,
     _check_cross_user_action,
     _jaccard,
+    _opening_repeat_issue,
     strip_actions,
+    tidy_outgoing_text,
     verify_message,
 )
 from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
@@ -877,6 +880,66 @@ def _life_line_used(line: Any, segments: Any) -> bool:
     return all(ch in it for ch in key)
 
 
+def _event_text(text: Any) -> str:
+    """去掉括号动作与标点，只留正文——比「是不是同一件事」时不该被动作干扰。"""
+    body = _ACTION_SPAN_RE.sub("", str(text or ""))
+    return re.sub(r"[\s\u3000，。！？、,.!?;:：；…—\-~～\"'“”‘’()（）\[\]【】]+", "", body)
+
+
+# 纯功能字组成的「共同片段」不算同一件事：「我刚」「了壶」「把窗」这种重合到处都是。
+_EVENT_STOP_CHARS = frozenset(
+    "刚了的是在把我和你她他它就还也都很有这那个一上下里到与么呢吧啊着过要会能"
+)
+# 共同片段至少这么长才算「同一件事」的证据（「睡0小时」「洒了半桌」这种）。
+EVENT_RUN_MIN = 3
+# 字符集合重合度：比 bigram 松，用来抓「换个说法的同一件事」。
+EVENT_CHAR_RATIO = 0.30
+
+
+def _common_run(a: str, b: str) -> str:
+    """最长**连续**公共子串（不是子序列）。
+
+    子序列会把「刚…泡茶…洒了半桌」和「泡茶…洒了半桌」算成同一件事，也会把毫不相干
+    的两句因为共享几个功能字算成同一件事；连续片段才是「同一件事」的可靠证据。
+    """
+    if not a or not b:
+        return ""
+    best_len, best_end = 0, 0
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best_len:
+                    best_len, best_end = cur[j], i
+        prev = cur
+    return a[best_end - best_len:best_end]
+
+
+def _same_event(a: Any, b: Any, bigram_ratio: float = GROUP_SEGMENT_DUP_RATIO) -> bool:
+    """这两段说的是不是同一件事（v2.2.7 / issue #3）。
+
+    三条任一成立即算：措辞级 bigram 高度重合 / 字符集合重合度高 / 有一段够长的
+    共同连续片段。第三条是主力：「刚醒，睡0小时」和「才睡0小时就醒了」措辞差得远，
+    但共享「睡0小时」这 4 个字——线上 17 秒 4 条说的就是这一件事。
+    """
+    ta, tb = _event_text(a), _event_text(b)
+    if not ta or not tb:
+        return False
+    try:
+        if _jaccard(_bigrams(ta), _bigrams(tb)) >= bigram_ratio:
+            return True
+        if _jaccard(set(ta), set(tb)) >= EVENT_CHAR_RATIO:
+            return True
+    except Exception:
+        return False
+    run = _common_run(ta, tb)
+    if len(run) >= EVENT_RUN_MIN and not all(ch in _EVENT_STOP_CHARS for ch in run):
+        return True
+    return False
+
+
 def _cap_group_segments(
     segments: List[str], waits: List[float], cap: int, hard_len: int = 0
 ) -> Tuple[List[str], List[float]]:
@@ -887,6 +950,32 @@ def _cap_group_segments(
     合并后若超过单条长度上限（hard_len > 0 时）就只丢多余的段，不硬拼成超长一条。
     """
     segs = [str(s or "") for s in (segments or [])]
+    # v2.2.7 / issue #3：先去掉「同一件事的第二段」，再谈 cap。
+    #
+    # 线上 17 秒 4 条全是「我刚睡醒」：破冰 + 破冰 + 起话头 + 连发补充，四个入口
+    # 各发一句，cap 只把它们并成两条，说的还是同一件事。并段治不了复读，得先认出
+    # 「这两段是一件事」再丢。判据见 `_same_event`：共享的连续片段才是证据
+    # （「睡0小时」「洒了半桌」），整体相似度抓不住换个说法的同一件事。
+    if len(segs) > 1:
+        _kept_segs: List[str] = []
+        _kept_waits: List[float] = []
+        _w = list(waits or [])
+        for _i, _seg in enumerate(segs):
+            _dup = False
+            for _prev in _kept_segs:
+                try:
+                    if _same_event(_prev, _seg):
+                        _dup = True
+                        break
+                except Exception:
+                    continue
+            if _dup:
+                continue
+            _kept_segs.append(_seg)
+            if _i > 0:
+                _kept_waits.append(_w[_i - 1] if _i - 1 < len(_w) else 0.0)
+        segs = _kept_segs
+        waits = _kept_waits
     if cap <= 0 or len(segs) <= cap:
         return list(segs), list(waits or [])
     merged = list(segs[:cap])
@@ -1201,13 +1290,35 @@ _GROUP_CONCRETE_WORDS = tuple(_FLOW_SELF_ANCHOR_WORDS) + (
 )
 
 
-def _group_proactive_issue(segments) -> str:
+def _species_safe(engine: Any, bid: str) -> str:
+    """取角色种族，取不到一律空串（v2.2.7）。
+
+    验收层和素材兜底都要用它，而这两处会被大量最小替身直接调用；替身上没有
+    `_species_of` 时不能因此整条路径炸掉——物种只是「更准」，不是「必需」。
+    """
+    try:
+        return str(engine._species_of(bid) or "")
+    except Exception:
+        return ""
+
+
+def _group_proactive_issue(
+    segments,
+    openings: Optional[Sequence[str]] = None,
+    used_lines: Optional[Sequence[str]] = None,
+    used_ratio: float = 0.5,
+) -> str:
     """v2.2.2：破冰 / 起话头的质量闸。返回空串表示可以发，否则是拒发原因。
 
     心流那条路早就有这道闸，破冰和起话头却只过 `_verify_all_segments`
     （只查动机泄漏、复读、问句），于是「今天天气不错」这种纯评价照样能进群。
     这两条路本来就更该说「她自己的事」——提示词要的就是这个，闸得跟上。
     括号里的动作（「（把翅膀拢了拢）」）也算她自己的事，所以不强制出现「我」。
+
+    v2.2.7 加两道：
+    * `openings`：开头轮换。线上 27 条破冰里 15 条以「刚」开头，提示词压不住，
+      只能按统计禁——最近 6 条里同一开头字 ≥3 次，这一条换说法。
+    * `used_lines`：同一件事不在这个群讲第二遍（与已用素材比相似度）。
     """
     joined = "".join(str(seg or "") for seg in segments or [])
     if not joined.strip():
@@ -1218,6 +1329,21 @@ def _group_proactive_issue(segments) -> str:
         return "在对某个人说话，不是在跟群里说"
     if not any(word in joined for word in _GROUP_CONCRETE_WORDS):
         return "没有一件具体的、她自己的事（只有一句空话）"
+    if openings:
+        _op = _opening_repeat_issue(joined, openings)
+        if _op:
+            return _op
+    if used_lines:
+        for _old in used_lines:
+            _old_text = str(_old or "").strip()
+            if not _old_text:
+                continue
+            try:
+                _same = _same_event(joined, _old_text, used_ratio)
+            except Exception:
+                continue
+            if _same:
+                return f"这件事刚在这个群讲过（「{_old_text[:20]}」）"
     return ""
 
 # 热聊续话（v2.1.8）：continue 的默认起点由 config 下调到 25 分钟，但刚聊热的那一小段
@@ -2349,6 +2475,9 @@ class SocialEngine:
         text = self._spoken_text(event)
         if not text:
             return
+        # v2.2.7：主链路发出的这句话也要进「最近说过什么」的进程内账本，
+        # `on_decorating_result` 那条改写钩子要用它判断「是不是又在说教」。
+        self._note_recent_spoken(text)
         bid = self._get_bot_id(event)
         uid = self._get_sender_id(event)
         if not bid or not uid or uid == bid:
@@ -2546,6 +2675,52 @@ class SocialEngine:
         if len(body) < 2 or body.startswith("/"):
             return ""
         return body[:400]
+
+    # ─── v2.2.7：主链路出口的「最近说过什么」（说教/复读的判据）──────────
+    #
+    # 线上被投诉的私聊是**普通对话回复**，不是主动消息：娜莉灵连着六条里四条
+    # 在管对方（「酥牧别刨根问底了」「别胡思乱想」「别一惊一乍的」）。主动消息
+    # 那边有验收闸，主链路这边原来一道都没有，插件也看不见自己刚说了什么。
+    # 这里留一个进程内的最近若干条，`on_decorating_result` 拿它判断「是不是
+    # 又在纠正对方」，够用且不落盘（重启丢一次不影响判据）。
+    RECENT_SPOKEN_MAX = 8
+
+    def _note_recent_spoken(self, text: str) -> None:
+        body = str(text or "").strip()
+        if not body:
+            return
+        try:
+            buf = getattr(self, "_recent_spoken", None)
+            if not isinstance(buf, list):
+                buf = []
+                self._recent_spoken = buf
+            buf.append(body[:400])
+            if len(buf) > int(self.RECENT_SPOKEN_MAX):
+                del buf[: len(buf) - int(self.RECENT_SPOKEN_MAX)]
+        except Exception:
+            pass
+
+    def recent_spoken_texts(self, count: int = 5) -> List[str]:
+        """最近说过的 count 条（旧→新）。取不到就返回空列表。"""
+        try:
+            buf = getattr(self, "_recent_spoken", None) or []
+            n = max(0, int(count))
+            return [str(x) for x in buf[-n:]] if n else []
+        except Exception:
+            return []
+
+    def tidy_outgoing(self, text: str, bid: str) -> str:
+        """主链路出口改写：删占位符、修物种、去掉说教句。
+
+        返回改写后的正文；不需要改时原样返回；全被删空返回空串（调用方据此
+        决定是否整条不发）。异常一律原样返回——出口改写坏了不该让消息发不出去。
+        """
+        try:
+            species = _species_safe(self, bid)
+            recent = self.recent_spoken_texts(5)
+            return tidy_outgoing_text(text, species=species, recent=recent)
+        except Exception:
+            return str(text or "")
 
     @staticmethod
     def _get_bot_id(event: Any) -> str:
@@ -3099,7 +3274,7 @@ class SocialEngine:
 
     @staticmethod
     def _verify_all_segments(segments, *, recent, called, allow_short=False,
-                             require_about_peer=False, msg_type=""):
+                             require_about_peer=False, msg_type="", species=""):
         """逐段过验收，返回 (不过的那段正文, 原因)；全过返回 ("", "")。
 
         `parts[0]` 只是模型输出的第一段；`plan_segments` 拆出来的后续段以前一律
@@ -3109,12 +3284,15 @@ class SocialEngine:
         v2.1.8：`msg_type` 透传给 `verify_message`。问候/道别/短应和这几类本来
         就该短，旧验收按「普通消息」判空泛，把「早安」「晚安」也打回，重生成又
         生成一遍同样的短句——线上表现为这类消息大量发不出去。
+
+        v2.2.7：`species` 透传，蹄类角色写「手」要被拦（见 `_check_species`）。
         """
         for text in segments:
             body = str(text or "")
             passed, reason = verify_message(
                 body, recent=recent, called=called, allow_short=allow_short,
                 require_about_peer=require_about_peer, msg_type=str(msg_type or ""),
+                species=str(species or ""),
             )
             if not passed:
                 return body, reason
@@ -3348,6 +3526,7 @@ class SocialEngine:
             # 普通消息验收，短应和（「哈哈」「确实」）常被判空泛打回。msg_type 只
             # 放宽这一类场景的判据，其余检查照旧。
             msg_type="react_time",
+            species=_species_safe(self, bid),
         )
         if bad_text:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
@@ -3528,7 +3707,40 @@ class SocialEngine:
             "group_name": str(g.get("name", "") or ""),
             # G3：近期在群里说过话的人名（供「自然地点一下某个人」）。
             "members": groupflow.member_names(samples) if self.cfg.group_mention_member else [],
+            # v2.2.7：她在这个群最近 6 条的开头字，给开头轮换闸与提示词用。
+            "openings": [
+                str(s.get("text", "") or "")
+                for s in samples
+                if s.get("self") and str(s.get("text", "") or "").strip()
+            ][-6:],
         }
+
+    def _species_of(self, bid: str) -> str:
+        """角色的种族（Core brief 的 `her.species`）。取不到返回空串。
+
+        v2.2.7 / issue #10 / #15：物种信息一直只进提示词，验收层和本地兜底素材
+        都没有它——于是蹄类角色能说出「我刚醒手还有点僵」，兜底素材里也有
+        「手还是湿的」。这里给两处消费者提供一个统一取数口。
+        """
+        try:
+            users = (self.state.bot(bid).get("users") or {})
+        except Exception:
+            return ""
+        for u in users.values():
+            if not isinstance(u, dict):
+                continue
+            brief = u.get("_brief")
+            if not isinstance(brief, dict):
+                continue
+            her = brief.get("her")
+            if isinstance(her, dict):
+                try:
+                    sp = _brief_text(her.get("species"))
+                except Exception:
+                    sp = ""
+                if sp:
+                    return str(sp)
+        return ""
 
     def _group_topic_hint(
         self, bid: str, gid: str, g: Dict[str, Any], now: float
@@ -3559,16 +3771,19 @@ class SocialEngine:
         # 群用过的行剔掉，剔完一件不剩就这次不发（起话头宁可空着，不拿剩余素材硬编）。
         dedup_hours = float(getattr(self.cfg, "group_topic_dedup_hours", 0.0) or 0.0)
         if dedup_hours > 0 and life:
+            # v2.2.7 / issue #2：**同群**也算用过了。旧判据 `life_used_elsewhere`
+            # 只认「别的群」，于是「旧票据」在同一个群 15:22 说了两遍、15:45 又说
+            # 两遍——同群重复全部放行。同一个群里同一件事六小时内说第二遍就是复读。
             kept = [
                 line for line in life
                 if not self.state.life_used_elsewhere(
-                    bid, line, gid, now, hours=dedup_hours
+                    bid, line, gid, now, hours=dedup_hours, same_group=True
                 )
             ]
             if len(kept) != len(life):
                 self.log(
                     f"群 {gid} 素材去重：{len(life)} 条里剔掉 "
-                    f"{len(life) - len(kept)} 条刚在别的群用过的"
+                    f"{len(life) - len(kept)} 条近期已经用过的"
                 )
             life = kept
         holiday = str(body.get("holiday") or "").strip()
@@ -3589,7 +3804,24 @@ class SocialEngine:
         if not life and not holiday and not weather_used:
             # 没有 Core（或 Core 还没给出任何东西）时，节日和天气同样是空的：
             # 原来这里直接返回空串，起话头一句话都起不来。用时间本身兜底。
-            life = groupflow.local_materials(now)
+            #
+            # v2.2.7 / issue #2：兜底素材**也要过一遍去重**。旧实现完全绕开
+            # `life_used` 账本，于是 Core 素材被剔空之后，本地硬编码那几句就会一轮
+            # 接一轮地重复——用户看到的「阴天/毛潮 6 次」就是这么来的。
+            life = groupflow.local_materials(now, species=_species_safe(self, bid))
+            if dedup_hours > 0 and life:
+                _kept_local = [
+                    line for line in life
+                    if not self.state.life_used_elsewhere(
+                        bid, line, gid, now, hours=dedup_hours, same_group=True
+                    )
+                ]
+                if len(_kept_local) != len(life):
+                    self.log(
+                        f"群 {gid} 兜底素材去重：{len(life)} 条里剔掉 "
+                        f"{len(life) - len(_kept_local)} 条这个群刚讲过的"
+                    )
+                life = _kept_local
             if life:
                 self.log(f"群 {gid} 没有 Core 素材，改用本地兜底素材")
         return (
@@ -3909,6 +4141,7 @@ class SocialEngine:
                 segments,
                 recent=[str(t).strip() for t in (group_ctx.get("own_recent") or []) if str(t).strip()],
                 called=str(self._last_persona.get(bid, "") or ""),
+                species=_species_safe(self, bid),
             )
         except Exception as ice_exc:
             # P2-14：验收器坏了仍然放行——这道闸是「少发假消息」，不是「拦死发送」，
@@ -3930,7 +4163,22 @@ class SocialEngine:
                     + throttle.summary(f"icebreak.rejected.{bid}")
                 )
             return False
-        _gp_issue = _group_proactive_issue(segments)
+        # v2.2.7 / issue #1 #2 #3：开头轮换 + 同群事件去重。
+        # 线上 27 条破冰 15 条以「刚」开头、旧票据同一个群 15:22 说两遍 15:45 又说
+        # 两遍——这两件事提示词压不住，只能在放行前按账本拦。
+        _used_lines: List[str] = []
+        try:
+            _used_lines = self.state.life_lines_used_in_group(
+                bid, gid, now, hours=xgroup_hours or 6.0
+            )
+        except Exception as _ul_exc:
+            _used_lines = []
+            logger.debug(f"[autonomous_social] 取本群已用素材失败（不影响发送）: {_ul_exc}")
+        _gp_issue = _group_proactive_issue(
+            segments,
+            openings=group_ctx.get("openings") or [],
+            used_lines=_used_lines,
+        )
         if _gp_issue:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
             self._m["last_rejected"] = str(segments[0])[:200]
@@ -4012,14 +4260,31 @@ class SocialEngine:
         try:
             self.state.note_send_shape(bid, segments[0], sent_ts)
             if life_pool:
-                used_line = next(
-                    (ln for ln in life_pool if _life_line_used(ln, segments)),
-                    life_pool[0],
-                )
-                self.state.note_life_used(
-                    bid, used_line, gid, sent_ts,
-                    hours=xgroup_hours if xgroup_hours > 0 else 6.0,
-                )
+                # v2.2.7 / issue #2：记错素材 = 去重失效。
+                # 旧实现 `next(..., life_pool[0])` 在「模型把素材改写到认不出」时
+                # 一律回落记第 0 条：于是真正用过的那条永远不落账、下一轮原样再来，
+                # 而第 0 条被白锁六小时。现在按相似度挑最像的那条，**都不像就不记**
+                # ——宁可漏记，也不要记错（漏记最多多讲一次，记错是永久错位）。
+                used_line = ""
+                best_ratio = 0.0
+                for ln in life_pool:
+                    try:
+                        ratio = _jaccard(_bigrams(str(ln)), _bigrams("".join(segments)))
+                    except Exception:
+                        continue
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        used_line = ln
+                if used_line and best_ratio >= 0.3:
+                    self.state.note_life_used(
+                        bid, used_line, gid, sent_ts,
+                        hours=xgroup_hours if xgroup_hours > 0 else 6.0,
+                    )
+                else:
+                    self.log(
+                        f"群 {gid} 这条没对上任何素材行（最高相似度 {best_ratio:.2f}），"
+                        f"不记素材账"
+                    )
         except Exception as exc:
             # 记账失败不该让已经发出去的消息变成「发送失败」。
             logger.debug(f"[autonomous_social] 群 {gid} 发送记账失败: {exc}")
@@ -8575,6 +8840,7 @@ class SocialEngine:
             # v2.1.8：问候/道别这类本来就该短，按普通消息判空泛会全打回。
             # 类型由 reason_meta 给出（greeting/closer/...），没有就空串=老行为。
             msg_type=str((reason_meta or {}).get("msg_type", "") or ""),
+            species=_species_safe(self, bid),
         )
         # ── 完整性：分享类消息不能只剩半句（v2.1.2）──────────────
         #
@@ -8602,11 +8868,32 @@ class SocialEngine:
         #
         # 所以这里比的是**由头原文**：同一件事在窗口内派给别人过了就不派。
         # 不依赖任何阈值，也不会因为换个说法就漏掉。
+        # v2.2.7 / issue #4：同一个人也不该连着收到同一件事。
+        #
+        # 下面那道比的是「派给别人过没有」——`anchor_recent_users` 只记 [uid]，
+        # 判定写的是 `if _used_by and uid not in _used_by`，发给同一个人第二次永远
+        # 放行。于是「娜莉灵来访、带来的东西」能被同一段对话连着吃两轮：用户说累，
+        # 她讲一遍自己热了那些东西；用户说不用，她再讲一遍还评价对方。这里补同人
+        # 冷却：窗口内已经对 TA 说过这件事，就换一件。
+        _about = str((reason_meta or {}).get("about") or "")
+        _a2 = (reason_meta or {}).get("anchor")
+        if not _about and isinstance(_a2, dict):
+            _about = str(_a2.get("about") or "")
+        if ok and _about and self.cfg.cross_user_repeat_hours > 0:
+            try:
+                _said_to_them = bool(self.state.anchor_used_for(
+                    bid, uid, _about, self._time(),
+                    hours=self.cfg.cross_user_repeat_hours,
+                ))
+            except Exception:
+                _said_to_them = False
+            if _said_to_them:
+                self._m["anchor_same_user_total"] = int(
+                    self._m.get("anchor_same_user_total", 0)) + 1
+                ok = False
+                why = f"「{_about[:16]}」刚跟 TA 说过了，换一个"
+                drop_anchor(u, _about, self._time())
         if ok and self.cfg.cross_user_repeat_hours > 0:
-            _about = str((reason_meta or {}).get("about") or "")
-            _a2 = (reason_meta or {}).get("anchor")
-            if not _about and isinstance(_a2, dict):
-                _about = str(_a2.get("about") or "")
             if _about:
                 _used_by = self.state.anchor_recent_users(
                     bid, self._time(), hours=self.cfg.cross_user_repeat_hours
@@ -8704,11 +8991,13 @@ class SocialEngine:
         _called = str(self._last_persona.get(bid, "") or "")
         _mtype = str((reason_meta or {}).get("msg_type", "") or "")
         bad_seg, seg_why = "", ""
+        _sp_priv = _species_safe(self, bid)
         if require_about_peer:
             _joined = "\n".join(str(s or "") for s in segments)
             bad_seg, seg_why = self._verify_all_segments(
                 [_joined], recent=_recent, called=_called,
                 require_about_peer=True, msg_type=_mtype,
+                species=_sp_priv,
             )
         # v2.2.4：退化的后续段（纯称呼/只有标题）丢掉继续发，不整条作废。
         if not bad_seg:
@@ -8717,6 +9006,7 @@ class SocialEngine:
                 _seg_bad, _why = self._verify_all_segments(
                     [_seg], recent=_recent, called=_called,
                     require_about_peer=False, msg_type=_mtype,
+                    species=_sp_priv,
                 )
                 if not _seg_bad:
                     _kept.append(_seg)

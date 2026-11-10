@@ -532,6 +532,14 @@ def add_anchor(
     for a in load_anchors(u):
         if _s(a.get("about")) == text:
             return None
+    # v2.2.7 / issue #14：池外那本「用过什么」的账也要查。
+    #
+    # 上面那个循环只看**池子里还在**的记录；池子满了会挤掉、状态保留会清空、老记录
+    # 到 TTL 会被 prune 掉——任何一次池外淘汰，同一件事就能被重新挂上、重新派一遍。
+    # `_remembered` 本来就是为「池子清空后仍然记得」写的（派生路径在用），
+    # 这里漏了它，于是「窝在沙发追剧」这类由头在池外淘汰后照样复活。
+    if now and text in _remembered(u, now):
+        return None
     item = {
         "kind": str(kind or KIND_DERIVED),
         "about": text,
@@ -1157,8 +1165,17 @@ def _wake_cue(body: Dict[str, Any], now: Optional[float] = None) -> str:
     # 睡够了才值得说「睡到自然醒」；没睡够那句是抱怨，归体感那条。
     if hours is not None and hours >= 7.0:
         return "刚睡醒，睡了挺久"
+    # v2.2.7（issue #6）：旧写法 `int(hours)` 会把 0.1~0.9 小时截成 0，直接说出
+    # 「刚醒，才睡0小时」——一个不存在的事实。改成按四舍五入取整后分档说话：
+    # 不足半小时/一小时各自有说法，2 小时以上才报具体数字。
     if hours is not None and hours > 0:
-        return f"刚醒，才睡{int(hours)}小时"
+        if hours < 0.5:
+            return "刚醒，好像没睡多久"
+        if hours < 1.5:
+            return "刚醒，才睡了一个多小时"
+        if hours < 2.0:
+            return "刚醒，才睡了不到2小时"
+        return f"刚醒，才睡{int(round(hours))}小时"
     return "刚醒"
 
 
