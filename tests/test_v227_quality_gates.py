@@ -149,6 +149,15 @@ class PlaceholderResidueTest(unittest.TestCase):
         self.assertNotIn("rendered", out)
         self.assertIn("今天好累", out)
 
+    def test_tidy_leaves_no_empty_bracket(self):
+        # 删掉带括号的占位符后不许留下「今天好累 ()」这种空壳（v2.2.8 真机抽查发现）。
+        out = verify_mod.tidy_outgoing_text(
+            "今天好累 (Model response will be rendered here)", species=""
+        )
+        self.assertNotIn("(", out)
+        self.assertNotIn(")", out)
+        self.assertEqual(out, "今天好累")
+
 
 class SpeciesConsistencyTest(unittest.TestCase):
     """露娜是蹄子，说「手还有点僵」就是穿帮。"""
@@ -349,6 +358,42 @@ class LocalMaterialsTest(unittest.TestCase):
         lines = groupflow.local_materials(NOW, count=4, species=HOOF)
         for line in lines:
             self.assertNotIn("手", line, f"蹄类素材里还有「手」：{line!r}")
+
+
+class EchoAlsoTest(unittest.TestCase):
+    """「也」是回声词：没有由头就不许用（v2.2.8）。"""
+
+    def test_echo_without_context_is_flagged(self):
+        reason = verify_mod._check_echo_also("我也爱你呀。", ())
+        self.assertTrue(reason, "没有由头的「我也爱你」应该被拦")
+
+    def test_echo_with_context_passes(self):
+        reason = verify_mod._check_echo_also("我也爱你呀。", ("我爱你",))
+        self.assertIsNone(reason, "对方说了「我爱你」，回「我也爱你」是正常的")
+
+    def test_plain_also_is_not_echo(self):
+        # 「我也想去」是「同样」，不是回声——不能被当成问题。
+        self.assertIsNone(verify_mod._check_echo_also("我也想去看看。", ()))
+
+    def test_tidy_drops_also_without_context(self):
+        got = verify_mod.tidy_outgoing_text("嗯 我也爱你 亲爱的。", context=())
+        self.assertNotIn("我也爱", got, f"没有由头还留着「也」：{got!r}")
+        self.assertIn("我爱你", got)
+
+    def test_tidy_keeps_also_with_context(self):
+        got = verify_mod.tidy_outgoing_text("我也爱你呀。", context=("我爱你",))
+        self.assertIn("我也爱你", got, f"有由头却把「也」删了：{got!r}")
+
+    def test_verify_rejects_echo_without_context(self):
+        ok, reason = verify_mod.verify_message("我也爱你呀，今天想你了。")
+        self.assertFalse(ok, "主动消息没有上下文，不该出现「我也爱你」")
+        self.assertIn("也", reason)
+
+    def test_proactive_prompt_forbids_echo(self):
+        # `_compose` 是 async 且要 provider，这里用源码断言（与其他结构性验收一致）：
+        # 主动消息提示词里必须有一条「别用『也』接」。
+        src = (PLUGIN_ROOT / "social" / "generator.py").read_text(encoding="utf-8")
+        self.assertIn("别用「也」接", src, "主动消息提示词没有禁止「也」")
 
 
 if __name__ == "__main__":

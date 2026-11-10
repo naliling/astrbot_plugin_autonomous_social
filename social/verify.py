@@ -983,8 +983,60 @@ def _check_preachy(text: str, recent: Sequence[str], window: int = 5, limit: int
     return "又在纠正对方（最近几条已经连着在管 TA 了，换成回应 TA 或说自己的事）"
 
 
+# ─── 回声「也」（v2.2.8 / issue #9）─────────────────────────────
+#
+# 线上真实样本（同一个人 3 条）：
+#   「嗯 我也爱你 亲爱的。外面好冷 我刚醒手还有点僵 快过来让我抱抱。」
+#   「(穿着睡衣趴着) 刚才那句话太噎人啦，不过我也爱你。」
+#   「(把收拾好的旧票据推到一边) 我也爱你呀。」
+#
+# 「也」是**回声词**：它必须回指对方刚说过的话。对方没说「爱你」，她说
+# 「我也爱你」，等于替对方捏了一句没说出口的话——用户原话是「如果只是主动
+# 消息那就更不行了，不要能说『也』」。
+#
+# 所以判据是**上下文**，不是禁词：上下文里没人说过对应的由头，这条就不许用
+# 「我也…」接。只认**情感回声**（爱/想/喜欢/心疼/舍不得/惦记/一样），不认
+# 「我也想去」这种普通并列——那种「也」是「同样」，不是回声。
+_ECHO_ALSO = re.compile(
+    r"我也(?:一样)?"
+    r"((?:很|好|真|挺|超|最)?(?:爱你|想你|喜欢你|心疼你|舍不得你|惦记你|念着你))"
+    r"|我也一样(?=[，。！？、,.!?;\s]|$)"
+)
+# 上下文里出现这些，才说明对方确实说过由头。
+_ECHO_TRIGGER = re.compile(
+    r"爱(?:你|您)|想你|喜欢(?:你|您)|心疼|舍不得|惦记|念着你|一样"
+)
+
+
+def _echo_also_hit(text: str) -> Optional[re.Match]:
+    """这条里有没有「我也…」式的回声。"""
+    return _ECHO_ALSO.search(strip_actions(str(text or "")))
+
+
+def _context_allows_echo(context: Sequence[str]) -> bool:
+    """上下文里有没有能接住「也」的由头。"""
+    ctx = " ".join(str(c or "") for c in (context or []))
+    return bool(_ECHO_TRIGGER.search(ctx))
+
+
+def _check_echo_also(
+    text: str, context: Sequence[str] = ()
+) -> Optional[str]:
+    """没有由头却说「我也爱你」——等于替对方说话。"""
+    hit = _echo_also_hit(text)
+    if not hit:
+        return None
+    if _context_allows_echo(context):
+        return None
+    return (
+        f"「{hit.group(0)[:10]}」里的「也」在接对方的话，"
+        "可对方没说这句（换个说法，别用「也」）"
+    )
+
+
 def tidy_outgoing_text(
-    text: str, *, species: str = "", recent: Sequence[str] = ()
+    text: str, *, species: str = "", recent: Sequence[str] = (),
+    context: Sequence[str] = (),
 ) -> str:
     """主链路回复的**确定性清理**（`on_decorating_result` 用，v2.2.7）。
 
@@ -995,7 +1047,9 @@ def tidy_outgoing_text(
 
     1. 删掉模板占位符（「(Model response will be rendered here)」）；
     2. 蹄类角色把身体部位的「手」改成「蹄子」；
-    3. 最近已经在连着纠正对方时，删掉这条里继续纠正对方的那几句。
+    3. 最近已经在连着纠正对方时，删掉这条里继续纠正对方的那几句；
+    4. 没有由头却说「我也爱你」时，把「也」去掉（`context` 由调用方传入
+       对方刚说的话；主动消息没有上下文，一律去掉）。
 
     改不动就原样返回；删空了返回空串，由调用方决定这条不发。
     """
@@ -1003,6 +1057,13 @@ def tidy_outgoing_text(
     if not body.strip():
         return body
     body = _PLACEHOLDER_RESIDUE.sub("", body)
+    # 占位符常常是**带括号**的：删掉文字会留下「今天好累 ()」这种空壳，
+    # 发出去比原文更怪。把只剩括号的一对一起清掉。
+    body = re.sub(r"[（(【\[「『]\s*[）)】\]」』]", "", body)
+    if _echo_also_hit(body) and not _context_allows_echo(context):
+        body = _ECHO_ALSO.sub(
+            lambda m: ("我" + m.group(1)) if m.group(1) else "我也是", body
+        )
     sp = _s(species).strip()
     if sp and _HOOF_SPECIES.search(sp):
         for old, new in (
@@ -1035,6 +1096,7 @@ def verify_message(
     allow_short: bool = False,
     msg_type: str = "",
     species: str = "",
+    context: Sequence[str] = (),
 ) -> Tuple[bool, str]:
     """验收一条即将发出的消息。返回 (通过, 原因)。
 
@@ -1080,6 +1142,11 @@ def verify_message(
         return False, reason
     # v2.2.7 / issue #6：连续纠正对方（「别…」「少…」「算你…」）。
     reason = _check_preachy(text, recent)
+    if reason:
+        return False, reason
+    # v2.2.8 / issue #9：没有由头却用「也」接对方的话（「我也爱你」）。
+    # 主动消息没有上下文（`context` 为空）→ 一律不许出现情感回声。
+    reason = _check_echo_also(text, context)
     if reason:
         return False, reason
     reason = _check_wall(text)

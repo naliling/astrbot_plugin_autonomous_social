@@ -318,9 +318,10 @@ class AutonomousSocial(Star):
         """发送前清理普通对话回复（v2.2.7，默认开启）。
 
         只改文本、不改语义：删模板占位符、蹄类把身体部位的「手」改「蹄子」、
-        已经在连着纠正对方时删掉这条里继续纠正对方的句子。清理后整条为空就
-        `clear_result()`——宁可这一轮不回，也不把「(Model response will be
-        rendered here)」发出去。
+        已经在连着纠正对方时删掉这条里继续纠正对方的句子、没有由头时去掉
+        「我也爱你」里的「也」（v2.2.8）。清理后整条为空就 `clear_result()`
+        ——宁可这一轮不回，也不把「(Model response will be rendered here)」
+        发出去。
         """
         if self._engine is None or Plain is None:
             return
@@ -340,6 +341,13 @@ class AutonomousSocial(Star):
             bid = engine._get_bot_id(event)
             if not bid:
                 return
+            # v2.2.8：对方刚说的那句是「也」的由头来源——TA 说了「我爱你」，
+            # 这条才能回「我也爱你」；TA 说「好累呀」，就不许用「也」接。
+            context = ""
+            try:
+                context = str(getattr(event, "message_str", "") or "")
+            except Exception:
+                context = ""
             changed = False
             new_chain: list = []
             for comp in chain:
@@ -347,7 +355,7 @@ class AutonomousSocial(Star):
                 if not isinstance(text, str):
                     new_chain.append(comp)
                     continue
-                cleaned = engine.tidy_outgoing(text, bid)
+                cleaned = engine.tidy_outgoing(text, bid, context)
                 if cleaned == text:
                     new_chain.append(comp)
                     continue

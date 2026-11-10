@@ -2709,16 +2709,21 @@ class SocialEngine:
         except Exception:
             return []
 
-    def tidy_outgoing(self, text: str, bid: str) -> str:
-        """主链路出口改写：删占位符、修物种、去掉说教句。
+    def tidy_outgoing(self, text: str, bid: str, context: Any = ()) -> str:
+        """主链路出口改写：删占位符、修物种、去掉说教句、去掉没由头的「也」。
 
+        `context` 是**对方刚说的那句话**（`event.message_str`）：只有它里面出现
+        「爱你/想你/喜欢你…」这类由头，这条才允许保留「我也爱你」。
         返回改写后的正文；不需要改时原样返回；全被删空返回空串（调用方据此
         决定是否整条不发）。异常一律原样返回——出口改写坏了不该让消息发不出去。
         """
         try:
             species = _species_safe(self, bid)
             recent = self.recent_spoken_texts(5)
-            return tidy_outgoing_text(text, species=species, recent=recent)
+            ctx = context if isinstance(context, (list, tuple)) else ([context] if context else [])
+            return tidy_outgoing_text(
+                text, species=species, recent=recent, context=ctx
+            )
         except Exception:
             return str(text or "")
 
