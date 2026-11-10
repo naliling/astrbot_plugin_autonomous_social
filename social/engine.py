@@ -3720,32 +3720,77 @@ class SocialEngine:
             ][-6:],
         }
 
+    SPECIES_CACHE_TTL = 600.0
+
     def _species_of(self, bid: str) -> str:
-        """角色的种族（Core brief 的 `her.species`）。取不到返回空串。
+        """角色的种族（Core 门面的 `her.species`）。取不到返回空串。
 
         v2.2.7 / issue #10 / #15：物种信息一直只进提示词，验收层和本地兜底素材
         都没有它——于是蹄类角色能说出「我刚醒手还有点僵」，兜底素材里也有
         「手还是湿的」。这里给两处消费者提供一个统一取数口。
+
+        v2.2.9：原来只读 `users[*]["_brief"]`，而那个键**生产环境从来没被写过**
+        （state.json 里连键都不存在）——于是物种闸整条链是死代码：`_check_species`
+        永远放行、`local_materials` 永远不换「蹄子」、出口改写永远不改。
+        改成先问 Core 门面（`_core_brief`，和提示词那条路同一个来源，实测线上返回
+        「天马」），拿不到才回退旧路径。结果按 bot 缓存 10 分钟：门面调用不算便宜，
+        而物种换人设才会变。
         """
+        key = str(bid or "")
         try:
-            users = (self.state.bot(bid).get("users") or {})
+            now = time.time()
         except Exception:
-            return ""
-        for u in users.values():
-            if not isinstance(u, dict):
-                continue
-            brief = u.get("_brief")
-            if not isinstance(brief, dict):
-                continue
+            now = 0.0
+        cache = getattr(self, "_species_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._species_cache = cache
+        hit = cache.get(key)
+        if isinstance(hit, tuple) and len(hit) == 2:
+            try:
+                if now and float(hit[1]) and (now - float(hit[1])) < float(
+                    self.SPECIES_CACHE_TTL
+                ):
+                    return str(hit[0] or "")
+            except Exception:
+                pass
+        sp = ""
+        try:
+            brief = SocialEngine._core_brief(self, bid, "")
+        except Exception:
+            brief = None
+        if isinstance(brief, dict):
             her = brief.get("her")
             if isinstance(her, dict):
                 try:
                     sp = _brief_text(her.get("species"))
                 except Exception:
                     sp = ""
-                if sp:
-                    return str(sp)
-        return ""
+        if not sp:
+            # 回退：旧路径（测试桩/旧数据把 brief 挂在用户记录里）。
+            try:
+                users = (self.state.bot(bid).get("users") or {})
+            except Exception:
+                users = {}
+            for u in users.values():
+                if not isinstance(u, dict):
+                    continue
+                brief2 = u.get("_brief")
+                if not isinstance(brief2, dict):
+                    continue
+                her2 = brief2.get("her")
+                if isinstance(her2, dict):
+                    try:
+                        sp = _brief_text(her2.get("species"))
+                    except Exception:
+                        sp = ""
+                    if sp:
+                        break
+        try:
+            cache[key] = (str(sp or ""), now)
+        except Exception:
+            pass
+        return str(sp or "")
 
     def _group_topic_hint(
         self, bid: str, gid: str, g: Dict[str, Any], now: float

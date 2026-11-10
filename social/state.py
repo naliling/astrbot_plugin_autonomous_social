@@ -1233,8 +1233,8 @@ class SocialState:
     )
 
     @staticmethod
-    def _repair_fields(record: Dict[str, Any], defaults: Dict[str, Any]) -> int:
-        """按默认值的类型修一条记录里的字段，返回修了几个。就地改，不抛。
+    def _repair_fields(record: Dict[str, Any], defaults: Dict[str, Any]) -> Tuple[int, int]:
+        """按默认值的类型修一条记录里的字段，返回 `(重置数, 归一化数)`。就地改，不抛。
 
         为什么必须在**加载期**做：单个字段类型坏掉（手改 state.json、旧版本写错、
         磁盘位翻转）之后，读它的每一处都得自己挡一次——`record_incoming` 的
@@ -1244,9 +1244,13 @@ class SocialState:
         与其在每个读点补 isinstance，不如在唯一入口把它修成正常值，读点照旧写。
 
         只修「类型不对」的，不修「值不好看」的：`message_count=999999` 是数据，
-        `message_count="abc"` 才是损坏。JSON 里 `5.0` 这种整数值也按 5 收下。
+        `message_count="abc"` 才是损坏。JSON 里 `5.0` 这种整数值也按 5 收下——
+        那是**归一化**，不是损坏，所以单独计数（v2.2.9：原来两类混在一个数字里，
+        日志说「已按默认值重置 28 个字段」，实际上 28 个全是 5.0→5，看起来像丢了
+        28 份数据，排查时被误导）。
         """
         repaired = 0
+        normalized = 0
         for key, default in defaults.items():
             if key not in record:
                 continue
@@ -1265,7 +1269,7 @@ class SocialState:
                     # 出现 5.0 与 5 的比较/哈希差异
                     if isinstance(value, float) and value.is_integer():
                         record[key] = int(value)
-                        repaired += 1
+                        normalized += 1
             elif isinstance(default, str):
                 if not isinstance(value, str):
                     record[key] = default
@@ -1283,13 +1287,15 @@ class SocialState:
                 if value is not None and not _is_number(value):
                     record[key] = None
                     repaired += 1
-        return repaired
+        return repaired, normalized
 
     def _migrate(self) -> None:
         """确保所有已存在的用户都有当前版本字段，清掉旧键，并洗掉被污染的正文。"""
         self._sanitize_once()
         repaired_users = 0
         repaired_groups = 0
+        normalized_users = 0
+        normalized_groups = 0
         try:
             for bot in self.data.get("bots", {}).values():
                 if not isinstance(bot, dict):
@@ -1300,7 +1306,9 @@ class SocialState:
                         continue
                     for k, v in user_defaults.items():
                         u.setdefault(k, v)
-                    repaired_users += self._repair_fields(u, user_defaults)
+                    _ru, _nu = self._repair_fields(u, user_defaults)
+                    repaired_users += _ru
+                    normalized_users += _nu
                     for k in self._RETIRED_USER_KEYS:
                         if k in u:
                             u.pop(k, None)
@@ -1314,7 +1322,9 @@ class SocialState:
                             continue
                         for k, v in group_defaults.items():
                             g.setdefault(k, v)
-                        repaired_groups += self._repair_fields(g, group_defaults)
+                        _rg, _ng = self._repair_fields(g, group_defaults)
+                        repaired_groups += _rg
+                        normalized_groups += _ng
                 # v1.12.0：清掉旧版历史导入误进 users 的群会话幽灵。旧版按 updated_at
                 # 取前 300 个会话再滤群，`GroupMessage` 类型不在识别表里被判 unknown
                 # 放行，群会话被当「人」导入、拿群 umo 去发主动消息。群消息在观察链路
@@ -1354,6 +1364,16 @@ class SocialState:
                 f"{repaired_groups} 个群字段类型不对，已按默认值重置"
                 "（不修的话这些用户此后每条消息都会抛异常，且不会自愈）。路径："
                 + str(self.path)
+            )
+        if normalized_users or normalized_groups:
+            # v2.2.9：`5.0`→`5` 这种是**归一化**，不是损坏，更不是数据丢失。
+            # 原来和上面那条共用一个计数，日志写「已按默认值重置 28 个字段」，
+            # 排查时会被读成「28 份数据被清了」。
+            self.mark_dirty()
+            logger.info(
+                f"[autonomous_social] 状态文件里有 {normalized_users} 个用户字段、"
+                f"{normalized_groups} 个群字段是整数值的浮点（5.0→5），已归一化，"
+                "数据没丢。路径：" + str(self.path)
             )
 
     def migrate_default_bot(self, real_bid: str) -> None:
