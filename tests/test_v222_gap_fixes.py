@@ -150,8 +150,14 @@ class SleepChanceTest(unittest.TestCase):
 class GroupDailyCapTest(unittest.TestCase):
     """71 个群 + 12 条/天 = 六天轮一圈，主人只看到「永远那几个群」。"""
 
-    def test_default_cap_raised(self):
-        self.assertEqual(config.GROUP_DAILY_TOTAL_CAP_DEFAULT, 20)
+    def test_default_is_unlimited(self):
+        """v2.2.47：默认 0 = 不限。
+
+        用户原话「一天只能主动12条不行 要么没限制要么把这个删掉 我要的是那个人的
+        主动 人是想说就说的」——所以默认值从 20 改成 0（0 在
+        `_group_daily_exhausted` 里直接 return False，即不拦）。想限制的人填正数。
+        """
+        self.assertEqual(config.GROUP_DAILY_TOTAL_CAP_DEFAULT, 0)
 
 
 if __name__ == "__main__":

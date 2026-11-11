@@ -521,12 +521,16 @@ class BondLineNameTest(unittest.TestCase):
         })
         self.assertIn("TA 的名片名是「爱筝挽起」", text)
         self.assertNotIn("冲击波冠军", text)
-        self.assertIn("你可以偶尔这么叫", text)
+        # v2.2.30：删掉「你可以偶尔这么叫」——它和下一句「开口要叫一声」打架。
+        self.assertNotIn("偶尔这么叫", text)
+        self.assertIn("开口要叫一声TA的称呼", text)
 
     def test_local_name_uses_the_same_card_name_wording(self):
         text = _bond_line({"_call_name": "游鱼", "_name_source": "local"})
         self.assertIn("TA 的名片名是「游鱼」", text)
-        self.assertIn("偶尔", text)
+        # v2.2.30：不再用「偶尔这么叫」这种可选措辞，来源差别只影响前半句。
+        self.assertNotIn("偶尔这么叫", text)
+        self.assertIn("开口要叫一声TA的称呼", text)
 
     def test_every_name_source_carries_the_usage_discipline(self):
         for target in (

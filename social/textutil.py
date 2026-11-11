@@ -191,6 +191,34 @@ _NAME_SPLIT = re.compile(r"[·•・|｜/\\．.\s]+")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
+_NAME_MIN_CHARS = 2
+
+
+def usable_call_name(raw: Any, uid: Any = "") -> str:
+    """这个字符串能不能当称呼念出来？不能就返回空串。
+
+    线上真实事故（v2.2.45 之前）：Core 给 `nickname` / `display_name` 填的是
+    **纯 UID 数字串**（`3391908372`），提示词于是写「你一直叫TA「3391908372」」，
+    模型既不肯念数字、又收到「必须叫一声」的指令，就自己编了个「星辰」叫了五条。
+
+    判据只拦「念不出口」的：太短、等于 uid、纯数字、没有任何文字。
+    `Alice` / `小明` / `玄黄玲珑` / `伟大而又全能の星辰光辉` 都照常返回。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    bare = "".join(text.split())
+    if len(bare) < _NAME_MIN_CHARS:
+        return ""
+    if uid and bare == str(uid).strip():
+        return ""
+    if re.fullmatch(r"[0-9０-９]+", bare):
+        return ""
+    if not re.search(r"[\u4e00-\u9fffA-Za-z]", bare):
+        return ""
+    return text
+
+
 def short_call_name(raw: Any) -> str:
     """她在消息里**喊**这个人时用的名字：太长的中文昵称只叫前一段。
 

@@ -342,6 +342,144 @@ def _action_tags(text: str) -> List[str]:
     return out
 
 
+# ─── v2.2.23：骨架自查（只给事实，不拦不改写）────────────────────
+#
+# 用户说「动作描写模板化：六条里动作只有两种，重复六次」。前面几版只用
+# `_check_action_repeat` 拦**主动消息**里 ≥4 字的动作标签，普通回复没人管，
+# 而普通回复占了 1327/1839。线上全量语料（1839 条，去重后）的骨架统计：
+#
+#   · 私聊 647/1327 = 48.8% 以括号动作开头；
+#   · 823/1839 = 44.8% 以表情结尾，其中 ❤/💕 占 98%；
+#   · 「动作 + 台词 + 爱心」三件套齐全 545/1839 = 29.6%；
+#   · 动作复用前几名：`伸懒腰` 7 次、`伸个懒腰` 6 次、`红瞳微眯，散发草莓酒香` 4 次
+#     —— 全是 3 字以内的标签，`_ACTION_TAG_MIN = 4` 的门槛一条都拦不到。
+#
+# 普通回复不能拦（拦了就是不回人话），所以这里只负责**算出该说什么事实**，
+# 由 `reply_echo_hint` 写进临时块，让她自己换。
+_ACTION_TIC_MIN = 3
+_ACTION_TIC_WINDOW = 6
+_ACTION_TIC_HITS = 2
+# 动作名给人（模型）看的时候最多这么长；分组仍按前 4 个汉字。
+_ACTION_TIC_DISPLAY = 12
+_ACTION_TIC_KEY = 3
+# `（180cm纯白翅膀…）`、`（3℃的窗边…）`、`（Mod 开关…）` 这类开头是量词/英文，
+# 直接取前 3 个字会得到「180」「3℃」「Mod」这种对模型毫无意义的名字。
+_ACTION_LEAD_NOISE = re.compile(r"^[0-9０-９A-Za-z\s\.,:;~\-—°℃%％()（）]+")
+
+
+def _action_span(text: str) -> str:
+    """这条消息的第一个括号动作，返回**完整短语**（去括号、去量词前缀、压空白）。
+
+    线上 942 个动作片段里有 879 个（93.3%）超过 3 个字，取前 3 字会得到
+    `放下茶`／`刚把取`／`迷迷糊`／`伸个懒` 这种半截词。提醒是要给模型看的，
+    给它一个半截词等于给了一句胡话，所以这里保留整段，展示时再截到
+    `_ACTION_TIC_DISPLAY`。
+    """
+    for m in _ACTION_BLOCKS.finditer(str(text or "")):
+        raw = m.group(0).strip().strip(_OPENERS + _CLOSERS)
+        body = _ACTION_LEAD_NOISE.sub("", _PUNCT_ONLY.sub("", raw).strip()).strip()
+        # 内部空格也去掉：提醒里「脸颊被汝揉着 尾尖轻」读着别扭，而且去空格后
+        # 共同前缀才是一个词，不会停在词中间。
+        body = "".join(body.split())
+        if len(body) >= _ACTION_TIC_MIN:
+            return body
+    return ""
+
+
+def _action_head(text: str) -> str:
+    """分组用的键：动作短语的开头几个汉字（没有动作就空串）。"""
+    span = _action_span(text)
+    if not span:
+        return ""
+    m = re.search(r"[\u4e00-\u9fff]{%d,}" % _ACTION_TIC_MIN, span)
+    if not m:
+        return ""
+    return m.group(0)[:_ACTION_TIC_KEY]
+
+
+def _opens_with_action(text: str) -> bool:
+    """是不是「一开口先写一个括号动作」。"""
+    body = str(text or "").lstrip()
+    if not body:
+        return False
+    m = _ACTION_BLOCKS.match(body)
+    return bool(m)
+
+
+# v2.2.27：每句都叫对方名字。线上 156 个有名字的对话方、842 条出方向消息里，
+# 17.3% 带名字——不算高；但有 8 个对话方是 **100%**，最长连叫 7 条：
+# `(后腿微微一僵)才没有……无家可归的猫别胡说。` / `什么惩罚？我才不怕，无家可归的猫。`
+# 名字放在句尾当标点，读起来像在点名叫人。和动作骨架一样只给事实，不禁用。
+_NAME_TAIL_STRIP = "。！？!?…~～，,、；;：: \t　"
+
+
+def name_density_tics(
+    texts: Sequence[str], name: str, window: int = 6, min_hits: int = 3
+) -> List[str]:
+    """最近几条里叫名字叫得太勤 → 返回一句事实（不给禁令）。"""
+    peer = "".join(str(name or "").split())
+    if len(peer) < 2:
+        return []
+    items = [
+        "".join(str(t or "").split())
+        for t in (texts or [])
+        if str(t or "").strip()
+    ]
+    items = items[-max(1, int(window)):]
+    if len(items) < min_hits:
+        return []
+    hits = [t for t in items if peer in t]
+    if len(hits) < min_hits:
+        return []
+    tail = sum(1 for t in hits if t.rstrip(_NAME_TAIL_STRIP).endswith(peer))
+    out = [f"你最近 {len(items)} 条里有 {len(hits)} 条都叫了对方的名字「{peer}」"]
+    if tail >= 2:
+        out.append(f"其中 {tail} 条把名字放在句尾")
+    return out
+
+
+def action_tics(
+    texts: Sequence[str],
+    window: int = _ACTION_TIC_WINDOW,
+    min_hits: int = _ACTION_TIC_HITS,
+) -> List[str]:
+    """最近几条里骨架太重复的事实，一句话一条（没有就空列表）。"""
+    from collections import Counter
+
+    recent = [str(t or "") for t in list(texts or ())[-max(2, int(window)):]]
+    out: List[str] = []
+    if len(recent) < 2:
+        return out
+    heads = Counter(h for h in (_action_head(t) for t in recent) if h)
+    top = [(h, c) for h, c in heads.most_common() if c >= max(2, int(min_hits))]
+    if top:
+        head, cnt = top[0]
+        # 展示用「这组动作的共同前缀」——`纯白翅膀`（而不是某一整句
+        # `纯白翅膀轻轻拢了拢`，那句只出现过一次）。前缀不足 3 个字时退回
+        # 最短的完整短语（`伸懒腰` / `伸个懒腰` 这种就各自报各自的）。
+        spans = [_action_span(t) for t in recent if _action_head(t) == head]
+        spans = [x for x in spans if x]
+        name = ""
+        if spans:
+            prefix = spans[0]
+            for other in spans[1:]:
+                n = 0
+                while n < min(len(prefix), len(other)) and prefix[n] == other[n]:
+                    n += 1
+                prefix = prefix[:n]
+            name = prefix if len(prefix) >= _ACTION_TIC_MIN else min(spans, key=len)
+        name = name or head
+        if len(name) > _ACTION_TIC_DISPLAY:
+            name = name[:_ACTION_TIC_DISPLAY]
+        out.append(
+            f"你最近 {len(recent)} 条里用了 {cnt} 次「{name}」这个动作"
+        )
+    opened = sum(1 for t in recent if _opens_with_action(t))
+    if len(recent) >= 5 and opened >= 3:
+        out.append(f"最近 {len(recent)} 条里有 {opened} 条都是先写括号动作再说话")
+    return out
+
+
 def _check_action_repeat(text: str, recent: Sequence[str], limit: int = 20) -> Optional[str]:
     """同一个动作标签在最近几条里已经用过。
 
@@ -361,6 +499,121 @@ def _check_action_repeat(text: str, recent: Sequence[str], limit: int = 20) -> O
         for old_tags in olds:
             if tag in old_tags:
                 return f"动作标签复读（「{tag}」最近已经用过）"
+    return None
+
+
+# ─── v2.2.12：「同一件事」的判据 ─────────────────────────────────
+#
+# 线上 2026-11-10 一天里的三件事，跨群闸一条都没拦住：
+#   08:03 群 691114631「本宫把茶壶茶盏都洗了」
+#   08:04 群 611456288「本宫方才把茶壶茶盏一并洗了」
+#   08:27 群 1097575806「本宫才把茶壶茶盏洗了」
+#   15:22 群 602543123「正把抽屉里的旧票据一张张用蹄子夹出来摊开」
+#   15:45 群 224992692「抽屉里攒的旧票据全叼出来摊开了」
+# 这几对的 bigram 重合度只有 0.10~0.35，`_check_cross_user` 的 0.6 阈值全部放行。
+# 换说法的同一件事，整体相似度就是不可靠；可靠的是**去掉模板词之后还剩下的连续
+# 公共片段**——「茶壶茶盏」「旧票据」「0小时」这种。
+_EVENT_BOILER = frozenset(
+    "本宫方才刚现在此刻正把了的一并也还都又很挺真就着过要会能是这那个上下里到与么呢吧啊得地"
+    "蹄子翅翼尖根用夹叼捧揉搓蹭搭垂拍摸甩抬举伸摊握攥捏贴靠趴躺坐卧侧身翻"
+)
+
+
+# v2.2.21：时间与感知框架字。两个句子的公共片段如果**全部**由这些字组成，
+# 那说明它们只是「昨晚梦见…」「中午在…」这类框架一样，不是同一件事。
+# 注意这里只用于「片段是否算内容」的判定，不参与内容字本身的过滤——
+# 时间字从内容字里剔掉会连带削弱真正的匹配（见本文件顶部注释）。
+_EVENT_FRAME = frozenset(
+    "昨今早午夜傍晚明后天年月日号点时分秒"
+    "梦到见想起说完还再又正刚才"
+)
+
+
+def _event_content(text: Any) -> str:
+    """去掉括号动作与模板词，只留「这件事」的内容字（汉字与数字）。"""
+    body = re.sub(r"[（(][^）)]*[）)]", "", _s(text))
+    return "".join(
+        ch for ch in body
+        if (("\u4e00" <= ch <= "\u9fff" or ch.isdigit()) and ch not in _EVENT_BOILER)
+    )
+
+
+def _content_run(a: str, b: str) -> str:
+    """两串内容字的最长**连续**公共片段（子序列会把不相干的两句也算上）。"""
+    if not a or not b:
+        return ""
+    best_len, best_end = 0, 0
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best_len:
+                    best_len, best_end = cur[j], i
+        prev = cur
+    return a[best_end - best_len:best_end]
+
+
+def _content_overlap(a: str, b: str) -> float:
+    """内容字集合的重合度（以较短那串为分母：同一件事换个说法会少字，不会多字）。"""
+    if not a or not b:
+        return 0.0
+    A, B = set(a), set(b)
+    return len(A & B) / max(1, min(len(A), len(B)))
+
+
+# 连续公共片段至少这么长才算同一件事（实测：应判同事件的 7 组是 3~11 字，
+# 不应判的 7 组最多 1 字）。
+_EVENT_RUN_MIN = 3
+# v2.2.13：光看片段长度不够。「晚安呀宝宝 / 宝宝晚安」「早点睡吧 / 你也早点睡」
+# 「今天好累 / 今天真累」这些内容字只有 2~4 个的客套话，片段 2~3 字、覆盖率却是
+# 100%，会被当成同一件事——她跟第二个人说晚安就被拦。所以内容字太少一律不算。
+_EVENT_CONTENT_MIN = 4      # 短句内容字下限：少于 4 个是客套，不是「一件事」
+_EVENT_SHORT_MIN = 6        # 片段只有 3 字时，两串都得够长（「旧票据」那种）
+_EVENT_LONG_MIN = 8         # 长句改看内容字覆盖率
+_EVENT_OVERLAP_LONG = 0.75
+
+
+def _same_event_text(a: Any, b: Any) -> bool:
+    """两句话是不是「同一件事」（不看措辞，看内容字）。
+
+    判据分三档（v2.2.13 收紧）：
+    1. 内容字连续公共片段 ≥4 字 —— 直接算同一件事（茶壶茶盏 / 煮壶热茶 / 睡0小时）；
+    2. 片段正好 3 字 —— 要求两边内容字都 ≥6（旧票据 / 洒半桌），否则是「早点睡」这类巧合；
+    3. 都没到 3 字 —— 只有长句（内容字 ≥8）且内容字覆盖率 ≥75% 才算。
+    另外内容字少于 4 个的一律不算：那是「晚安」「我在呢」的客套，不是事件；
+    公共片段若全是时间/感知框架字（`昨晚梦`）也不算（v2.2.21）。
+    """
+    ca, cb = _event_content(a), _event_content(b)
+    if not ca or not cb:
+        return False
+    short = min(len(ca), len(cb))
+    if short < _EVENT_CONTENT_MIN:
+        return False
+    cut = _content_run(ca, cb)
+    # 纯框架片段不算内容重合（「昨晚梦」不是事件，「娜莉灵」才是）
+    if cut and all(ch in _EVENT_FRAME for ch in cut):
+        cut = ""
+    run = len(cut)
+    if run >= _EVENT_RUN_MIN + 1:
+        return True
+    if run >= _EVENT_RUN_MIN and short >= _EVENT_SHORT_MIN:
+        return True
+    return short >= _EVENT_LONG_MIN and _content_overlap(ca, cb) >= _EVENT_OVERLAP_LONG
+
+
+def _check_same_event(text: str, olds: Sequence[str]) -> Optional[str]:
+    """这条和她最近说过的某条是同一件事吗（返回拒发原因）。"""
+    for old in list(olds or []):
+        old_text = _s(old)
+        if not old_text:
+            continue
+        try:
+            if _same_event_text(text, old_text):
+                return f"这件事刚说过（「{old_text[:20]}」），换一件"
+        except Exception:
+            continue
     return None
 
 
@@ -389,6 +642,13 @@ def _check_cross_user(
         ratio = _jaccard(cur, _bigrams(strip_actions(old_text)))
         if ratio >= threshold:
             return f"和刚发给{who}的那条太像（{ratio:.0%}），换一句"
+        # v2.2.12：换说法的同一件事。bigram 抓不住「本宫把茶壶茶盏都洗了」和
+        # 「本宫方才把茶壶茶盏一并洗了」（0.2 上下），但那确实是同一件事。
+        try:
+            if _same_event_text(text, old_text):
+                return f"和{who}说过的是同一件事（「{old_text[:18]}」），换一件事说"
+        except Exception:
+            continue
     return None
 
 
@@ -926,6 +1186,64 @@ _HAND_BODY = re.compile(
 )
 
 
+_OTHER_POSSESSIVE = re.compile(r"[你您汝爾尔他她牠它]|TA|ta|Ta|tA")
+_SELF_POSSESSIVE = re.compile(r"我|本宫|自己|俺|偶|咱")
+
+
+def _hand_owner(text: str, idx: int) -> str:
+    """「手」在 idx 这个位置，是**谁**的？
+
+    往左看 6 个字，取最近的那个所有格标记：
+    有「你/您/汝/他/她」→ other（对方的手就是手，不改不拦）；
+    有「我/本宫/自己」→ self；
+    什么都没有 → unknown（按她自己算，保持 v2.2.7 的老行为）。
+    """
+    win = text[max(0, idx - 6):idx]
+    best, who = -1, "unknown"
+    for m in _OTHER_POSSESSIVE.finditer(win):
+        if m.end() > best:
+            best, who = m.end(), "other"
+    for m in _SELF_POSSESSIVE.finditer(win):
+        if m.end() > best:
+            best, who = m.end(), "self"
+    return who
+
+
+def _hand_is_meta(text: str, idx: int) -> bool:
+    """「有手指 / 没手指」是在说人形生物，不是在说她自己。"""
+    return idx > 0 and text[idx - 1] in "有没无"
+
+
+_HAND_WORD_MAP = (
+    ("手臂", "前腿"),
+    ("手心", "蹄心"),
+    ("手背", "蹄背"),
+    ("手掌", "蹄掌"),
+    ("手指", "蹄尖"),
+    ("手腕", "蹄腕"),
+    ("手肘", "前腿"),
+    ("手", "蹄子"),
+)
+
+
+def _hoof_hand_sub(text: str) -> str:
+    """把**她自己**的手换成蹄子；对方的手、以及「有手指」这类说法原样保留。"""
+
+    def _rep(m):
+        piece = m.group(0)
+        idx = m.start() + piece.index("手")
+        if _hand_owner(text, idx) == "other" or _hand_is_meta(text, idx):
+            return piece
+        # v2.2.19：按部位换词（`手臂`→`前腿`、`手心`→`蹄心`），比一律
+        # 「蹄子」自然；不在表里的（`手还有点僵`）仍回落成「蹄子」。
+        for old, new in _HAND_WORD_MAP:
+            if piece.startswith(old):
+                return new + piece[len(old):]
+        return piece.replace("手", "蹄子", 1)
+
+    return _HAND_BODY.sub(_rep, text)
+
+
 def _check_species(text: str, species: str = "") -> Optional[str]:
     """蹄类/兽类角色不许出现「手」这类人形身体部位。
 
@@ -934,8 +1252,12 @@ def _check_species(text: str, species: str = "") -> Optional[str]:
     sp = _s(species).strip()
     if not sp or not _HOOF_SPECIES.search(sp):
         return None
-    hit = _HAND_BODY.search(str(text or ""))
-    if hit:
+    body = str(text or "")
+    for hit in _HAND_BODY.finditer(body):
+        idx = hit.start() + hit.group(0).index("手")
+        # v2.2.18：对方的手不是她的错；「有手指」是在说人。
+        if _hand_owner(body, idx) == "other" or _hand_is_meta(body, idx):
+            continue
         return (
             f"身体不一致（她是{sp}，没有「{hit.group(0)}」这种东西）"
         )
@@ -955,15 +1277,23 @@ def _check_species(text: str, species: str = "") -> Optional[str]:
 # 这一条又想纠正 → 拒。偶尔一句「别闹」是情趣，连着五句是训话。
 _PREACHY = re.compile(
     r"别(?:再)?(?:问|管|吵|闹|想|猜|打听|刨根问底|胡思乱想|一惊一乍|自作多情|瞎想|乱猜)"
-    r"|别[^，。！？、,.!?;]{0,6}了"
+    # v2.2.11：`别` 会误伤「别人都走了」「特别冷了」——左边是这些字、或右边
+    # 直接跟名词（的/人/处/样）时，不是「别…」祈使，跳过。
+    r"|(?<![特区个分差类性别识离级派历])别(?![的人处样])[^，。！？、,.!?;]{0,6}了"
     r"|少(?:自作多情|来这套|管闲事|废话|装)"
     # v2.2.10：线上真有一条「少在这装可怜了」——`少` 后面跟的是地点/对象再跟动词，
     # 上面那支漏了。这里只认**小句开头**的「少…了/吧」，避免「多少/减少/很少」误伤。
     r"|(?:(?<=[，,、；;：:。！？!?\s])|^)少[^，。！？、,.!?;]{0,6}(?:了|吧)"
-    r"|不(?:许|准)[^，。！？、,.!?;]{0,6}(?:了|吧)?"
+    # v2.2.11：这里原来是 `不许.{0,6}(?:了|吧)?`，`了|吧` 是可选的，于是
+    # 「就不许出去」「不准自己偷偷睡着」也被算成说教——二轮真机上这两条是
+    # 情话里的身体指令，属于误报。收窄成**只认纠正对方的话语/想法**
+    # （问、想、猜、说、打听、念叨、吵、闹、管）。身体指令是情趣，不是说教。
+    r"|不(?:许|准)(?:再)?[^，。！？、,.!?;]{0,6}(?:问|想|猜|说|打听|念叨|吵|闹|管)"
     r"|算你(?:老实|识相|识趣)"
     r"|问(?:这个|这些|这么多)?(?:干嘛|干什么)"
-    r"|多管闲事|大惊小怪|一惊一乍|胡思乱想|自作多情"
+    # v2.2.19：`胡思乱想` 单独出现不算——她描述「听他在胡思乱想」也被误判，
+    # 整条动作描写因此被剪掉；「别胡思乱想」那一支拦得住真说教。
+    r"|多管闲事|大惊小怪|一惊一乍|自作多情"
 )
 
 
@@ -971,8 +1301,81 @@ _PREACHY = re.compile(
 # v2.2.10：清理时只剪掉这一小段，不整句删——线上 22:39:53 那条
 # 「（嘟囔着拱了拱）没睡透，别闹。上次冷落我可还记着仇呢，不给我补偿可别想我理你。」
 # 被整句删光，结果是**她这一轮一句话没说**，比说教更糟。
-_PREACHY_CLAUSE_LEFT = "，,、；;：:"
+# v2.2.11：真机里模型大量用**空格**断句（「宝宝快抱紧我 不许再问这些奇奇怪怪
+# 的了」），只认逗号会把整段前半截当同一小句一起剪掉。空格也算小句边界。
+_PREACHY_CLAUSE_LEFT = "，,、；;：: \t　"
 _PREACHY_CLAUSE_END = "。！？!?，,、；;…"
+
+
+def _starts_with_word(text: str) -> bool:
+    """这一截是不是从「字」开始（汉字 / 字母 / 数字）。
+
+    剪掉中间的小句之后，前后两截直接粘在一起要补个逗号；但如果下一截开口就是
+    表情或标点（真机回放里出现过 `宝宝快抱紧我，💕`），补出来的逗号比不补更难看。
+    """
+    ch = str(text or "").lstrip()[:1]
+    if not ch:
+        return False
+    return ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+
+
+_PREACHY_DANGLE_TAIL = (
+    "的话", "的话就", "既如此", "既然", "因为", "所以", "要是", "如果", "虽然",
+    "但是", "而且", "然后", "结果", "可是", "不过", "哪怕", "除非", "就", "才",
+    "还", "也", "又", "但", "而", "并", "或",
+)
+_PREACHY_KEEP_RATIO = 0.34
+_BRACKET_PAIRS = (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"), ("「", "」"), ("『", "』"))
+_LEAD_BAD_PUNCT = "，,、；;：:。！？!?…~～ \t　"
+_LEAD_BAD_PUNCT_HEAD = tuple(_LEAD_BAD_PUNCT)
+
+
+def _brackets_balanced(text: str) -> bool:
+    for lo, hi in _BRACKET_PAIRS:
+        if text.count(lo) != text.count(hi):
+            return False
+    return True
+
+
+def _body_length(text: str) -> int:
+    """去掉括号动作和标点之后还剩多少实字。"""
+    return len(str(strip_actions(text or "")).strip(_LEAD_BAD_PUNCT))
+
+
+def _preachy_trim_safe(original: str, candidate: str) -> bool:
+    """剪完的这句还能不能发？
+
+    线上真出过这几种剪坏：括号没闭合、以逗号开头、只剩一句前言（「唔 既如此」）、
+    停在「再气我的话」这种半截条件上。任何一条不满足就整条不剪——宁可留一句
+    带脾气的话，也不能发一条断句。
+    """
+    cand = str(candidate or "").strip()
+    if not cand:
+        return False
+    if not _brackets_balanced(cand):
+        return False
+    if cand.lstrip().startswith(_LEAD_BAD_PUNCT_HEAD):
+        return False
+    tail = cand.rstrip(" \t　")
+    # v2.2.19：尾巴上常挂 emoji（`…再气我的话💕`），endswith 会因它失效，
+    # 先把尾部非汉字剥掉再判半截话。
+    tail = re.sub(r"[^\u4e00-\u9fff]+$", "", tail)
+    if tail.endswith(_PREACHY_DANGLE_TAIL):
+        return False
+    if _body_length(cand) < max(3, _body_length(original) * _PREACHY_KEEP_RATIO):
+        return False
+    return True
+
+
+def _inside_brackets(text: str, pos: int) -> bool:
+    """pos 是不是落在某个括号里面？（括号里的动作描写不该被当小句剪）"""
+    depth = 0
+    for i, ch in enumerate(text[:pos]):
+        if ch in "（(【[「『":
+            depth += 1
+        elif ch in "）)】]」』":
+            depth = max(0, depth - 1)
+    return depth > 0
 
 
 def _strip_preachy_clauses(sentence: str) -> str:
@@ -983,7 +1386,10 @@ def _strip_preachy_clauses(sentence: str) -> str:
     调用方按残余长度决定要不要丢这一句。
     """
     text = str(sentence or "")
-    hits = list(_PREACHY.finditer(text))
+    hits = [
+        m for m in _PREACHY.finditer(text)
+        if not _inside_brackets(text, m.start())  # v2.2.19
+    ]
     for m in reversed(hits):
         start = m.start()
         left = 0
@@ -995,6 +1401,11 @@ def _strip_preachy_clauses(sentence: str) -> str:
         for i in range(m.end(), len(text)):
             if text[i] in _PREACHY_CLAUSE_END:
                 end = i + (1 if text[i] in "。！？!?…" else 0)
+                break
+            # v2.2.19：模型大量用空格断句（「别闹了 贴紧些」）。以前找不到标点就
+            # 一路吃到句尾，把后面的好话也删了；这里让空格同样收尾。
+            if text[i] in " \t　":
+                end = i
                 break
         text = text[:left] + text[end:]
     return text
@@ -1012,9 +1423,15 @@ def _check_preachy(text: str, recent: Sequence[str], window: int = 5, limit: int
     一条都不拦——单句逗弄是人物性格，不是毛病。
     """
     olds = [str(o or "") for o in list(recent or [])[-window:]]
-    if sum(1 for o in olds if _preachy_hits(o)) < limit:
+    # v2.2.11：原来按「有多少**条消息**在说教」计数，于是同一条里说教两次只算
+    # 一次——二轮真机 03:11:39「哪、哪有 别胡思乱想的。…不许再问这些奇奇怪怪
+    # 的了」就是这样漏掉的（前一条 03:09 只有一句，合起来不够 2）。改成按
+    # **命中次数**累加：一句里两处也算两处。
+    mine = _preachy_hits(text)
+    if mine <= 0:
         return None
-    if _preachy_hits(text) <= 0:
+    # 同一条里连着纠正对方两处，本身就是训话，不需要历史佐证。
+    if sum(_preachy_hits(o) for o in olds) < limit and mine < limit:
         return None
     return "又在纠正对方（最近几条已经连着在管 TA 了，换成回应 TA 或说自己的事）"
 
@@ -1070,6 +1487,44 @@ def _check_echo_also(
     )
 
 
+# ─── 口头禅开头轮换（v2.2.11 / 二轮真机）────────────────────────
+#
+# 二轮 13 条私聊里 6 条以「唔」开头（46%）：
+#   `唔……最喜欢你了`、`唔 急什么？`、`唔哈 突然这么用力`、`唔……今天太累了嘛`
+# 这不是人设里的口头禅，是**开头懒得换**。群聊侧 v2.2.7 已经有统计式开头轮换
+# （`_opening_repeat_issue`：最近 6 条里同一开头 ≥3 次就退这条），但普通对话回复
+# 的提示词不在本插件手里，只能在出口这一侧治：同一个填充字用滥了，就把开头这
+# 一下摘掉。只摘「唔/嗯/哦」这类没有实义的填充，不动句子内容。
+_FILLER_HEADS = "唔嗯哦噢啊诶欸唉呃"
+_FILLER_TAIL = "…．.。 　\t~～，,"
+
+
+def _strip_filler_head(
+    text: str, recent: Sequence[str], window: int = 6, limit: int = 3
+) -> str:
+    """开头填充字用滥了，就把开头这一下摘掉。
+
+    `唔……最喜欢你了` → `最喜欢你了`；`唔哈 突然这么用力` → `哈 突然这么用力`。
+    摘完剩不到 3 个字就原样返回（不能把一条消息摘没）。
+    """
+    body = str(text or "")
+    cur = opening_head(body)
+    if not cur or cur not in _FILLER_HEADS:
+        return body
+    heads = [opening_head(o) for o in list(recent or [])[-window:]]
+    if sum(1 for h in heads if h == cur) < limit:
+        return body
+    stripped = strip_actions(body).lstrip()
+    if not stripped.startswith(cur):
+        return body
+    # 前面可能还有括号动作（`（蹭了蹭）唔……`），原样留着。
+    lead = body.split(stripped, 1)[0] if stripped else ""
+    rest = stripped[len(cur):].lstrip(_FILLER_TAIL)
+    if len(strip_actions(rest).strip()) < 3:
+        return body
+    return (lead + rest).strip()
+
+
 def tidy_outgoing_text(
     text: str, *, species: str = "", recent: Sequence[str] = (),
     context: Sequence[str] = (),
@@ -1085,7 +1540,8 @@ def tidy_outgoing_text(
     2. 蹄类角色把身体部位的「手」改成「蹄子」；
     3. 最近已经在连着纠正对方时，删掉这条里继续纠正对方的那几句；
     4. 没有由头却说「我也爱你」时，把「也」去掉（`context` 由调用方传入
-       对方刚说的话；主动消息没有上下文，一律去掉）。
+       对方刚说的话；主动消息没有上下文，一律去掉）；
+    5. 开头填充字（唔/嗯/哦）在最近几条里用滥了，摘掉开头这一下。
 
     改不动就原样返回；删空了返回空串，由调用方决定这条不发。
     """
@@ -1110,12 +1566,11 @@ def tidy_outgoing_text(
             ("右手", "右蹄"),
         ):
             body = body.replace(old, new)
-        body = _HAND_BODY.sub(
-            lambda m: m.group(0).replace("手", "蹄子", 1), body
-        )
+        body = _hoof_hand_sub(body)  # v2.2.18：只改她自己的手
     if _preachy_hits(body):
         olds = [str(o or "") for o in list(recent or [])[-5:]]
-        if sum(1 for o in olds if _preachy_hits(o)) >= 2:
+        # 窗口里累计命中 ≥2，或**这一条自己**就纠了两处（同一条里连纠两下 = 训话）。
+        if sum(_preachy_hits(o) for o in olds) >= 2 or _preachy_hits(body) >= 2:
             # v2.2.10：**剪小句，不整句删**。整句删会把回复删空（线上真发生过：
             # 「没睡透，别闹。…可别想我理你。」→ 空 → 这一轮她一个字没说）。
             # 先按句末标点切，句内剪掉「，别…」这类祈使小句；剪完只剩括号动作/
@@ -1139,11 +1594,21 @@ def tidy_outgoing_text(
             # 补个逗号才是人话；前一截已经有句末标点就不补。
             buf = ""
             for piece in kept:
-                if buf and not buf.rstrip().endswith(tuple("。！？!?…，,、；;：:")):
-                    buf = buf.rstrip() + "，"
+                if buf and not buf.rstrip().endswith(tuple("。！？!?…，,；;：:")):
+                    if _starts_with_word(piece):
+                        buf = buf.rstrip() + "，"
                 buf += piece
             joined = buf.strip()
-            body = joined or body
+            # 剪完只剩表情/标点（真机出现过只剩「💕」）就退回原文：宁可有脾气，
+            # 也不能发一条残缺的。全是空（全被剪）同样退回原文。
+            keep = strip_actions(joined).strip(
+                "，。！？!?…~～、；;：: 　"
+            )
+            # v2.2.19：剪完还要过一遍「像不像话」——括号闭合、不以逗号开头、
+            # 不停在半截条件上、实字没被剪掉太多。不过就整条不剪。
+            body = joined if (len(keep) >= 3 and _preachy_trim_safe(body, joined)) else body
+    # v2.2.11：口头禅开头（「唔……」「嗯」）在最近几条里用滥了，摘掉开头这一下。
+    body = _strip_filler_head(body, recent)
     body = re.sub(r"[ \t]{2,}", " ", body).strip()
     return body
 

@@ -124,6 +124,26 @@ def format_utc_offset(minutes: Any) -> str:
     return f"UTC{sign}{hours}"
 
 
+def host_utc_offset_minutes() -> Optional[int]:
+    """插件所在机器（宿主/容器）自己的 UTC 偏移，单位分钟；读不到给 None。
+
+    v2.2.36 起用来做「配置时区 vs 本机时区」的自检：线上曾经配着 UTC+2、宿主在
+    UTC+8，她的安静时段 23–7 于是落在宿主时间 05:00–13:00，整个上午都不在，而
+    日志和面板一个字都不提，只能靠人肉对比时间词才发现。这里只是把本机偏移取出来，
+    不参与计时——计时仍然只认配置。
+    """
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+    except Exception:
+        return None
+    if offset is None:
+        return None
+    try:
+        return int(offset.total_seconds() // 60)
+    except Exception:
+        return None
+
+
 def normalize_timezone(value: Any) -> str:
     """配置里的时区收成规范写法：UTC±H[:MM]；跟随写法一律 auto。"""
     minutes = parse_utc_offset(value)

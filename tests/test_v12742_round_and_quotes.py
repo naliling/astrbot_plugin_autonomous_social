@@ -4,8 +4,8 @@
 
 线上真实日志（一天之内同一条重复了 9763 次）：
 
-    念想「有点想你了」 2114128887 → LLM 不可用（provider 取不到或调用失败），本轮未发送
-    念想「在干嘛呢」     3574784101 → LLM 不可用（provider 取不到或调用失败），本轮未发送
+    念想「有点想你了」 2114128887 → LLM 不可用（3 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送
+    念想「在干嘛呢」     3574784101 → LLM 不可用（3 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送
     ……（一分钟内 550 行）
 
 根因不是「日志写得太多」，是**一轮里把 550 个候选全试了一遍**：
@@ -202,7 +202,7 @@ class _RoundEngine:
         return False, self.result
 
 
-INFRA = "LLM 不可用（provider 取不到或调用失败），本轮未发送"
+INFRA = "LLM 不可用（3 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送"
 
 
 class AttemptGate(unittest.TestCase):

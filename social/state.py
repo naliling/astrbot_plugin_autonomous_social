@@ -742,6 +742,36 @@ class SocialState:
             self._append_group_sample(g, text, now, sample_cap, self_flag=True)
         self.mark_dirty()
 
+    def annotate_last_group_sample(
+        self, bid: str, gid: str, sources: Optional[List[str]] = None
+    ) -> bool:
+        """给这个群最近一条「她自己说的」样本补上出处（v2.2.38）。
+
+        为什么要有：最常被问的排障问题是「她为什么突然说这个」。私聊主动消息一直有
+        `proactive_log[].about` 记着由头，群这条链路却只落正文——素材用完就查不回来
+        （Core 的 state 只存当前状态、不存历史），于是「这句是从哪条日程来的」答不上来。
+        这里只补可追溯性，不改任何输出。
+        """
+        items: List[str] = []
+        for raw in sources or []:
+            body = str(raw or "").strip()
+            if body:
+                items.append(body[:60])
+        if not items:
+            return False
+        try:
+            samples = self.group(bid, gid).get("samples")
+        except Exception:
+            return False
+        if not isinstance(samples, list):
+            return False
+        for entry in reversed(samples):
+            if isinstance(entry, dict) and entry.get("self"):
+                entry["sources"] = items[:2]
+                self.mark_dirty()
+                return True
+        return False
+
     def flow_hour_count(self, g: Dict[str, Any], now: float) -> int:
         """当前自然小时里已经心流插了几次（跨桶自动归零）。"""
         if int(g.get("flow_hour_bucket", 0) or 0) != int(now // 3600):
@@ -770,7 +800,7 @@ class SocialState:
         g["topic_at"] = now
         self.mark_dirty()
 
-    def note_group_send(self, bid: str, now: float, day: str) -> None:
+    def note_group_send(self, bid: str, now: float, day: str, reply: bool = False) -> None:
         """v2.1.2：记一次群里的主动发言（破冰/起话头/心流都算），给全局日上限用。
 
         原来只有「每群每天几条」的账（`note_icebreak` / `note_group_topic`），
@@ -787,7 +817,30 @@ class SocialState:
             b["group_send_day"] = day
             b["group_send_count_day"] = 1
         b["group_send_at"] = now
+        # v2.2.35：另记一本「群内接话」的账。口径不变（接话仍然占主动额度），
+        # 只是让日志能说清「N 条里有几条是在接群友的话」——原来一律写成
+        # 「已经主动说了 13 条（上限 12）」，读起来像她超额发言、也分不清
+        # 那 1 条其实是回人话（线上 11-11 05:59 就是这样）。
+        if reply:
+            if str(b.get("group_reply_day", "") or "") == day:
+                try:
+                    b["group_reply_count_day"] = int(b.get("group_reply_count_day", 0) or 0) + 1
+                except (TypeError, ValueError):
+                    b["group_reply_count_day"] = 1
+            else:
+                b["group_reply_day"] = day
+                b["group_reply_count_day"] = 1
         self.mark_dirty()
+
+    def group_reply_count(self, bid: str, day: str) -> int:
+        """v2.2.35：这个角色今天在群里「接群友的话」说了几条（跨天自动归零）。"""
+        b = self.bot(bid)
+        if str(b.get("group_reply_day", "") or "") != day:
+            return 0
+        try:
+            return max(0, int(b.get("group_reply_count_day", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def group_send_count(self, bid: str, day: str) -> int:
         """v2.1.2：这个角色今天在群里已经主动说了几条（跨天自动归零）。"""
@@ -2517,6 +2570,170 @@ class SocialState:
                     break
         return out
 
+    def group_self_texts(
+        self, bid: str, gid: str, now: float, hours: float = 12.0, limit: int = 12
+    ) -> List[str]:
+        """她在**这个群**里最近说过的话（旧→新）。
+
+        v2.2.12：`_check_repeat` 只跟 `own_recent`（最多 3 条）比，`life_used`
+        只记素材行——于是「同一件事换个说法」在本群里照样能说第二遍。线上 11-10
+        群 602543123 15:22 说旧票据、17:19 又说「上午那点事总算理完了」，
+        两本账都没响。这里直接取她说过的正文，比较交给 `_check_same_event`。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows: List[Tuple[float, str]] = []
+        g = (self.bot(bid).get("groups") or {}).get(str(gid))
+        if not isinstance(g, dict):
+            return []
+        for e in (g.get("samples") or []):
+            if not isinstance(e, dict) or not e.get("self"):
+                continue
+            ts = _safe_ts(e.get("ts"))
+            if ts < cutoff:
+                continue
+            text = str(e.get("text", "") or "").strip()
+            if text:
+                rows.append((ts, text))
+        rows.sort(key=lambda r: r[0])
+        out: List[str] = []
+        seen = set()
+        for _ts, text in rows:
+            if text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+        return out[-max(1, int(limit)):]
+
+    def own_group_openings(
+        self, bid: str, now: float, hours: float = 24.0, limit: int = 6
+    ) -> List[str]:
+        """她**在所有群里**最近开口的正文（旧→新，最多 limit 条）。
+
+        v2.2.17：开头是「她自己」的习惯，不是「这个群」的记忆。
+        线上 11-10 那天她发了 52 条群消息、25 个群，13 条以「刚」开头；
+        但按群分开看，每个群只见到 1~5 条——「最近 6 条里同一个开头 ≥3 次」
+        这种统计在单个群里永远凑不满。实测把 52 条按群回放，开头轮换闸
+        一条都拦不住（`scripts/replay_group_openings.py`）。
+        所以这里跨群汇总她的开口样本，给提示词轮换和 `_opening_repeat_issue`
+        一个真正看得见她习惯的窗口。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows: List[Tuple[float, str]] = []
+        groups = self.bot(bid).get("groups") or {}
+        if not isinstance(groups, dict):
+            return []
+        for _gid, g in groups.items():
+            if not isinstance(g, dict):
+                continue
+            for e in (g.get("samples") or []):
+                if not isinstance(e, dict) or not e.get("self"):
+                    continue
+                ts = _safe_ts(e.get("ts"))
+                if ts < cutoff:
+                    continue
+                text = str(e.get("text", "") or "").strip()
+                if text:
+                    rows.append((ts, text))
+        rows.sort(key=lambda r: r[0])
+        out: List[str] = []
+        for _ts, text in rows:
+            if out and out[-1] == text:
+                continue
+            out.append(text)
+        return out[-max(1, int(limit)):]
+
+
+    def recent_own_group_texts(
+        self, bid: str, now: float, hours: float = 6.0, limit: int = 12
+    ) -> List[Tuple[str, str]]:
+        """她**在所有群里**最近说过的话，返回 [(gid, 正文)]，最近的排前面。
+
+        v2.2.20：跨渠道二传。旧账本分方向各查各的——群侧只跟「别的群」比
+        （`recent_group_self_others`），私聊只跟「别的用户」比
+        （`recent_proactive_others`）。于是同一件事可以先进群、再跟人私聊讲一遍，
+        或者反过来：线上 1839 条语料里，私聊主动消息有 25 条和 6 小时内的群发言
+        是同一件事（「刚用蹄子夹着碗勺洗完」逐字重复、「娜莉灵下午来了一趟」对
+        群里的「听娜莉灵说话」）。这里给私聊侧一个看得见群发言的窗口。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows: List[Tuple[float, str, str]] = []
+        groups = self.bot(bid).get("groups") or {}
+        if not isinstance(groups, dict):
+            return []
+        for gid, g in groups.items():
+            if not isinstance(g, dict):
+                continue
+            for e in (g.get("samples") or []):
+                if not isinstance(e, dict) or not e.get("self"):
+                    continue
+                ts = _safe_ts(e.get("ts"))
+                if ts < cutoff:
+                    continue
+                text = str(e.get("text", "") or "").strip()
+                if text:
+                    rows.append((ts, str(gid), text))
+        rows.sort(key=lambda r: -r[0])
+        return [(who, text) for _ts, who, text in rows[:max(1, int(limit))]]
+
+    def recent_proactive_all(
+        self, bid: str, now: float, hours: float = 6.0, limit: int = 12
+    ) -> List[Tuple[str, str]]:
+        """她最近**发给任何人**的主动消息，返回 [(uid, 正文)]，最近的排前面。
+
+        v2.2.20 的另一半：群侧开口前要先看看「这件事是不是刚跟谁私聊讲过」。
+        不传 uid 是有意的——私聊对象是谁不影响判断，反正都不该拿到群里再说一遍。
+        """
+        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
+        rows: List[Tuple[float, str, str]] = []
+        users = self.bot(bid).get("users") or {}
+        if not isinstance(users, dict):
+            return []
+        for uid, u in users.items():
+            if not isinstance(u, dict):
+                continue
+            for e in (u.get("proactive_log") or []):
+                if not isinstance(e, dict):
+                    continue
+                ts = _safe_ts(e.get("ts"))
+                if ts < cutoff:
+                    continue
+                text = str(e.get("text", "") or "").strip()
+                if text:
+                    rows.append((ts, str(uid), text))
+        rows.sort(key=lambda r: -r[0])
+        return [(who, text) for _ts, who, text in rows[:max(1, int(limit))]]
+
+    def group_other_bot_spoke(self, bid: str, gid: str) -> float:
+        """**别的角色**最近一次在这个群开口的时间戳（没有就 0）。
+
+        v2.2.32：群侧冷却原来按 `(bot, gid)` 各记一本账，互不相看。线上 11-08
+        17:35:13 天鼠刚破冰「今天就想窝着喝热牛奶」，3 秒后茉心在同一个群说
+        「水池里的碗总算洗了」——两个"人"同时开口，读起来就不像真人。
+        这里不新建共享账，直接读 state 里本来就有的其它 bot 的
+        `groups[gid]["last_bot_spoke"]`：四个角色本来就在同一个状态文件里。
+        """
+        latest = 0.0
+        try:
+            bots = self.data.get("bots") or {}
+        except Exception:
+            return 0.0
+        for other_bid, bot in bots.items():
+            if str(other_bid) == str(bid) or not isinstance(bot, dict):
+                continue
+            try:
+                g = (bot.get("groups") or {}).get(gid) or {}
+            except Exception:
+                continue
+            if not isinstance(g, dict):
+                continue
+            try:
+                ts = float(g.get("last_bot_spoke") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ts > latest:
+                latest = ts
+        return latest
+
     def recent_group_self_others(
         self, bid: str, gid: str, now: float, hours: float = 2.0
     ) -> List[Tuple[str, str]]:
@@ -2563,6 +2780,50 @@ class SocialState:
         if not rows:
             return 0.0
         return sum(1 for r in rows if int(r.get("q", 0) or 0)) / float(len(rows))
+
+    def recent_own_out(
+        self,
+        bid: str,
+        uid: str,
+        now: float,
+        hours: float = 2.0,
+        limit: int = 4,
+    ) -> List[str]:
+        """她最近对**这个人**说过的话（新→旧，v2.2.22）。
+
+        只用于「回复前提醒模型别再讲一遍」，不做拦截：普通回复如果被闸掉，
+        表现就是她不回人话，比复读更糟。
+        """
+        bot = self.bot(bid)
+        users = bot.get("users") or {}
+        u = users.get(uid)
+        if not isinstance(u, dict):
+            return []
+        conv = u.get("conversation")
+        if not isinstance(conv, list):
+            return []
+        win = max(0.0, float(hours or 0.0)) * 3600.0
+        out: List[str] = []
+        seen: set = set()
+        for item in reversed(conv):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("dir", "") or "") != "out":
+                continue
+            try:
+                ts = float(item.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if win > 0 and now > 0 and (now - ts) > win:
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= max(1, int(limit or 1)):
+                break
+        return out
 
     def recent_proactive(
         self, bid: str, uid: str, now: Optional[float] = None, days: float = PROACTIVE_LOG_DAYS

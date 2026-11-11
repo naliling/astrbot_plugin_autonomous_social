@@ -37,6 +37,7 @@ from . import history_ingest
 from . import memory_bridge
 from . import pacing
 from .clock import (
+    host_utc_offset_minutes,
     TIMEZONE_AUTO,
     city_epoch,
     city_now,
@@ -62,13 +63,21 @@ from .config import (
 from .core_bridge import CORE_SAID_MAX, CoreBridge
 from .input_state import InputStateNotifier, wait_reason as input_wait_reason
 from .sanitize import sanitize_incoming
+from .textutil import short_call_name, usable_call_name
 from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_anchors
 from .verify import (
     _bigrams,
     _check_cross_user,
+    _check_same_event,
+    _content_overlap,
+    _content_run,
+    _event_content,
+    _same_event_text,
+    action_tics,
     _check_cross_user_action,
     _jaccard,
     _opening_repeat_issue,
+    name_density_tics,
     opening_head,
     strip_actions,
     tidy_outgoing_text,
@@ -116,6 +125,7 @@ from .threads import (
     loop_review_pending,
     mark_followup_sent,
     unfinished_signal,
+    last_in_text,
     LOOP_LATE_HOURS,
     PROMISE_WAIT_SECONDS,
 )
@@ -944,12 +954,54 @@ def _same_event(a: Any, b: Any, bigram_ratio: float = GROUP_SEGMENT_DUP_RATIO) -
 # 碎片段：短、且没有句末落点。线上真机（22:18:52–22:18:57）四条连发：
 #   「窗边伸了个懒腰」「眼睛闭了会儿」「骨头都松了。你刚才那句来抱抱」「还暖着呢。…」
 # 前两条就是被拆出来的半截话——一段话被拆成弹幕，读起来像她喘不上气。
-FRAGMENT_MIN_CHARS = 8
+# v2.2.45：原来这里还有一条 `len(body) >= FRAGMENT_MIN_CHARS` 的早退（8 字），
+# 真机（2026-11-11 19:10–19:12）里被切出来的段都在 8~27 字，于是全部判定「不碎」，
+# 一句话被拆成 4 条弹幕：「滚烫的汤顺着食道暖进心里了」「那股香气钻在舌尖挥之不去」
+# 「可惜眼下这口热气腾腾的汤呀」「少人陪着分食呢。💕」。长度与「说没说完」无关，
+# 现在只看落点：有句末标点才算说完。
 _FRAGMENT_TAIL = ("。", "！", "？", "…", "~", "～", "!", "?", ".", "”", "’", "」", "』")
 # 问句/邀约本身就是完整的一句（「你要不要也来」「来抱抱」），不该被当碎片吞进上一句。
+# v2.2.45：把「吧|啊|呀|嘛|么」从这一支删掉——「…这口热气腾腾的汤呀」不是完整句，
+# 语气词只说明她想收尾，不代表话已经说完了。
 _FRAGMENT_SELF_CONTAINED = re.compile(
-    r"要不要|有没有|是不是|好不好|行不行|好吗|行吗|吗|吧|啊|呀|嘛|么|？|\?"
+    r"要不要|有没有|是不是|好不好|行不行|好吗|行吗|吗|呢？|？|\?"
 )
+# 合并上限：两段并起来超过这个字数就不再并，避免把整条发言糊成一大坨。
+FRAGMENT_MERGE_MAX_CHARS = 90
+# 判断「说没说完」时，先剥掉结尾的表情/空白再看标点——「少人陪着分食呢。💕」
+# 是说完的，「…这口热气腾腾的汤呀」才是没说完。
+_TRAIL_KEEP = "\u4e00-\u9fff0-9A-Za-z。！？…~～!?.”’」』"
+# 语气词收尾：短句（≤12 字）就是完整的一句（「那你早点睡吧」「好呀」）；
+# 长句里同样的语气词只表示她想收尾，话还没说完（「…这口热气腾腾的汤呀」）。
+_FRAGMENT_SOFT_TAIL = ("吧", "啊", "呀", "嘛", "么", "啦", "哦", "喔")
+FRAGMENT_SOFT_MAX_CHARS = 12
+
+
+# v2.2.45：Core 那边这个人的 name 可能只是 UID 数字串（真机：roles[bid].users[uid]
+# 的 name/display_name/nickname 全是 "3391908372"），而 aso 自己的名片账本里是「玄黄玲珑」。
+# 原取值链 Core 优先，于是提示词把「3391908372」当称呼喂给模型，模型受不了就自己编了
+# 一个「星辰」，连续五条都这么叫。名字不可用就该往下回退，而不是硬塞。
+def _usable_call_name(name: Any, uid: str = "") -> str:
+    """这个名字配不配当称呼。纯数字/纯符号/等于 uid/太短 一律不认。
+
+    v2.2.46：判据下沉到 `textutil.usable_call_name`，生成侧（`_bond_line`）用同一份，
+    免得一处洗干净、另一处又把数字串当「她一直这么叫」。
+    """
+    try:
+        return usable_call_name(name, uid)
+    except Exception:
+        pass
+    text = str(name or "").strip()
+    if len(text) < 2:
+        return ""
+    bare = "".join(text.split())
+    if not bare or bare == str(uid or "").strip():
+        return ""
+    if re.fullmatch(r"[0-9０-９]+", bare):
+        return ""
+    if not re.search(r"[\u4e00-\u9fffA-Za-z]", bare):
+        return ""
+    return text
 
 
 def _is_fragment(seg: Any) -> bool:
@@ -964,11 +1016,14 @@ def _is_fragment(seg: Any) -> bool:
     body = strip_actions(raw).strip()
     if not body:
         return False
-    if len(body) >= FRAGMENT_MIN_CHARS:
+    core = re.sub(rf"[^{_TRAIL_KEEP}]+$", "", body.rstrip(" \t\u3000"))
+    if core.endswith(_FRAGMENT_TAIL):
+        return False
+    if core.endswith(_FRAGMENT_SOFT_TAIL) and len(core) <= FRAGMENT_SOFT_MAX_CHARS:
         return False
     if _FRAGMENT_SELF_CONTAINED.search(body):
         return False
-    return not body.endswith(_FRAGMENT_TAIL)
+    return True
 
 
 def _merge_fragments(
@@ -993,8 +1048,11 @@ def _merge_fragments(
         # 末尾的碎片没有「下一段」可并，并进上一段。
         if _is_fragment(merged[-1]):
             head = merged[-2].rstrip()
+            tail = merged[-1].lstrip()
+            if len(head) + len(tail) > FRAGMENT_MERGE_MAX_CHARS:
+                return merged, mw
             sep = "" if head.endswith(("，", "、", ",", "；", ";", "：", ":")) else "，"
-            merged[-2] = head + sep + merged[-1].lstrip()
+            merged[-2] = head + sep + tail
             merged.pop()
             if mw:
                 mw.pop()
@@ -1012,6 +1070,90 @@ def _merge_fragments(
             changed = True
             break
     return merged, mw[: max(0, len(merged) - 1)]
+
+
+# v2.2.26：同一次发言内部判重，只认「几乎在说同一句」。
+# 回放 209 个历史连发簇：按 `_same_event_text` 会删掉 14 段，其中 5 段其实
+# 是另一个念头（`叠着衣服的手都懒得抬` 被 `叠衣服正巧把情绪捋顺了` 吃掉、
+# `后来想清楚了吗` 被 `你上次说的「你最好想清楚」` 吃掉、`那句「没意思」说得
+# 倒轻巧` 被`昨夜梦见汝那点温存`吃掉）。真该删的 9 段 bigram 都在 0.26 以上，
+# 误删的 5 段都 ≤0.12，中间有清晰间隙，所以这里另立一套更严的阈值。
+_SEGMENT_DUP_BIGRAM = 0.25
+_SEGMENT_DUP_OVERLAP = 0.70
+_SEGMENT_QUESTION = re.compile(
+    r"[？?]|吗|呢|什么|怎么|哪|谁|多久|几时|好不好|行不行|要不要"
+)
+
+
+def _near_verbatim(a: str, b: str) -> bool:
+    """两段是不是「几乎同一句」——同一次发言里删段只许用这个判据。
+
+    只看**内容字**（去掉「本宫/方才/用蹄子夹着」这些模板字），而且要求
+    一段是另一段的子串，或者内容字重合足够高。回放 209 个历史连发簇时，
+    这样刚好放过 5 段「其实是另一个念头」的句子（`后来想清楚了吗` 与
+    「你最好想清楚」、`那句「没意思」说得倒轻巧` 与「昨夜梦见汝那点温存」）。
+    """
+    try:
+        ca, cb = _event_content(a), _event_content(b)
+        if not ca or not cb:
+            return False
+        na, nb = "".join(ca), "".join(cb)
+        if na in nb or nb in na:
+            return True
+        if _jaccard(_bigrams(na), _bigrams(nb)) >= _SEGMENT_DUP_BIGRAM:
+            return True
+        return (
+            min(len(ca), len(cb)) >= 6
+            and _content_overlap(ca, cb) >= _SEGMENT_DUP_OVERLAP
+        )
+    except Exception:
+        return False
+
+
+def _dedupe_same_event_segments(
+    segments: List[str], waits: List[float]
+) -> Tuple[List[str], List[float]]:
+    """同一次发言里两段说的是同一件事，只留前面那段（v2.2.22）。
+
+    线上真机：`折腾半天，总算把晚饭备好了` 和 1 秒后的 `总算把晚饭备好了`
+    是同一条回复拆出来的两段；`傍晚用蹄子夹着锅柄把妹妹带的东西热了一锅`
+    之后又发 `把妹妹带来的东西热了一锅`。同一件事在一次发言里说两遍，
+    不是「想到什么说什么」，是把一句话说了两遍。
+    """
+    segs = [str(s or "") for s in (segments or [])]
+    ws = [float(w or 0.0) for w in (waits or [])]
+    if len(segs) < 2:
+        return segs, ws
+    kept: List[str] = []
+    kept_idx: List[int] = []
+    for idx, seg in enumerate(segs):
+        # 问句是「这一轮要问对方的那句话」，删了就成了半截话。
+        if _SEGMENT_QUESTION.search(seg):
+            kept.append(seg)
+            kept_idx.append(idx)
+            continue
+        dup = ""
+        for old in kept:
+            try:
+                if _near_verbatim(seg, old):
+                    dup = old
+                    break
+            except Exception:
+                continue
+        if dup:
+            logger.info(
+                f"[autonomous_social] 同一次发言里重复了同一件事，只发前面那段："
+                f"{seg[:40]!r}（与 {dup[:40]!r} 是同一件事）"
+            )
+            continue
+        kept.append(seg)
+        kept_idx.append(idx)
+    if len(kept) == len(segs):
+        return segs, ws
+    if len(kept) <= 1:
+        return kept, []
+    new_ws = [ws[i] if i < len(ws) else 0.0 for i in kept_idx[1:]]
+    return kept, new_ws
 
 
 def _cap_group_segments(
@@ -1226,6 +1368,7 @@ UNFINISHED_WAIT_SECONDS = 1800.0
 # 找它必须极克制：真实使用里两台 bot 互相「你一句我一句」会刷成无限对话。
 # 这三道是 social 侧的第二道闸；Core 侧还有「同机 bot 互聊最多连续 3 轮」，
 # 两边各自独立把关、互不依赖（任何一边修好都能单独生效）。
+TZ_MISMATCH_MINUTES = 120        # 配置时区和本机时区差这么多小时……不，这么多分钟，就必须说出来（v2.2.36）
 BOT_PEER_MIN_GAP_SECONDS = 6 * 3600.0   # 距上次主动找它至少隔 6 小时
 BOT_PEER_DAILY_CAP = 1                  # 每天最多主动找它 1 次
 
@@ -1332,7 +1475,7 @@ def _flow_lead_issue(text) -> str:
     return "开口就是在接别人的话（首句没有她自己），不发"
 
 
-def _flow_quality_issue(segments) -> str:
+def _flow_quality_issue(segments, openings=None) -> str:
     """v2.2.1：群心流插话的质量闸。返回空串表示可以发，否则是拒发原因。
 
     用户原话是「那不应该加质量吗」——不砍量，改质量：插话是补充这件事，
@@ -1345,6 +1488,12 @@ def _flow_quality_issue(segments) -> str:
         if _PURE_ECHO_RE.match(body):
             return "整条只是附和"
     joined = "".join(str(seg or "") for seg in segments or [])
+    # v2.2.47：心流也要管开头。破冰/起话头 v2.2.7 就接了这道统计闸，心流一直没接，
+    # 于是「刚…」成灾时心流是漏网的那条路。判据同破冰（最近 6 条里同一开头 ≥3 次）。
+    if openings:
+        _op = _opening_repeat_issue(joined, openings)
+        if _op:
+            return _op
     if joined.strip():
         lead = _flow_lead_issue(joined)
         if lead:
@@ -1368,6 +1517,23 @@ _GROUP_CONCRETE_WORDS = tuple(_FLOW_SELF_ANCHOR_WORDS) + (
     "拿", "放", "抱", "背", "穿", "脱", "换", "开", "关", "推", "拉", "挪", "钻",
     "凉", "热", "冷", "空", "懒", "闷", "亮", "暗", "斜", "落", "湿", "响",
 )
+
+
+def _bump_review(engine: Any, key: str) -> None:
+    """记一次发前自评结果（v2.2.43）。
+
+    必须写成**模块级函数**而不是 SocialEngine 的方法：既有测试用
+    ``types.SimpleNamespace`` 造替身、只贴自己用到的几个绑定方法，
+    ``_bump_review(self, ...)`` 会 AttributeError，把新功能变成 19 个老测试的红。
+    """
+    try:
+        counters = getattr(engine, "_round_review", None)
+        if not isinstance(counters, dict):
+            counters = {}
+            engine._round_review = counters
+        counters[key] = counters.get(key, 0) + 1
+    except Exception:
+        pass
 
 
 def _species_safe(engine: Any, bid: str) -> str:
@@ -1414,6 +1580,7 @@ def _group_proactive_issue(
     openings: Optional[Sequence[str]] = None,
     used_lines: Optional[Sequence[str]] = None,
     used_ratio: float = 0.5,
+    spoken: Optional[Sequence[str]] = None,
 ) -> str:
     """v2.2.2：破冰 / 起话头的质量闸。返回空串表示可以发，否则是拒发原因。
 
@@ -1451,6 +1618,12 @@ def _group_proactive_issue(
                 continue
             if _same:
                 return f"这件事刚在这个群讲过（「{_old_text[:20]}」）"
+    # v2.2.12：拿**她在这个群里真说出去的正文**再比一遍。素材账只记素材行，
+    # 模型改写之后就对不上；正文比较才治得了「换个说法又说一遍」。
+    if spoken:
+        _sp = _check_same_event(joined, spoken)
+        if _sp:
+            return _sp
     return ""
 
 # 热聊续话（v2.1.8）：continue 的默认起点由 config 下调到 25 分钟，但刚聊热的那一小段
@@ -1666,6 +1839,30 @@ def _gap_jitter_factor(
     return low + (high - low) * ratio
 
 
+def _polish_filler_head(engine: Any, text: str) -> str:
+    """发送口最后一道：口头禅开头用滥了就摘掉（v2.2.47）。
+
+    为什么放在 `_send_with_retry`：群聊、私聊主动、连发补发、被动回复**全部**
+    从这里出去。`tidy_outgoing_text` 只管得到普通回复（on_decorating_result），
+    主动消息与群消息从来不过它，于是「唔……」能在私聊里占 46%。
+    这里只做**改写**、不拦消息：摘掉一个没有实义的填充字，绝不改变内容。
+    用 ``getattr`` 兜底——测试替身没有这两个方法时原样返回。
+    """
+    body = str(text or "")
+    if not body.strip():
+        return body
+    try:
+        fn = getattr(engine, "recent_spoken_texts", None)
+        recent = list(fn(6) or []) if callable(fn) else []
+    except Exception:
+        recent = []
+    try:
+        from .verify import _strip_filler_head as _strip
+        return str(_strip(body, recent) or body)
+    except Exception:
+        return body
+
+
 class SocialEngine:
     """自主社交引擎。"""
 
@@ -1757,6 +1954,9 @@ class SocialEngine:
         # 「其它未发 N 条」到底是什么（v1.27.50：曾把闸门日志降到 debug，
         # 于是 39 条失败一条原因都没有）。
         self._round_skip_samples: Dict[str, int] = {}
+        # v2.2.42：发前自评的结果（ok / rewrite / drop / fail），每轮清零并进汇总行。
+        # 没有这四个数就看不出「自评到底跑了没」，断言不了就等于没接。
+        self._round_review: Dict[str, int] = {}
         # ── 运行指标（只记数字与短原因，不含任何正文）────────────────────
         # 为什么要有：状态页原来只写「心跳：每 8~15 分钟一次」这种**静态说明**，
         # 于是「没触发」时根本分不清是没到时间、provider 取不到、用户被隔离、
@@ -2043,6 +2243,40 @@ class SocialEngine:
         """
         text = str(result or "")
         return any(text.startswith(marker) or marker in text for marker in _INFRA_NOTES)
+
+    def _llm_unavailable_note(self, bid: str) -> str:
+        """「LLM 不可用」到底是哪一种，直接写在文案里。
+
+        v2.2.33：以前三种情况共用一句「provider 取不到」。线上 13:00 那一轮我照
+        着这行日志先去查了三遍 provider 配置，实际是三条专供 provider 都在 90 秒
+        超时之后进了退避。文案说错原因，比没有原因更费时间。
+
+        - 真的没配 provider → 「没配 provider」
+        - 正在退避 → 「调不通，退避中（还剩 N 秒）」
+        - 其它 → 「调用失败：超时/连接/5xx 这类瞬时故障」
+
+        前缀固定是「LLM 不可用」：`_INFRA_NOTES` 靠它分类，改了「一轮里剩下的候选
+        不必再试」这套判断就失效。
+        """
+        try:
+            ids = [str(x) for x in (getattr(self.cfg, "proactive_provider_ids", None) or []) if str(x).strip()]
+        except Exception:
+            ids = []
+        if not ids:
+            return "LLM 不可用（没配 provider），本轮未发送"
+        left = 0.0
+        try:
+            left = float(self.generator.llm_backoff_remaining() or 0.0)
+        except Exception:
+            left = 0.0
+        if left > 0.5:
+            return (
+                f"LLM 不可用（{len(ids)} 条 provider 都调不通，退避中，"
+                f"还剩 {int(left + 0.999)} 秒），本轮未发送"
+            )
+        return (
+            f"LLM 不可用（{len(ids)} 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送"
+        )
 
     # ─── 记忆联动（astrbot_plugin_memory_companion） ───────
 
@@ -2621,6 +2855,78 @@ class SocialEngine:
             bid, uid, text, store_text=self.cfg.store_message_text
         )
 
+    def reply_echo_hint(self, bid: str, uid: str) -> str:
+        """回复前提醒：「你刚跟这个人说过这些，别再说一遍」（v2.2.22）。
+
+        普通对话回复的提示词不在本插件手里，出口也没法拦（拦了就是不回人话），
+        所以只在她开口**之前**把最近说过的话摆到模型眼前——和群聊「这几个开头
+        这次别用了」是同一套做法：给事实，不给禁令。
+        """
+        try:
+            if not bid or not uid:
+                return ""
+            if not bool(getattr(self.cfg, "reply_echo_guard", True)):
+                return ""
+            hours = float(getattr(self.cfg, "reply_echo_hours", 2.0) or 0.0)
+            if hours <= 0:
+                return ""
+            limit = max(1, int(getattr(self.cfg, "reply_echo_limit", 4) or 4))
+            fn = getattr(self.state, "recent_own_out", None)
+            if not callable(fn):
+                return ""
+            rows = fn(bid, uid, self._time(), hours, limit)
+        except Exception as _e:
+            self._note_soft_fail("回声提醒取数", _e)
+            return ""
+        if not rows:
+            return ""
+        lines: List[str] = []
+        for item in rows:
+            text = " ".join(str(item or "").split())
+            if not text:
+                continue
+            if len(text) > 40:
+                text = text[:40] + "…"
+            lines.append(text)
+        if not lines:
+            return ""
+        # v2.2.23：骨架自查（最近几条是不是同一个括号动作/同一个开头骨架），
+        # 和开头轮换一样只给事实：让她自己换，不拦不改写。
+        tics: List[str] = []
+        wide: List[str] = []
+        try:
+            wide = fn(bid, uid, self._time(), hours, max(6, limit))
+            tics = action_tics(wide)
+        except Exception:
+            tics = []
+        # v2.2.27：名字叫得太勤也给她看一眼（线上 8 个对话方 100% 每条都叫）。
+        name_tics: List[str] = []
+        try:
+            peer_name = str((self.state.user(bid, uid) or {}).get("name") or "")
+            name_tics = name_density_tics(wide, peer_name)
+        except Exception:
+            name_tics = []
+        tail = ""
+        if tics:
+            tail += (
+                "这一轮注意：" + "；".join(tics)
+                + "。换个动作，或者干脆不写动作，直接说话。\n"
+            )
+        if name_tics:
+            tail += (
+                "还有：" + "；".join(name_tics)
+                + "。名字不用每句都叫——句尾挂个名字，读起来像在点名叫人。\n"
+            )
+        return (
+            "<autonomous_social_echo_guard>\n"
+            "下面这些是你刚跟这个人说过的话（越往后越近）：\n"
+            + "\n".join(f"{i}. {t}" for i, t in enumerate(lines, 1))
+            + "\n同一件事别再讲第二遍：接着对方的话往下说，或者问问他，"
+            "实在没有新东西就少说两句。\n"
+            + tail
+            + "</autonomous_social_echo_guard>"
+        )
+
     def consume_pending_proactive_context(self, bid: str, uid: str) -> str:
         """取出并清除待注入本轮 LLM 请求的主动消息文本。
 
@@ -2807,6 +3113,58 @@ class SocialEngine:
         except Exception:
             pass
 
+    def _note_proactive_name(self, bid: str, uid: str, text: str) -> None:
+        """只统计：主动消息里有没有叫对方的名字（v2.2.30）。
+
+        为什么需要它：提示词里写着「开口要叫一声TA的称呼」，但模型听不听无法离线验证。
+        线上 664 条主动消息里只有 15.5% 含完整短名（宽松上限 16%），说明多半没听。
+        这里攒真机比例，下一轮据此决定要不要在发送前兜一道。
+
+        只统计，不改写、不拦——名字是亲密感，漏叫也不能不发。
+        """
+        try:
+            name = short_call_name(
+                str((self.state.user(bid, uid) or {}).get("name") or "")
+            )
+            if not name:
+                return
+            self._pro_name_total = int(getattr(self, "_pro_name_total", 0)) + 1
+            if name in str(text or ""):
+                return
+            self._pro_name_miss = int(getattr(self, "_pro_name_miss", 0)) + 1
+            if self._pro_name_miss % 10 == 1:
+                logger.info(
+                    f"[autonomous_social][{bid}] 主动消息没叫对方名字累计 "
+                    f"{self._pro_name_miss}/{self._pro_name_total}"
+                    f"（称呼「{name}」）：{str(text or '')[:26]}"
+                )
+        except Exception:
+            pass
+
+    def _note_soft_fail(self, where: str, exc: BaseException) -> None:
+        """降级继续的地方，至少要留个痕。
+
+        v2.2.22 那次 `_dedupe_same_event_segments` 漏了 import，`NameError` 被
+        `except Exception: pass` 吞掉，去重静默空转——**代码在跑，功能没跑**。
+        所以凡是「出错了也不停」的地方，都过这里：同一个位置前 3 次、之后每 50 次
+        记一条 warning，既不刷屏，也不会再无声降级。
+        """
+        try:
+            counts = getattr(self, "_soft_fail_counts", None)
+            if counts is None:
+                counts = {}
+                self._soft_fail_counts = counts
+            key = str(where or "未知")
+            seen = int(counts.get(key, 0)) + 1
+            counts[key] = seen
+            if seen <= 3 or seen % 50 == 0:
+                logger.warning(
+                    f"[autonomous_social] {key} 出错了，已降级继续"
+                    f"（第 {seen} 次）：{type(exc).__name__}: {exc}"
+                )
+        except Exception:
+            pass
+
     def recent_spoken_texts(self, count: int = 5) -> List[str]:
         """最近说过的 count 条（旧→新）。取不到就返回空列表。"""
         try:
@@ -2875,13 +3233,14 @@ class SocialEngine:
                         f"[autonomous_social][{bid}] 出口「刚」开头累计 "
                         f"{self._gang_head_hits}/{self._spoken_total}：{str(text or '')[:30]}"
                     )
-            except Exception:
-                pass
+            except Exception as _e:
+                self._note_soft_fail("出口「刚」开头统计", _e)
             ctx = context if isinstance(context, (list, tuple)) else ([context] if context else [])
             return tidy_outgoing_text(
                 text, species=species, recent=recent, context=ctx
             )
-        except Exception:
+        except Exception as _e:
+            self._note_soft_fail("出口清理", _e)
             return str(text or "")
 
     @staticmethod
@@ -3607,6 +3966,11 @@ class SocialEngine:
         if not parts:
             self.log(f"群 {gid} 心流：模型选择不接或生成为空")
             return
+        # v2.2.42：发前全面看一眼（与破冰同一套材料：群里刚在聊什么 + 她自己说过什么）。
+        _reviewed = await SocialEngine._review_group_draft(self, parts, group_ctx)
+        if _reviewed is None:
+            return
+        parts = _reviewed
         # ── 验收层（与私聊侧同一套五道检查）────────────────────
         # 群心流以前没有任何验收：模型写什么就发什么，含动机泄漏、括号截断、
         # 复读（同一晚 23 条一个调子）的毛病都可能直接进群。与私聊侧对齐：
@@ -3705,7 +4069,9 @@ class SocialEngine:
             return
         # v2.2.1：插话是「补充这件事」，不是「跟某个人对话」。判定抽成模块级函数，
         # 便于单独回归（tests/test_v221_flow_quality.py）。
-        _flow_issue = _flow_quality_issue(segments)
+        _flow_issue = _flow_quality_issue(
+            segments, list(group_ctx.get("openings") or [])
+        )
         if _flow_issue:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
             self._m["last_rejected"] = str(segments[0] if segments else "")[:200]
@@ -3778,7 +4144,8 @@ class SocialEngine:
             self.state.note_send_shape(bid, segments[0], sent_ts)
             # v2.1.2：心流也算进「她今天在群里说了几句」的全局账。
             self.state.note_group_send(
-                bid, sent_ts, self._moment_of(bid, sent_ts).strftime("%Y-%m-%d")
+                bid, sent_ts, self._moment_of(bid, sent_ts).strftime("%Y-%m-%d"),
+                reply=True,
             )
         except Exception as exc:
             logger.debug(f"[autonomous_social] 记心流发送形态失败: {exc}")
@@ -3832,6 +4199,14 @@ class SocialEngine:
             own_recent.append(text)
             if len(own_recent) >= 3:
                 break
+        # v2.2.17：跨群汇总她自己最近的开头样本（取不到就回落本群历史）。
+        _x_openings: List[str] = []
+        try:
+            _fn = getattr(self.state, "own_group_openings", None)
+            if _fn is not None:
+                _x_openings = list(_fn(bid, self._time(), 24.0, 6) or [])
+        except Exception:
+            _x_openings = []
         # 最新一条群友发言（不是她自己的）：接话建议要指向它。
         latest: Dict[str, Any] = {}
         for s in reversed(samples):
@@ -3871,8 +4246,12 @@ class SocialEngine:
             "group_name": str(g.get("name", "") or ""),
             # G3：近期在群里说过话的人名（供「自然地点一下某个人」）。
             "members": groupflow.member_names(samples) if self.cfg.group_mention_member else [],
-            # v2.2.7：她在这个群最近 6 条的开头字，给开头轮换闸与提示词用。
-            "openings": [
+            # v2.2.7：她最近 6 条的开头字，给开头轮换闸与提示词用。
+            # v2.2.17：改成**跨群**取。她的开口习惯不分群，按群统计等于看不见：
+            # 线上 11-10 她发 52 条群消息、13 条以「刚」开头，但分散在 25 个群，
+            # 每个群只 1~5 条，「最近 6 条里同一开头 ≥3 次」永远凑不满。
+            "openings": _x_openings
+            or [
                 str(s.get("text", "") or "")
                 for s in samples
                 if s.get("self") and str(s.get("text", "") or "").strip()
@@ -4113,13 +4492,16 @@ class SocialEngine:
             return False
         try:
             used = int(self.state.group_send_count(bid, today))
+            _rfn = getattr(self.state, "group_reply_count", None)
+            _replied = int(_rfn(bid, today)) if callable(_rfn) else 0
         except Exception:
             return False
         if used < cap:
             return False
         if throttle.allow(f"groupcap.{bid}.{today}"):
             logger.info(
-                f"[autonomous_social][{bid}] 今天群聊已经主动说了 {used} 条（上限 {cap}），"
+                f"[autonomous_social][{bid}] 今天群聊已经说了 {used} 条（上限 {cap}，"
+                f"其中接群友的话 {_replied} 条），"
                 "剩下的时间只回话、不再主动开口" + throttle.summary(f"groupcap.{bid}.{today}")
             )
         return True
@@ -4210,6 +4592,8 @@ class SocialEngine:
                 today=today,
                 is_quiet=is_quiet,
                 asleep=asleep,
+                live_minutes=float(getattr(self.cfg, "recent_talk_minutes", 0.0) or 0.0),
+                flow_on=bool(getattr(self.cfg, "group_flow_enabled", True)),
             ):
                 out.append((gid, g))
         return out
@@ -4229,6 +4613,23 @@ class SocialEngine:
             return False
         if self.send_breaker_left(bid) > 0:
             return False
+        # v2.2.32：同一个群里，别的角色刚开过口就让她先别抢话——两个角色三秒内
+        # 各说一句，别人看到的是「这号在自言自语」。只挡主动开口，不挡回人话。
+        _xgap = int(getattr(self.cfg, "group_cross_bot_gap_seconds", 0) or 0)
+        if _xgap > 0:
+            _other_fn = getattr(self.state, "group_other_bot_spoke", None)
+            _other_ts = 0.0
+            try:
+                if callable(_other_fn):
+                    _other_ts = float(_other_fn(bid, gid) or 0.0)
+            except Exception:
+                _other_ts = 0.0
+            if _other_ts > 0 and 0.0 <= now - _other_ts < _xgap:
+                self.log(
+                    f"群 {gid} 另一个角色 {int(now - _other_ts)} 秒前刚说过话，"
+                    f"这次先不开口（group_cross_bot_gap_seconds={_xgap}）"
+                )
+                return False
         group_ctx = self._build_group_ctx(bid, gid, g)
         group_ctx["now"] = now
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
@@ -4299,6 +4700,12 @@ class SocialEngine:
                     "模型决定这次不说，不占今天的次数"
                 )
                 return False
+            # v2.2.42：发前全面看一眼（接不接得住、是不是又讲一遍、是不是模板开头）。
+            # 放在 split/验收之前：模型改写完照样要过下面的规则闸，改写不能开后门。
+            _reviewed = await SocialEngine._review_group_draft(self, parts, group_ctx)
+            if _reviewed is None:
+                return False
+            parts = _reviewed
             # ── 验收层（与私聊侧、心流同一套）──────────────────────
             # 破冰以前也是裸发：模型写出动机泄漏、括号截断、复读（连着几天同一句）
             # 都会直接进群。判不过就不发——宁可不破冰，不可抛一句废话头。
@@ -4352,6 +4759,30 @@ class SocialEngine:
                             f"群 {gid} 跨群撞车，未发送：{hit}｜原文：{seg[:80]}"
                         )
                         return False
+        # v2.2.20：跨渠道二传（群 → 私聊）。她刚跟谁私聊讲过的事，不该再拿到群里
+        # 讲一遍——群里的听众和私聊那位看的是同一份日程素材。
+        xch_hours = float(getattr(self.cfg, "cross_channel_dedup_hours", 0.0) or 0.0)
+        if xch_hours > 0:
+            _pfn = getattr(self.state, "recent_proactive_all", None)
+            if _pfn is not None:
+                try:
+                    ptexts = _pfn(bid, now, hours=xch_hours)
+                except Exception:
+                    ptexts = []
+                if ptexts:
+                    for seg in segments:
+                        hit4 = _check_cross_user(
+                            seg, ptexts, threshold=_group_cross_ratio(self.cfg)
+                        )
+                        if hit4:
+                            self._m["rejected_total"] = int(
+                                self._m.get("rejected_total", 0)
+                            ) + 1
+                            self.log(
+                                f"群 {gid} 这件事刚跟人私聊讲过，未发送："
+                                f"{hit4}｜原文：{seg[:80]}"
+                            )
+                            return False
         try:
             bad_text, ice_why = self._verify_all_segments(
                 segments,
@@ -4382,6 +4813,7 @@ class SocialEngine:
         # v2.2.7 / issue #1 #2 #3：开头轮换 + 同群事件去重。
         # 线上 27 条破冰 15 条以「刚」开头、旧票据同一个群 15:22 说两遍 15:45 又说
         # 两遍——这两件事提示词压不住，只能在放行前按账本拦。
+        evt_hours = float(getattr(self.cfg, "group_event_dedup_hours", 12.0) or 12.0)
         _used_lines: List[str] = []
         try:
             _used_lines = self.state.life_lines_used_in_group(
@@ -4390,10 +4822,20 @@ class SocialEngine:
         except Exception as _ul_exc:
             _used_lines = []
             logger.debug(f"[autonomous_social] 取本群已用素材失败（不影响发送）: {_ul_exc}")
+        _spoken: List[str] = []
+        try:
+            # v2.2.12：窗口内她在本群说过的正文（含心流接话与连发补发）。
+            _spoken = self.state.group_self_texts(
+                bid, gid, now, hours=evt_hours, limit=12
+            )
+        except Exception as _sp_exc:
+            _spoken = []
+            logger.debug(f"[autonomous_social] 取本群已说正文失败（不影响发送）: {_sp_exc}")
         _gp_issue = _group_proactive_issue(
             segments,
             openings=group_ctx.get("openings") or [],
             used_lines=_used_lines,
+            spoken=_spoken,
         )
         if _gp_issue:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
@@ -4496,6 +4938,12 @@ class SocialEngine:
                         bid, used_line, gid, sent_ts,
                         hours=xgroup_hours if xgroup_hours > 0 else 6.0,
                     )
+                    # v2.2.38：把「这句用的是哪条素材」写进群样本，将来问「她为什么
+                    # 突然说这个」时能自证。只加可追溯性，不改输出。
+                    try:
+                        self.state.annotate_last_group_sample(bid, gid, [used_line])
+                    except Exception:
+                        pass
                 else:
                     self.log(
                         f"群 {gid} 这条没对上任何素材行（最高相似度 {best_ratio:.2f}），"
@@ -4843,20 +5291,20 @@ class SocialEngine:
         # ── 称呼：门面 > state.json（nickname→display_name）> 本地账本名片名 ──
         # 门面给了空 nickname 时以门面为准：它现算，文件里的可能是几小时前的旧值。
         if "nickname" in block:
-            u_copy["_nickname"] = _brief_text(block.get("nickname"))
+            u_copy["_nickname"] = usable_call_name(_brief_text(block.get("nickname")), uid)
         elif "nickname" in snap:
-            u_copy["_nickname"] = _brief_text(snap.get("nickname"))
+            u_copy["_nickname"] = usable_call_name(_brief_text(snap.get("nickname")), uid)
         nickname = _brief_text(u_copy.get("_nickname"))
 
-        display_name = _brief_text(block.get("display_name"))
+        display_name = usable_call_name(_brief_text(block.get("display_name")), uid)
         if not display_name:
-            display_name = _brief_text(snap.get("display_name"))
+            display_name = usable_call_name(_brief_text(snap.get("display_name")), uid)
         if display_name:
             u_copy["_display_name"] = display_name
 
-        brief_call = _brief_text(block.get("call_name"))
-        snap_call = _brief_text(snap.get("call_name"))
-        local_name = _brief_text(local.get("name"))
+        brief_call = _usable_call_name(_brief_text(block.get("call_name")), uid)
+        snap_call = _usable_call_name(_brief_text(snap.get("call_name")), uid)
+        local_name = _usable_call_name(_brief_text(local.get("name")), uid)
         if brief_call:
             call_name = brief_call
             name_source = _brief_text(block.get("name_source"))
@@ -5002,6 +5450,49 @@ class SocialEngine:
         except Exception:
             pass
         return value
+
+    def _tz_mismatch_note(self) -> str:
+        """插件时区和本机时区差 ≥2 小时时，给一句能直接照做的话（v2.2.36）。
+
+        时区是配置项，插件不替用户改；但「她的钟和你的钟差六小时」这种事必须喊出来，
+        不能只活在文档里。返回空串 = 没问题（或读不到，读不到就不吵）。
+        """
+        try:
+            offset = self._plugin_tz_offset()
+        except Exception:
+            return ""
+        if offset is None:
+            return ""  # auto：跟随 Core/本机，没有「配错」这回事
+        host = host_utc_offset_minutes()
+        if host is None:
+            return ""
+        diff = int(offset) - int(host)
+        if abs(diff) < TZ_MISMATCH_MINUTES:
+            return ""
+        try:
+            cfg_label = normalize_timezone(getattr(self.cfg, "timezone_offset", ""))
+        except Exception:
+            cfg_label = "?"
+        try:
+            host_label = format_utc_offset(int(host))
+        except Exception:
+            host_label = "本机"
+        try:
+            qs = int(getattr(self.cfg, "quiet_start", 23))
+            qe = int(getattr(self.cfg, "quiet_end", 7))
+            host_qs = (qs - diff // 60) % 24
+            host_qe = (qe - diff // 60) % 24
+            window = f"她的「{qs} 点到 {qe} 点」安静时段在你这边是 {host_qs} 点到 {host_qe} 点；"
+        except Exception:
+            window = ""
+        hours = abs(diff) / 60.0
+        hours_text = f"{hours:g}"
+        return (
+            f"时区配置是 {cfg_label}，本机是 {host_label}，差了 {hours_text} 小时："
+            + window
+            + f"她的问候、每日额度和状态页时间也都按 {cfg_label} 算。"
+            + f"想让她跟你同一个钟，把插件设置里的「时区」改成 {host_label}（或 auto）。"
+        )
 
     def _tz_label(self, bid: str = "") -> str:
         """日志/回执里那个钟叫什么：配了时区就写 UTC+8，auto 才写「本机」。
@@ -7568,6 +8059,7 @@ class SocialEngine:
                 )
         self._round_skips = {}
         self._round_skip_samples = {}
+        self._round_review = {}
         if not self.cfg.enabled:
             return
 
@@ -7800,7 +8292,15 @@ class SocialEngine:
         # 却永远走不到发送段（它在最后面），表现是「好感 90% 的人一条都收不到」。
         if not greets and not anchored and not threads and not loops and not closers \
                 and not promises and not misses and not intimacies:
-            self.log("没有人攒够念头，本轮只是把时间补算上")
+            _why = ""
+            if self._round_skips:
+                _why = "（这一轮被跳过的原因：" + "、".join(
+                    f"{name} {count}"
+                    for name, count in sorted(
+                        self._round_skips.items(), key=lambda kv: -kv[1]
+                    )[:6]
+                ) + "）"
+            self.log("没有人攒够念头，本轮只是把时间补算上" + _why)
             # 没人可找时仍可能有冷群该破冰（破冰走群数据，不依赖 per-user 念头）
             if self.cfg.group_icebreak_enabled:
                 try:
@@ -8302,6 +8802,14 @@ class SocialEngine:
                 + (f"，尝试配额用完跳过 {skipped} 个" if skipped else "")
                 + _skip_text
                 + (
+                    "；发前自评 "
+                    + "/".join(
+                        f"{k} {v}" for k, v in sorted(self._round_review.items())
+                    )
+                    if self._round_review
+                    else ""
+                )
+                + (
                     "；这些被归进「其它」的原因："
                     + "、".join(
                         f"{k}（{v}）"
@@ -8369,7 +8877,10 @@ class SocialEngine:
         取不到配置按开处理——旧配置没有这个键时行为不变。
         """
         try:
-            return bool(getattr(self.cfg, "allow_private_chat", True))
+            if not bool(getattr(self.cfg, "allow_private_chat", True)):
+                return False
+            # v2.2.47：「只主动群聊」开着就不在私聊里主动开口。
+            return not bool(getattr(self.cfg, "group_only", False))
         except Exception:
             return True
 
@@ -8379,7 +8890,10 @@ class SocialEngine:
         关掉后群聊侧全部停：心流接话、冷场破冰、起话头、群连发。
         """
         try:
-            return bool(getattr(self.cfg, "allow_group_chat", True))
+            if not bool(getattr(self.cfg, "allow_group_chat", True)):
+                return False
+            # v2.2.47：「只主动私聊」开着就不在群里主动开口。
+            return not bool(getattr(self.cfg, "private_only", False))
         except Exception:
             return True
 
@@ -8964,7 +9478,7 @@ class SocialEngine:
                 # LLM 不可用/退避中/超时：这是基础设施故障，不是「模型觉得不该说」。
                 # 两者走同一条 defer_cue 会把一个真实的由头（如「明天面试」）静默作废：
                 # 一次持续十几小时的 key 失效就够把 3 次重试预算全烧光。
-                note = "LLM 不可用（provider 取不到），本轮未发送"
+                note = self._llm_unavailable_note(bid)
                 self._last_llm_error[bid] = note
                 return _gate_blocked(self, "llm_unavailable", note)
             if not decision.send:
@@ -9054,7 +9568,14 @@ class SocialEngine:
         # 放在验收层之前：自评说「丢」就不必再走一遍规则；说「改写」则换正文
         # 再让下面的验收重判——改写不能成为绕过验收的后门。
         if parts:
-            _reviewed = await SocialEngine._review_draft(self, parts, decision, _cards)
+            _reviewed = await SocialEngine._review_draft(
+                self, parts, decision, _cards,
+                recent_own=[
+                    e.get("text", "")
+                    for e in (self.state.recent_proactive(bid, uid, self._time()) or [])
+                ],
+                peer_line=str(last_in_text(u, self._time(), 24 * 3600.0) or ""),
+            )
             if _reviewed is None:
                 self.log("生成后自评：这条不该发，丢掉")
                 defer_cue()
@@ -9165,6 +9686,22 @@ class SocialEngine:
                 hit2 = _check_cross_user_action(parts[0], others)
                 if hit2:
                     ok, why = False, hit2
+        # v2.2.20：跨渠道二传。私聊这条主动消息，跟「她最近在所有群里说过的话」
+        # 比一遍——素材只有一份，群里讲完再跟人讲一遍，对方看到的就是二手货。
+        xch = float(getattr(self.cfg, "cross_channel_dedup_hours", 0.0) or 0.0)
+        if ok and xch > 0:
+            _gfn = getattr(self.state, "recent_own_group_texts", None)
+            if _gfn is not None:
+                try:
+                    gtexts = _gfn(bid, self._time(), xch)
+                except Exception:
+                    gtexts = []
+                if gtexts:
+                    hit3 = _check_cross_user(
+                        parts[0], gtexts, threshold=self.cfg.cross_user_repeat_ratio
+                    )
+                    if hit3:
+                        ok, why = False, "这件事刚在群里讲过，私聊再说就成了二传"
         if not ok:
             self._m["last_failure"] = f"[{bid}] 验收不过：{why}"
             self._m["last_rejected"] = (raw_generated or parts[0])[:200]
@@ -9221,8 +9758,13 @@ class SocialEngine:
         # 「窗边伸了个懒腰」「眼睛闭了会儿」就是同一句话被切成两半发出去。
         try:
             segments, waits = _merge_fragments(segments, waits)
-        except Exception:
-            pass
+        except Exception as _e:
+            self._note_soft_fail("私聊碎片合并", _e)
+        # v2.2.22：同一次发言里两段说同一件事，只发一遍（线上 1 秒内重复那批）。
+        try:
+            segments, waits = _dedupe_same_event_segments(segments, waits)
+        except Exception as _e:
+            self._note_soft_fail("同次发言去重", _e)
         # 逐段验收：`parts[0]` 过了**不代表后续段也过**——模型常在结尾再补一句纯括号
         # 的内心（「（记住了 宝宝16岁…）」），拆段后那一段会**单独**发出去，看起来就是
         # 「内心独白被当成发言发了一条」。旧版只验 parts[0]，这一路完全免检。
@@ -9558,6 +10100,7 @@ class SocialEngine:
                 _a = (reason_meta or {}).get("anchor")
                 if isinstance(_a, dict):
                     _sent_about = str(_a.get("about") or "")
+            SocialEngine._note_proactive_name(self, bid, uid, segments[0])
             self.state.record_outgoing(
                 bid, uid, segments[0], msg_type,
                 about=_sent_about,
@@ -10369,8 +10912,88 @@ class SocialEngine:
             ),
         }
 
+    async def _review_group_draft(
+        self,
+        parts: Optional[List[str]],
+        group_ctx: Dict[str, Any],
+        decision: Any = None,
+    ) -> Optional[List[str]]:
+        """群聊侧的「发前全面看一眼」（v2.2.42）。
+
+        私聊的自评在 `_review_draft` 里，材料是「她最近主动说过什么 + 对方最后一句」；
+        群聊要看的是另外三样：群里刚在聊什么、她自己在这个群说过什么、是不是又在报时。
+        破冰与心流两条路径都走这里，避免两处各写一遍再走偏。
+
+        返回 None 表示「这条不该发」；返回列表表示可以发（可能被改写）。
+        自查失败一律放行——自评是附加的一层，坏了不能连累发送。
+        """
+        if not parts:
+            return parts
+        try:
+            enabled = bool(getattr(self.cfg, "draft_review_enabled", False))
+        except Exception:
+            enabled = False
+        fn = getattr(self.generator, "review_draft", None)
+        if not (enabled and callable(fn)):
+            return parts
+        try:
+            _recent = group_ctx.get("recent") or []
+            _group_lines: List[str] = []
+            for it in _recent[-6:]:
+                try:
+                    if it.get("self"):
+                        continue
+                    _t = str(it.get("text", "") or "").strip()
+                except Exception:
+                    continue
+                if _t:
+                    _group_lines.append(_t)
+            _own = [str(t or "").strip() for t in (group_ctx.get("own_recent") or []) if str(t or "").strip()]
+            _peer = ""
+            _later = group_ctx.get("latest")
+            if isinstance(_later, dict) and not _later.get("self"):
+                _peer = str(_later.get("text", "") or "").strip()
+            result = fn(
+                getattr(self.generator, "provider", None),
+                "\n".join(str(part or "") for part in parts),
+                None,
+                None,
+                recent_own=_own,
+                peer_line=_peer,
+                group_lines=_group_lines,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, dict):
+                return parts
+            verdict = str(result.get("verdict") or "ok").strip().lower()
+            if verdict == "drop":
+                _bump_review(self, "drop")
+                self.log("群发前自评：这条不该发，丢掉")
+                return None
+            if verdict == "rewrite":
+                _text = str(result.get("text") or "").strip()
+                if _text:
+                    # 改写只当替换正文，段落结构沿用原来的第一段；后面的段不再保留，
+                    # 免得「改了一段、另几段还是旧的」拼出半截话。
+                    _bump_review(self, "rewrite")
+                    self.log(f"群发前自评：改写了一条（{str(result.get('reason') or '')[:40]}）")
+                    return [_text]
+                _bump_review(self, "ok")
+        except Exception as exc:
+            _bump_review(self, "fail")
+            logger.debug(f"[autonomous_social] 群发前自评失败（按通过）: {exc}")
+        return parts
+
     async def _review_draft(
-        self, parts: Optional[List[str]], decision: Any, cards: Any
+        self,
+        parts: Optional[List[str]],
+        decision: Any,
+        cards: Any,
+        *,
+        recent_own: Any = (),
+        peer_line: str = "",
+        group_lines: Any = (),
     ) -> Optional[List[str]]:
         """生成后自评 + 成稿事实核对：返回正文列表；drop 返回 None。
 
@@ -10395,18 +11018,26 @@ class SocialEngine:
                     "\n".join(str(part or "") for part in parts),
                     getattr(decision, "plan", None) if decision is not None else None,
                     cards,
+                    recent_own=recent_own,
+                    peer_line=peer_line,
+                    group_lines=group_lines,
                 )
                 if inspect.isawaitable(result):
                     result = await result
                 if isinstance(result, dict):
                     verdict = str(result.get("verdict") or "ok").strip().lower()
                     if verdict == "drop":
+                        _bump_review(self, "drop")
                         return None
                     if verdict == "rewrite":
                         text = str(result.get("text") or "").strip()
                         if text:
+                            _bump_review(self, "rewrite")
                             reviewed = [text]
+                    else:
+                        _bump_review(self, "ok")
             except Exception as exc:
+                _bump_review(self, "fail")
                 logger.debug(f"[autonomous_social] 生成后自评失败（按通过）: {exc}")
         SocialEngine._note_grounded(self, reviewed, cards)
         return reviewed
@@ -11560,6 +12191,14 @@ class SocialEngine:
             _gate_note(self, "platform_circuit", _circuit_text, umo=str(target or "")[:80])
             return _SendResult(False, _circuit_text, False, local_skip=True)
         last_err = ""
+        # v2.2.47：口头禅开头用滥了就摘掉这一下（只改写，不拦消息）。
+        try:
+            _polished = _polish_filler_head(self, text)
+            if _polished and _polished != text:
+                self.log(f"出口摘掉开头口头禅：{text[:40]!r} → {_polished[:40]!r}")
+                text = _polished
+        except Exception:
+            pass
         peer_unreachable = False
         # P3-09：原来写死 range(1)，SEND_RETRY_COUNT 这个常量完全不起作用
         # （配成 3 也只发一次）。range(1 + N) 让常量真正生效；默认 0 时仍是
@@ -12025,7 +12664,11 @@ class SocialEngine:
                 rows = await asyncio.to_thread(
                     history_ingest.collect_from_history,
                     self._data_dir,
-                    private_only=self.cfg.private_only,
+                    # v2.2.47：这行原来读 `private_only`，而那一项已改成「只主动私聊」。
+                    # 用 getattr 兜底：老配置没有新键时按 True（旧行为）处理。
+                    private_only=bool(
+                        getattr(self.cfg, "history_private_only", True)
+                    ),
                     store_text=self.cfg.store_message_text,
                     existing_uids=history_ingest.existing_uids(self.state),
                     target_bid=history_ingest.seed_target_bid(self.state),
@@ -12141,6 +12784,13 @@ class SocialEngine:
     async def run(self) -> None:
         """后台主循环。"""
         logger.info("[autonomous_social] 后台循环已启动")
+        # v2.2.36：时区配错不会报错、只会让她「活在你的昨天/明天」，启动时喊一次。
+        try:
+            _tz_note = self._tz_mismatch_note()
+        except Exception:
+            _tz_note = ""
+        if _tz_note:
+            logger.warning("[autonomous_social] " + _tz_note)
         # P2-11：这两步原来在 while 的 try 之外。`_prune_expired` 要遍历所有用户，
         # `_heartbeat_range` 要读配置；任一步抛异常（某条记录字段类型不对、配置被改成
         # 坏值）run() 就永久退出，而 main.py 没有重启逻辑——插件看着还在，后台再也
@@ -13337,6 +13987,7 @@ class SocialEngine:
             f"{'她所在城市' if normalize_quiet_clock(getattr(self.cfg, 'quiet_clock', 'local')) == 'core' else '本机时钟'}"
             f"算"
             + (f"\n- 本次运行：{boot_line}" if boot_line else "")
+            + (f"\n- ⚠️ 时区：{self._tz_mismatch_note()}" if self._tz_mismatch_note() else "")
         )
         sections.append(
             "【人格】按会话解析，各角色互不影响\n" + persona_text

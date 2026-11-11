@@ -139,16 +139,20 @@ class SchemaContractTest(unittest.TestCase):
             self.assertIs(node.get("default"), EXPECTED_DEFAULTS[key], key)
             for field in ("description", "hint"):
                 self.assertTrue(str(node.get(field) or "").strip(), f"{key}.{field} 为空")
-            self.assertIs(node.get("obvious_hint"), True, key)
+            self.assertNotIn("obvious_hint", node, key)
 
     def test_schema_default_matches_dataclass(self):
         for key in NEW_KEYS:
             self.assertIs(SCHEMA[key]["default"], getattr(SocialConfig(), key), key)
 
-    def test_schema_key_count_is_134(self):
+    def test_schema_key_count_is_142(self):
         # v2.2.7：新增 decorate_outgoing（出口改写），131 → 132。
         # v2.2.10：新增 allow_private_chat / allow_group_chat（私聊、群聊总开关），132 → 134。
-        self.assertEqual(len(SCHEMA), 134)
+        # v2.2.12：新增 group_event_dedup_hours（同群不重复说同一件事），134 → 135。
+        # v2.2.20：新增 cross_channel_dedup_hours（群私聊之间不二传），135 → 136。
+        # v2.2.32：新增 group_cross_bot_gap_seconds（同群跨角色不抢话），139 → 140。
+        # v2.2.47：新增 group_only（只主动群聊）与 history_private_only（只导入私聊历史），140 → 142。
+        self.assertEqual(len(SCHEMA), 142)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -236,7 +240,7 @@ class ReadmeTest(unittest.TestCase):
         self.assertEqual(_readme_count(), len(SCHEMA))
         # v2.2.7：新增 decorate_outgoing，README 的「共 N 项」跟着 131 → 132。
         # v2.2.10：新增 allow_private_chat / allow_group_chat，跟着 132 → 134。
-        self.assertEqual(_readme_count(), 134)
+        self.assertEqual(_readme_count(), 142)
 
 
 class EngineWiringTest(unittest.TestCase):

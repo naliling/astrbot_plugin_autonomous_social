@@ -33,9 +33,16 @@ from .style_profile import (
     build_style_profile,
     emoji_habit,
 )
-from .textutil import balance_brackets, is_quotable, short_call_name, strip_segments
+from .textutil import (
+    balance_brackets,
+    is_quotable,
+    short_call_name,
+    strip_segments,
+    usable_call_name,
+)
 from .throttle import throttle
 from .verify import (
+    action_tics,
     merge_lead_line,
     opening_head,
     strip_actions,
@@ -1292,7 +1299,11 @@ def _opening_neurons(recent: List[str]) -> List[str]:
         body = str(text or "").strip()
         if not body:
             continue
-        head = body[:OPENING_CHARS]
+        # v2.2.25：先剥掉开头的括号动作再取首字。以前直接取 `body[:1]`，
+        # 凡是「（翅膀收拢）唔…」这种动作起头的消息，首字是「（」，被判成
+        # 「没有起头」直接跳过——线上 951 条主动消息里 231 条（24.3%）是这么
+        # 被瞎掉的，196 个对话方里有 54 个（27.6%）因此一句开头提示都拿不到。
+        head = (opening_head(body) or "")[:OPENING_CHARS]
         if not head:
             continue
         # 纯标点/表情开头的没有「起头」可言，跳过
@@ -1362,8 +1373,11 @@ def _bond_line(target: Dict[str, Any]) -> str:
     bits: List[str] = []
     # v2.2.5：特别关心名单里配的专属称谓优先级最高——用户点名要她这么叫。
     pet_name = short_call_name(_name_text(target.get("_pet_name")))
-    nickname = _name_text(target.get("_nickname"))
-    raw_name = _name_text(target.get("_call_name")) or nickname
+    # v2.2.46：nickname 可能是 Core 填的纯 UID 数字串（线上 3391908372 就是这样），
+    # 它原来优先级比 `_call_name` 高，于是提示词写成「你一直叫TA「3391908372」」，
+    # 模型不肯念数字、又收到「必须叫一声」的指令，就自己编了个名字（线上叫了五条「星辰」）。
+    nickname = usable_call_name(_name_text(target.get("_nickname")))
+    raw_name = usable_call_name(_name_text(target.get("_call_name"))) or nickname
     source = _name_text(target.get("_name_source"))
     # 长名片只叫前一段（线上真实记录：「爱筝挽起·冲击波冠军」被整段念出来）。
     call_name = short_call_name(raw_name)
@@ -1380,7 +1394,10 @@ def _bond_line(target: Dict[str, Any]) -> str:
         elif source == "nickname":
             bits.append(f"你一直叫TA「{call_name}」")
         else:
-            bits.append(f"TA 的名片名是「{call_name}」，你可以偶尔这么叫")
+            # v2.2.30：原来这里写「你可以偶尔这么叫」，和下一句「开口要叫一声」打架，
+            # 模型按松的来。线上 664 条主动消息里只有 15.5% 叫了名字（宽松上限 16%）。
+            # 现在两句合一：名片的来源差别只影响「是不是她习惯叫的」，不再暗示可选。
+            bits.append(f"TA 的名片名是「{call_name}」")
         # v1.28.13：主动消息是「主动找 TA」，得让对方看得出是在找谁。
         # 原来是「别每条都叫，别每句开头都是名字」——线上实测矫枉过正：
         # 主动消息一条接一条，没有一条叫名字，用户的原话是「主动消息还是不会认人」。
@@ -1652,8 +1669,22 @@ def _review_plan_lines(plan: Any) -> List[str]:
     return lines
 
 
-def _review_prompt(text: str, plan: Any, cards: Any) -> str:
-    """自评提示词：一道三选一的选择题，而不是「你觉得怎么样」。"""
+def _review_prompt(
+    text: str,
+    plan: Any,
+    cards: Any,
+    *,
+    recent_own: Any = (),
+    peer_line: str = "",
+    group_lines: Any = (),
+) -> str:
+    """自评提示词：一道三选一的选择题，而不是「你觉得怎么样」。
+
+    v2.2.42：原来只查「有没有编事实」，现在把发言质量整体过一遍——
+    接不接得住对方、是不是又讲了一遍同一件事、是不是在说教、开头是不是模板、
+    是不是半截话。这些正是用户抱怨的那几条，靠规则层抓不住，只能让模型在同一次
+    调用里一起看。
+    """
     lines = [
         "你是发送前的最后一道检查。只看这条消息现在能不能原样发出去；不要重写风格，不要新增事实。",
         "",
@@ -1673,6 +1704,15 @@ def _review_prompt(text: str, plan: Any, cards: Any) -> str:
             "（这次没有卡：正文里任何具体时间、地点、数字、人名都可能是编的）",
             "",
         ]
+    _own = [str(t or "").strip() for t in (recent_own or []) if str(t or "").strip()][-4:]
+    if _own:
+        lines += ["【她最近自己说过的（越往后越近）】", *[f"- {t[:80]}" for t in _own], ""]
+    _peer = str(peer_line or "").strip()
+    if _peer:
+        lines += ["【对方最后一句】", _peer[:160], ""]
+    _group = [str(t or "").strip() for t in (group_lines or []) if str(t or "").strip()][-4:]
+    if _group:
+        lines += ["【群里最近几句（别人说的）】", *[f"- {t[:80]}" for t in _group], ""]
     lines += [
         "从下面三个结论里选一个，只输出一个 JSON，不要解释：",
         '{"verdict":"ok"}  正文可以直接发',
@@ -1684,6 +1724,17 @@ def _review_prompt(text: str, plan: Any, cards: Any) -> str:
         "2. 选 rewrite 时，改后的正文不许新增任何事实，只许删掉或弱化没有出处的部分。",
         "3. 正文里出现证据卡找不到出处的具体事实时，必须处理（删掉或改成不确定的说法）。",
         "4. 不要因为「不够有趣」「不够甜」就 rewrite，只有具体问题才算。",
+        "5. 接不接得住：上面有【对方最后一句】或【群里最近几句】时，正文必须能跟它接上；"
+        "完全在自说自话（比如对方说累，她讲自己今天干了什么）就要 rewrite——改成先接那句话。",
+        "6. 又说了一遍：【她最近自己说过的】里已经讲过的事，正文再讲一遍就要 rewrite——"
+        "换一件没讲过的，或者干脆接对方的话。",
+        "7. 说教：正文在纠正、指挥、评价对方（「别…」「不许…」「少…」「你不该…」）就要 rewrite，"
+        "改成说自己的感受或直接回应；一次发言最多留一处这种句子。",
+        "8. 模板开头：每条都以「刚」「本宫」「唔」这类同一个字起头，或者开头就是括号动作加一个"
+        "短句，连看几条一模一样，就要 rewrite——换个起头方式。",
+        "9. 半截话：正文停在「把…」「因为…」「所以…」这种没说完的地方，或者只有括号动作没有"
+        "正文，必须 rewrite 补完整。",
+        "10. 身体与称呼：她是蹄类/有翼角色时不能写「手」；对方的称呼按上下文来，不要每句都挂名字。",
     ]
     return "\n".join(lines)
 
@@ -1721,8 +1772,15 @@ async def review_draft(
     call_llm: Any = None,
     enabled: bool = True,
     max_tokens: int = REVIEW_MAX_TOKENS,
+    recent_own: Any = (),
+    peer_line: str = "",
+    group_lines: Any = (),
 ) -> Dict[str, Any]:
     """生成后自评：一次受约束的选择题调用。
+
+    recent_own / peer_line / group_lines 是「发前全面看一眼」用的材料：她最近说过什么、
+    对方最后一句是什么、群里最近在聊什么。没有这些，模型只能评价这句话本身像不像人话，
+    评不出「答非所问」「又说一遍」。
 
     为什么 call_llm 由调用方注入：这里不该知道 provider 怎么调、超时多少、怎么退避；
     那些都在 MessageGenerator 里，测试也只需要传一个假函数。
@@ -1737,7 +1795,10 @@ async def review_draft(
         return {"verdict": "ok", "reason": "empty_text"}
     if not callable(call_llm):
         return {"verdict": "ok", "reason": "no_call_llm"}
-    prompt = _review_prompt(body, plan, cards)
+    prompt = _review_prompt(
+        body, plan, cards,
+        recent_own=recent_own, peer_line=peer_line, group_lines=group_lines,
+    )
     try:
         raw = await call_llm(provider, prompt)
     except Exception as e:  # noqa: BLE001 - fail-open
@@ -1748,6 +1809,20 @@ async def review_draft(
         return {"verdict": "ok", "reason": "review_unparsed"}
     return parsed
 
+
+def _exc_text(exc: Any) -> str:
+    """异常的可读文本：message 为空时至少给出类型名。
+
+    线上出现过 `LLM 已连续失败 9 次（text_chat 抛出异常: ）`——冒号后面是空的。
+    超时/取消这类异常的 `str()` 就是空串，于是「连续失败 9 次」查不出原因，
+    只能靠猜。这里统一成 `TimeoutError` / `ValueError: bad arg` 这种形状。
+
+    放模块级而不是类里：两个调用点都在类体内部（一个 staticmethod、一个实例方法），
+    裸名解析不到类属性，写成 `@staticmethod` 会 `NameError`（v2.2.28 第一版就踩了）。
+    """
+    name = type(exc).__name__ if exc is not None else "异常"
+    text = str(exc or "").strip()
+    return f"{name}: {text}" if text else name
 
 class MessageGenerator:
     """主动消息生成器。"""
@@ -1870,6 +1945,9 @@ class MessageGenerator:
         *,
         enabled: Optional[bool] = None,
         max_tokens: Optional[int] = None,
+        recent_own: Any = (),
+        peer_line: str = "",
+        group_lines: Any = (),
     ) -> Dict[str, Any]:
         """发送前自评（v2.1.5 §5）。
 
@@ -1889,7 +1967,9 @@ class MessageGenerator:
 
         # 裸名解析到模块级 review_draft：类属性不在方法作用域里，这里不会递归调自己。
         return await review_draft(
-            provider, text, plan, cards, call_llm=_call, enabled=bool(enabled)
+            provider, text, plan, cards,
+            call_llm=_call, enabled=bool(enabled),
+            recent_own=recent_own, peer_line=peer_line, group_lines=group_lines,
         )
 
     async def generate_with_tools(
@@ -2666,6 +2746,33 @@ class MessageGenerator:
             blocks.append(
                 f"你刚才在这个群里插过一句：「{last_flow[:GROUP_LINE_MAX_CHARS]}」。别重复这个意思。"
             )
+        # v2.2.39：心流接话也要知道自己最近怎么开口的。
+        # 开头轮换这道统计闸原本只挂在破冰/起话头分支上（v2.2.7），心流这条
+        # 一直没有——而线上「刚…」开头的群消息里，有相当一部分就是心流接话。
+        # 这里只给事实（你最近用过这些开头、这个字用滥了别再用），不硬拦：
+        # 心流本来就是「有话说才说」，拦掉等于让她在热群里闭嘴。
+        openings = [
+            str(x).strip() for x in (group_ctx.get("openings") or []) if str(x).strip()
+        ]
+        if openings:
+            flow_banned = ""
+            heads = [opening_head(o) for o in openings[-6:]]
+            heads = [h for h in heads if h]
+            for h in set(heads):
+                if heads.count(h) >= 3 and len(h) == 1:
+                    flow_banned = h
+                    break
+            note = (
+                "【你最近在群里开口用过的开头】（最新在前，同一个开头别再用）：\n"
+                + "\n".join(f"  · {o[:GROUP_LINE_MAX_CHARS]}" for o in openings[-6:])
+            )
+            if flow_banned:
+                note += (
+                    f"\n你最近「{flow_banned}」字开头用得太多了，这一条不要用"
+                    f"「{flow_banned}」开头。"
+                )
+            blocks.append(note)
+
         # 接话目标：最新一条群友发言。
         # 不指出来时模型盯着一屏流水账，很容易滑回自说自话或接一句隔了好几条的旧消息。
         latest = group_ctx.get("latest") if isinstance(group_ctx.get("latest"), dict) else {}
@@ -2985,6 +3092,21 @@ class MessageGenerator:
                 blocks_out.append(
                     "  你最近开头用过：" + "、".join(heads)
                     + "（这几个这次都别用了，换个说法起头）"
+                )
+            # v2.2.25：动作骨架也给一句事实。群聊侧早有「先接话 / 别报时态」，
+            # 私聊主动侧一直没说「你这几条都是先写括号动作再开口」——线上 18 个
+            # 对话方的主动消息里，6 条有 5 条都是这个骨架。
+            try:
+                tics = [
+                    t
+                    for t in action_tics(list(target.get("_recent_proactive") or [])[-6:])
+                    if t
+                ]
+            except Exception:
+                tics = []
+            if tics:
+                blocks_out.append(
+                    "  " + "；".join(tics) + "。这次换个起手，或者干脆不写动作。"
                 )
             out_block = "\n".join(blocks_out)
 
@@ -4211,7 +4333,7 @@ class MessageGenerator:
                     last_err = f"{label} 签名不匹配: {r}"
                     continue
                 self._note_llm_failure(
-                    scope, f"{label} 抛出异常: {r}", fatal=_looks_fatal(str(r))
+                    scope, f"{label} 抛出异常: {_exc_text(r)}", fatal=_looks_fatal(str(r))
                 )
                 return None
             text, err = _response_text(r)
@@ -4418,7 +4540,7 @@ class MessageGenerator:
         except Exception as e:
             if throttle.allow("llm.exception"):
                 logger.warning(
-                    f"[autonomous_social] LLM 调用异常（{label}）: {e}"
+                    f"[autonomous_social] LLM 调用异常（{label}）: {_exc_text(e)}"
                     + throttle.summary("llm.exception")
                 )
             return e

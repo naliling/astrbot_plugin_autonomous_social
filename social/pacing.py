@@ -46,6 +46,10 @@ MAX_PARTS = 4
 # 插件把 base 夹到 1.01 后 `ln(wc+1)/ln(1.01) ≈ 100×ln(wc+1)`，一条 15 字的分段
 # 要等 4 分钟——实测补发间隔 84 秒 / 221 秒。补发是同一条消息的后续段，不该隔几分钟。
 MAX_PART_INTERVAL = 30.0
+# v2.2.37：两段之间最短也要 1.2 秒。线上的 Bot 级 segmented_reply.interval 有
+# 0.5,1.1 / 0.8,1.1 这种配法，算下来 3 秒能连发 7 条，读起来是机关枪。这是
+# 唯一一个「覆盖框架参数」的地方，理由只此一条：低于 1.2 秒不像人在打字。
+MIN_PART_INTERVAL = 1.2
 
 
 def _cap_parts(segments: List[str], limit: int = MAX_PARTS) -> List[str]:
@@ -293,7 +297,7 @@ def part_interval(text: str, cfg: dict, *, rng: random.Random | None = None) -> 
         wc = _word_count(text)
         i = math.log(wc + 1, base)
         # 再封一道顶：万一算出分钟级，也别让后续段拖太久。
-        return min(MAX_PART_INTERVAL, rnd.uniform(i, i + 0.5))
+        return max(MIN_PART_INTERVAL, min(MAX_PART_INTERVAL, rnd.uniform(i, i + 0.5)))
     interval = cfg.get("interval") or "1.5,3.5"
     try:
         if isinstance(interval, str):
@@ -304,7 +308,7 @@ def part_interval(text: str, cfg: dict, *, rng: random.Random | None = None) -> 
         low, high = 1.5, 3.5
     if low > high:
         low, high = high, low
-    return rnd.uniform(low, high)
+    return max(MIN_PART_INTERVAL, rnd.uniform(low, high))
 
 
 def plan_parts(

@@ -422,25 +422,42 @@ class AutonomousSocial(Star):
             if not can_use_temp and not isinstance(contexts, list):
                 return
             text = self._engine.consume_pending_proactive_context(bid, uid)
-            if not text:
-                return
-            lines = [line.strip() for line in text.split("\n") if line.strip()]
-            if not lines:
-                return
-            hint = (
-                "<autonomous_social_proactive_context>\n"
-                "以下是你在当前对话中刚刚主动发出的原文；这是你已经说过的话，"
-                "不是用户的新消息，只在本次回复中参考：\n"
-                + "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, 1))
-                + "\n</autonomous_social_proactive_context>"
-            )
+            lines = [line.strip() for line in str(text or "").split("\n") if line.strip()]
+            # v2.2.22：普通回复里她看不到「自己刚跟这个人说过什么」，同一件事会在
+            # 几分钟内讲两遍（线上 1327 条私有回复里 51 条，3.8%）。这里只提醒，
+            # 不拦话——拦掉普通回复等于她不回人。
+            echo = ""
             if can_use_temp:
-                extra_parts.append(TextPart(text=hint).mark_as_temp())
-                logger.debug(
-                    f"[autonomous_social] 主动消息已临时注入本轮上下文（{len(text)} 字）: {text[:40]}…"
-                )
+                try:
+                    echo = str(self._engine.reply_echo_hint(bid, uid) or "")
+                except Exception as exc:
+                    logger.debug(f"[autonomous_social] 组装回复提醒失败（跳过）: {exc}")
+                    echo = ""
+            if not lines and not echo:
                 return
-            if isinstance(contexts, list):
+            if lines:
+                hint = (
+                    "<autonomous_social_proactive_context>\n"
+                    "以下是你在当前对话中刚刚主动发出的原文；这是你已经说过的话，"
+                    "不是用户的新消息，只在本次回复中参考：\n"
+                    + "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, 1))
+                    + "\n</autonomous_social_proactive_context>"
+                )
+            else:
+                hint = ""
+            if can_use_temp:
+                if hint:
+                    extra_parts.append(TextPart(text=hint).mark_as_temp())
+                    logger.debug(
+                        f"[autonomous_social] 主动消息已临时注入本轮上下文（{len(text)} 字）: {text[:40]}…"
+                    )
+                if echo:
+                    extra_parts.append(TextPart(text=echo).mark_as_temp())
+                    logger.debug(
+                        f"[autonomous_social] 已把「刚跟这个人说过什么」提醒注入本轮（{len(echo)} 字）"
+                    )
+                return
+            if isinstance(contexts, list) and lines:
                 for line in lines:
                     contexts.append({"role": "assistant", "content": line})
                 logger.warning(

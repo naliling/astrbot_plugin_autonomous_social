@@ -532,10 +532,11 @@ MAX_SENDS_PER_ROUND_DEFAULT = 8
 # 群聊与私聊两套逻辑各走各的开关：private_only 只管私聊侧的主动，
 # 下面这些管群聊侧。默认在 bot 所在的所有群生效（不需要白名单）。
 #
-# `private_only` **只管「要不要在群里主动说话」这一件事**：群会话会不会被当成
-# 「人」导入是另一码事（历史导入只收私聊会话、seed 名单只收私聊类型），
-# 与这一项无关。以前两者共用这一个开关，于是把它关掉时群会话会被建成用户条目，
-# 而条目的 umo 是群地址 —— 发送路径照着它发，一句私聊口吻的主动消息就进了群。
+# `private_only`（只主动私聊）与 `group_only`（只主动群聊）是一对方向开关，
+# 管的是**在哪一侧主动开口**；群会话会不会被当成「人」导入是另一码事
+# （那件事由 `history_private_only` 管，见「消息记录」组）。以前两者共用
+# private_only 一个开关，于是把它关掉时群会话会被建成用户条目，而条目的 umo
+# 是群地址 —— 发送路径照着它发，一句私聊口吻的主动消息就进了群。
 
 # 心流：bot 在群里说过话后，开一个「关注窗口」，窗口内群消息若值得接就无需被@接一句。
 # 保守档——只有 bot 自己刚发过言才会开窗，不主动盯着整个群。
@@ -594,11 +595,34 @@ GROUP_TOPIC_DAILY_CAP_DEFAULT = 1
 GROUP_TOPIC_DEDUP_HOURS_MIN = 0.0
 GROUP_TOPIC_DEDUP_HOURS_MAX = 48.0
 GROUP_TOPIC_DEDUP_HOURS_DEFAULT = 6.0
+# v2.2.12：她在**同一个群**里多久之内不许把同一件事再说一遍。
+# 线上 11-10 群 602543123 15:22 说旧票据、17:19 又说「上午那点事总算理完了」，
+# 素材账（只记素材行）抓不住模型改写后的正文，这里按正文比。0 = 关闭。
+GROUP_EVENT_DEDUP_HOURS_DEFAULT = 12.0
+# 同一个群里，别的角色刚说过话之后，这个角色至少安静这么多秒再主动开口。
+# 0 = 关闭。默认 120 秒：只挡「两个角色三秒内各说一句」这种穿帮，不压她自己的节奏。
+GROUP_CROSS_BOT_GAP_DEFAULT = 120
+GROUP_CROSS_BOT_GAP_MAX = 3600
+
+# v2.2.20：跨渠道（群↔私聊）同一件事的窗口。
+# 素材是共用的一份，群和私聊都在用，而旧护栏按渠道各查各的：群只看别的群、
+# 私聊只看别的用户。0 = 关闭（不比对另一条渠道）。
+CROSS_CHANNEL_DEDUP_HOURS_DEFAULT = 6.0
 
 # v2.1.2：每个角色**在所有群里**一天最多主动说几条（破冰 + 起话头 + 心流都算）。
 # 每群各自的额度只管单群，59 个群 × 2 就是一天 118 条——线上 11-06 群发 68 条、
 # 私聊 13 条，群聊把私聊挤没了，而主人以为「她不太找我」。
-GROUP_DAILY_TOTAL_CAP_DEFAULT = 20
+# v2.2.22：「回复前提醒」的窗口与条数。普通回复没法拦（拦了就是不回人话），
+# 只能在她开口之前把最近说过的话摆到模型眼前。0 小时 = 关掉提醒。
+REPLY_ECHO_HOURS_DEFAULT = 2.0
+REPLY_ECHO_HOURS_MAX = 72.0
+REPLY_ECHO_LIMIT_DEFAULT = 4
+REPLY_ECHO_LIMIT_MAX = 12
+
+# v2.2.47：默认 0 = **不限**。用户原话「一天只能主动12条不行 要么没限制要么把这个
+# 删掉 我要的是那个人的主动 人是想说就说的」——一天说几条该由她自己决定，不该由
+# 一个总数上限替她决定。想限制的人仍可填正数；0 一律视为不限。
+GROUP_DAILY_TOTAL_CAP_DEFAULT = 0
 GROUP_DAILY_TOTAL_CAP_MAX = 100
 
 # v2.1.2：特别关心的**独立**小时配额。特别关心已经绕过「TA 没开口」「没回就停」，
@@ -882,6 +906,14 @@ class SocialConfig:
     # v2.2.7：普通对话回复发出前的确定性清理（占位符/物种用词/连着的说教句）。
     # 默认开——线上被投诉的那几句全部来自普通回复，而那条链本来没有任何闸。
     decorate_outgoing: bool = True
+    # v2.2.22：回复前提醒——普通回复里她看不见「自己刚说过什么」，同一件事
+    # 会在几分钟内讲两遍（线上 3.8%）。这里把最近说过的话作为本轮临时内容块
+    # 注入，只提醒、不拦话。
+    reply_echo_guard: bool = True
+    # 窗口：只看最近这么多小时内对同一个人说过的话（0 = 不提醒）。
+    reply_echo_hours: float = REPLY_ECHO_HOURS_DEFAULT
+    # 最多列几条（列太多反而像背清单）。
+    reply_echo_limit: int = REPLY_ECHO_LIMIT_DEFAULT
 
     # 主动发出的消息要不要追加进 AstrBot 的会话历史（WebUI 可见、别的插件读得到）
     persist_proactive_history: bool = True
@@ -952,7 +984,18 @@ class SocialConfig:
     quiet_use_core_night: bool = True
 
     # 行为限制
-    private_only: bool = True
+    #
+    # v2.2.47：`private_only` 从这天起是**真开关**——「只主动私聊」，开了就不在群里
+    # 主动开口。它原来只是个历史导入过滤条件，名字和实际作用对不上（用户问「只主动
+    # 群聊的开关你做了么」，才发现这一项一直是个空壳）。那个过滤条件另立一项
+    # `history_private_only`，归到「消息记录」里，功能一个都不缺。
+    # 默认 False：以前的用户群聊是开着能用的，不能因为改名就悄悄把群聊停了。
+    private_only: bool = False
+    # 「只主动群聊」：开了就不在私聊里主动开口。与 `private_only` 是同一功能的两个方向，
+    # 两个都开等于都不主动（面板文案已写明）。
+    group_only: bool = False
+    # 历史导入时只扫私聊会话（v2.2.47 从 `private_only` 拆出来的原语义）。
+    history_private_only: bool = True
     debug: bool = False
 
     # 性格与语气：直接取用 AstrBot 内置人格设定，按目标会话的 umo 解析（多角色天然隔离），
@@ -1092,6 +1135,10 @@ class SocialConfig:
     # 于是同一件事一小时里挨个群播一遍（线上 11-06 16:40 五个群收到同一套）。这个
     # 窗口内用过的素材/措辞不在第二个群再说。0 = 关。
     group_topic_dedup_hours: float = GROUP_TOPIC_DEDUP_HOURS_DEFAULT
+    group_event_dedup_hours: float = GROUP_EVENT_DEDUP_HOURS_DEFAULT
+    group_cross_bot_gap_seconds: int = GROUP_CROSS_BOT_GAP_DEFAULT
+    # v2.2.20：多久之内不许把同一件事在群和私聊两边都说一遍。0 = 关闭
+    cross_channel_dedup_hours: float = CROSS_CHANNEL_DEDUP_HOURS_DEFAULT
     # v2.1.2：每个角色在所有群里一天最多主动说几条（破冰 + 起话头 + 心流都算）。
     # 0 = 不设总上限（只按每群各自的额度）。
     group_daily_total_cap: int = GROUP_DAILY_TOTAL_CAP_DEFAULT
@@ -1509,7 +1556,9 @@ class SocialConfig:
                 g("timezone_offset", _d("timezone_offset", TIMEZONE_DEFAULT))
             ),
             quiet_use_core_night=gb("quiet_use_core_night", True),
-            private_only=gb("private_only", True),
+            private_only=gb("private_only", False),
+            group_only=gb("group_only", False),
+            history_private_only=gb("history_private_only", True),
             debug=gb("debug", False),
             input_state_enabled=gb("input_state_enabled", True),
             input_state_interval_seconds=max(
@@ -1657,6 +1706,36 @@ class SocialConfig:
                 GROUP_TOPIC_DAILY_CAP_MIN,
                 min(GROUP_TOPIC_DAILY_CAP_MAX, gi("group_topic_daily_cap", GROUP_TOPIC_DAILY_CAP_DEFAULT)),
             ),
+            group_event_dedup_hours=max(
+                0.0,
+                min(
+                    72.0,
+                    gf(
+                        "group_event_dedup_hours",
+                        GROUP_EVENT_DEDUP_HOURS_DEFAULT,
+                    ),
+                ),
+            ),
+            group_cross_bot_gap_seconds=max(
+                0,
+                min(
+                    GROUP_CROSS_BOT_GAP_MAX,
+                    gi(
+                        "group_cross_bot_gap_seconds",
+                        GROUP_CROSS_BOT_GAP_DEFAULT,
+                    ),
+                ),
+            ),
+            cross_channel_dedup_hours=max(
+                0.0,
+                min(
+                    72.0,
+                    gf(
+                        "cross_channel_dedup_hours",
+                        CROSS_CHANNEL_DEDUP_HOURS_DEFAULT,
+                    ),
+                ),
+            ),
             group_topic_dedup_hours=max(
                 GROUP_TOPIC_DEDUP_HOURS_MIN,
                 min(
@@ -1753,6 +1832,21 @@ class SocialConfig:
             ),
             track_own_replies=gb("track_own_replies", True),
             decorate_outgoing=gb("decorate_outgoing", True),
+            reply_echo_guard=gb("reply_echo_guard", True),
+            reply_echo_hours=max(
+                0.0,
+                min(
+                    REPLY_ECHO_HOURS_MAX,
+                    gf("reply_echo_hours", REPLY_ECHO_HOURS_DEFAULT),
+                ),
+            ),
+            reply_echo_limit=max(
+                1,
+                min(
+                    REPLY_ECHO_LIMIT_MAX,
+                    int(gf("reply_echo_limit", REPLY_ECHO_LIMIT_DEFAULT)),
+                ),
+            ),
             persist_proactive_history=gb("persist_proactive_history", True),
             use_core_clock=gb("use_core_clock", True),
             use_core_facade=facade_mode,
@@ -1855,6 +1949,9 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     "silent_giveup_days": SILENT_GIVEUP_DAYS_DEFAULT,
     "special_care_min_affection": SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
     "group_daily_total_cap": GROUP_DAILY_TOTAL_CAP_DEFAULT,
+    "private_only": False,
+    "group_only": False,
+    "history_private_only": True,
     "special_care_hourly_cap": SPECIAL_CARE_HOURLY_CAP_DEFAULT,
     "group_idle_hours": GROUP_IDLE_HOURS_DEFAULT,
     "group_topic_gap_hours": GROUP_TOPIC_GAP_HOURS_DEFAULT,

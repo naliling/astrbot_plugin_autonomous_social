@@ -966,11 +966,20 @@ def group_topic_due(
     is_quiet: bool,
     asleep: bool = False,
     has_history_minimum: int = 5,
+    live_minutes: float = 0.0,
+    flow_on: bool = True,
 ) -> bool:
     """G1：这个群现在该不该由她**主动起个话头**（不必等群彻底冷掉）。
 
     比破冰宽松（不要求群安静很久），但仍旧保守：得有人聊过、她自己在群里静了够久、
     今天没起够、群没凉透、不在安静时段、**她醒着**。
+
+    v2.2.29：加一条**选模式**的守卫——群里 `live_minutes` 分钟内有群友说话，说明
+    话头已经在了，此刻该做的是接话（心流），不是另起一个话头。线上实测：她的
+    100 条群主动发言里 12 条发生在「前 30 分钟群友说过话」的群；其中
+    `本宫才收尽最后一缕夜梦`、`刚用蹄子把杯子从桌上挪到地上` 这类紧跟在群友
+    `撅了`、`@扎姆夏 w~` 之后的，就是模式选错。心流关掉时（`flow_on=False`）
+    不启用这条，免得把群彻底说死。
     """
     if asleep:
         return False
@@ -998,6 +1007,10 @@ def group_topic_due(
     )
     if now - last_proactive < cooldown:
         return False
+    if flow_on and live_minutes > 0:
+        alive = now - last_seen
+        if 0.0 <= alive <= live_minutes * 60.0:
+            return False
     if str(group.get("topic_day", "") or "") == today:
         if _i(group.get("topic_count_day", 0)) >= max(1, daily_cap):
             return False

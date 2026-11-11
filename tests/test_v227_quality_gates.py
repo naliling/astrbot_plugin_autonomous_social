@@ -467,6 +467,25 @@ class PreachyClauseTrimTest(unittest.TestCase):
         self.assertNotIn("别胡思乱想", got, f"祈使小句没剪掉：{got!r}")
         self.assertIn("旧票据", got, f"同一条里别的内容被误删：{got!r}")
 
+    def test_no_comma_before_emoji(self):
+        """剪完小句别补出「宝宝快抱紧我，💕」这种逗号（v2.2.16）。
+
+        回放第二轮 03:11:39 那条真机消息时发现的：句尾是表情，补逗号反而更难看。
+        """
+        got = verify_mod.tidy_outgoing_text(
+            "哪、哪有 别胡思乱想的。刚醒呢 宝宝快抱紧我 不许再问这些奇奇怪怪的了。💕",
+            recent=self._RECENT,
+        )
+        self.assertNotIn("，💕", got, f"表情前补了逗号：{got!r}")
+        self.assertIn("宝宝快抱紧我", got, f"正文被误删：{got!r}")
+
+    def test_comma_kept_between_two_sentences(self):
+        """下一截是正常文字时，逗号照补——不能为了避表情把粘连也放过去。"""
+        got = verify_mod.tidy_outgoing_text(
+            "没睡透，别闹。上次冷落我可还记着仇呢。", recent=self._RECENT
+        )
+        self.assertIn("没睡透，上次冷落我", got, f"两截粘在一起了：{got!r}")
+
 
 class ChannelSwitchTest(unittest.TestCase):
     """v2.2.10：私聊 / 群聊总开关（`allow_private_chat` / `allow_group_chat`）。
@@ -530,6 +549,97 @@ class ChannelSwitchTest(unittest.TestCase):
         for name in ("_speak", "_send_burst_followup"):
             src = inspect.getsource(getattr(engine_mod.SocialEngine, name))
             self.assertIn("_private_gate(self)", src, f"{name} 没有查私聊总开关")
+
+
+class PreachyScopeTest(unittest.TestCase):
+    """v2.2.11：身体指令是情趣，不是「说教」。"""
+
+    def test_body_commands_are_not_preachy(self):
+        for text in ("就不许出去", "不准自己偷偷睡着", "不许碰翅根", "别磨磨蹭蹭的"):
+            self.assertEqual(verify_mod._preachy_hits(text), 0, text)
+
+    def test_correcting_your_talk_is_still_preachy(self):
+        for text in (
+            "别胡思乱想的",
+            "不许再问这些奇奇怪怪的了",
+            "酥牧别刨根问底了",
+            "少自作多情了",
+        ):
+            self.assertGreater(verify_mod._preachy_hits(text), 0, text)
+
+    def test_common_words_do_not_trigger(self):
+        for text in ("别人都走了", "特别冷了", "区别在哪了"):
+            self.assertEqual(verify_mod._preachy_hits(text), 0, text)
+
+    def test_two_corrections_in_one_message_is_preachy(self):
+        # 二轮真机 03:11:39 那条：同一条里「别胡思乱想」+「不许再问」，
+        # 前一条只有一句，按「条数」计数永远凑不够 2，于是整条放行了。
+        text = "哪、哪有 别胡思乱想的。刚醒呢 宝宝快抱紧我 不许再问这些奇奇怪怪的了。"
+        self.assertGreaterEqual(verify_mod._preachy_hits(text), 2)
+        got = verify_mod.tidy_outgoing_text(text, recent=["嗯 我有点困了"])
+        self.assertNotIn("别胡思乱想", got)
+        self.assertNotIn("不许再问", got)
+        self.assertIn("宝宝快抱紧我", got, "剪说教不该把正文一起剪掉")
+
+    def test_single_curt_remark_is_kept(self):
+        got = verify_mod.tidy_outgoing_text("没睡透，别闹。", recent=["你回来啦"])
+        self.assertIn("别闹", got, "偶尔一句是性格，不该动")
+
+
+class FillerHeadTest(unittest.TestCase):
+    """v2.2.11：口头禅开头用滥了就摘掉开头这一下。"""
+
+    def test_overused_filler_is_stripped(self):
+        recent = ["唔……早", "唔 好困", "唔 别闹"]
+        self.assertEqual(
+            verify_mod._strip_filler_head("唔……最喜欢你了", recent), "最喜欢你了"
+        )
+
+    def test_filler_is_kept_when_not_overused(self):
+        recent = ["唔……早", "唔 好困"]
+        self.assertEqual(
+            verify_mod._strip_filler_head("唔……最喜欢你了", recent), "唔……最喜欢你了"
+        )
+
+    def test_action_prefix_is_preserved(self):
+        recent = ["唔……早", "唔 好困", "唔 别闹"]
+        got = verify_mod._strip_filler_head("（蹭了蹭）唔……好困呀，想睡了", recent)
+        self.assertNotIn("唔", got)
+        self.assertIn("好困呀", got)
+        self.assertIn("蹭了蹭", got, "括号动作要原样保留")
+
+    def test_short_result_keeps_original(self):
+        recent = ["唔", "唔", "唔"]
+        self.assertEqual(verify_mod._strip_filler_head("唔……嗯", recent), "唔……嗯")
+
+    def test_tidy_applies_rotation(self):
+        recent = ["唔……早", "唔 好困", "唔 别闹"]
+        got = verify_mod.tidy_outgoing_text("唔 急什么？肉穴被你蹭得火热了。", recent=recent)
+        self.assertFalse(got.startswith("唔"), got)
+
+
+class QuietRoundReasonTest(unittest.TestCase):
+    """v2.2.15：早退那条日志必须带上「为什么这一轮没人可发」。
+
+    线上真的踩到了：她一整个窗口一条没发，日志只写「没有人攒够念头」，
+    看起来像念头不够，其实是安静时段整轮跳过。沉默必须能自我解释。
+    """
+
+    def _src(self):
+        import social.engine as engine_mod
+        return Path(engine_mod.__file__).read_text(encoding="utf-8")
+
+    def test_early_return_logs_skip_reasons(self):
+        src = self._src()
+        i = src.index("没有人攒够念头")
+        j = src.index("_persist_metrics", i)
+        seg = src[max(0, i - 800):j]
+        self.assertIn("这一轮被跳过的原因", seg, "早退日志没写跳过原因")
+        self.assertIn("_round_skips", seg, "早退日志没用本轮跳过计数")
+
+    def test_skips_are_reset_each_round(self):
+        src = self._src()
+        self.assertIn("self._round_skips = {}", src, "跳过计数没有每轮清零")
 
 
 if __name__ == "__main__":

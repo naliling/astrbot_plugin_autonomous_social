@@ -11,13 +11,13 @@
     TA 一直没回、她已经主动发了 3 条           14
     复读（和最近发过的一条重合度 72% 以上）     8
     空泛（正文只有 '笨凝'）                     8
-    LLM 不可用（provider 取不到），本轮未发送    6
+    LLM 不可用（3 条 provider 都调不通，退避中，还剩 43 秒）    6
 
 ## 四条根因
 
 1. **`_dead_providers` 是永久集合**：三个专供模型只要都进过黑名单，
    `_get_provider` 在严格模式下永远返回 None，整轮只打一句「LLM 不可用
-   （provider 取不到）」，直到重载插件才恢复。→ 改成带 TTL 的跳过表。
+   （3 条 provider 都调不通，退避中）」，直到重载插件才恢复。→ 改成带 TTL 的跳过表。
 2. **`_call_llm` 收到 None**：`_review_draft` 传的是
    `getattr(self.generator, "provider", None)`，而 `MessageGenerator` 上没有
    `provider` 属性，于是每次自评都拿 None 去调，`_candidates` 必然为空——
@@ -159,7 +159,7 @@ class StrictFallsBackWhenTemporarilyDeadTest(unittest.TestCase):
     """严格模式是防「ID 配错」，不是防「模型暂时抽风」。
 
     11-10 凌晨实测：三个专供模型进 TTL 黑名单后，每轮只打一句
-    「LLM 不可用（provider 取不到），本轮未发送」，静默到重载插件。
+    「LLM 不可用（3 条 provider 都调不通，退避中，还剩 43 秒）」，静默到重载插件。
     """
 
     def _wire(self, clock, *, strict=True):

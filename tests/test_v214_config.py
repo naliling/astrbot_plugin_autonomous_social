@@ -209,7 +209,9 @@ class SchemaTest(unittest.TestCase):
             entry = SCHEMA[key]
             self.assertTrue(str(entry.get("description", "")).strip(), key)
             self.assertTrue(str(entry.get("hint", "")).strip(), key)
-            self.assertIn("obvious_hint", entry, key)
+            # v2.2.44：面板会在带 obvious_hint 的项前面渲染 ‼️，用户要求只留文字，
+            # 所以这个字段整体删掉，这里改成断言它不存在。
+            self.assertNotIn("obvious_hint", entry, key)
 
     def test_schema_default_drives_config_default(self):
         # _d() 以 schema 为准：schema 里写 true，硬编码兜底即使是 False 也读 true。
