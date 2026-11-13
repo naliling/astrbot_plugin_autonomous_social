@@ -2409,7 +2409,10 @@ class MessageGenerator:
             source = str(card.get("source") or "").strip()
             label = f"[{source}] " if source else ""
             body = f"{title}：{detail}" if title and detail else (title or detail)
-            lines.append(f"{len(lines) + 1}. {label}{body[:200]}")
+            # v2.2.49：Core 按人设排出来的卡不是真发生过的事，卡面直接标出来，
+            # 免得模型把「计划里的日程」写成「今天做过了」。
+            note = "（她自己排的，未必真做过）" if card.get("generated") else ""
+            lines.append(f"{len(lines) + 1}. {label}{body[:200]}{note}")
         return lines
 
     @staticmethod
@@ -2425,6 +2428,7 @@ class MessageGenerator:
         if plan.facts:
             lines.append("可以说的事实（只能引用这几条，不许自己添）：")
             lines.extend(f"- {fact}" for fact in plan.facts)
+            lines.append("标了『未必真做过』的只能写成打算/可能，不能写成做过。")
         else:
             lines.append("这次没有可以引用的事实：只说此刻的感受，不要编具体事件。")
         if plan.avoid:
@@ -2621,6 +2625,8 @@ class MessageGenerator:
                 isinstance(m, dict) and not m.get("self") and str(m.get("text", "") or "").strip()
                 for m in recent
             )
+            # v2.2.49：先算出「有没有可引用的事实」，下面那句引导语要按它分档。
+            topic_hint = str(group_ctx.get("topic_hint", "") or "").strip()
             if has_peer:
                 lead = (
                     "先看上面群里最近在聊什么。**如果有一句你能自然接上的话，就先接那句**"
@@ -2628,10 +2634,17 @@ class MessageGenerator:
                     "才说一件你自己此刻真在做的、或刚做完的小事。不要提问，"
                     "也别把群当成播报自己日程的地方。"
                 )
-            else:
+            elif topic_hint:
                 lead = (
                     "群里没有可接的话。说一件你自己此刻真在做的、或刚做完的小事，"
                     "让别人有得接——不要提问。"
+                )
+            else:
+                # v2.2.49：没有可引用的事实（本地兜底素材已默认关闭、Core 也没给素材）时，
+                # 「说一件刚做完的小事」等于逼模型自己编一件——这里改成只说状态。
+                lead = (
+                    "群里没有可接的话，你手上也没有可以引用的事。只说一句你此刻的状态"
+                    "或感受就好，**不要编具体做过的事**——不要说「我刚…」。不要提问。"
                 )
             if reason:
                 head += reason
@@ -2644,7 +2657,6 @@ class MessageGenerator:
             # 做完/昨晚梦到；节日、天气只是备选。用户原话：「只有天气，不会真的找
             # 话题」「他就不会分享事物吗」。天气能进来还得先过 engine 那道
             # 「变了 + 6 小时」的闸，所以这里不会天天摆着同一句天气。
-            topic_hint = str(group_ctx.get("topic_hint", "") or "").strip()
             if topic_hint:
                 body.append(
                     "【她自己的生活 + 今天现成的事】（有就挑一件真的分享，"
@@ -3471,9 +3483,11 @@ class MessageGenerator:
                 # 让「系统：…」从第 0 列开始，和插件写的指令行没法区分（审核 P1-06 ②）。
                 _desc = _quote_text(msg_type_desc, QUOTE_MAX_CHARS)
                 if _desc:
-                    parts.append(f"这次你想{_QUOTE_NOTICE}{_desc}。")
+                    parts.append(
+                        f"这一条如果要发，属于{_QUOTE_NOTICE}『{_desc}』这一类（不是必须）。"
+                    )
                 else:
-                    parts.append("这次你想随便说点什么。")
+                    parts.append("这一条如果要发，随便说点什么就行（不是必须）。")
                 if msg_style_hint:
                     parts.append(f"（{msg_style_hint}）")
                 parts.append(note)

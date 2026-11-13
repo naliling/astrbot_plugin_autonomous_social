@@ -527,6 +527,8 @@ class _HintEngine:
     def __init__(self, body):
         self.core = types.SimpleNamespace(bot_self_state=lambda _bid: body)
         self.cfg = SocialConfig.from_astrbot({})
+        # v2.2.49：本地兜底素材默认关；本文件几条用例专门验兜底路径，显式打开。
+        self.cfg.local_materials_enabled = True
         self.state = types.SimpleNamespace(life_used_elsewhere=lambda *a, **k: False)
 
     def log(self, *a, **k):
@@ -585,6 +587,22 @@ class GroupTopicHintTest(unittest.TestCase):
                 self.assertTrue(text, "没有 Core 时应该用本地兜底素材")
                 self.assertTrue(_life, "兜底素材要一并返回给 _icebreak 记账")
                 self.assertEqual(weather, "")
+
+    def test_local_fallback_off_keeps_holiday_and_skips_local_lines(self):
+        engine = _HintEngine({"holiday": "中秋节"})
+        engine.cfg.local_materials_enabled = False
+        text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
+        self.assertIn("今天是中秋节", text)
+        self.assertEqual(life, [], "开关关掉后不该再用本地硬编码素材")
+        self.assertEqual(weather, "")
+
+    def test_local_fallback_off_without_any_material_is_empty(self):
+        engine = _HintEngine({})
+        engine.cfg.local_materials_enabled = False
+        text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
+        self.assertEqual(text, "", "没有 Core/节日/天气时不该硬编素材")
+        self.assertEqual(life, [])
+        self.assertEqual(weather, "")
 
     def test_body_raising_is_tolerated(self):
         class _Boom:

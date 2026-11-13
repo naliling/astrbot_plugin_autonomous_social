@@ -161,6 +161,14 @@ _COMMAND_NAMES = (
     "自主社交状态", "社交自检", "触发社交", "主动消息预览", "主动消息记录", "群社交状态",
 )
 
+# v2.2.49：这些 source 的卡是 Core 按她的人设「排出来」的生活，不是真发生过的事。
+# 卡面加注与规划约束都靠这个标记区分（见 generator._card_lines / _plan_block）；
+# 刚发生 / 天气 / 节日这类真实来源不在表里，保持 generated=False。
+_GENERATED_CARD_SOURCES = frozenset({
+    "日程", "想做的事", "未完事项", "梦境", "生活素材",
+    "兴趣", "责任", "社交", "歇着", "偶发",
+})
+
 
 def _strip_ts(conv: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """去掉只为排序用的 ts，返回 prompt 侧要的 {dir,text} 列表。
@@ -4408,8 +4416,12 @@ class SocialEngine:
             )
             if worth:
                 weather_used = weather
-        if not life and not holiday and not weather_used:
-            # 没有 Core（或 Core 还没给出任何东西）时，节日和天气同样是空的：
+        if (
+            bool(getattr(self.cfg, "local_materials_enabled", False))
+            and not life and not holiday and not weather_used
+        ):
+            # v2.2.49：本地硬编码生活场景默认关——这些句子会被当成「她今天的事」。
+            # 开关打开且没有 Core（或 Core 还没给出任何东西）时，节日和天气同样是空的：
             # 原来这里直接返回空串，起话头一句话都起不来。用时间本身兜底。
             #
             # v2.2.7 / issue #2：兜底素材**也要过一遍去重**。旧实现完全绕开
@@ -7936,7 +7948,7 @@ class SocialEngine:
         在该会话里本来就在用的人格，插件不再插手。
         """
         try:
-            name, prompt = await resolve_persona(self.context, umo)
+            name, prompt = await resolve_persona(self.context, umo, self.cfg)
         except Exception as e:
             if throttle.allow(f"persona.read.{bid or '-'}"):
                 logger.warning(
@@ -10390,9 +10402,10 @@ class SocialEngine:
 
     @staticmethod
     def _normalize_cards(raw_cards: Any, *, at: float) -> List[Dict[str, Any]]:
-        """把 core 给的卡归一成 9 键形状，并丢掉过期卡。
+        """把 core 给的卡归一成 10 键形状，并丢掉过期卡。
 
         过期卡必须丢：模型看到一件「已经过期的事」会把它说成正在发生，比空手更假。
+        `generated` 标记这张卡是不是她按人设排出来的（见 _GENERATED_CARD_SOURCES）。
         """
         out: List[Dict[str, Any]] = []
         if isinstance(raw_cards, dict):
@@ -10409,6 +10422,7 @@ class SocialEngine:
             if expires and at and expires <= at:
                 continue
             kind = str(item.get("kind") or "life").strip() or "life"
+            source = str(item.get("source") or "生活素材").strip() or "生活素材"
             out.append(
                 {
                     "id": str(item.get("id") or "").strip(),
@@ -10416,7 +10430,8 @@ class SocialEngine:
                     "purpose": str(item.get("purpose") or kind).strip() or kind,
                     "title": title,
                     "detail": detail,
-                    "source": str(item.get("source") or "生活素材").strip() or "生活素材",
+                    "source": source,
+                    "generated": source in _GENERATED_CARD_SOURCES,
                     "captured_at": captured or at,
                     "expires_at": expires or (at + 6 * 3600.0 if at else 0.0),
                     "anchor_key": str(item.get("anchor_key") or "").strip(),

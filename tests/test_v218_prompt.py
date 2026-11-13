@@ -272,10 +272,17 @@ class IcebreakPromptTest(unittest.TestCase):
         self.assertIn("不要用问句收尾", text)
 
     def test_lead_asks_for_a_concrete_thing_of_her_own(self):
-        text = _group_prompt("icebreak", {})
+        # v2.2.49：有素材时才要求「说一件具体的事」；没有素材不能逼模型编。
+        text = _group_prompt("icebreak", {"topic_hint": "- 刚把碗洗了"})
         self.assertIn("不要提问", text)
         self.assertIn("说一件你自己此刻真在做的", text)
         self.assertNotIn("让大家搭句话", text)
+
+    def test_no_material_lead_does_not_ask_for_a_made_up_event(self):
+        text = _group_prompt("icebreak", {})
+        self.assertIn("不要提问", text)
+        self.assertIn("不要编具体做过的事", text)
+        self.assertNotIn("说一件你自己此刻真在做的", text)
 
     def test_no_question_variant_is_stricter_and_not_like_a_bot(self):
         text = _group_prompt("icebreak", {"no_question": True})
@@ -288,7 +295,7 @@ class IcebreakPromptTest(unittest.TestCase):
         self.assertIn("别用「最近怎么样」这种万能问句", text)
 
     def test_topic_mode_uses_the_same_lead(self):
-        text = _group_prompt("topic", {})
+        text = _group_prompt("topic", {"topic_hint": "- 刚把碗洗了"})
         self.assertIn("说一件你自己此刻真在做的", text)
         self.assertNotIn("跟大家聊点什么", text)
         self.assertNotIn("可以带一个轻松的小问题", text)

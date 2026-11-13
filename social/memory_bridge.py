@@ -951,21 +951,26 @@ async def write_proactive(
 
     **写入会产生 embedding 成本**（对面开 `retrieval.embedding_enabled` 时每条一次），
     且仅私聊可见（写进 `private_pair`，群聊检索不到）。超时 8 秒。
+
+    v2.2.49：payload 头明确写「这是她主动说的一句话，不是发生过的事」——主动消息是
+    生成的话，不能将来被当成「她做过什么」的事实；importance 也降到 0.3，并打上
+    `her_own_words` 标签，方便对面按「她自己的话」而不是「发生的事」检索。
     """
     text = str(content or "").strip()
     uid = str(uid or "").strip()
     if bridge is None or not text or not uid:
         return
     topic = str(about or "").strip()[:60]
-    head = f"（她主动找 TA 说的，由头：{topic}）" if topic else "（她主动找 TA 说的）"
+    head = "（这是她主动说的一句话，不是发生过的事"
+    head += f"；由头：{topic}）" if topic else "）"
     payload = f"{head}{text}"
     await _record_external(
         bridge,
         uid,
         payload,
         idempotency_key=_idempotency_key(umo, payload, ts),
-        importance=0.5,
-        tags=["proactive"],
+        importance=0.3,
+        tags=["proactive", "her_own_words"],
     )
 
 

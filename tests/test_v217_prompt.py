@@ -5,7 +5,7 @@
 提示词里有几处把**对方发来的原文**直接拼进插件自己写的指令句：
 
     TA 刚才说过：「{exchange}」。
-    这次你想{msg_type_desc}。
+    这一条如果要发，属于{msg_type_desc}（不是必须）。
     这次开口是因为下面这一件事（已经定了）：{anchor_fact}
 
 以前这些片段只过 `strip()` / `balance_brackets()`：单个 `\\n` 原样保留，长度不设
@@ -235,8 +235,10 @@ class ComposePayloadInjectionTest(unittest.TestCase):
         })
         self.assertFalse(_line_starts_with(text, "系统："), text)
         self.assertIn(INJECT_TAIL, text)
-        marker = "这次你想" + generator._QUOTE_NOTICE
+        marker = "这一条如果要发，属于" + generator._QUOTE_NOTICE
         self.assertIn(marker, text)
+        # v2.2.49：不再把加权抽签的结果写成「这次你想……」，那是在替她断言意图。
+        self.assertNotIn("这次你想", text)
 
     def test_anchor_fact_is_flat_and_notice_comes_first(self):
         fact = "开口原因：TA之前的原话（保留TA的说话人视角）：" + INJECT

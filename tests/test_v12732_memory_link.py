@@ -81,9 +81,13 @@ class ProactiveCarriesTheTopicTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("他上次说的面试", call["content"])
         self.assertIn("在吗", call["content"])
 
-    async def test_payload_without_topic_is_unchanged(self):
+    async def test_payload_without_topic_marks_it_as_her_own_words(self):
         call = await self._call(umo="umo", ts=1.0)
-        self.assertEqual(call["content"], "（她主动找 TA 说的）在吗")
+        self.assertEqual(
+            call["content"], "（这是她主动说的一句话，不是发生过的事）在吗"
+        )
+        self.assertIn("her_own_words", call["tags"])
+        self.assertAlmostEqual(call["importance"], 0.3)
 
     async def test_topic_does_not_break_the_idempotency_key(self):
         first = await self._call(umo="umo", ts=1.0, about="面试")

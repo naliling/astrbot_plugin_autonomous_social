@@ -701,9 +701,10 @@ TIME_PROJECTION_ENABLED_DEFAULT = True
 # v2.1.5：这两项在 engine.py 里早就被 getattr(cfg, ..., False) 读着，但配置层一直
 # 没这两个字段——getattr 的兜底是 False，于是「生成后自评一遍再发」和「先查一次
 # 记忆再开口」两条路永远是死代码。补进配置层等于给已有的实现接上电源。
-# - draft_review_enabled：自评只能收紧不能放宽（改完照样过验收层），风险低，默认开。
+# - draft_review_enabled：v2.2.49 起默认关——自评会把正文整条替换成另一模型改写版，
+#   而计数只有 _bump_review 累加、不记日志，用户看不出被换过；想开的人自己开。
 # - memory_tools_enabled：每轮多一次模型调用、多一份延迟，默认关，想要的人自己开。
-DRAFT_REVIEW_ENABLED_DEFAULT = True
+DRAFT_REVIEW_ENABLED_DEFAULT = False
 MEMORY_TOOLS_ENABLED_DEFAULT = False
 
 REPLY_WINDOW_MIN = 1
@@ -1144,6 +1145,9 @@ class SocialConfig:
     group_daily_total_cap: int = GROUP_DAILY_TOTAL_CAP_DEFAULT
     # v2.1.0：一次起话头最多发几段（0 = 不限）。多出来的段并进最后一段。
     group_topic_max_segments: int = GROUP_TOPIC_MAX_SEGMENTS_DEFAULT
+    # v2.2.49：没有 Core 素材时，是否用本地「现在几点」的硬编码生活场景兜底。
+    # 这些句子会被当成「她今天的事」写进 prompt，默认关；关掉后按节日/天气退回。
+    local_materials_enabled: bool = False
     # G3 → v1.28.0：群主动**默认不点名**。用户原话是「主动消息发群时会叫别人」
     # ——模型只要拿到名字，就会拿别人的名字去提问/点评/招呼，而打招呼本来该对着
     # 整个群说。打开后也只剩一种用法：心流接话时，可以叫**正在接的那一个人**一句；
@@ -1190,11 +1194,14 @@ class SocialConfig:
     # 防她按日期自己换算、说「好久没见」。关掉不注入。
     time_projection_enabled: bool = TIME_PROJECTION_ENABLED_DEFAULT
     # v2.1.5：生成后自评一次（generator.review_draft），不过就换个时机重来。
-    # 关掉则生成完直接进验收层，省一次模型调用。
+    # 关掉则生成完直接进验收层，省一次模型调用。v2.2.49 起默认关。
     draft_review_enabled: bool = DRAFT_REVIEW_ENABLED_DEFAULT
     # v2.1.5：允许她先查一次记忆再开口（generator.generate_with_tools）。
     # 会多一次模型调用，所以默认关；生成器不支持工具时自动退回普通生成。
     memory_tools_enabled: bool = MEMORY_TOOLS_ENABLED_DEFAULT
+    # v2.2.49：会话没绑人格时，是否按 umo 前缀（平台名）找同名人格顶替。
+    # 多个 bot 共用同一平台前缀时会把 A 的人格套到 B 身上，默认关，走原有回退链。
+    persona_platform_fallback: bool = False
 
     @property
     def mood_scale(self) -> float:
@@ -1757,6 +1764,7 @@ class SocialConfig:
                     gi("group_topic_max_segments", GROUP_TOPIC_MAX_SEGMENTS_DEFAULT),
                 ),
             ),
+            local_materials_enabled=gb("local_materials_enabled", False),
             group_mention_member=gb("group_mention_member", False),
             group_interject_others=gb("group_interject_others", True),
             group_stale_days=max(
@@ -1896,13 +1904,14 @@ class SocialConfig:
                 "time_projection_enabled", TIME_PROJECTION_ENABLED_DEFAULT
             ),
             # v2.1.5 两项：同样走 gb()，面板里填的 "false"/"0"/"off" 也认。
-            # 注意默认值与 engine.py 的 getattr 兜底不同（那边是 False），以 schema 为准。
+            # v2.2.49：draft_review 默认改成 False 后，与 engine.py 的 getattr 兜底一致。
             draft_review_enabled=gb(
                 "draft_review_enabled", DRAFT_REVIEW_ENABLED_DEFAULT
             ),
             memory_tools_enabled=gb(
                 "memory_tools_enabled", MEMORY_TOOLS_ENABLED_DEFAULT
             ),
+            persona_platform_fallback=gb("persona_platform_fallback", False),
         )
 
     def in_quiet_hours(self, h: int) -> bool:

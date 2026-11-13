@@ -43,6 +43,8 @@ v1.28.4：
   并推进这个人的 `last_interaction`。
 - 只加不改：旧 Core 忽略这个字段；旧社交插件没有它时 Core 按「只知道她开过口」
   降级，不会拿占位文本污染 `spoke_log`。
+- v2.2.49：同时写 `last_proactive_generated: true`——这句话是她**生成**的，不是发生过的
+  事；Core 侧可以据此只把它当「她说过的话」，不写进「她做过什么」。
 """
 
 from __future__ import annotations
@@ -87,6 +89,8 @@ class SignalsWriter:
             "last_target_uid": "",
             # 主动消息的原文（v1.28.4）：Core 靠它把这句话补记进情绪账本。
             "last_proactive_text": "",
+            # v2.2.49：原文是生成的话，不是发生过的事（给 Core 区分用）。
+            "last_proactive_generated": False,
             "ignored_streak": 0,
             # 她手上还开着的事（见 note_open_items）。默认写空列表而不是省略这个键：
             # 「没有开着的事」是一个**有意义的结论**，Core 靠它判断「这件事结了没有」。
@@ -143,6 +147,7 @@ class SignalsWriter:
         slot = {"last_proactive_at": 0.0,
                 "last_target_uid": "",
                 "last_proactive_text": "",
+                "last_proactive_generated": False,
                 "ignored_streak": 0,
                 "open_items": []}
         by_bid[key] = slot
@@ -162,6 +167,7 @@ class SignalsWriter:
             for key, empty in (("last_proactive_at", 0.0),
                                ("last_target_uid", ""),
                                ("last_proactive_text", ""),
+                               ("last_proactive_generated", False),
                                ("ignored_streak", 0),
                                ("open_items", [])):
                 if self._payload.get(key) != empty:
@@ -189,11 +195,13 @@ class SignalsWriter:
         slot["last_proactive_at"] = when
         slot["last_target_uid"] = str(target_uid or "")
         slot["last_proactive_text"] = body
+        slot["last_proactive_generated"] = True
         if getattr(self, "_roles", 1) <= 1:
             # 单 Bot：Core 只会把这一个角色的消息认成自己的，照旧写顶层
             self._payload["last_proactive_at"] = when
             self._payload["last_target_uid"] = str(target_uid or "")
             self._payload["last_proactive_text"] = body
+            self._payload["last_proactive_generated"] = True
         self._dirty = True
         self.flush()
 

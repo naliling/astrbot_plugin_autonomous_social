@@ -118,9 +118,15 @@
     },
     "draft_review_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "发前自评",
         "hint": "发之前让模型把这条当话看一遍，不合格就改写或不发。"
+    },
+    "persona_platform_fallback": {
+        "type": "bool",
+        "default": false,
+        "description": "人格按平台名兜底",
+        "hint": "会话没绑人格时，按 umo 前缀（平台名）找同名人格顶替；多个 bot 共用同一平台会串台，默认关。"
     },
     "max_output_tokens_enabled": {
         "type": "bool",
@@ -1142,6 +1148,15 @@
         },
         "description": "群主动消息最多几段",
         "hint": "多出来的段并进最后一段，不碎句连发。",
+        "condition": {
+            "allow_group_chat": true
+        }
+    },
+    "local_materials_enabled": {
+        "type": "bool",
+        "default": false,
+        "description": "没有素材时用本地场景兜底",
+        "hint": "没有 Core 素材时，用「现在几点」拼几句生活场景当素材；默认关，关掉后只按节日/天气起话头。",
         "condition": {
             "allow_group_chat": true
         }

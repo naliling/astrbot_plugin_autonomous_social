@@ -104,10 +104,11 @@ def _persona_prompt(persona: Any) -> str:
     return _truncate(str(prompt or "").strip())
 
 
-async def resolve_persona(context: Any, umo: str) -> Tuple[str, str]:
+async def resolve_persona(context: Any, umo: str, cfg: Any = None) -> Tuple[str, str]:
     """返回该会话当前生效人格的 (名字, 设定原文)；拿不到时为 ("", "")。
 
     名字只用于状态展示与日志，原文用于拼进 prompt。
+    `cfg` 可选：只有 `persona_platform_fallback` 打开时才按平台名顶替人格。
     """
     persona_mgr = getattr(context, "persona_manager", None)
     if persona_mgr is None:
@@ -128,12 +129,14 @@ async def resolve_persona(context: Any, umo: str) -> Tuple[str, str]:
         logger.info(f"[autonomous_social] 会话 {umo} 没解析到生效人格（未绑人格/无默认/显式不用），主动消息退回默认口吻")
         return "", ""
 
-    # 平台名兜底：umo 前缀就是平台名（`露娜:GroupMessage:…`），而人格表里常常正好
-    # 有同名人格。线上三个 bot 的会话人格**全都没绑**，于是全都回落到全局默认
-    # （娜莉灵）——阿莉娜和露娜的主动消息都在用娜莉灵的口吻，用户一眼就看出串台。
+    # 平台名兜底（v2.2.49 起默认关）：umo 前缀就是平台名（`露娜:GroupMessage:…`），
+    # 而人格表里常常正好有同名人格。线上三个 bot 的会话人格**全都没绑**，于是全都
+    # 回落到全局默认（娜莉灵）——阿莉娜和露娜的主动消息都在用娜莉灵的口吻，用户一眼就看出串台。
     #
     # 只在「解析出来的是全局默认、且前缀有同名人格」时替换：手工绑过的会话不受影响。
-    persona = await _prefer_platform_persona(persona_mgr, umo, persona)
+    # 但多个 bot 共用同一平台前缀时会把 A 的人格套到 B 身上，所以做成开关，默认不顶替。
+    if bool(getattr(cfg, "persona_platform_fallback", False)):
+        persona = await _prefer_platform_persona(persona_mgr, umo, persona)
     # 人设存在但没名字时给中性占位；NO_PERSONA_MARKER 的含义是「不用人格」，不能拿来当名字显示
     return _persona_name(persona) or "（未命名人设）", _persona_prompt(persona)
 

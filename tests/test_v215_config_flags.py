@@ -8,8 +8,8 @@
 
 所以这里钉四件事：
 
-* 默认值与 engine.py 的 getattr 兜底**故意不同**（draft 默认开、memory 默认关），
-  以 schema 为准——engine 那边的 False 只是「配置层没写」时的兜底，不是产品默认；
+* 默认值与 engine.py 的 getattr 兜底一致（v2.2.49 起 draft 也默认关，memory 默认关），
+  以 schema 为准——engine 那边的 False 原本只是「配置层没写」时的兜底；
 * 面板里填的 `"false"/"0"/"off"` 真的能关掉（gb 归一，老坑 P3-07）；
 * schema 键数、README 行、README 计数三处与 dataclass 一致；
 * engine.py 读的属性名与 dataclass 字段名对得上（这条是防死代码复发的唯一断言）。
@@ -66,7 +66,7 @@ README = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 
 # v2.1.5 的两项：名字是外部契约（engine.py 的 getattr、面板、README 都按这个名字读）。
 NEW_KEYS = ("draft_review_enabled", "memory_tools_enabled")
-EXPECTED_DEFAULTS = {"draft_review_enabled": True, "memory_tools_enabled": False}
+EXPECTED_DEFAULTS = {"draft_review_enabled": False, "memory_tools_enabled": False}
 # 从 engine.py 里读的属性名 → 期望的 dataclass 字段。两者必须一致，否则又是死代码。
 ENGINE_ATTRS = {
     "draft_review_enabled": "engine.py:8650 的 bool(getattr(self.cfg, \"draft_review_enabled\", False))",
@@ -101,20 +101,20 @@ def _readme_count() -> int:
 
 
 class DefaultsTest(unittest.TestCase):
-    """出厂状态：自评开、记忆工具关——与 engine.py 的 getattr 兜底故意不同。"""
+    """出厂状态：自评关、记忆工具关——与 engine.py 的 getattr 兜底一致。"""
 
     def test_constants(self):
-        self.assertIs(config_mod.DRAFT_REVIEW_ENABLED_DEFAULT, True)
+        self.assertIs(config_mod.DRAFT_REVIEW_ENABLED_DEFAULT, False)
         self.assertIs(config_mod.MEMORY_TOOLS_ENABLED_DEFAULT, False)
 
     def test_dataclass_defaults(self):
         c = SocialConfig()
-        self.assertIs(c.draft_review_enabled, True)
+        self.assertIs(c.draft_review_enabled, False)
         self.assertIs(c.memory_tools_enabled, False)
 
     def test_from_astrbot_empty_dict_uses_defaults(self):
         c = _cfg()
-        self.assertIs(c.draft_review_enabled, True)
+        self.assertIs(c.draft_review_enabled, False)
         self.assertIs(c.memory_tools_enabled, False)
 
     def test_fields_are_bool_typed(self):
@@ -145,14 +145,15 @@ class SchemaContractTest(unittest.TestCase):
         for key in NEW_KEYS:
             self.assertIs(SCHEMA[key]["default"], getattr(SocialConfig(), key), key)
 
-    def test_schema_key_count_is_142(self):
+    def test_schema_key_count_is_144(self):
         # v2.2.7：新增 decorate_outgoing（出口改写），131 → 132。
         # v2.2.10：新增 allow_private_chat / allow_group_chat（私聊、群聊总开关），132 → 134。
         # v2.2.12：新增 group_event_dedup_hours（同群不重复说同一件事），134 → 135。
         # v2.2.20：新增 cross_channel_dedup_hours（群私聊之间不二传），135 → 136。
         # v2.2.32：新增 group_cross_bot_gap_seconds（同群跨角色不抢话），139 → 140。
         # v2.2.47：新增 group_only（只主动群聊）与 history_private_only（只导入私聊历史），140 → 142。
-        self.assertEqual(len(SCHEMA), 142)
+        # v2.2.49：新增 persona_platform_fallback 与 local_materials_enabled，142 → 144。
+        self.assertEqual(len(SCHEMA), 144)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -197,14 +198,14 @@ class StringNormalizationTest(unittest.TestCase):
                 )
 
     def test_empty_string_falls_back_to_default(self):
-        self.assertIs(_cfg(draft_review_enabled="").draft_review_enabled, True)
+        self.assertIs(_cfg(draft_review_enabled="").draft_review_enabled, False)
         self.assertIs(_cfg(memory_tools_enabled="").memory_tools_enabled, False)
 
     def test_unrecognized_value_never_raises(self):
         for raw in ("随便", "maybe", object(), [1], {"a": 1}):
             with self.subTest(raw=raw):
                 c = _cfg(draft_review_enabled=raw, memory_tools_enabled=raw)
-                self.assertIs(c.draft_review_enabled, True)
+                self.assertIs(c.draft_review_enabled, False)
                 self.assertIs(c.memory_tools_enabled, False)
 
     def test_native_bools_and_numbers(self):
@@ -240,7 +241,8 @@ class ReadmeTest(unittest.TestCase):
         self.assertEqual(_readme_count(), len(SCHEMA))
         # v2.2.7：新增 decorate_outgoing，README 的「共 N 项」跟着 131 → 132。
         # v2.2.10：新增 allow_private_chat / allow_group_chat，跟着 132 → 134。
-        self.assertEqual(_readme_count(), 142)
+        # v2.2.49：新增 persona_platform_fallback / local_materials_enabled，跟着 142 → 144。
+        self.assertEqual(_readme_count(), 144)
 
 
 class EngineWiringTest(unittest.TestCase):

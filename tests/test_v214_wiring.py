@@ -221,12 +221,13 @@ CARD_KEYS = {
     "captured_at",
     "expires_at",
     "anchor_key",
+    "generated",
 }
 
 
 # ─── 一、证据卡 ──────────────────────────────────────────────────
 class EvidenceCardsTest(unittest.TestCase):
-    def test_normalizes_to_nine_keys(self):
+    def test_normalizes_to_ten_keys(self):
         eng = _engine(facade=_FakeFacade(opportunities=[{"id": "o1", "title": "面试", "detail": "她明天下午面试"}]))
         cards = eng.evidence_cards("bid1", at=NOW)
         self.assertEqual(1, len(cards))
