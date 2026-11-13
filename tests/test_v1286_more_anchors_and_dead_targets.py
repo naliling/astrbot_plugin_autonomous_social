@@ -77,6 +77,8 @@ import social.anchors as anchors  # noqa: E402
 from social import engine as engine_mod  # noqa: E402
 from social.core_bridge import CoreBridge  # noqa: E402
 
+from tests import _self_narration  # noqa: E402
+
 
 class _Bridge(CoreBridge):
     def __init__(self):
@@ -284,6 +286,15 @@ class BodyCueTest(unittest.TestCase):
 
 class PlanCueTest(unittest.TestCase):
     """`day.next` 是列表（Core 给最多两条），原来只用第一条。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （计划由头的 kind 是 KIND_PLAN）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_both_entries(self):
         got = anchors._plan_cues(_body(day={"next": ["去超市", "回家做饭"]}))

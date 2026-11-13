@@ -55,6 +55,8 @@ from social.state import SocialState  # noqa: E402
 
 NOW = 1_700_000_000.0
 
+from tests import _self_narration  # noqa: E402
+
 
 class _StubProvider:
     """`_get_provider` 的最小替身：只需要能算出一个退避 scope。"""
@@ -319,6 +321,15 @@ class DreamsBridgeTest(unittest.TestCase):
 
 class AnchorLifeSourcesTest(unittest.TestCase):
     """S2：刚做完 / 正在做 / 梦到都要能成为由头；天气不许绕过闸。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （生活来源排到天气前面）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_doing_is_ongoing_not_just_finished(self):
         """用户反馈的语义错误：「刚忙完在厨房煮饭」——doing 是此刻正在做。"""

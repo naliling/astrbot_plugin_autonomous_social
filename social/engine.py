@@ -64,7 +64,13 @@ from .core_bridge import CORE_SAID_MAX, CoreBridge
 from .input_state import InputStateNotifier, wait_reason as input_wait_reason
 from .sanitize import sanitize_incoming
 from .textutil import short_call_name, usable_call_name
-from .anchors import anchor_meta, anchor_sentence, drop_anchor, prepare_round_anchors
+from .anchors import (
+    anchor_meta,
+    anchor_sentence,
+    drop_anchor,
+    prepare_round_anchors,
+    purge_self_narration_anchors,
+)
 from .verify import (
     _bigrams,
     _check_cross_user,
@@ -1903,6 +1909,19 @@ class SocialEngine:
                 "data/plugin_data/astrbot_plugin_autonomous_social/state.json"
             )
         self.state = SocialState(state_path, time_source=self._time)
+        # v2.2.48：池子里**已经派生好**的「她今天在干什么」由头清一次。
+        # 只关新派生不够——旧条目还在池子里躺着、还能被念两小时（派生类 TTL），
+        # 用户看到的就是「改了怎么还在播报我干了啥」。
+        # 见 `anchors.purge_self_narration_anchors`（按 kind 清、幂等、打标记）。
+        _dropped_self_narration = 0
+        for _bot_state in (self.state.data.get("bots") or {}).values():
+            if isinstance(_bot_state, dict):
+                _dropped_self_narration += purge_self_narration_anchors(_bot_state)
+        if _dropped_self_narration:
+            logger.info(
+                f"[autonomous_social] 清掉 {_dropped_self_narration} 条"
+                f"「她今天在干什么」的存量由头"
+            )
         self.core = CoreBridge(self.cfg.mode, data_dir=data_dir)
         # 契约 v2 的同进程只读门面。懒解析：插件加载顺序不保证，构造时 Core 可能还没起来。
         # `None` 表示「还没查过」或「查过但没找到」，两者都由 `core_facade` 的缓存区分。

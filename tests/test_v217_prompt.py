@@ -85,6 +85,8 @@ def _line_starts_with(text: str, prefix: str) -> bool:
     """有没有哪一行以 prefix 开头（引文里出现它就算伪造指令行）。"""
     return any(line.startswith(prefix) for line in text.splitlines())
 
+from tests import _self_narration  # noqa: E402
+
 
 class QuoteTextTest(unittest.TestCase):
     """P1-06 的专用清洗函数：单行 + 有界 + 剥占位符 + 括号配平。"""
@@ -477,6 +479,15 @@ class ComposeClockAndBudgetTest(unittest.TestCase):
 
 class AnchorFlattenTest(unittest.TestCase):
     """P1-06 ③ 的源头 + P3-16：about 压平、day.doing 只认 str。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （脏 doing 回落到 schedule_event）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_anchor_sentence_about_is_flattened(self):
         line = anchors.anchor_sentence({"kind": "derived", "about": INJECT})

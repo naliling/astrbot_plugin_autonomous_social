@@ -101,6 +101,8 @@ def _fresh(topics, **kw):
 
 # ─── A1：topics 当由头 ───────────────────────────────────────────
 
+from tests import _self_narration  # noqa: E402
+
 
 class TopicRelationTest(unittest.TestCase):
     """「你上次说的那个X，后来呢」——素材是 `u["topics"]`。
@@ -372,6 +374,15 @@ class TopicSanitizeTest(unittest.TestCase):
 
 
 class DoneOngoingCapTest(unittest.TestCase):
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （done/ongoing 的条数与过滤）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
     def _derive(self, body):
         kinds: dict = {}
         return anchors._derive_from_state(body, {}, NOW, set(), kinds=kinds)

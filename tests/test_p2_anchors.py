@@ -72,13 +72,22 @@ class DerivedAnchorTemplateIntact(unittest.TestCase):
         self.assertTrue(any(a.endswith("」后来呢") for a in abouts), abouts)
 
     def test_5_ongoing_task_fragment_keeps_full_width(self):
-        """#5：`还在{_short(task, 14)}` 曾经被 offer 再切一刀（16 → 14）。"""
+        """#5：`还在{_short(task, 14)}` 曾经被 offer 再切一刀（16 → 14）。
+
+        v2.2.48：`ongoing` 属于「她今天在干什么」，这类由头默认不再产出
+        （`SELF_NARRATION_ENABLED=False`，用户原话「发言看起来很傻」）。本条验的是
+        **截断**，所以直接测派生层本身，不经过 `prepare_round_anchors` 的取舍。
+        """
         task = "整理二〇二四年度的个人档案和报销单据"
         expect = "还在" + task[:14]
         self.assertGreater(len(expect), 14, "这条用例要求片段比旧的 14 字上限长")
-        picks = anchors.prepare_round_anchors(
-            {}, {"ongoing": [task]}, NOW, limit=1)
-        self.assertEqual(anchors._s(picks[0].get("about")), expect)
+        was = anchors.SELF_NARRATION_ENABLED
+        anchors.SELF_NARRATION_ENABLED = True
+        try:
+            texts = anchors._derive_from_state({"ongoing": [task]}, {}, NOW, set())
+        finally:
+            anchors.SELF_NARRATION_ENABLED = was
+        self.assertIn(expect, texts)
         self.assertNotEqual(expect, expect[:14], "旧行为：整句被再次截到 14 字")
 
     def test_5_offer_layer_cap_is_the_storage_cap(self):
@@ -89,7 +98,11 @@ class DerivedAnchorTemplateIntact(unittest.TestCase):
         self.assertEqual(len(anchors._s(item.get("about"))), anchors.ANCHOR_TEXT_MAX)
 
     def test_5_no_derived_anchor_is_cut_mid_template(self):
-        """把各类 body 过一遍：凡是带后缀的模板，后缀必须完整。"""
+        """把各类 body 过一遍：凡是带后缀的模板，后缀必须完整。
+
+        v2.2.48：`doing` / `ongoing` 这类「她今天在干什么」的由头默认不再产出，
+        这条用例要覆盖它们的模板完整性，所以临时把开关打开（验的是截断，不是默认）。
+        """
         bodies = [
             RICH_BODY,
             {"day": {"doing": "整理个案笔记"}},
@@ -97,14 +110,19 @@ class DerivedAnchorTemplateIntact(unittest.TestCase):
             {"weather": {"env": "外面在下雨"}},
         ]
         seen = 0
-        for body in bodies:
-            for text in anchors._derive_from_state(body, {}, NOW, set()):
-                seen += 1
-                self.assertLessEqual(len(text), anchors.ANCHOR_TEXT_MAX, text)
-                if text.startswith("你上次说的「"):
-                    self.assertTrue(text.endswith("」后来呢"), text)
-                if text.startswith("你上次说") and "后来好点没" in text:
-                    self.assertTrue(text.endswith("，后来好点没"), text)
+        was = anchors.SELF_NARRATION_ENABLED
+        anchors.SELF_NARRATION_ENABLED = True
+        try:
+            for body in bodies:
+                for text in anchors._derive_from_state(body, {}, NOW, set()):
+                    seen += 1
+                    self.assertLessEqual(len(text), anchors.ANCHOR_TEXT_MAX, text)
+                    if text.startswith("你上次说的「"):
+                        self.assertTrue(text.endswith("」后来呢"), text)
+                    if text.startswith("你上次说") and "后来好点没" in text:
+                        self.assertTrue(text.endswith("，后来好点没"), text)
+        finally:
+            anchors.SELF_NARRATION_ENABLED = was
         self.assertGreater(seen, 3, "样本太少，这条用例没验到东西")
 
 
@@ -238,15 +256,39 @@ class TierPoolCapIsReal(unittest.TestCase):
                            anchors.TIER_POOL_MAX[anchors.TIER_LOW])
 
     def test_10_tier_really_bounds_the_pick(self):
-        """前后对比：旧值 high/mid/low = 12/8/4（而池子只装 5 条），v1.28.7 起 8/6/4。"""
+        """前后对比：旧值 high/mid/low = 12/8/4（而池子只装 5 条），v1.28.7 起 8/6/4。
+
+        v2.2.48：`SELF_NARRATION_ENABLED=False` 后，RICH_BODY 那套「在做 / 刚做完 /
+        接下来 / 想做 / 没做完」不再产生由头（用户原话「发言看起来很傻」），
+        所以档位上限改用**硬来源**凑满：梦、刚发生的事、刚醒、体感、今天挺空的、
+        对方说过的话、沉默太久、天气、节日。
+        """
+        body = {
+            "day": {
+                "dreams": ["在海边捡到一只玻璃瓶"],
+                "wake": {"asleep": False, "wake_at": NOW - 600.0,
+                         "last_sleep_hours": 7.5},
+            },
+            "event": {"phrase": "被人夸了一句"},
+            "hunger": 80.0,
+            "sleep_pressure": 80.0,
+            "feelings": ["今天挺空的", "有点想出去走走"],
+            "weather": {"env": "外面下着大雨"},
+            "holiday": "中秋",
+        }
+        user = {
+            "said": [{"said": "明天去面试", "ts": NOW - 3600.0},
+                     {"said": "下周三体检", "ts": NOW - 7200.0}],
+            "last_seen": NOW - 30 * 86400.0,
+        }
         want = {
             anchors.TIER_HIGH: 8,
             anchors.TIER_MID: 6,
             anchors.TIER_LOW: 4,
         }
         for tier, n in want.items():
-            picks = anchors.prepare_round_anchors({}, dict(RICH_BODY), NOW,
-                                                 limit=12, tier=tier)
+            picks = anchors.prepare_round_anchors(
+                dict(user), dict(body), NOW, limit=12, tier=tier)
             self.assertEqual(len(picks), n, f"{tier} 档取了 {len(picks)} 条")
 
     def test_10_no_dangling_pick_outside_the_pool(self):
@@ -346,7 +388,7 @@ class RememberedSurvivesThePool(unittest.TestCase):
         anchors.consume(u, "刚忙完个案笔记", NOW)
         u["anchors"] = []
         picks = anchors.prepare_round_anchors(
-            u, {"day": {"doing": "个案笔记"}}, NOW + 600.0, limit=2)
+            u, {"event": {"phrase": "刚忙完个案笔记"}}, NOW + 600.0, limit=2)
         abouts = [anchors._s(p.get("about")) for p in picks]
         self.assertNotIn("刚忙完个案笔记", abouts, f"同一件事又被派出来了：{abouts}")
 

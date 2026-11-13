@@ -18,9 +18,20 @@ def body(**kw):
     base.update(kw)
     return base
 
+from tests import _self_narration  # noqa: E402
+
 
 class OngoingBecomesAnAnchor(unittest.TestCase):
     """Core 那边的跨天任务是她能说的最好的一件事。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （还在{任务} 能被派生）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_used_as_anchor(self):
         got = _derive_from_state(
@@ -80,6 +91,15 @@ class SpareTimeIsAnAnchor(unittest.TestCase):
 
 class WantsIsAnAnchor(unittest.TestCase):
     """她今天**自己想做**的事——最好的一类由头。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （day.wants 能变成由头）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_used(self):
         got = _derive_from_state(
@@ -155,6 +175,15 @@ class RealContractShapes(unittest.TestCase):
 
 class SourceCountWentUp(unittest.TestCase):
     """加上三个来源之后，一轮能派生的条数应该变多。"""
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （来源计数变多）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
 
     def test_more_than_before(self):
         plain = _derive_from_state(body(), {"said": []}, NOW, set())

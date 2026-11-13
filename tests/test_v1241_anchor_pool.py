@@ -43,8 +43,19 @@ BODY = {
     "asleep": False,
 }
 
+from tests import _self_narration  # noqa: E402
+
 
 class PoolIsOneShotQueue(unittest.TestCase):
+
+    def setUp(self):
+        # v2.2.48：`SELF_NARRATION_ENABLED=False` 之后，这条用例验的机制
+        # （用过的由头让位给新派生的）默认不再产出由头，显式打开开关只测机制本身。
+        self._sn = _self_narration.enable()
+
+    def tearDown(self):
+        _self_narration.restore(self._sn)
+
     def test_consumed_anchor_makes_way_for_fresh_ones(self):
         """一轮派生 → 消费一条 → 下一轮**必须还能派生出新的**。
 

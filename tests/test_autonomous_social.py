@@ -2161,7 +2161,10 @@ class TestVerifyCorpus(unittest.TestCase):
     def test_anchor_rule_is_what_stops_paraphrase_repeat(self):
         """换个说法重说同一件事，靠由头一次性规则，不靠文本相似度。"""
         u = {"last_seen": 0.0}
-        body = {"day": {"doing": "追剧"}}
+        # v2.2.48：`day.doing` 这类「她今天在干什么」不再派生由头
+        # （`SELF_NARRATION_ENABLED=False`，用户原话「发言看起来很傻」），
+        # 这里换一条**硬来源**（刚发生的事）来验「同一件事不会被重新派生」。
+        body = {"event": {"phrase": "被夸了一句"}}
         now = 1_700_000_000.0
         first = anchors.prepare_round_anchors(u, body, now, limit=5)
         self.assertTrue(first)

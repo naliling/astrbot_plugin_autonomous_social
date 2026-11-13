@@ -453,6 +453,42 @@ def prune_anchors(u: Dict[str, Any], now: float) -> None:
         u["anchors"] = kept
 
 
+# 存量清理标记（每个 bot 一条）：开关关掉之后只清一次。
+SELF_NARRATION_PURGE_KEY = "self_narration_purged"
+# 池子里属于「她今天在干什么」的两种 kind。`KIND_DERIVED` 里还混着 feelings / idle
+# 这类正常来源，一起清掉的代价是丢几条「今天挺空的」，下一轮 Core 会重新给；
+# 反过来按文本猜模板会漏掉 `done`（它本身没有模板前缀）。
+_SELF_NARRATION_KINDS = (KIND_DERIVED, KIND_PLAN)
+
+
+def purge_self_narration_anchors(bot_state: Dict[str, Any]) -> int:
+    """v2.2.48：清掉池子里**已经派生好**的「她今天在干什么」由头，返回条数。
+
+    为什么要清存量：由头是「先派生进池子、之后才被消费」的（派生类 TTL 2 小时），
+    开关关掉只能阻止**新**派生，池子里躺着的旧条目还能被念两小时——用户看到的
+    就是「改了怎么还在播报我干了啥」。启动时清一次，开关才真的当场生效。
+
+    幂等：清过就在 bot 状态里打标记，之后不再扫。
+    """
+    if not isinstance(bot_state, dict) or bot_state.get(SELF_NARRATION_PURGE_KEY):
+        return 0
+    dropped = 0
+    for user_state in (bot_state.get("users") or {}).values():
+        if not isinstance(user_state, dict):
+            continue
+        pool = user_state.get("anchors")
+        if not isinstance(pool, list):
+            continue
+        kept = [
+            item for item in pool
+            if not (isinstance(item, dict) and item.get("kind") in _SELF_NARRATION_KINDS)
+        ]
+        dropped += len(pool) - len(kept)
+        user_state["anchors"] = kept
+    bot_state[SELF_NARRATION_PURGE_KEY] = True
+    return dropped
+
+
 # 「最近用过的事」独立记一本账，不挂在由头池上。
 #
 # 避重（`_remembered`）原来只在 `u["anchors"]` 里找 `used_at` 还在冷却期里的记录，
@@ -663,6 +699,30 @@ def _clause(text: Any, n: int) -> str:
     return balance_brackets(head if 0 < len(head) <= n else s[:n])
 
 
+# ── 「她今天在干什么」这一类由头（v2.2.48 起默认不再主动说）──────
+#
+# 用户反馈（原话）：「发言很严重 这是谁造成的？要么删掉要么成背景别影响到所有
+# 角色」「发言看起来很傻！」。日志里她的主动开口是
+# 「刚费力把碗洗好」「整理着衣柜」「折腾这厚被套比去外面走一圈都累」——
+# 全是把自己日程里的琐事当成搭话的理由。
+#
+# 这不是模型编的，是这里喂的：`_derive_from_state` 把 `day.doing` / `day.done` /
+# `day.next` / `day.wants` / `ongoing` 派生成「由头」，模型照着念。
+# 线上 245 个用户的由头分布是 `{derived: 839, miss: 250, greet: 109, weather: 1}`
+# —— 839 条全是这一路，于是「主动开口」实际变成了「隔一阵子汇报我在干什么」。
+#
+# 关掉之后，她只在**真有话说**的时候开口：梦、刚发生的事（被夸/被骂/被敷衍）、
+# 刚睡醒、饿/困/乏、对方说过的话、沉默太久、节日、天气变了。没有这些就沉默
+# ——`engine._anchored_picks` 拿不到由头会直接 `return []`，那个人不进队
+# （`engine.py:8212`「没有由头的人不进队——没什么可说的就别说话」）。
+#
+# **只影响「派生」**：存量池里已经挂着的这类由头不再新派，但池子不清——派生类
+# TTL 只有 2 小时，老记录两小时内自然过期，不需要迁移状态。
+#
+# 要恢复旧行为：改回 `True` 即可，其余代码不用动。
+SELF_NARRATION_ENABLED = False
+
+
 def _derive_from_state(
     body: Dict[str, Any], u: Dict[str, Any], now: float, taken: set,
     *, last_talk: Optional[float] = None,
@@ -695,6 +755,17 @@ def _derive_from_state(
         out.append(text)
         if kinds is not None:
             kinds[text] = kind
+
+    def offer_self(text: str, kind: str = KIND_DERIVED) -> None:
+        """「她今天在干什么」这一类由头——v2.2.48 起默认不再产出。
+
+        见 `SELF_NARRATION_ENABLED` 上面那段：doing / done / next / wants /
+        ongoing 五处都走这里。**别的来源不走**——梦、刚发生的事、刚醒、体感、
+        对方说过的话、沉默时长仍然是「她真有话说」的凭据。
+        """
+        if not SELF_NARRATION_ENABLED:
+            return
+        offer(text, kind)
 
     # ①-dream 她刚醒时还记得的梦（v1.28.0，Core 2.28 起 `day.dreams`）。
     #
@@ -764,7 +835,7 @@ def _derive_from_state(
     # doing 有时本身就以「在」开头（Core 的 event 名常写成「在厨房煮饭」），
     # 再补一个「正在」会得到「正在在厨房煮饭」，与 Core `_with_at` 的叠字判据一致处理。
     if doing and not is_vague_doing(doing):
-        offer(f"正在{doing}" if not doing.startswith("在") else doing)
+        offer_self(f"正在{doing}" if not doing.startswith("在") else doing)
 
     # 「刚做完」：`day.done` 本身已经带「下午/傍晚」这类时间词，直接说就是一件具体
     # 的事，不用再套模板（套了反而会得到「刚忙完下午在门诊接待」）。
@@ -786,12 +857,12 @@ def _derive_from_state(
             text = item.strip()
             if not text or "才醒" in text or is_vague_doing(text):
                 continue
-            offer(text)
+            offer_self(text)
 
     # 「接下来」：`day.next` 是**列表**（Core 给最多两条），原来只用第一条，
     # 白丢了一条。v1.28.6 起两条都给，各自一条由头（KIND_PLAN）。
     for item in _plan_cues(body):
-        offer(f"接下来是{item}", KIND_PLAN)
+        offer_self(f"接下来是{item}", KIND_PLAN)
 
     # 天气**不在这里**（v1.28.0）。
     #
@@ -818,18 +889,18 @@ def _derive_from_state(
             body_txt = _short(text, 12)
             # 别拼成「想去拐去那家书店」——模型给的 event 本身常带「去/想」。
             if body_txt.startswith(("去", "来", "拐去", "拐到", "过去")):
-                offer(f"她今天{body_txt}")
+                offer_self(f"她今天{body_txt}")
             elif body_txt.startswith("想"):
-                offer(f"她今天{body_txt}")
+                offer_self(f"她今天{body_txt}")
             else:
-                offer(f"她今天想去{body_txt}")
+                offer_self(f"她今天想去{body_txt}")
 
     # ① 她手上还没做完的那件事（Core 那边跨天跟着的 `ongoing`）。
     #
     # 这是**最好**的一类：她今天确实在干这件事，说出来有内容、有上下文，
     # 而且明天还能接着说——不像天气（说完就没了）也不像沉默时长（说一次就过期）。
     for task in _ongoing_tasks(body):
-        offer(f"还在{_short(task, 14)}")
+        offer_self(f"还在{_short(task, 14)}")
 
     # ①-bis 她最近**做过**的事：**已删除**（v1.27.39）。
     #
