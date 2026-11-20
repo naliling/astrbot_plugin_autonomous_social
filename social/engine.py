@@ -110,7 +110,7 @@ from .state import (
     _is_question_text,
     _norm_life_key,
 )
-from . import groupflow
+from . import groupflow, private_turn
 from .threads import (
     live_loops,
     live_promises,
@@ -3037,6 +3037,61 @@ class SocialEngine:
         return _strip_ts(
             _splice_ledger_into_session(session_history, ledger, limit)
         )
+
+    def _prepare_private_context(
+        self, target: Dict[str, Any], user: Dict[str, Any], meta: Dict[str, Any],
+        now: float, recent: Any,
+    ) -> Tuple[Dict[str, Any], str]:
+        """把「这轮能当当前对话看的素材」投影到生成目标上。
+
+        v2.2.50：`last_message` / `last_spoken_text` / `topics` / Core 的 `said`
+        都不带时间戳。把它们原样塞进 prompt，模型会把 500 小时前的一句「你冷吗」
+        当成刚问的来答，于是隔几小时还在冒「不冷呀」。这里只认带时间戳、
+        落在这条主动消息之后、且在有效窗口内的真实对话；其余一律不进「当前对话」。
+        风格样本仍保留原始账本（那是口吻参考，不是事实）。
+        """
+        meta = dict(meta or {})
+        category = str(meta.get("category") or "")
+        try:
+            limit = int(_num(getattr(self.cfg, "context_inject_count", 5)))
+        except (TypeError, ValueError):
+            limit = 5
+        window = _num(getattr(self.cfg, "continue_window_hours", 0)) * 3600.0
+        rows = private_turn.dialogue(user, meta, now, window) if limit > 0 else []
+        peer = next((row["text"] for row in reversed(rows) if row["dir"] == "in"), "")
+        own = next((row["text"] for row in reversed(rows) if row["dir"] == "out"), "")
+        if category in private_turn.THREADS:
+            meta.update(asked=own, about=peer)
+            if category == "continue":
+                meta["asked_question"] = own.endswith(("?", "？"))
+        if category == "closer":
+            meta["asked"] = own
+            meta["about"] = ""
+            meta["exchange"] = [row["text"] for row in rows if row["dir"] == "in"][-3:]
+        if category == "continuity" and not rows:
+            # 老状态留下的「continuity」在无真实来话时退化成普通时段类，别当续话写。
+            meta.update(category="time", msg_type="", msg_type_desc="", style_hint="")
+        sent = private_turn.last_proactive(user)
+        waiting = private_turn.unanswered(user)
+        target.update(
+            _private_scene="thread" if rows else "starter",
+            _style_conversation=user.get("conversation") or [],
+            _proactive_unanswered=waiting,
+            _proactive_unanswered_hours=round(max(0.0, now - sent) / 3600.0, 1) if waiting else 0.0,
+            _recent_proactive=[
+                str(row.get("text") or "").strip() for row in recent or ()
+                if isinstance(row, dict) and str(row.get("text") or "").strip()
+            ],
+            conversation=rows[-limit:] if limit > 0 else [],
+            last_message=peer, last_spoken_text=own,
+            topics=[], _said=[], cue="", loop="",
+        )
+        # Core 的日程/正在做的事只是背景，不能当「她刚做完」的事实进素材块。
+        body = target.get("_body")
+        if isinstance(body, dict):
+            target["_body"] = {k: v for k, v in body.items()
+                               if k not in ("activity", "day", "schedule")}
+        return meta, peer
 
     async def _load_session_history(self, umo: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """只读 AstrBot 会话库，取最近几轮用户与正常聊天记录。
@@ -8989,6 +9044,13 @@ class SocialEngine:
         # 这里重取一次，全函数统一；轮次指标仍用 `try_once` 那个 now。
         now = self._time()
         umo = str(u.get("umo", "") or "")
+        # 基线从 state.user 取，与末尾复查同一来源（测试桩里传入的 u 可能是副本）。
+        # 轻量桩没有 state 时退回传入的 u，保持 fail-open。
+        try:
+            _base_user = self.state.user(bid, uid)
+        except Exception:
+            _base_user = u
+        peer_revision = private_turn.peer_revision(_base_user)
         if not umo:
             return _gate_blocked(self, "no_session", "没有可用的会话来源（umo），发不出去")
         # v2.2.4：WebChat 不主动发消息（面板里本来就会说话，主动敲他没意义）。
@@ -9126,13 +9188,23 @@ class SocialEngine:
         #
         # 两类豁免：问候（早/晚安本来不指望回）、到点的由头（她想起一件具体的事）。
         # 「很想说」不豁免——连着两三次都没回应时，再“想说”也该等对方先开口。
-        category = str((preset[1] or {}).get("category") or "") if preset else ""
+        requested_meta = (preset[1] or {}) if preset else {}
+        category = str(requested_meta.get("category") or "")
         is_greet = category == "greet"
-        has_cue = bool(live_cue(u, self._time()) if self.cfg.cue_followup else False)
+        # v2.2.50：到点由头只给「真的去说那件事」的候选放行，不再整体绕过等待闸。
+        # 否则挂着一个无关 cue 时，问候/念想/分享都跟着免疫，用户看到的就是没话找话。
+        has_cue = ""
+        if self.cfg.cue_followup:
+            has_cue = (private_turn.selected_due_cue(u, requested_meta, now) if preset
+                       else (live_cue(u, now) or ""))
+        waiting_for_peer = private_turn.unanswered(u)
+        # 接续类消息必须有新的对方来话；拿旧话题当「刚才那句」接着说就是答非所问。
+        # 到点 cue 不算接续（它有明确的新事件由头），不受这道限制。
+        if (waiting_for_peer and category in private_turn.THREADS
+                and not has_cue):
+            return _gate_blocked(self, "awaiting_user", "对方没有新来话，不接上一段对话")
         if not (is_greet or has_cue):
             # TA 的话还没说完（「我今天去面试，那个…」）：这时候开口就是抢话。
-            # 只认 30 分钟内的新鲜信号，且同样让问候/到点由头/特别关心豁免——
-            # 半截话是「别插嘴」，不是「永远别说话」。
             _wait = str(u.get("await_unfinished", "") or "")
             _wait_at = _num(u.get("await_unfinished_at", 0) or 0)
             if (
@@ -9152,13 +9224,16 @@ class SocialEngine:
                 silent_sent = int(_num(u.get("silent_sent", 0) or 0))
             except (TypeError, ValueError):
                 silent_sent = 0
-            if silent_sent >= COLD_SILENCE_SENT and not _sc:
+            # 特别关心可以放宽间隔，但不能把「一直不回」变成「可以继续自说自话」。
+            if silent_sent >= COLD_SILENCE_SENT:
                 return _gate_blocked(self, 
                     "pending_unanswered",
                     f"TA 一直没回、她已经主动发了 {silent_sent} 条，先等 TA 开口",
                     silent_sent=silent_sent,
                 )
-            if str(u.get("pending_result", "") or "") == "waiting" and not _sc:
+            if str(u.get("pending_result", "") or "") == "waiting" and (
+                waiting_for_peer or not private_turn.last_proactive(u)
+            ):
                 return _gate_blocked(self, 
                     "awaiting_user", "上一条主动发的还没回，现在再发就是追着说"
                 )
@@ -9394,6 +9469,18 @@ class SocialEngine:
         else:
             reason, reason_meta = generate_reason(u_copy, now, self._moment_of(bid, now).hour)
 
+        # v2.2.50：把「这轮真正能当当前对话看的素材」收口到一处。旧的 last_message /
+        # last_spoken_text / topics / 长期记忆引文不带时间戳，会被模型当成刚发生的事来接，
+        # 这是「隔几小时还在答『不冷呀』」的根因。没有真实来话的续话类在这里直接拦掉。
+        recent_pro = self.state.recent_proactive(bid, uid, now)
+        reason_meta, peer_line = SocialEngine._prepare_private_context(
+            self, u_copy, u, reason_meta, now, recent_pro,
+        )
+        if reason_meta.get("category") in private_turn.THREADS and not peer_line:
+            return _gate_blocked(self, "no_live_dialogue", "没有可核实的对方来话，不延续旧对话")
+        if has_cue:
+            reason_meta["_selected_due_cue"] = has_cue
+
         # 人格按该用户的会话来源解析，不同角色/会话各用各自的人设
         try:
             _persona_name, persona_prompt = await self._persona(umo, bid)
@@ -9605,7 +9692,7 @@ class SocialEngine:
                     e.get("text", "")
                     for e in (self.state.recent_proactive(bid, uid, self._time()) or [])
                 ],
-                peer_line=str(last_in_text(u, self._time(), 24 * 3600.0) or ""),
+                peer_line=peer_line,
             )
             if _reviewed is None:
                 self.log("生成后自评：这条不该发，丢掉")
@@ -9613,7 +9700,7 @@ class SocialEngine:
                 return _gate_blocked(self, "draft_rejected", "生成后自评认为这条不该发，丢掉")
             parts = _reviewed
 
-        # 生成期间对方可能发了新消息
+        # 生成期间对方可能发了新消息：对方刚开口就别插话（保持原有 2 分钟窗口语义）。
         latest = self.state.user(bid, uid)
         if self._time() - _num(latest.get("last_seen", 0)) < FINAL_CHECK_GAP_SECONDS:
             defer_cue()
@@ -9932,6 +10019,27 @@ class SocialEngine:
             }.get(_gate_code, "发送前闸拦下")
             self.log(f"发前闸拦下：{_gate_code}（{_gate_detail}）")
             return _gate_blocked(self, _gate_code, _gate_cn, detail=str(_gate_detail or "")[:120])
+        # ── v2.2.50：正文级三道私聊专项闸 ──────────────────────
+        # 前面的 evidence_missing 只查规划阶段列出的 facts，正文临时添的没出处；
+        # 这里直接看最终正文，只拦两类高信号事故，不碰感受、打算、人设动作。
+        if private_turn.reply_without_turn(_gate_text):
+            return _gate_blocked(self, "reply_without_live_turn", "这句话在回答没有发生的新来话，不发")
+        if has_cue and not private_turn.on_due_topic(_gate_text, has_cue):
+            fail_anchor()
+            defer_cue()
+            return _gate_blocked(self, "cue_off_topic", "正文没有接这次到点的事，不发")
+        if not _cards:
+            _cards = await SocialEngine._evidence_cards(self, bid, uid=uid, at=now)
+        missing_activity = private_turn.unsupported_activity(
+            _gate_text, private_turn.event_facts(_cards, reason_meta),
+        )
+        if missing_activity:
+            fail_anchor()
+            defer_cue()
+            return _gate_blocked(self, "unsupported_activity", "正文声称做过一件没有出处的事，不发",
+                                 detail=missing_activity[:100])
+        if private_turn.peer_revision(self.state.user(bid, uid)) != peer_revision:
+            return _gate_blocked(self, "peer_just_replied", "对话已有新消息或会话已变化，不发送旧草稿")
         # ── v2.1.5 发信链路三件：熔断 → 收口 → 预算 ─────────────
         # 都放在配额之前：它们拦的是「这一轮根本不该占用发送额度」的情况，
         # 先占配额再退，会把这一小时的名额白白烧掉。
