@@ -234,26 +234,26 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `cross_user_repeat_ratio` | `0.88` | **跟别人说过的话有多像就不发**：相似度超过这个值就不发，越低越严。 |
 | `cross_user_repeat_hours` | `0.5` | **跨人查重回看多久**：往前比对多少小时内发过的记录。 |
 | `cross_user_calibrate` | `false` | **记录相似度分布**：只写日志供你调阈值，不影响发送。 |
-| `followup_enabled` | `false` | **对方话断了就接一句**：聊天突然停住时，过一会儿主动接上。 |
+| `followup_enabled` | `true` | **对方话断了就接一句**：聊天突然停住时，过一会儿主动接上。 |
 | `probe_after_minutes` | `30` | **对方敷衍后多久追问**：对方回得很敷衍，隔这么久再问那件事。 |
 | `followup_after_minutes` | `30` | **话停了多久问一句**：冷场之后隔多久开口。 |
 | `followup_max_minutes` | `70` | **追话最长时限**：超过这么久就别追了，像翻旧账。 |
 | `followup_cooldown_minutes` | `30` | **两次追话的间隔**：追完一次至少歇这么久。 |
-| `continue_enabled` | `false` | **她说完对方没声了再接一句**：对方一句话没回就消失时，过一阵接一句。 |
+| `continue_enabled` | `true` | **她说完对方没声了再接一句**：对方一句话没回就消失时，过一阵接一句。 |
 | `continue_after_minutes` | `25` | **接话前至少等多久**：她上一条说完后隔这么久才允许接。 |
 | `continue_window_hours` | `8` | **接话窗口最长多久**：超过就当这场话过去了。 |
 | `cue_followup` | `true` | **记住约定的事到点问**：对方说过「明天面试」这类事，到时间主动问。 |
-| `loop_enabled` | `false` | **主动问后续**：对方提过但没结果的事，过几小时问一句后来怎样。 |
+| `loop_enabled` | `true` | **主动问后续**：对方提过但没结果的事，过几小时问一句后来怎样。 |
 | `loop_min_hours` | `2.5` | **回访最短间隔**：至少隔这么久再问。 |
 | `loop_max_hours` | `14` | **回访最长等待**：超过就不问了。 |
-| `closer_enabled` | `false` | **没人回就自己收尾**：主动说的话没人接，过一阵自己收场。 |
+| `closer_enabled` | `true` | **没人回就自己收尾**：主动说的话没人接，过一阵自己收场。 |
 | `closer_after_hours` | `8` | **多久没人回才收尾**：隔这么久才补一句收场的话。 |
 | `silent_giveup_days` | `0` | **对方几天不开口就停发**：连续这么多天没回应就不再主动找。 |
 | `miss_affection_min` | `42` | **说想她的好感门槛**：好感到这里才会主动说想念。 |
 | `miss_daily_cap` | `3` | **每天最多说几次想她**：没有正事、只是想找对方的次数上限。 |
 | `special_care_enabled` | `true` | **特别关心**：总开关：给少数人单独放宽间隔和额度。 |
 | `special_care_uids` | `[]` | **特别关心名单**：逐条填 user_id 或 平台:user_id。 |
-| `special_care_auto` | `false` | **自动认定特别关心**：好感够高、聊得够多的人自动纳入并记住。 |
+| `special_care_auto` | `true` | **自动认定特别关心**：好感够高、聊得够多的人自动纳入并记住。 |
 | `special_care_min_affection` | `55` | **自动认定的好感门槛**：好感达到多少才自动纳入。 |
 | `special_care_min_turns` | `100` | **自动认定的对话轮数**：聊到多少轮才算关系够近。 |
 | `special_care_min_messages` | `60` | **自动认定的消息条数**：老版本没有轮数时的替代门槛。 |
@@ -271,11 +271,11 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `flow_max_replies_per_window` | `3` | **一个窗口最多接几次**：超过就不再插话。 |
 | `flow_hourly_cap` | `6` | **每群每小时最多接几次**：防某个群被她刷屏。 |
 | `flow_ignored_exit` | `2` | **连续被忽略就退出**：连着几次没人理就停下。 |
-| `group_icebreak_enabled` | `false` | **群聊冷场破冰**：群太久没人说话时抛个话题。 |
+| `group_icebreak_enabled` | `true` | **群聊冷场破冰**：群太久没人说话时抛个话题。 |
 | `group_idle_hours` | `1` | **群安静多久算冷场**：到这么久没人说话才考虑破冰。 |
 | `icebreak_daily_cap` | `2` | **每群每天最多破冰几次**：防止天天在同一群破冰。 |
 | `group_stale_days` | `3` | **多少天没消息算退群**：超过就不再去这个群破冰。 |
-| `group_topic_enabled` | `false` | **群内主动起话头**：她自己静了一阵、又有现成话头时可以主动起话题。 |
+| `group_topic_enabled` | `true` | **群内主动起话头**：她自己静了一阵、又有现成话头时可以主动起话题。 |
 | `group_topic_gap_hours` | `2.5` | **同群隔多久才能再起话头**：她在同一个群里静了这么久才考虑起话题。 |
 | `group_topic_daily_cap` | `1` | **每群每天最多起几次话头**：和破冰分开计数。 |
 | `group_topic_max_segments` | `2` | **群主动消息最多几段**：多出来的段并进最后一段，不碎句连发。 |
@@ -287,7 +287,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `group_cross_bot_gap_seconds` | `120` | **别的角色刚说话就先等她**：几个角色同群时避免前后几秒抢着开口。 |
 | `global_proactive_gap_seconds` | `120` | **跨角色主动发言冷却**：任一角色主动开口后，其它角色暂时不主动开口，避免几个 bot 在同一分钟各说一句很像的话；不影响回人话，0=关闭。 |
 | `group_mention_member` | `false` | **接话时可以点名群友**：只影响接话，破冰与起话头不点名。 |
-| `group_interject_others` | `false` | **别人互聊时可以插话**：交给模型判断：接得上才插，接不上不插。 |
+| `group_interject_others` | `true` | **别人互聊时可以插话**：交给模型判断：接得上才插，接不上不插。 |
 | `group_closeout_enabled` | `true` | **群里被围观时收口**：被反复 @ 或叫名字时，除点名外一律不说话。 |
 | `group_closeout_window_seconds` | `300` | **收口统计窗口**：在这段时间内数被唤醒的次数。 |
 | `group_closeout_threshold` | `3` | **收口阈值**：窗口内被唤醒几次算过载。 |
@@ -296,8 +296,8 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `group_ref_sample_size` | `30` | **参考库容量**：每个群保留多少条群友发言样本。 |
 | `group_ref_prompt_count` | `8` | **生成时引用几条样本**：写群消息时参考多少条群友发言。 |
 | `max_message_length` | `30` | **单条消息长度上限**：超了会截断或分段。 |
-| `allow_burst` | `false` | **主动消息分段连发**：开则按 AstrBot 分段回复设置拆段，关则只发一整条。 |
-| `decorate_outgoing` | `false` | **普通回复发送前清理**：删模板占位符、把错的身体词改对、剪掉说教小句。 |
+| `allow_burst` | `true` | **主动消息分段连发**：开则按 AstrBot 分段回复设置拆段，关则只发一整条。 |
+| `decorate_outgoing` | `true` | **普通回复发送前清理**：删模板占位符、把错的身体词改对、剪掉说教小句。 |
 | `track_own_replies` | `true` | **记住自己说过的话**：她要知道自己上一句说了什么才能接上。 |
 | `reply_echo_guard` | `true` | **回复前提醒她刚说过什么**：把最近说过的话放进上下文，避免同一件事讲两遍。 |
 | `reply_echo_hours` | `2` | **提醒回看多久**：只看最近这么多小时对同一个人说过的话。 |
@@ -326,7 +326,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `use_core_clock` | `true` | **按她的城市计时**：关掉则按本机时间算。 |
 | `use_core_facade` | `auto` | **走 Core 门面取数据**：同进程直连 Core 读取情境。 |
 | `time_projection_enabled` | `true` | **每轮告诉她此刻是几点**：免得她自己换算时间、说错「好久没见」。 |
-| `greeting_enabled` | `false` | **早晚问候**：到点主动说早安和晚安。 |
+| `greeting_enabled` | `true` | **早晚问候**：到点主动说早安和晚安。 |
 | `greeting_morning_start` | `7` | **早安窗口开始**：从几点算早上。 |
 | `greeting_morning_end` | `11` | **早安窗口结束**：到几点就不再补早安。 |
 | `greeting_midday_start` | `12` | **午间问候开始**：错过早安时的兜底，不是补一个早安。 |

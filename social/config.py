@@ -499,7 +499,7 @@ SEED_URGE_SCALE = 0.5
 
 # 早晚问候（时间性触发）：早安/晚安窗口（小时）。v2.1.1 起按插件时区
 # （timezone_offset，默认 UTC+8）的钟走；填 auto 才退回她所在城市/本机时钟
-GREETING_ENABLED_DEFAULT = False
+GREETING_ENABLED_DEFAULT = True
 GREETING_MORNING_START_DEFAULT = 7
 GREETING_MORNING_END_DEFAULT = 11
 GREETING_NIGHT_START_DEFAULT = 21
@@ -882,7 +882,7 @@ class SocialConfig:
     cue_followup: bool = True
 
     # 这一场话断了就接一句（追问那件事 / 问一句在不在）。这不等念头攒满
-    followup_enabled: bool = False
+    followup_enabled: bool = True
     followup_after_minutes: int = FOLLOWUP_AFTER_DEFAULT
     probe_after_minutes: int = PROBE_AFTER_DEFAULT
     followup_max_minutes: int = FOLLOWUP_MAX_DEFAULT
@@ -890,7 +890,7 @@ class SocialConfig:
 
     # 接话：她回完、对方就没声了 → 隔一阵接一句/问一句人去哪了。
     # 关掉（或窗口算成 0）= 回旧行为：这条路永远不成立，她说完之后对方消失就是消失。
-    continue_enabled: bool = False
+    continue_enabled: bool = True
     continue_after_minutes: int = CONTINUE_AFTER_DEFAULT
     continue_window_hours: int = CONTINUE_WINDOW_HOURS_DEFAULT
 
@@ -899,11 +899,11 @@ class SocialConfig:
     silent_giveup_days: int = SILENT_GIVEUP_DAYS_DEFAULT
 
     # 隔一阵回访对方提过的那件事（面试、复查、搬家…没说结果）
-    loop_enabled: bool = False
+    loop_enabled: bool = True
     loop_min_hours: float = LOOP_MIN_HOURS_DEFAULT
     loop_max_hours: float = LOOP_MAX_HOURS_DEFAULT
     # 她主动发的话没人回时，过一阵自己冒一句把话收掉，而不是从此静音
-    closer_enabled: bool = False
+    closer_enabled: bool = True
     closer_after_hours: int = CLOSER_AFTER_DEFAULT
 
     # 是否把 bot 在主链路里自己说的话也记进对话账本（追问判定的地基）
@@ -911,7 +911,7 @@ class SocialConfig:
 
     # v2.2.7：普通对话回复发出前的确定性清理（占位符/物种用词/连着的说教句）。
     # 默认开——线上被投诉的那几句全部来自普通回复，而那条链本来没有任何闸。
-    decorate_outgoing: bool = False
+    decorate_outgoing: bool = True
     # v2.2.22：回复前提醒——普通回复里她看不见「自己刚说过什么」，同一件事
     # 会在几分钟内讲两遍（线上 3.8%）。这里把最近说过的话作为本轮临时内容块
     # 注入，只提醒、不拦话。
@@ -1054,7 +1054,7 @@ class SocialConfig:
     special_care_enabled: bool = True
     # 逐条 "uid"，或 "平台:uid"（平台就是 umo 的第一段，如 aiocqhttp / 娜莉灵）
     special_care_uids: Any = field(default_factory=list)
-    special_care_auto: bool = False
+    special_care_auto: bool = True
     special_care_min_affection: int = SPECIAL_CARE_MIN_AFFECTION_DEFAULT
     special_care_min_turns: int = 100
     # 自动认定次要依据：Core 老版本没有对话轮数时，退回社交层自己数的消息条数
@@ -1084,7 +1084,7 @@ class SocialConfig:
     # 连发模式：主动消息可拆成多条短句逐条补发。拆法与间隔跟这个 Bot 在 AstrBot
     # 里的「分段回复」设置走（见 pacing.py）；这里只是总开关——关掉后无论框架怎么配
     # 都只发一整条。
-    allow_burst: bool = False
+    allow_burst: bool = True
 
     # 输入状态（正在输入）：她写主动消息的那几秒，QQ 会给对方显示她在输入。
     # 只在 NapCat（aiocqhttp）私聊里生效；interval/timeout 与 Core 那边同一套口径。
@@ -1119,7 +1119,7 @@ class SocialConfig:
     allow_private_chat: bool = True
     allow_group_chat: bool = True
     group_flow_enabled: bool = True
-    group_icebreak_enabled: bool = False
+    group_icebreak_enabled: bool = True
     group_ref_lib_enabled: bool = True
     # 参考库是否落盘群友发言正文（关掉则只统计、不存正文，参考库会空）
     group_store_message_text: bool = True
@@ -1134,7 +1134,7 @@ class SocialConfig:
     group_idle_hours: float = GROUP_IDLE_HOURS_DEFAULT
     icebreak_daily_cap: int = ICEBREAK_DAILY_CAP_DEFAULT
     # G1：群内主动起话头（不只在冷场时）。她在群里静了这么久之后可以起一个新话头。
-    group_topic_enabled: bool = False
+    group_topic_enabled: bool = True
     group_topic_gap_hours: float = GROUP_TOPIC_GAP_HOURS_DEFAULT
     group_topic_daily_cap: int = GROUP_TOPIC_DAILY_CAP_DEFAULT
     # v2.1.0：跨群去重窗口（小时）。她只有一份生活、群有好几个，而每轮只挑一个群，
@@ -1164,7 +1164,7 @@ class SocialConfig:
     # v1.28.0：别人在群里对聊、或者这句话是在叫别人时，心流不再硬拦——用户原话
     # 「不是必须，但是能不能插嘴看模型」。关掉退回旧语义：这两种场合一律不插。
     # 频率/窗口/配额等护栏不受它影响，仍然全部生效。
-    group_interject_others: bool = False
+    group_interject_others: bool = True
     group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
@@ -1628,7 +1628,7 @@ class SocialConfig:
             tier_override=gl("tier_override", None),
             special_care_enabled=gb("special_care_enabled", True),
             special_care_uids=gl("special_care_uids", None),
-            special_care_auto=gb("special_care_auto", False),
+            special_care_auto=gb("special_care_auto", True),
             special_care_min_affection=max(
                 0, min(100, gi("special_care_min_affection", SPECIAL_CARE_MIN_AFFECTION_DEFAULT))
             ),
@@ -1654,7 +1654,7 @@ class SocialConfig:
                 USER_RETENTION_MIN,
                 min(USER_RETENTION_MAX, gi("user_retention_days", USER_RETENTION_DEFAULT)),
             ),
-            allow_burst=gb("allow_burst", False),
+            allow_burst=gb("allow_burst", True),
             max_sends_per_round=max(
                 MAX_SENDS_PER_ROUND_MIN,
                 min(MAX_SENDS_PER_ROUND_MAX, gi("max_sends_per_round", MAX_SENDS_PER_ROUND_DEFAULT)),
@@ -1682,7 +1682,7 @@ class SocialConfig:
             allow_private_chat=gb("allow_private_chat", True),
             allow_group_chat=gb("allow_group_chat", True),
             group_flow_enabled=gb("group_flow_enabled", True),
-            group_icebreak_enabled=gb("group_icebreak_enabled", False),
+            group_icebreak_enabled=gb("group_icebreak_enabled", True),
             group_ref_lib_enabled=gb("group_ref_lib_enabled", True),
             group_store_message_text=gb("group_store_message_text", True),
             flow_window_minutes=max(
@@ -1712,7 +1712,7 @@ class SocialConfig:
                 ICEBREAK_DAILY_CAP_MIN,
                 min(ICEBREAK_DAILY_CAP_MAX, gi("icebreak_daily_cap", ICEBREAK_DAILY_CAP_DEFAULT)),
             ),
-            group_topic_enabled=gb("group_topic_enabled", False),
+            group_topic_enabled=gb("group_topic_enabled", True),
             group_topic_gap_hours=max(
                 GROUP_TOPIC_GAP_HOURS_MIN,
                 min(GROUP_TOPIC_GAP_HOURS_MAX, gf("group_topic_gap_hours", GROUP_TOPIC_GAP_HOURS_DEFAULT)),
@@ -1784,7 +1784,7 @@ class SocialConfig:
             ),
             local_materials_enabled=gb("local_materials_enabled", False),
             group_mention_member=gb("group_mention_member", False),
-            group_interject_others=gb("group_interject_others", False),
+            group_interject_others=gb("group_interject_others", True),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, gi("group_stale_days", GROUP_STALE_DAYS_DEFAULT))
             ),
@@ -1830,7 +1830,7 @@ class SocialConfig:
             ),
             respect_user_rhythm=gb("respect_user_rhythm", False),
             cue_followup=gb("cue_followup", True),
-            followup_enabled=gb("followup_enabled", False),
+            followup_enabled=gb("followup_enabled", True),
             followup_after_minutes=followup_after,
             probe_after_minutes=probe_after,
             followup_max_minutes=followup_max,
@@ -1838,7 +1838,7 @@ class SocialConfig:
                 FOLLOWUP_COOLDOWN_MIN,
                 min(FOLLOWUP_COOLDOWN_MAX, gi("followup_cooldown_minutes", FOLLOWUP_COOLDOWN_DEFAULT)),
             ),
-            continue_enabled=gb("continue_enabled", False),
+            continue_enabled=gb("continue_enabled", True),
             continue_after_minutes=continue_after,
             continue_window_hours=continue_window_hours,
             silent_giveup_days=max(
@@ -1848,16 +1848,16 @@ class SocialConfig:
                     gi("silent_giveup_days", SILENT_GIVEUP_DAYS_DEFAULT),
                 ),
             ),
-            loop_enabled=gb("loop_enabled", False),
+            loop_enabled=gb("loop_enabled", True),
             loop_min_hours=loop_min,
             loop_max_hours=loop_max,
-            closer_enabled=gb("closer_enabled", False),
+            closer_enabled=gb("closer_enabled", True),
             closer_after_hours=max(
                 CLOSER_AFTER_MIN,
                 min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
             track_own_replies=gb("track_own_replies", True),
-            decorate_outgoing=gb("decorate_outgoing", False),
+            decorate_outgoing=gb("decorate_outgoing", True),
             reply_echo_guard=gb("reply_echo_guard", True),
             reply_echo_hours=max(
                 0.0,

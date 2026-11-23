@@ -618,13 +618,13 @@ class ContinueAccountingTest(unittest.TestCase):
 class ContinueConfigTest(unittest.TestCase):
     def test_defaults(self):
         cfg = SocialConfig()
-        self.assertFalse(cfg.continue_enabled)
+        self.assertTrue(cfg.continue_enabled)
         self.assertEqual(cfg.continue_after_minutes, 25)
         self.assertEqual(cfg.continue_window_hours, 8)
         self.assertEqual(CONTINUE_AFTER_DEFAULT, 25)
         self.assertEqual(CONTINUE_WINDOW_HOURS_DEFAULT, 8)
         from_empty = SocialConfig.from_astrbot({})
-        self.assertFalse(from_empty.continue_enabled)
+        self.assertTrue(from_empty.continue_enabled)
         # `from_astrbot({})` 走的是 `_conf_schema.json` 里的 default，不是 config.py
         # 的常量；两处都必须是 25，否则「面板显示的值」和「真正生效的值」会分叉。
         self.assertEqual(from_empty.continue_after_minutes, 25)

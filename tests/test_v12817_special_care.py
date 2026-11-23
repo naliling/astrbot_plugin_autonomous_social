@@ -134,7 +134,7 @@ class SpecialCareConfigTest(unittest.TestCase):
     def test_defaults(self):
         cfg = SocialConfig()
         self.assertTrue(cfg.special_care_enabled)
-        self.assertFalse(cfg.special_care_auto)
+        self.assertTrue(cfg.special_care_auto)
         self.assertEqual(cfg.special_care_gap_minutes, 20)
         self.assertEqual(cfg.special_care_daily_cap, 8)
         self.assertFalse(
