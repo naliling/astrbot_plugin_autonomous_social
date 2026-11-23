@@ -261,6 +261,7 @@ def _engine(**cfg) -> SocialEngine:
     # 安静时段压成零长：断言不能取决于跑测试时本机几点。
     eng.cfg.quiet_start = 0
     eng.cfg.quiet_end = 0
+    eng.cfg.continue_enabled = True
     eng.cfg.quiet_clock = QUIET_CLOCK_LOCAL
     eng.cfg.quiet_use_core_night = True
     eng.cfg.use_core_clock = True

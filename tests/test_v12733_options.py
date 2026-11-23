@@ -168,9 +168,9 @@ class FollowupChainOptionTest(unittest.TestCase):
         cfg = _cfg()
         self.assertEqual(cfg.followup_after_minutes, 30)
         self.assertEqual(cfg.followup_max_minutes, 70)
-        self.assertEqual(cfg.probe_after_minutes, 12)
+        self.assertEqual(cfg.probe_after_minutes, 30)
         self.assertEqual(cfg.followup_cooldown_minutes, 30)
-        self.assertTrue(cfg.followup_enabled)
+        self.assertFalse(cfg.followup_enabled)
 
     def test_probe_after_clamped(self):
         self.assertEqual(_cfg(probe_after_minutes=0).probe_after_minutes, PROBE_AFTER_MIN)
@@ -214,8 +214,8 @@ class LoopAndCloserOptionTest(unittest.TestCase):
         self.assertEqual(cfg.loop_min_hours, 2.5)
         self.assertEqual(cfg.loop_max_hours, 14.0)
         self.assertEqual(cfg.closer_after_hours, 8)
-        self.assertTrue(cfg.loop_enabled)
-        self.assertTrue(cfg.closer_enabled)
+        self.assertFalse(cfg.loop_enabled)
+        self.assertFalse(cfg.closer_enabled)
 
     def test_loop_min_clamped(self):
         self.assertEqual(_cfg(loop_min_hours=0).loop_min_hours, LOOP_MIN_HOURS_FLOOR)
@@ -296,7 +296,7 @@ class QuietHoursOptionTest(unittest.TestCase):
 class GreetingWindowOptionTest(unittest.TestCase):
     def test_defaults(self):
         cfg = _cfg()
-        self.assertTrue(cfg.greeting_enabled)
+        self.assertFalse(cfg.greeting_enabled)
         self.assertEqual(
             cfg.greeting_windows(),
             (

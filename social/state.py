@@ -241,7 +241,14 @@ class SocialState:
 
     def __init__(self, path: str, time_source=None):
         self.path = path
-        self.data: Dict[str, Any] = {"version": STATE_VERSION, "bots": {}}
+        self.data: Dict[str, Any] = {
+            "version": STATE_VERSION,
+            "bots": {},
+            # v2.2.52：跨 bot 全局发言令牌。记「任意一个角色最近一次主动开口」的时刻，
+            # 让同一轮心跳里几个角色不会前后几秒各发一句雷同的话。放在顶层（不在
+            # bots[bid] 里），四个角色天然看到同一份。
+            "last_any_bot_proactive_ts": 0.0,
+        }
         self._dirty = False
         # 读不出原来的记忆时上闸门：闸门未解除前拒绝写盘。不上闸门的话，
         # 内存里已经是空壳，第一条新消息一标脏就会把空状态盖回磁盘。
@@ -936,6 +943,9 @@ class SocialState:
             return
 
         self.data = x
+        # v2.2.52：老状态文件没有全局令牌字段，补一个默认值（不标脏，读出来是什么就是什么）
+        if "last_any_bot_proactive_ts" not in self.data:
+            self.data["last_any_bot_proactive_ts"] = 0.0
         # 先置不脏再迁移：_migrate 只在真的改了数据时才标脏。顺序反了的话，
         # 迁移的结果会被当成「已落盘」而丢弃，下次启动又重跑一遍
         self._dirty = False
@@ -2702,6 +2712,29 @@ class SocialState:
                     rows.append((ts, str(uid), text))
         rows.sort(key=lambda r: -r[0])
         return [(who, text) for _ts, who, text in rows[:max(1, int(limit))]]
+
+    def last_any_bot_proactive(self) -> float:
+        """v2.2.52：任意一个角色最近一次**主动开口**（群破冰/起话头 + 私聊主动）的时刻。
+
+        与 `group_other_bot_spoke` 不同，这本账不按群、不按角色：一轮心跳里引擎会
+        串行遍历所有 bot，若各自发言只看自己的冷却，就会出现「三个角色在同一分钟
+        各说一句都很像的话」。所有主动发送前统一读这个时间戳做全局冷却。
+        """
+        try:
+            return float(self.data.get("last_any_bot_proactive_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def note_any_bot_proactive(self, now: float) -> None:
+        """记一次任意角色的主动发言成功。多实例部署时调用方负责把 state 落盘。"""
+        try:
+            ts = float(now)
+        except (TypeError, ValueError):
+            return
+        if not (ts > 0):
+            return
+        self.data["last_any_bot_proactive_ts"] = ts
+        self.mark_dirty()
 
     def group_other_bot_spoke(self, bid: str, gid: str) -> float:
         """**别的角色**最近一次在这个群开口的时间戳（没有就 0）。

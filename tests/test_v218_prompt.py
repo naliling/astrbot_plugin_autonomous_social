@@ -91,7 +91,9 @@ class _Ctx:
 
 
 def _group_prompt(mode, ctx=None, max_len=60):
-    gen = generator.MessageGenerator(_Ctx(), SocialConfig())
+    cfg = SocialConfig()
+    cfg.allow_burst = True  # 2.2.51 起默认关；这里测的是「打开时」的措辞
+    gen = generator.MessageGenerator(_Ctx(), cfg)
     out = gen._compose_group(mode, ctx or {}, "人设", max_len)
     assert out is not None, "群聊提示词不该为空"
     return out[0]
@@ -115,7 +117,9 @@ def _flow_ctx(**extra):
 
 
 def _compose_prompt(meta, target=None, reason=""):
-    gen = generator.MessageGenerator(_Ctx(), SocialConfig())
+    cfg = SocialConfig()
+    cfg.allow_burst = True  # 2.2.51 起默认关；这里测的是「打开时」的措辞
+    gen = generator.MessageGenerator(_Ctx(), cfg)
     out = _run(gen._compose(
         "umo",
         {"conversation": []} if target is None else target,

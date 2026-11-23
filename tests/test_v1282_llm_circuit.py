@@ -328,7 +328,7 @@ class ThrottleDefaultsTest(unittest.TestCase):
         self.assertEqual(schema["heartbeat_max_minutes"]["default"], 30)
         # v2.1.0 松闸（CHANGELOG「默认值松闸」）：3 → 8。面板提示同步改成
         # 「每轮尝试次数 = 这个数 × 4」，所以 8 同时意味着一轮最多 32 次尝试。
-        self.assertEqual(schema["max_sends_per_round"]["default"], 8)
+        self.assertEqual(schema["max_sends_per_round"]["default"], 2)
 
     def test_config_fallback_defaults_match_schema(self) -> None:
         from social.config import (
@@ -337,7 +337,7 @@ class ThrottleDefaultsTest(unittest.TestCase):
         )
 
         self.assertEqual(HEARTBEAT_MAX_DEFAULT, 30)
-        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 8)
+        self.assertEqual(MAX_SENDS_PER_ROUND_DEFAULT, 2)
 
     def test_attempts_per_round_is_bounded(self) -> None:
         """一轮 LLM 尝试次数 = max_sends_per_round × ATTEMPT_PER_SEND，且被面板上界夹住。
@@ -353,12 +353,12 @@ class ThrottleDefaultsTest(unittest.TestCase):
         from social.engine import ATTEMPT_PER_SEND
 
         cfg = SocialConfig.from_astrbot({})
-        self.assertEqual(cfg.max_sends_per_round, 8)
+        self.assertEqual(cfg.max_sends_per_round, 2)
         self.assertEqual(ATTEMPT_PER_SEND, 4)
         # 默认一轮 8×4=32 次尝试、面板拉到最大 10×4=40 次。写成等值而不是
         # 「<= 40」：后者恒真（左边就是 40），改了什么它都不会红。
-        self.assertEqual(cfg.max_sends_per_round * ATTEMPT_PER_SEND, 32)
-        self.assertEqual(MAX_SENDS_PER_ROUND_MAX * ATTEMPT_PER_SEND, 40)
+        self.assertEqual(cfg.max_sends_per_round * ATTEMPT_PER_SEND, 8)
+        self.assertEqual(MAX_SENDS_PER_ROUND_MAX * ATTEMPT_PER_SEND, 16)
 
 
 if __name__ == "__main__":

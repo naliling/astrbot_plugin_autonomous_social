@@ -134,7 +134,7 @@ class SpecialCareConfigTest(unittest.TestCase):
     def test_defaults(self):
         cfg = SocialConfig()
         self.assertTrue(cfg.special_care_enabled)
-        self.assertTrue(cfg.special_care_auto)
+        self.assertFalse(cfg.special_care_auto)
         self.assertEqual(cfg.special_care_gap_minutes, 20)
         self.assertEqual(cfg.special_care_daily_cap, 8)
         self.assertFalse(
@@ -199,7 +199,7 @@ class SpecialCareManualTest(unittest.TestCase):
 
 class SpecialCareAutoTest(unittest.TestCase):
     def test_auto_marks_close_relationship(self):
-        eng = _engine()
+        eng = _engine(special_care_auto=True)
         u = _user("10086")
         snap = {"affection": 96.0, "mood": {"turn_count": 300}}
         self.assertTrue(eng._special_care_effective("b1", "10086", u, snap=snap))
@@ -220,7 +220,7 @@ class SpecialCareAutoTest(unittest.TestCase):
         self.assertFalse(eng._special_care_effective("b1", "10086", u, snap=snap))
 
     def test_auto_falls_back_to_message_count(self):
-        eng = _engine()
+        eng = _engine(special_care_auto=True)
         u = _user("10086", message_count=120)
         snap = {"affection": 96.0, "mood": {}}
         self.assertTrue(eng._special_care_effective("b1", "10086", u, snap=snap))
@@ -238,7 +238,7 @@ class SpecialCareAutoTest(unittest.TestCase):
         self.assertFalse(u["special_care"])
 
     def test_flag_is_sticky_without_resnapshot(self):
-        eng = _engine()
+        eng = _engine(special_care_auto=True)
         u = _user("10086")
         snap = {"affection": 96.0, "mood": {"turn_count": 300}}
         self.assertTrue(eng._special_care_effective("b1", "10086", u, snap=snap))

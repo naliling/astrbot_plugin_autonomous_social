@@ -320,7 +320,7 @@ def _quote_text(text: Any, limit: int = QUOTE_MAX_CHARS) -> str:
 
 # 主动消息最多带几句「她平时的原话」当声音样本。再多就变成台词本：
 # 模型会开始挑句子复用，而不是照那个语气自己造。
-OWN_STYLE_SAMPLES = 4
+OWN_STYLE_SAMPLES = 6
 
 
 def _own_style_block(target: Dict[str, Any]) -> str:
@@ -670,7 +670,7 @@ def _plan_list(value: Any, item_max: int, limit: int) -> List[str]:
 
 
 # 文风级反重复：展示最近发出的几条
-RECENT_OUT_COUNT = 3
+RECENT_OUT_COUNT = 5
 
 # 对话历史展示条数
 MAX_HISTORY_MESSAGES = 10

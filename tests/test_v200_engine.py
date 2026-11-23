@@ -280,7 +280,7 @@ class P202SpecialCareMinMessagesTest(unittest.TestCase):
         return {"affection": 96.0, "mood": {}}
 
     def test_message_count_uses_min_messages(self):
-        eng = _engine()  # min_messages 默认 60
+        eng = _engine(special_care_auto=True)  # min_messages 默认 60
         u = _user("u1", message_count=70)
         self.assertTrue(
             eng._special_care_effective("b1", "u1", u, snap=self._snap(), now=NOW),
@@ -295,7 +295,7 @@ class P202SpecialCareMinMessagesTest(unittest.TestCase):
         )
 
     def test_explicit_min_messages_is_honored(self):
-        eng = _engine(special_care_min_messages=100)
+        eng = _engine(special_care_auto=True, special_care_min_messages=100)
         u70 = _user("u1", message_count=70)
         u101 = _user("u2", message_count=101)
         self.assertFalse(
@@ -306,7 +306,7 @@ class P202SpecialCareMinMessagesTest(unittest.TestCase):
         )
 
     def test_real_turn_count_still_uses_min_turns(self):
-        eng = _engine()  # min_turns 默认 100
+        eng = _engine(special_care_auto=True)  # min_turns 默认 100
         u = _user("u1", message_count=70)
         snap = {"affection": 96.0, "mood": {"turn_count": 120}}
         self.assertTrue(eng._special_care_effective("b1", "u1", u, snap=snap, now=NOW))

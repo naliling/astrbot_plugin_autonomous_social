@@ -313,10 +313,10 @@ class ThreadWindowsTest(unittest.TestCase):
     """`_thread_windows` 从四元组变六元组，默认配置的值必须能对上 schema 默认。"""
 
     def test_default_windows(self):
-        windows = _engine()._thread_windows()
+        windows = _engine(continue_enabled=True)._thread_windows()
         self.assertEqual(len(windows), 6)
         probe, presence, ceiling, context, cont_after, cont_max = windows
-        self.assertEqual(probe, 12 * 60.0)
+        self.assertEqual(probe, 30 * 60.0)  # v2.2.51：probe_after_minutes 12→30
         self.assertEqual(presence, 30 * 60.0)
         self.assertEqual(ceiling, 70 * 60.0)
         self.assertEqual(context, 70 * 60.0)
@@ -331,7 +331,7 @@ class ThreadWindowsTest(unittest.TestCase):
 
     def test_custom_windows(self):
         _p, _s, _c, _x, cont_after, cont_max = _engine(
-            continue_after_minutes=120, continue_window_hours=3
+            continue_enabled=True, continue_after_minutes=120, continue_window_hours=3
         )._thread_windows()
         self.assertEqual((cont_after, cont_max), (120 * 60.0, 3 * 3600.0))
 
@@ -340,7 +340,7 @@ class ThreadPickContinueTest(unittest.TestCase):
     """端到端：bot 回完 + 用户沉默 2 小时 → 产出一个 continue 候选。"""
 
     def test_pick_produces_a_continue_candidate(self):
-        eng = _engine()
+        eng = _engine(continue_enabled=True)
         _silent_user(eng, seen_ago=2 * 3600 + 60, spoken_ago=2 * 3600)
         picked = eng._thread_pick("b1", NOW, None)
         self.assertIsNotNone(picked, "「她回完、对方消失 2 小时」应当成为候选")
@@ -358,7 +358,7 @@ class ThreadPickContinueTest(unittest.TestCase):
 
     def test_followup_off_does_not_kill_continue(self):
         """followup 与 continue 是两个开关：关掉追问不该顺手关掉接话。"""
-        eng = _engine(followup_enabled=False)
+        eng = _engine(followup_enabled=False, continue_enabled=True)
         _silent_user(eng, seen_ago=2 * 3600 + 60, spoken_ago=2 * 3600)
         picked = eng._thread_pick("b1", NOW, None)
         self.assertIsNotNone(picked)
@@ -366,7 +366,7 @@ class ThreadPickContinueTest(unittest.TestCase):
 
     def test_followup_off_does_not_revive_probe(self):
         """反过来也不能顺手把追问打开：followup 关掉时 probe 候选必须被丢掉。"""
-        eng = _engine(followup_enabled=False)
+        eng = _engine(followup_enabled=False, continue_enabled=True)
         _user(
             eng,
             last_seen=NOW - 2400,
@@ -405,7 +405,7 @@ class ThreadGateContinueTest(unittest.TestCase):
 
 class ThreadMarkContinueTest(unittest.TestCase):
     def test_mark_labels_it_as_continue(self):
-        eng = _engine()
+        eng = _engine(continue_enabled=True)
         _silent_user(eng, seen_ago=2 * 3600 + 60, spoken_ago=2 * 3600)
         mark = eng._thread_mark("b1", "u1", NOW)
         self.assertIn("接话", mark, f"面板没把接话标出来：{mark}")
@@ -618,13 +618,13 @@ class ContinueAccountingTest(unittest.TestCase):
 class ContinueConfigTest(unittest.TestCase):
     def test_defaults(self):
         cfg = SocialConfig()
-        self.assertTrue(cfg.continue_enabled)
+        self.assertFalse(cfg.continue_enabled)
         self.assertEqual(cfg.continue_after_minutes, 25)
         self.assertEqual(cfg.continue_window_hours, 8)
         self.assertEqual(CONTINUE_AFTER_DEFAULT, 25)
         self.assertEqual(CONTINUE_WINDOW_HOURS_DEFAULT, 8)
         from_empty = SocialConfig.from_astrbot({})
-        self.assertTrue(from_empty.continue_enabled)
+        self.assertFalse(from_empty.continue_enabled)
         # `from_astrbot({})` 走的是 `_conf_schema.json` 里的 default，不是 config.py
         # 的常量；两处都必须是 25，否则「面板显示的值」和「真正生效的值」会分叉。
         self.assertEqual(from_empty.continue_after_minutes, 25)
@@ -664,7 +664,7 @@ class ContinueConfigTest(unittest.TestCase):
 
 class ContinueStatusTextTest(unittest.TestCase):
     def test_status_line_is_on(self):
-        text = _engine()._continue_status_text()
+        text = _engine(continue_enabled=True)._continue_status_text()
         self.assertIn("接话", text)
         self.assertIn("25", text)
         self.assertIn("8", text)
@@ -679,7 +679,7 @@ class ContinueStatusTextTest(unittest.TestCase):
         self.assertIn("self._continue_status_text()", src, "面板没把「接话」那一行拼进去")
 
     def test_full_status_page_carries_the_line(self):
-        text = asyncio.run(_engine().status_text())
+        text = asyncio.run(_engine(continue_enabled=True).status_text())
         self.assertIn("- 接话：开", text)
 
 

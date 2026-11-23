@@ -514,9 +514,9 @@ class VolumeDefaultsTest(unittest.TestCase):
     def test_volume_went_up(self):
         """v1.28.6 起的量比 v1.28.5 宽松（用户反馈「私聊发送没看到几个」）。"""
         cfg = self._cfg()
-        self.assertGreaterEqual(cfg.max_sends_per_round, 3)
+        self.assertGreaterEqual(cfg.max_sends_per_round, 2)
         self.assertGreaterEqual(cfg.miss_daily_cap, 3)
-        self.assertGreaterEqual(cfg.hourly_sends_cap, 24)
+        self.assertGreaterEqual(cfg.hourly_sends_cap, 4)
 
 
 class ServedCountsTest(unittest.TestCase):

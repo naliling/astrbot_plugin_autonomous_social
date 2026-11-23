@@ -153,7 +153,7 @@ class SchemaContractTest(unittest.TestCase):
         # v2.2.32：新增 group_cross_bot_gap_seconds（同群跨角色不抢话），139 → 140。
         # v2.2.47：新增 group_only（只主动群聊）与 history_private_only（只导入私聊历史），140 → 142。
         # v2.2.49：新增 persona_platform_fallback 与 local_materials_enabled，142 → 144。
-        self.assertEqual(len(SCHEMA), 144)
+        self.assertEqual(len(SCHEMA), 145)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -242,7 +242,7 @@ class ReadmeTest(unittest.TestCase):
         # v2.2.7：新增 decorate_outgoing，README 的「共 N 项」跟着 131 → 132。
         # v2.2.10：新增 allow_private_chat / allow_group_chat，跟着 132 → 134。
         # v2.2.49：新增 persona_platform_fallback / local_materials_enabled，跟着 142 → 144。
-        self.assertEqual(_readme_count(), 144)
+        self.assertEqual(_readme_count(), 145)
 
 
 class EngineWiringTest(unittest.TestCase):

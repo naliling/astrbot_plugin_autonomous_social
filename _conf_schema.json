@@ -53,12 +53,12 @@
     },
     "activity_level": {
         "type": "int",
-        "default": 75,
+        "default": 25,
         "min": 10,
-        "max": 90,
+        "max": 50,
         "slider": {
             "min": 10,
-            "max": 90,
+            "max": 50,
             "step": 1
         },
         "description": "活跃度",
@@ -329,12 +329,12 @@
     },
     "max_sends_per_round": {
         "type": "int",
-        "default": 8,
+        "default": 2,
         "min": 1,
-        "max": 10,
+        "max": 4,
         "slider": {
             "min": 1,
-            "max": 10,
+            "max": 4,
             "step": 1
         },
         "description": "一轮最多联系几个人",
@@ -441,12 +441,12 @@
     },
     "hourly_sends_cap": {
         "type": "int",
-        "default": 24,
+        "default": 4,
         "min": 0,
-        "max": 200,
+        "max": 12,
         "slider": {
             "min": 0,
-            "max": 200,
+            "max": 12,
             "step": 2
         },
         "description": "每小时最多发几条",
@@ -507,7 +507,7 @@
     },
     "followup_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "对方话断了就接一句",
         "hint": "聊天突然停住时，过一会儿主动接上。",
         "condition": {
@@ -516,7 +516,7 @@
     },
     "probe_after_minutes": {
         "type": "int",
-        "default": 12,
+        "default": 30,
         "min": 1,
         "max": 120,
         "slider": {
@@ -527,7 +527,7 @@
         "description": "对方敷衍后多久追问",
         "hint": "对方回得很敷衍，隔这么久再问那件事。",
         "condition": {
-            "followup_enabled": true
+            "followup_enabled": false
         }
     },
     "followup_after_minutes": {
@@ -543,7 +543,7 @@
         "description": "话停了多久问一句",
         "hint": "冷场之后隔多久开口。",
         "condition": {
-            "followup_enabled": true
+            "followup_enabled": false
         }
     },
     "followup_max_minutes": {
@@ -559,7 +559,7 @@
         "description": "追话最长时限",
         "hint": "超过这么久就别追了，像翻旧账。",
         "condition": {
-            "followup_enabled": true
+            "followup_enabled": false
         }
     },
     "followup_cooldown_minutes": {
@@ -575,12 +575,12 @@
         "description": "两次追话的间隔",
         "hint": "追完一次至少歇这么久。",
         "condition": {
-            "followup_enabled": true
+            "followup_enabled": false
         }
     },
     "continue_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "她说完对方没声了再接一句",
         "hint": "对方一句话没回就消失时，过一阵接一句。",
         "condition": {
@@ -600,7 +600,7 @@
         "description": "接话前至少等多久",
         "hint": "她上一条说完后隔这么久才允许接。",
         "condition": {
-            "continue_enabled": true
+            "continue_enabled": false
         }
     },
     "continue_window_hours": {
@@ -616,7 +616,7 @@
         "description": "接话窗口最长多久",
         "hint": "超过就当这场话过去了。",
         "condition": {
-            "continue_enabled": true
+            "continue_enabled": false
         }
     },
     "cue_followup": {
@@ -630,7 +630,7 @@
     },
     "loop_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "主动问后续",
         "hint": "对方提过但没结果的事，过几小时问一句后来怎样。",
         "condition": {
@@ -650,7 +650,7 @@
         "description": "回访最短间隔",
         "hint": "至少隔这么久再问。",
         "condition": {
-            "loop_enabled": true
+            "loop_enabled": false
         }
     },
     "loop_max_hours": {
@@ -666,12 +666,12 @@
         "description": "回访最长等待",
         "hint": "超过就不问了。",
         "condition": {
-            "loop_enabled": true
+            "loop_enabled": false
         }
     },
     "closer_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "没人回就自己收尾",
         "hint": "主动说的话没人接，过一阵自己收场。",
         "condition": {
@@ -691,7 +691,7 @@
         "description": "多久没人回才收尾",
         "hint": "隔这么久才补一句收场的话。",
         "condition": {
-            "closer_enabled": true
+            "closer_enabled": false
         }
     },
     "silent_giveup_days": {
@@ -762,7 +762,7 @@
     },
     "special_care_auto": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "自动认定特别关心",
         "hint": "好感够高、聊得够多的人自动纳入并记住。",
         "condition": {
@@ -1035,7 +1035,7 @@
     },
     "group_icebreak_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "群聊冷场破冰",
         "hint": "群太久没人说话时抛个话题。",
         "condition": {
@@ -1056,7 +1056,7 @@
         "hint": "到这么久没人说话才考虑破冰。",
         "condition": {
             "allow_group_chat": true,
-            "group_icebreak_enabled": true
+            "group_icebreak_enabled": false
         }
     },
     "icebreak_daily_cap": {
@@ -1073,7 +1073,7 @@
         "hint": "防止天天在同一群破冰。",
         "condition": {
             "allow_group_chat": true,
-            "group_icebreak_enabled": true
+            "group_icebreak_enabled": false
         }
     },
     "group_stale_days": {
@@ -1090,12 +1090,12 @@
         "hint": "超过就不再去这个群破冰。",
         "condition": {
             "allow_group_chat": true,
-            "group_icebreak_enabled": true
+            "group_icebreak_enabled": false
         }
     },
     "group_topic_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "群内主动起话头",
         "hint": "她自己静了一阵、又有现成话头时可以主动起话题。",
         "condition": {
@@ -1116,7 +1116,7 @@
         "hint": "她在同一个群里静了这么久才考虑起话题。",
         "condition": {
             "allow_group_chat": true,
-            "group_topic_enabled": true
+            "group_topic_enabled": false
         }
     },
     "group_topic_daily_cap": {
@@ -1133,7 +1133,7 @@
         "hint": "和破冰分开计数。",
         "condition": {
             "allow_group_chat": true,
-            "group_topic_enabled": true
+            "group_topic_enabled": false
         }
     },
     "group_topic_max_segments": {
@@ -1241,6 +1241,22 @@
             "allow_group_chat": true
         }
     },
+    "global_proactive_gap_seconds": {
+        "type": "int",
+        "default": 120,
+        "min": 0,
+        "max": 3600,
+        "slider": {
+            "min": 0,
+            "max": 3600,
+            "step": 10
+        },
+        "description": "跨角色主动发言冷却",
+        "hint": "任一角色主动开口后，其它角色暂时不主动开口，避免几个 bot 在同一分钟各说一句很像的话；不影响回人话。0=关闭。",
+        "condition": {
+            "enabled": true
+        }
+    },
     "group_mention_member": {
         "type": "bool",
         "default": false,
@@ -1252,7 +1268,7 @@
     },
     "group_interject_others": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "别人互聊时可以插话",
         "hint": "交给模型判断：接得上才插，接不上不插。",
         "condition": {
@@ -1359,12 +1375,12 @@
     },
     "max_message_length": {
         "type": "int",
-        "default": 60,
+        "default": 30,
         "min": 10,
-        "max": 500,
+        "max": 80,
         "slider": {
             "min": 10,
-            "max": 500,
+            "max": 80,
             "step": 10
         },
         "description": "单条消息长度上限",
@@ -1372,13 +1388,13 @@
     },
     "allow_burst": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "主动消息分段连发",
         "hint": "开则按 AstrBot 分段回复设置拆段，关则只发一整条。"
     },
     "decorate_outgoing": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "普通回复发送前清理",
         "hint": "删模板占位符、把错的身体词改对、剪掉说教小句。"
     },
@@ -1662,7 +1678,7 @@
     },
     "greeting_enabled": {
         "type": "bool",
-        "default": true,
+        "default": false,
         "description": "早晚问候",
         "hint": "到点主动说早安和晚安。"
     },
@@ -1679,7 +1695,7 @@
         "description": "早安窗口开始",
         "hint": "从几点算早上。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "greeting_morning_end": {
@@ -1695,7 +1711,7 @@
         "description": "早安窗口结束",
         "hint": "到几点就不再补早安。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "greeting_midday_start": {
@@ -1711,7 +1727,7 @@
         "description": "午间问候开始",
         "hint": "错过早安时的兜底，不是补一个早安。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "greeting_midday_end": {
@@ -1727,7 +1743,7 @@
         "description": "午间问候结束",
         "hint": "和开始时间相同等于关掉午间问候。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "greeting_night_start": {
@@ -1743,7 +1759,7 @@
         "description": "晚安窗口开始",
         "hint": "从几点开始说晚安。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "greeting_night_end": {
@@ -1759,7 +1775,7 @@
         "description": "晚安窗口结束",
         "hint": "到几点就不再补晚安。",
         "condition": {
-            "greeting_enabled": true
+            "greeting_enabled": false
         }
     },
     "owner_only_commands": {

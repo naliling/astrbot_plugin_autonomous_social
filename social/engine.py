@@ -4716,6 +4716,11 @@ class SocialEngine:
                     f"这次先不开口（group_cross_bot_gap_seconds={_xgap}）"
                 )
                 return False
+        # v2.2.52：跨 bot 全局主动发言闸（所有主动类发送共用，不按群）
+        _global_block = SocialEngine._global_proactive_block(self, now)
+        if _global_block:
+            self.log(f"群 {gid} {_global_block}（global_proactive_gap_seconds）")
+            return False
         group_ctx = self._build_group_ctx(bid, gid, g)
         group_ctx["now"] = now
         group_ctx["clock_offset"] = self._clock_offset_for(bid)
@@ -4985,6 +4990,8 @@ class SocialEngine:
         # v2.1.2：破冰 / 起话头都记进「今天在群里说了几句」的总账（见
         # `_group_daily_exhausted`）。被闸拦下的不算，只有真发出去才记。
         self.state.note_group_send(bid, sent_ts, day)
+        # v2.2.52：让其它角色看到「刚有人主动开口过」，全局错峰令牌
+        self.state.note_any_bot_proactive(sent_ts)
         if weather_used:
             # 与私聊由头同口径：真发出去了才算「说过天气」，6 小时内不再拿天气当
             # 话头。记在群状态上（`g` 随后会被 state.save() 落盘）。
@@ -6840,15 +6847,18 @@ class SocialEngine:
         """这一段对话里最后一个人说话的时刻。沉默从这一刻算起。"""
         return max(_num(u.get("last_seen", 0) or 0), _num(u.get("last_spoken", 0) or 0))
 
-    def _own_style_texts(self, bid: str, uid: str, now: float, limit: int = 4) -> List[str]:
-        """她最近几条**真实回复**（conversation 里 dir=="out"），供生成侧对齐口吻。
+    def _own_style_texts(self, bid: str, uid: str, now: float, limit: int = 6) -> List[str]:
+        """她最近几条**真实出站原话**（conversation 里 dir=="out" + 真发出去的主动消息），供生成侧对齐口吻。
 
         v2.1.8「声音统一」：人格设定回答的是「她是谁」，但像不像她还取决于最近几条
         回复的句长、语气词、标点习惯。主动消息与正常聊天用的是同一个模型，却经常
-        串味（聊天里短短一句，主动消息里一段排比）。这里给她最近 4 条出站原话当锚。
+        串味（聊天里短短一句，主动消息里一段排比）。这里给她最近几条出站原话当锚。
 
-        排除 `recent_proactive` 里的原文：那是主动消息，不是「聊天里的她」；拿它当
-        风格参考会把上一轮的毛病固化下来。倒序取最近的，重复句只留一条。
+        v2.2.52「越用越像自己」：limit 4→6，与 generator.OWN_STYLE_SAMPLES 对齐
+        （2.2.51 改了那个常量却没同步这里，实际一直只喂 4 条）。样本来自她真实的
+        被动回复——那才是「像她本人」的声音；主动消息里的模板腔（一水儿「小雪了…
+        亲爱的💕」）不能当学习源，否则越学越腻。真实回复攒得越多，这里喂得越足，
+        画像越贴本人，这就是「越用越像自己」。
         """
         try:
             u = self.state.user(bid, uid)
@@ -9113,6 +9123,11 @@ class SocialEngine:
                     why=str(_q_why or ""),
                 )
 
+        # v2.2.52：跨 bot 全局主动发言闸（和安静时段一样挡在 LLM 之前，零 token）
+        _global_block = SocialEngine._global_proactive_block(self, now)
+        if _global_block:
+            return _gate_blocked(self, "global_proactive_gap", _global_block)
+
         # **兄弟 bot 的第二道闸**（v1.28.16）。
         #
         # 私聊观察不再把同进程的兄弟 bot 整个挡在门外（见 `observe`），它们现在也
@@ -10332,6 +10347,8 @@ class SocialEngine:
                     u["special_care_source"] = "manual"
             bot = self.state.bot(bid)
             bot["last_global_send"] = sent_ts
+            # v2.2.52：让其它角色看到「刚有人主动开口过」，全局错峰令牌
+            self.state.note_any_bot_proactive(sent_ts)
             await self._persist_state()
         except Exception as _acct_exc:
             if throttle.allow(f"speak.account.{bid}"):
@@ -12285,6 +12302,25 @@ class SocialEngine:
         if not is_quiet:
             return ""
         return f"现在是安静时段（{why}），不打扰"
+
+    def _global_proactive_block(self, now: float) -> str:
+        """v2.2.52：跨 bot 全局主动发言闸。
+
+        一轮心跳里引擎串行遍历所有角色，各自只看自己的冷却，就会出现几个角色在
+        同一分钟各发一句雷同的话（真机 04:35:14/43/47 三个角色连发）。这里在
+        「真正去生成之前」统一查一份全局时间戳：任一角色刚主动开过口，其余角色
+        在 `global_proactive_gap_seconds` 内先不主动开口。只拦主动，不拦回人话。
+        """
+        gap = int(getattr(self.cfg, "global_proactive_gap_seconds", 0) or 0)
+        if gap <= 0:
+            return ""
+        try:
+            last = float(self.state.last_any_bot_proactive() or 0.0)
+        except Exception:
+            return ""
+        if last > 0 and 0.0 <= now - last < gap:
+            return f"另一个角色 {int(now - last)} 秒前刚主动开口，先错开"
+        return ""
 
     async def _send_with_retry(
         self, target: str, text: str, bid: str = ""

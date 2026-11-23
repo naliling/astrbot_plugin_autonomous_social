@@ -236,8 +236,8 @@ class InterjectConfigTest(unittest.TestCase):
     """新配置项：默认开、能在面板/代码两侧生效。"""
 
     def test_default_is_on(self):
-        self.assertTrue(SocialConfig().group_interject_others)
-        self.assertTrue(
+        self.assertFalse(SocialConfig().group_interject_others)
+        self.assertFalse(
             SocialConfig.from_astrbot({}).group_interject_others,
             "from_astrbot 没读这一项（面板上的开关不会生效）",
         )
@@ -256,7 +256,7 @@ class InterjectConfigTest(unittest.TestCase):
         )
         spec = schema["group_interject_others"]
         self.assertEqual(spec["type"], "bool")
-        self.assertIs(spec["default"], True)
+        self.assertIs(spec["default"], False)
         self.assertIn("模型判断", spec["hint"])
 
 

@@ -1465,7 +1465,17 @@ def prepare_round_anchors(
     # A1/L2：再补节日/天气两类由头。只在正常主动那条路给——「念想」通道说的必须是
     # 关于 TA 的，插一句「今天是中秋」就跑题了。
     if not relational:
-        for extra_kind, text in derive_extras(u, body, now, used):
+        # v2.2.52：天气仍进池（它是没话说时的救场素材），但凡已有具体由头，
+        # 天气就**排到最后**——引擎一轮只取前 limit 条、且优先消费第一条，
+        # 于是具体事先说，天气不再抢到发言位。原来天气靠 `derive_extras` 追加
+        # 却常因别的由头空而补到前面，读起来就是「几个角色一水儿小雪了/晚安」。
+        extras = list(derive_extras(u, body, now, used))
+        weather_extras = [e for e in extras if e[0] == KIND_WEATHER]
+        other_extras = [e for e in extras if e[0] != KIND_WEATHER]
+        has_concrete = any(
+            _s(a.get("kind")) not in (KIND_WEATHER, KIND_HOLIDAY) for a in picked
+        )
+        for extra_kind, text in other_extras + (weather_extras if not has_concrete else []):
             if len(picked) >= limit:
                 # 到量就停：再 `add_anchor` 会把池子里最不急的一条挤出去，
                 # 而那条可能正好在 `picked` 里——留下一条池中已无的悬空记录。
@@ -1474,6 +1484,18 @@ def prepare_round_anchors(
             if item is not None:
                 item.setdefault("tries", 0)
                 picked.append(item)
+        # 已有具体由头时天气仍进池，但放到最末：既保住「生活排在天气前」的顺序，
+        # 也保留天气作为兜底候选（测试与真实救场都需要它在池里）。
+        if has_concrete:
+            for extra_kind, text in weather_extras:
+                # 已有具体由头时，天气只在不突破池上限时才追加到末尾；
+                # 名额已被具体由头占满（如 high 档 8 条）就不再加。
+                if len(picked) >= limit:
+                    break
+                item = add_anchor(u, extra_kind, text, now=now)
+                if item is not None:
+                    item.setdefault("tries", 0)
+                    picked.append(item)
     return picked
 
 
