@@ -8476,6 +8476,7 @@ class SocialEngine:
         # 该不该开口。给的是一句人话，不是一堆数字。
         u_copy["_tier"] = _tier
         u_copy["_tier_note"] = anchors.tier_note(_tier, _aff, _warmth)
+        u_copy["_proactive_growth_context"] = True
         u_copy["_energy"] = user_core.get("energy") if user_core else None
         u_copy["_social_energy"] = user_core.get("social_energy") if user_core else None
         # Core 记的「这个人上次说话」时刻。主动消息里的「距离上次说话」用它，
@@ -10635,6 +10636,7 @@ class SocialEngine:
             u_copy["_affection"] = affection
             u_copy["_tier"] = tier
             u_copy["_tier_note"] = anchors.tier_note(tier, aff, warmth)
+            u_copy["_proactive_growth_context"] = True
             u_copy["_energy"] = user_core.get("energy") if user_core else None
             u_copy["_social_energy"] = user_core.get("social_energy") if user_core else None
             u_copy["_last_interaction"] = user_core.get("last_interaction") if user_core else None

@@ -159,9 +159,8 @@ WHY_MAX_CHARS = 60
 # ─── 状态文件「读盘被占用」的退避节奏（秒）─────────────────
 #
 # 为什么需要：Windows 上杀软扫描、资源管理器索引、OneDrive 同步都会在几毫秒到几百
-# 毫秒内独占 state.json，报出来是 PermissionError / EBUSY。旧实现把它和「JSON 坏了」
-# 走同一条路——把原文件 rename 成 .unreadable.xxx，然后插件拿着空壳跑、还拒绝写盘。
-# 线上表现就是「重启一次，她把我全忘了」，而原文件其实一个字节都没坏。
+# 瞬时占用只退避重试；内容损坏或其他读取失败都会保留原文件并关闭写盘闸门。
+# 不会把无法读取的状态误当成空状态覆盖回去。
 # 100/300/900ms 三次足够熬过这类瞬时占用，加起来不到 1.5 秒，只在启动或重试时付一次。
 _READ_RETRY_DELAYS = (0.1, 0.3, 0.9)
 # 这些 errno 的含义都是「文件现在被占着/暂时不让读」，过一会儿就好
@@ -251,9 +250,8 @@ class SocialState:
         # 内存里已经是空壳，第一条新消息一标脏就会把空状态盖回磁盘。
         self._load_failed = False
         self._write_blocked_warned = False
-        # 「读盘被占用」与「文件内容坏了」必须分开：前者原文件是好的，只是这一瞬间
-        # 打不开，绝不能改名；后者才该备份留证。这个标记决定闸门要不要留一个
-        # 自动重试的口子（retry_load / flush），而不是等到重载插件。
+        # 所有读取失败都保留原文件并关闭写盘闸门；只有瞬时错误允许自动重试。
+        # 内容损坏需人工处理，不能把内存空壳写回磁盘。
         self._load_deferred = False
         self._load_error = ""
         # 上次「我们读到/写下」的那份文件的 (mtime, size)。写盘前比对它，是为了
@@ -880,17 +878,13 @@ class SocialState:
     def load(self, *, allow_sleep: bool = True) -> None:
         """从磁盘加载状态。
 
-        两种情况必须分开处理，**不能都当「记忆读不出来」**：
+        读取失败时一律保留原文件并暂停写盘：
 
-        1. 内容真的坏了（JSON 语法错、不是 UTF-8、顶层结构不是预期形状）：
-           原文件已经是废的，挪到一边留证、报 error、上写盘闸门，等人工处理。
-        2. 文件读不出来但内容没坏（Windows 杀软扫描、OneDrive 同步、另一个进程
-           刚好打开着——表现为 PermissionError / EBUSY）：原文件是**好的**，
-           只是这一瞬间打不开。旧实现把它和坏文件走同一条路，`os.rename` 把
-           state.json 改成了 .unreadable.xxx：全部记忆从原路径消失，插件拿着
-           空壳继续跑还拒绝写盘，重启之后依然如此。线上表现就是「升级/重启一次，
-           她把我全忘了」。现在这里只记「本次没加载上」，原文件一动不动，
-           并允许后续心跳重试（`retry_load`，`flush()` 每轮也会顺手试一次）。
+        1. 内容无效（JSON/UTF-8/结构不符合预期）：记录错误、关闭写盘闸门，
+           不自动改名或覆盖；修复原文件后重载。
+        2. 临时无法读取（Windows 杀软扫描、OneDrive 同步、另一个进程占用）：
+           原文件同样保持不动并关闭闸门，但允许后续心跳重试（`retry_load`，
+           `flush()` 每轮也会顺手试一次）。
 
         allow_sleep=False 是给周期重试用的：那条路径每 30 秒就会走一次，
         在里面做 100/300/900ms 退避会把事件循环卡住；文件锁放开后一次就能读出来。
@@ -955,9 +949,9 @@ class SocialState:
     def _read_json_with_retry(self, *, allow_sleep: bool = True) -> Any:
         """读一次状态文件；只有「被占用」这类瞬时错误才退避重试。
 
-        内容坏了（JSON/编码）重试一万次也还是坏的，那属于要备份留证的另一条路；
-        非瞬时的 OSError（磁盘错误之类）重试同样没有意义。所以这里只对
-        `_is_transient_read_error` 判真的错误重试，其余原样抛给 load() 分类。
+        内容坏了（JSON/编码）不重试：load() 会记录错误、保留原文件并关闭写盘闸门。
+        其他非瞬时错误同样没有重试意义；这里只对 `_is_transient_read_error` 判真的
+        错误退避重试，其余原样抛给 load() 分类。
         """
         delays = _READ_RETRY_DELAYS if allow_sleep else ()
         attempt = 0
@@ -1023,8 +1017,8 @@ class SocialState:
 
         只在 deferred 时才真的重读：
         - 已经加载好的一律不碰——重读会把内存里还没落盘的改动丢掉；
-        - 已经判定为内容损坏（备份过）的也不碰——备份只该做一次，重试只会
-          一遍遍撞同一个坏文件，并把 .unreadable.* 越堆越多。
+        - 内容无效的文件不会进入 deferred，也不会被自动重试；原文件留在原位，
+          需人工处理后重新加载。
 
         allow_sleep 默认 False：周期心跳每 30 秒就会调到这里，退避等待会把事件
         循环卡住；文件锁放开之后单次尝试就能读出来。
@@ -1051,9 +1045,8 @@ class SocialState:
     def load_status(self) -> Dict[str, Any]:
         """加载状态摘要，供状态页/排障面板显示「记忆到底加载上没有」。
 
-        为什么不让人去翻日志：这两种失败的表现都是「她好像什么都忘了」，
-        而处理方式完全不同——被占用等一会儿自己就好了，内容损坏必须人工去
-        处理 .unreadable.* 文件。状态页上必须能一眼分开。
+        读取失败时记忆可能暂不可用；状态页需要显示失败原因和是否会自动重试，
+        方便区分瞬时占用与需要人工修复的内容错误。
         """
         return {
             "ok": not self._load_failed,
@@ -1262,25 +1255,14 @@ class SocialState:
             )
 
     def _fail_load(self, reason: str) -> None:
-        """加载失败：备份原文件、报错、上闸门；内存留空壳且不标脏。"""
+        """读取或校验失败：保留原文件、记录原因并上闸门；内存留空壳且不标脏。"""
         logger.error(f"[autonomous_social] {reason}，路径：{self.path}")
-        self._backup_unreadable()
+        self._load_error = reason
+        self._load_deferred = False
+        self._write_blocked_warned = False
         self.data = {"version": STATE_VERSION, "bots": {}}
         self._dirty = False
         self._load_failed = True
-
-    def _backup_unreadable(self) -> None:
-        """把读不出来的原文件挪到一边，别让它被空状态覆盖。"""
-        try:
-            backup_path = f"{self.path}.unreadable.{int(time.time())}"
-            if os.path.exists(self.path):
-                os.rename(self.path, backup_path)
-                logger.error(
-                    f"[autonomous_social] 原状态文件已备份到 {backup_path}，"
-                    "确认后可自行删除；在修好它并重载插件之前，插件不会写回新状态。"
-                )
-        except OSError:
-            pass
 
     # v1.7.7 的「悬空跟进」在 v1.8.0 换成了不分谁说话的 thread_*，旧键留着只会让人
     # 以为还有人在读它。
@@ -1651,8 +1633,8 @@ class SocialState:
             )
             return
         logger.error(
-            f"[autonomous_social] 状态写入已暂停：原文件读不出来，"
-            f"继续写会拿空状态覆盖掉它。处理完请重载插件。路径：{self.path}"
+            f"[autonomous_social] 状态写入已暂停：原文件读不出来（{self._load_error}），"
+            f"原文件保持不动；处理后重载插件前不会写入新状态。路径：{self.path}"
         )
 
     def save(self) -> None:

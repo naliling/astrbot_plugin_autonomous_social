@@ -234,7 +234,7 @@ class _NullState:
 # ─── 阻断③：状态文件读不出来被静默清空并覆盖 ────────────────────────
 
 class TestStateLoadFailure(unittest.TestCase):
-    """读不出原来的记忆时，必须备份 + 报错 + 拒绝写盘，绝不能拿空状态盖回去。"""
+    """读不出原来的记忆时，必须保留原文件、报告错误并拒绝写盘。"""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -243,11 +243,27 @@ class TestStateLoadFailure(unittest.TestCase):
     def _make(self, name, write):
         p = os.path.join(self.tmp, name)
         write(p)
+        with open(p, "rb") as f:
+            self._original = f.read()
         st = SocialState(p)
         st.user("bot1", "u1")["last_message"] = "新消息"
         st.mark_dirty()
         st.flush()
         return st, p
+
+    def _assert_corrupt_file_preserved(self, st, p):
+        self.assertTrue(st._load_failed, "读取失败必须关闭写盘闸门")
+        self.assertFalse(st._load_deferred, "内容错误不应自动重试")
+        self.assertTrue(os.path.exists(p))
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), self._original)
+        prefix = os.path.basename(p) + ".unreadable"
+        self.assertFalse(any(name.startswith(prefix) for name in os.listdir(self.tmp)))
+        self.assertTrue(st.load_status()["error"])
+        st.save()
+        self.assertFalse(st.flush())
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), self._original)
 
     def test_valid_file_loads_normally(self):
         def write(p):
@@ -257,29 +273,25 @@ class TestStateLoadFailure(unittest.TestCase):
         self.assertFalse(st._load_failed)
         self.assertTrue(os.path.exists(p))
 
-    def test_broken_json_is_backed_up_and_blocks_writes(self):
+    def test_broken_json_stays_in_place_and_blocks_writes(self):
         def write(p):
             open(p, "w").write('{"bots": {"bot1": ')
         st, p = self._make("broken.json", write)
-        self.assertTrue(st._load_failed, "损坏文件必须上闸门")
-        self.assertFalse(os.path.exists(p), "原文件已被备份，不该被空状态覆盖")
-        backups = [f for f in os.listdir(self.tmp) if f.startswith("broken.json.unreadable")]
-        self.assertTrue(backups, "必须留下可恢复的备份")
+        self._assert_corrupt_file_preserved(st, p)
 
-    def test_non_utf8_is_treated_as_unreadable(self):
+    def test_non_utf8_is_preserved_and_blocks_writes(self):
         """UnicodeDecodeError 是 ValueError 子类，不会被 JSONDecodeError 捕获。"""
         def write(p):
             open(p, "wb").write(b'{"bots": {"b": {"n": "\xff\xfe"}}}')
-        st, _p = self._make("bin.json", write)
-        self.assertTrue(st._load_failed)
+        st, p = self._make("bin.json", write)
+        self._assert_corrupt_file_preserved(st, p)
 
-    def test_unexpected_shape_is_not_treated_as_empty(self):
+    def test_unexpected_shape_is_preserved_and_blocks_writes(self):
         def write(p):
             with open(p, "w") as f:
                 json.dump({"version": 1, "data": {}}, f)
         st, p = self._make("shape.json", write)
-        self.assertTrue(st._load_failed)
-        self.assertFalse(os.path.exists(p), "结构不对时同样不能被空状态覆盖")
+        self._assert_corrupt_file_preserved(st, p)
 
     def test_migration_result_is_not_discarded(self):
         def write(p):
@@ -1980,6 +1992,56 @@ class TestExpression(unittest.TestCase):
         heads = generator._opening_neurons(
             ["诶你吃了吗", "诶今天好热", "诶我睡了", "刚下班", "对了昨天那个"])
         self.assertEqual(heads[0], "诶", "连着三条都以诶开头，结论里却没它")
+
+
+class ProactiveGrowthContextTest(unittest.TestCase):
+    @staticmethod
+    def _target(previous_ts, latest_ts, previous_dir="in", latest_dir="in", enabled=True, tier="mid"):
+        return {
+            "_proactive_growth_context": enabled,
+            "_tier": tier,
+            "conversation": [
+                {"dir": previous_dir, "ts": previous_ts},
+                {"dir": latest_dir, "ts": latest_ts},
+            ],
+        }
+
+    def test_stage_guidance_is_optional_and_tier_specific(self):
+        lines = [
+            generator._relationship_growth_line(self._target(1, 2, tier=tier))
+            for tier in ("low", "mid", "high")
+        ]
+        self.assertTrue(all(lines))
+        self.assertEqual(len(set(lines)), 3)
+        self.assertEqual(generator._relationship_growth_line(self._target(1, 2, enabled=False)), "")
+        self.assertNotIn("必须", lines[0] + lines[1] + lines[2])
+
+    def test_short_return_accepts_only_inclusive_window(self):
+        for gap in (60, 1800):
+            target = self._target(100, 100 + gap)
+            self.assertTrue(generator._short_return_context_line(target, 2000))
+        for gap in (59, 1801):
+            target = self._target(100, 100 + gap)
+            self.assertEqual(generator._short_return_context_line(target, 3000), "")
+
+    def test_short_return_rejects_invalid_or_nonpositive_timestamps(self):
+        invalid_pairs = (
+            (0, 60), (-59, 1), (-120, -60), (1000, 900),
+            (None, 1100), ("invalid", 1100), (1000, 2201),
+        )
+        for previous_ts, latest_ts in invalid_pairs:
+            with self.subTest(previous_ts=previous_ts, latest_ts=latest_ts):
+                target = self._target(previous_ts, latest_ts)
+                self.assertEqual(generator._short_return_context_line(target, 2000), "")
+        self.assertEqual(
+            generator._short_return_context_line(self._target(100, 160, previous_dir="unknown"), 2000),
+            "",
+        )
+        self.assertEqual(
+            generator._short_return_context_line(self._target(100, 160, latest_dir="out"), 2000),
+            "",
+        )
+
 
 
 # ─── v1.19.0 容器实测反馈：入口清洗 / provider 探测 / 可见性 / 规模 ──

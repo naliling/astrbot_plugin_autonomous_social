@@ -1005,6 +1005,54 @@ def _relationship_line(target: Dict[str, Any]) -> str:
     return "【内部状态参考·影响语气和内容选择，绝不要在消息里说出这些感受或抱怨】\n" + "；".join(bits) + "。"
 
 
+def _relationship_growth_line(target: Dict[str, Any]) -> str:
+    """Give ordinary proactive prompts optional, tier-specific relationship context."""
+    if not target.get("_proactive_growth_context"):
+        return ""
+    tier = str(target.get("_tier") or "").strip().lower()
+    guidance = {
+        "low": "关系还在熟悉阶段；相关话题可以轻轻延续，个人观点和经历保持简短、只说有根据的部分。",
+        "mid": "关系已有一些熟悉感；有自然关联时可以延续共同话题，并分享一点真实、相关的个人看法。",
+        "high": "关系较熟；有自然关联时可以分享更深一点的个人想法，但不推定当下的意愿或亲密程度。",
+    }.get(tier)
+    if not guidance:
+        return ""
+    return (
+        "【关系阶段参考·仅作可选背景】" + guidance
+        + "这些只是可选背景，不要求延续任何话题、披露个人经历或得到回应；不要编造事实。"
+    )
+
+
+def _short_return_context_line(target: Dict[str, Any], now_epoch: float) -> str:
+    """Describe a recent inbound interval as optional timing context, never a prompt to greet."""
+    if not target.get("_proactive_growth_context"):
+        return ""
+    conv = target.get("conversation")
+    if not isinstance(conv, list) or len(conv) < 2:
+        return ""
+    previous, latest = conv[-2], conv[-1]
+    if not isinstance(previous, dict) or not isinstance(latest, dict):
+        return ""
+    if previous.get("dir") not in ("in", "out") or latest.get("dir") != "in":
+        return ""
+    try:
+        previous_ts = float(previous.get("ts"))
+        latest_ts = float(latest.get("ts"))
+        now_ts = float(now_epoch)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if previous_ts <= 0.0 or latest_ts <= 0.0:
+        return ""
+    gap = latest_ts - previous_ts
+    if not (60.0 <= gap <= 1800.0 and latest_ts <= now_ts):
+        return ""
+    minutes = max(1, int((gap + 30.0) // 60.0))
+    return (
+        f"【近期来话·仅作时间背景】最近一条来话与上一条记录间隔约{minutes}分钟；"
+        "无需提及时间、问候或追问，也不意味着对方需要回应。"
+    )
+
+
 # 亲密/贴面语境的轻量级识别词：命中时不把最近的露骨聊天逐字塞进生成 prompt——
 # 那会触发模型自己的安全训练、发出拒绝/乱码。改用一句中性的氛围提示，
 # 让她顺着当下亲密的氛围说下去，而不是把露骨正文抹进来。
@@ -2807,6 +2855,10 @@ class MessageGenerator:
                 if conv_text and "history" not in dropped:
                     ref_lines.append("最近的对话：")
                     ref_lines.append(conv_text)
+                    if not intimate:
+                        return_line = _short_return_context_line(target, ref)
+                        if return_line:
+                            ref_lines.append(return_line)
             block = ""
             if ref_lines:
                 block = (
@@ -2841,6 +2893,10 @@ class MessageGenerator:
                 parts.append(body_line)
             if relation_line:
                 parts.append(relation_line)
+            if not intimate:
+                growth_line = _relationship_growth_line(target)
+                if growth_line:
+                    parts.append(growth_line)
             if bond_line:
                 parts.append(bond_line)
             if mind_block and "mind" not in dropped:
@@ -2927,7 +2983,7 @@ class MessageGenerator:
             else:
                 parts.extend([
                     "",
-                    "你正准备给一个熟悉的人发一条消息——是你主动开口，不是回TA的那条。",
+                    "这是一条主动消息草稿；结合当前上下文自然表达，不假设对方需要回应。",
                 ])
 
 

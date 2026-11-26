@@ -94,6 +94,22 @@ class _TempStateCase(unittest.TestCase):
         with open(self.path, encoding="utf-8") as f:
             return json.load(f)
 
+    def _read_disk_bytes(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def _assert_failed_file_preserved(self, state, original):
+        self.assertTrue(state._load_failed)
+        self.assertFalse(state._load_deferred)
+        self.assertIn("状态文件", state.load_status()["error"])
+        self.assertEqual(self._read_disk_bytes(), original)
+        self.assertEqual(_unreadable_backups(self.tmp), [])
+        state.user("b", "u1")["last_message"] = "新消息"
+        state.mark_dirty()
+        state.save()
+        self.assertFalse(state.flush())
+        self.assertEqual(self._read_disk_bytes(), original)
+
 
 # ─── P0-01：读盘被占用 ≠ 文件坏了 ──────────────────────────────
 
@@ -179,16 +195,11 @@ class StateLoadDeferredTest(_TempStateCase):
             state.data["bots"]["b"]["users"]["u1"]["last_message"], "旧"
         )
 
-    def test_corrupt_json_still_backs_up(self):
+    def test_corrupt_json_stays_in_place_and_blocks_writes(self):
         _dump_to_file(self.path, None, text='{"bots": {"b": ')
+        original = self._read_disk_bytes()
         state = SocialState(self.path, time_source=lambda: 1.0)
-        self.assertTrue(state._load_failed)
-        self.assertFalse(
-            state._load_deferred,
-            "内容坏了不是「被占用」，重试没有意义，不该进重试路径",
-        )
-        self.assertFalse(os.path.exists(self.path))
-        self.assertEqual(len(_unreadable_backups(self.tmp)), 1, "损坏的文件要留证据")
+        self._assert_failed_file_preserved(state, original)
 
     def test_retry_load_recovers_after_the_lock_is_released(self):
         real_read = SocialState._read_json_with_retry
@@ -250,13 +261,12 @@ class StateLoadDeferredTest(_TempStateCase):
         self.assertTrue(os.path.exists(self.path))
         self.assertEqual(_unreadable_backups(self.tmp), [])
 
-    def test_corrupt_file_is_not_retried_forever(self):
+    def test_corrupt_file_stays_in_place_and_is_not_retried(self):
         _dump_to_file(self.path, None, text="不是 JSON")
+        original = self._read_disk_bytes()
         state = SocialState(self.path, time_source=lambda: 1.0)
         self.assertFalse(state.retry_load(), "损坏文件重试没有意义")
-        self.assertEqual(
-            len(_unreadable_backups(self.tmp)), 1, "重试不该再备份出第二份"
-        )
+        self._assert_failed_file_preserved(state, original)
 
     def test_blocked_write_warns_only_once(self):
         state = self._load_with_read_error(PermissionError(13, "还被占着"))
