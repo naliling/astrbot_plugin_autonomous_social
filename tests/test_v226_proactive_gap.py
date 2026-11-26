@@ -138,67 +138,19 @@ class HardGapTest(unittest.TestCase):
 
 
 class IncompleteLeadTest(unittest.TestCase):
-    """主段不能是碎片：只有称呼、半句、或指着「那句」的指代。"""
+    def test_legacy_lead_gate_does_not_filter_text(self):
+        for text in ("小阔耐", "因为", "又嫩又圆润那句", "晚安"):
+            with self.subTest(text=text):
+                self.assertFalse(SocialEngine._incomplete_lead(text, ("小阔耐",)))
 
-    def test_bare_call_name_is_incomplete(self):
-        self.assertTrue(SocialEngine._incomplete_lead("小阔耐", ("小阔耐",)))
-
-    def test_name_with_particle_is_incomplete(self):
-        self.assertTrue(SocialEngine._incomplete_lead("小阔耐呀～", ("小阔耐",)))
-
-    def test_same_text_without_names_can_stand(self):
-        # 不按字数一刀切：不知道 TA 叫什么时，「小阔耐」可能只是句昵称
-        self.assertFalse(SocialEngine._incomplete_lead("小阔耐"))
-
-    def test_short_greeting_can_stand_alone(self):
-        self.assertFalse(SocialEngine._incomplete_lead("晚安", ("小阔耐",)))
-
-    def test_dangling_reference_is_incomplete(self):
-        self.assertTrue(SocialEngine._incomplete_lead("又嫩又圆润那句"))
-
-    def test_connector_tail_is_incomplete(self):
-        self.assertTrue(SocialEngine._incomplete_lead("我今天在楼下看见一只猫，因为"))
-
-    def test_actions_and_punct_are_stripped(self):
-        self.assertTrue(SocialEngine._incomplete_lead("（笑）小阔耐～", ("小阔耐",)))
-
-    def test_complete_sentence_passes(self):
-        self.assertFalse(SocialEngine._incomplete_lead("你今天有没有好好吃饭"))
-
-    def test_merge_two_segments(self):
-        segs, waits, why = SocialEngine._merge_incomplete_lead(
-            ["小阔耐", "你今天吃饭没"], [12.0, 20.0], ("小阔耐",)
+    def test_legacy_merge_helper_preserves_segments_and_waits(self):
+        segments = ["小阔耐", "你今天吃饭没"]
+        waits = [12.0, 20.0]
+        self.assertEqual(
+            SocialEngine._merge_incomplete_lead(segments, waits, ("小阔耐",)),
+            (segments, waits, ""),
         )
-        self.assertEqual(segs, ["小阔耐你今天吃饭没"])
-        self.assertEqual(waits, [20.0])
-        self.assertEqual(why, "")
 
-    def test_merge_keeps_rest(self):
-        segs, waits, why = SocialEngine._merge_incomplete_lead(
-            ["小阔耐", "第一句", "第二句"], [1.0, 2.0], ("小阔耐",)
-        )
-        self.assertEqual(segs, ["小阔耐第一句", "第二句"])
-        self.assertEqual(waits, [2.0])
-        self.assertEqual(why, "")
-
-    def test_single_short_segment_returns_reason(self):
-        segs, waits, why = SocialEngine._merge_incomplete_lead(
-            ["小阔耐"], [], ("小阔耐",)
-        )
-        self.assertEqual(segs, ["小阔耐"])
-        self.assertEqual(waits, [])
-        self.assertIn("不能单独开口", why)
-
-    def test_complete_single_segment_untouched(self):
-        segs, waits, why = SocialEngine._merge_incomplete_lead(["你今天有没有好好吃饭"], [])
-        self.assertEqual(segs, ["你今天有没有好好吃饭"])
-        self.assertEqual(why, "")
-
-    def test_wired_after_plan_segments(self):
-        src = (PLUGIN_ROOT / "social" / "engine.py").read_text(encoding="utf-8")
-        self.assertIn("_merge_incomplete_lead(\n            segments, waits, _lead_names\n        )", src)
-        self.assertIn('"short_main"', src)
-        self.assertIn('u.get("_call_name")', src)
 
 
 class PartIntervalCapTest(unittest.TestCase):

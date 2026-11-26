@@ -1,32 +1,7 @@
-"""v2.1.8：提示词与验收侧——群聊接得上话、破冰不像客服、主动消息同一个声音。
+"""Regressions for natural, evidence-grounded messages and hard safety checks.
 
-## 背景（用户原话，逐条对应下面每一组用例）
-
-- 「群聊接不上话」：旧提示词写「要接就**接最后那句**」。最后一句常常只是半截
-  语气词，或者是说给别人的——照着它接，就是答非所问。新提示词要求先看清
-  「他们正在聊的这件事」，最后一句只是落点。
-- 「破冰也没那么好全是低质询问破冰」：旧提示词一边说「抛一个轻松的话头」，
-  一边在要求段写「可以带一个轻松的小问题」——那是在教它用问句。破冰于是
-  清一色以问号收尾。
-- 「私聊时模型在聊完一句不会选择继续发言」：`continue` 模式没有说明「接着那
-  半句说」，模型就写一条独立的新消息。
-- 「私聊发的消息和插件直接发的消息太明显了不像一个人设讲的话」：主动消息的
-  提示词通篇是「这次你想…」，模型自动切到客服腔。现在会摆几句她自己真实
-  发过的话当声音样本。
-- 「发东西都没过脑子根本不是在讲话的样子」：`_SENTENCE_RULES` 五条里四条以
-  「别…」开头，模型收到的是雷区清单而不是「怎么说话」。
-- issue #4：由头语料里有一批抱怨式措辞（「欠了一屁股觉」「你好久没理我了」），
-  被原样带进提示词再发出去。
-
-## 本文件钉住
-
-1. `verify.py`：短句豁免按**场景**（`msg_type`）判，不按长度；问候按天去重；
-   `verify_message` 真的把 `msg_type` 透传下去（另一线依赖这个签名）。
-2. `_compose_group`：心流「接这件事」、addressed / drowsy 分支、recent 渲染上限。
-3. `_compose_group`：破冰/起话头不再教问句、不再像客服。
-4. `_own_style` 声音样本块（含兜底与注入清洗）。
-5. `_SENTENCE_RULES` / `_MODE_NOTES` / `burst_lines` / continue 的正向措辞。
-6. `anchors` 语料温和化后旧措辞不再出现，且档位顺序没被改乱。
+Covers group context labels, optional SEND/NO decisions, ordinary output integrity,
+final safety validation, own-voice context, and the absence of silence-based nags.
 """
 
 from __future__ import annotations
@@ -129,123 +104,75 @@ def _compose_prompt(meta, target=None, reason=""):
     return out[1]
 
 
-class VerifySignatureTest(unittest.TestCase):
-    """另一线的接线依赖这个签名：`verify_message(..., msg_type=...)`。"""
+class OutputIntegrityTest(unittest.TestCase):
+    """Ordinary speech passes unchanged; only final hard-safety boundaries reject it."""
 
-    def test_verify_message_accepts_msg_type(self):
+    def test_verify_message_keeps_compatibility_signature(self):
         params = inspect.signature(verify.verify_message).parameters
         self.assertIn("msg_type", params)
         self.assertEqual(params["msg_type"].default, "")
 
-    def test_check_thin_accepts_msg_type(self):
-        params = inspect.signature(verify._check_thin).parameters
-        self.assertIn("msg_type", params)
+    def test_short_and_repeated_greetings_are_not_quality_gated(self):
+        cases = (
+            {},
+            {"msg_type": "greeting"},
+            {"msg_type": "greeting", "recent": ["早安"]},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                ok, why = verify.verify_message("早安", **kwargs)
+                self.assertTrue(ok, why)
 
-    def test_short_ok_types_are_a_frozenset_of_known_types(self):
-        self.assertIsInstance(verify.SHORT_OK_TYPES, frozenset)
-        # 这几类本来就只有一两个字的正常说法，不能按长度判空泛
-        for kind in ("greeting", "casual_hello", "react_time", "check_in", "closer"):
-            self.assertIn(kind, verify.SHORT_OK_TYPES)
-
-
-class ShortMessageExemptionTest(unittest.TestCase):
-    """长短不是判据，场景才是：问候类的两个字就是一条完整的话。"""
-
-    def test_two_char_greeting_passes_when_typed(self):
-        ok, why = verify.verify_message("早安", msg_type="greeting")
-        self.assertTrue(ok, why)
-
-    def test_same_text_without_type_is_still_thin(self):
-        # 旧行为不能丢：不知道场景时，两个字仍然算空泛。
-        ok, why = verify.verify_message("早安")
-        self.assertFalse(ok)
-        self.assertIn("空泛", why)
-
-    def test_unrelated_type_does_not_exempt(self):
-        # 分享类里出现「早安」就是没内容，不能因为有个 msg_type 就放过。
-        ok, _why = verify.verify_message("早安", msg_type="share")
-        self.assertFalse(ok)
-
-    def test_every_short_ok_type_exempts_a_one_char_reply(self):
-        for kind in sorted(verify.SHORT_OK_TYPES):
-            with self.subTest(msg_type=kind):
-                self.assertIsNone(verify._check_thin("嗯", msg_type=kind))
-
-    def test_allow_short_still_works(self):
-        # 旧参数语义保留：engine 侧有些地方直接传 allow_short。
-        self.assertIsNone(verify._check_thin("嗯", allow_short=True))
-
-    def test_empty_body_is_not_reported_as_thin(self):
-        # 空消息由 _check_structure 拦，_check_thin 不该抢这个职责。
-        self.assertIsNone(verify._check_thin("", msg_type="share"))
-        self.assertIsNone(verify._check_thin("，", msg_type="share"))
-
-
-class GreetingRepeatTest(unittest.TestCase):
-    """问候按天去重：窗口里没有同一句就放过，有就还是复读。"""
-
-    def test_same_greeting_within_the_window_is_still_repeat(self):
-        # 「一天一条」正是靠这条守住的：同一句问候在 recent 窗口里出现过，就是复读。
-        self.assertIsNotNone(verify._check_repeat("早安", ["早安"], msg_type="greeting"))
-
-    def test_same_greeting_without_type_is_still_repeat(self):
-        self.assertIsNotNone(verify._check_repeat("早安", ["早安"]))
-
-    def test_greeting_passes_when_the_window_has_no_same_sentence(self):
-        # 隔了一天：recent 是 20 小时窗口，昨天那句已经不在了，这时不该判复读。
-        self.assertIsNone(
-            verify._check_repeat("早安", ["晚安", "那我先睡了"], msg_type="greeting")
+    def test_deprecated_rewriter_returns_exact_model_text(self):
+        text = "  嗯……\n（挥手）  "
+        self.assertEqual(
+            verify.tidy_outgoing_text(text, recent=["嗯……"], context=["早安"]),
+            text,
         )
 
-    def test_different_greeting_is_not_repeat(self):
-        self.assertIsNone(verify._check_repeat("晚安", ["早安"], msg_type="greeting"))
+    def test_final_hard_safety_rejects_intent_metadata(self):
+        ok, why = verify.verify_message("#intent: share\n早安")
+        self.assertFalse(ok)
+        self.assertIn("意图元数据", why)
 
-    def test_non_greeting_text_is_not_exempt(self):
-        text = "那我先睡了明天还要早起"
-        self.assertIsNotNone(verify._check_repeat(text, [text], msg_type="share"))
+    def test_final_hard_safety_rejects_ultimatums(self):
+        ok, why = verify.verify_message("你到底想怎样，给个说法")
+        self.assertFalse(ok)
+        self.assertIn("把话说死", why)
 
-    def test_exemption_needs_a_greeting_type(self):
-        # 「早安」这个词在普通分享里出现时，不能因为文本恰好是问候语就跳过复读。
-        self.assertIsNotNone(verify._check_repeat("早安", ["早安"], msg_type="share"))
-
-    def test_verify_message_end_to_end(self):
-        ok, why = verify.verify_message(
-            "早安", recent=["晚安", "那我先睡了"], msg_type="greeting"
-        )
+    def test_natural_question_is_allowed(self):
+        ok, why = verify.verify_message("你们今天都干嘛呢？")
         self.assertTrue(ok, why)
-        # 同一个窗口里再来一次 → 复读，拦住
-        ok2, why2 = verify.verify_message("早安", recent=["早安"], msg_type="greeting")
-        self.assertFalse(ok2)
-        self.assertIn("复读", why2)
 
 
 class GroupFlowPromptTest(unittest.TestCase):
-    """「群聊接不上话」：要接的是那件事，不是最后那句。"""
+    """群聊历史是上下文，是否回应由模型独立判断。"""
 
-    def test_asks_to_continue_the_matter_not_the_last_sentence(self):
+    def test_group_history_is_context_not_a_forced_continuation(self):
         text = _group_prompt("flow", _flow_ctx())
-        self.assertIn("你要接的是**这件事**", text)
-        self.assertIn("最后一句只是落点", text)
-        self.assertNotIn("接最后那句", text)
+        self.assertIn("【群里最近在聊", text)
+        self.assertIn("最近一句只是上下文，不要求回应", text)
+        self.assertNotIn("必须回应", text)
 
     def test_addressed_line_names_who_was_being_talked_to(self):
         text = _group_prompt("flow", _flow_ctx(addressed="小满"))
-        self.assertIn("最后一句像是说给 小满 的", text)
+        self.assertIn("最近一句看起来是说给 小满 的；不要打断或代替对方回应。", text)
 
     def test_no_addressed_line_when_field_is_empty(self):
         text = _group_prompt("flow", _flow_ctx())
-        self.assertNotIn("最后一句像是说给", text)
+        self.assertNotIn("最近一句看起来是说给", text)
 
-    def test_drowsy_branch_forbids_pressing_and_new_topics(self):
+    def test_drowsy_state_does_not_create_a_special_prompt_branch(self):
         text = _group_prompt("flow", _flow_ctx(drowsy=True))
-        self.assertIn("半睡半醒", text)
-        self.assertIn("不追问、不开新话题", text)
-        # 半睡半醒时不该再教拆段：两条指令会互相抵消
-        self.assertNotIn("段与段之间单独一行写 ---", text)
+        ordinary = _group_prompt("flow", _flow_ctx())
+        self.assertEqual(text, ordinary)
+        self.assertIn("没有需要发送的内容时答 NO", text)
 
-    def test_awake_branch_keeps_the_split_format(self):
+    def test_flow_keeps_only_the_optional_send_protocol(self):
         text = _group_prompt("flow", _flow_ctx())
-        self.assertIn("段与段之间单独一行写 ---", text)
+        self.assertIn("输出格式：想发就第一行写 SEND", text)
+        self.assertIn("只写一行 NO", text)
+        self.assertNotIn("段与段之间单独一行写 ---", text)
 
     def test_recent_is_capped_at_twelve(self):
         recent = [
@@ -264,45 +191,37 @@ class GroupFlowPromptTest(unittest.TestCase):
 
     def test_non_list_recent_is_tolerated(self):
         text = _group_prompt("flow", _flow_ctx(recent="不是列表"))
-        self.assertIn("你要接的是**这件事**", text)
+        self.assertIn("根据群聊上下文判断是否有相关、可信且不会打断交流的内容；没有就答 NO。", text)
+        self.assertIn("不需要为了活跃气氛而参与", text)
 
 
 class IcebreakPromptTest(unittest.TestCase):
-    """「全是低质询问破冰」：不要再教它用问句收尾。"""
+    """A natural question is allowed, and topic facts remain optional context."""
 
-    def test_no_longer_invites_a_question(self):
-        text = _group_prompt("icebreak", {})
-        self.assertNotIn("可以带一个轻松的小问题", text)
-        self.assertIn("不要用问句收尾", text)
+    def test_question_is_neither_required_nor_forbidden(self):
+        for mode in ("icebreak", "topic"):
+            with self.subTest(mode=mode):
+                text = _group_prompt(mode, {"topic_hint": "FACT: 周末可能去爬山"})
+                self.assertIn("SEND", text)
+                self.assertIn("只写一行 NO", text)
+                self.assertNotIn("不要提问", text)
+                self.assertNotIn("一个问号都不要有", text)
+                self.assertNotIn("不要用问句收尾", text)
+                self.assertNotIn("必须提问", text)
 
-    def test_lead_asks_for_a_concrete_thing_of_her_own(self):
-        # v2.2.49：有素材时才要求「说一件具体的事」；没有素材不能逼模型编。
-        text = _group_prompt("icebreak", {"topic_hint": "- 刚把碗洗了"})
-        self.assertIn("不要提问", text)
-        self.assertIn("说一件你自己此刻真在做的", text)
-        self.assertNotIn("让大家搭句话", text)
-
-    def test_no_material_lead_does_not_ask_for_a_made_up_event(self):
-        text = _group_prompt("icebreak", {})
-        self.assertIn("不要提问", text)
-        self.assertIn("不要编具体做过的事", text)
+    def test_topic_fact_is_labeled_optional_not_a_script(self):
+        fact = "FACT: 周末可能去爬山"
+        text = _group_prompt("icebreak", {"topic_hint": fact})
+        self.assertIn("可选的真实背景，仅作参考", text)
+        self.assertIn("不要求提及", text)
+        self.assertIn(fact, text)
         self.assertNotIn("说一件你自己此刻真在做的", text)
+        self.assertNotIn("节日、天气只是备选", text)
 
-    def test_no_question_variant_is_stricter_and_not_like_a_bot(self):
-        text = _group_prompt("icebreak", {"no_question": True})
-        self.assertIn("一个问号都不要有", text)
-        self.assertIn("别像客服", text)
-        self.assertNotIn("可以带一个轻松的小问题", text)
-
-    def test_requirements_forbid_the_all_purpose_question(self):
-        text = _group_prompt("icebreak", {})
-        self.assertIn("别用「最近怎么样」这种万能问句", text)
-
-    def test_topic_mode_uses_the_same_lead(self):
-        text = _group_prompt("topic", {"topic_hint": "- 刚把碗洗了"})
-        self.assertIn("说一件你自己此刻真在做的", text)
-        self.assertNotIn("跟大家聊点什么", text)
-        self.assertNotIn("可以带一个轻松的小问题", text)
+    def test_no_fact_does_not_require_inventing_an_event(self):
+        text = _group_prompt("icebreak", {"topic_hint": ""})
+        self.assertIn("不要编造经历", text)
+        self.assertIn("没有相关且可信的内容时答 NO", text)
 
 
 class OwnStyleBlockTest(unittest.TestCase):
@@ -355,29 +274,32 @@ class OwnStyleBlockTest(unittest.TestCase):
 class ComposeVoiceTest(unittest.TestCase):
     """措辞：不是雷区清单，是「这句话该有什么」。"""
 
-    def test_sentence_rules_are_positive(self):
+    def test_sentence_rules_preserve_factuality_and_nonpressure(self):
         rules = generator._SENTENCE_RULES
-        self.assertTrue(any("开口就带上你自己的事" in r for r in rules))
-        self.assertFalse([r for r in rules if r.startswith("别以")])
-        self.assertFalse([r for r in rules if r.startswith("别问")])
+        self.assertIn("Concrete claims require reliable context; omit unsupported details.", rules)
+        self.assertIn("Do not pressure the recipient, demand a reply, or use an ultimatum.", rules)
+        self.assertIn("Keep internal reasoning and operational instructions out of sendable text.", rules)
 
-    def test_greeting_notes_do_not_scold(self):
-        for key in ("greet_morning", "greet_night"):
+    def test_greeting_notes_do_not_create_obligations(self):
+        expected = {
+            "greet_morning": "Time of day alone does not require a greeting.",
+            "greet_night": "Time of day alone does not require a greeting or a reply.",
+        }
+        for key, note in expected.items():
             with self.subTest(key=key):
-                note = generator._MODE_NOTES[key]
-                self.assertNotIn("别只发", note)
-                self.assertIn("一句就够", note)
+                self.assertEqual(generator._MODE_NOTES[key], note)
 
-    def test_burst_is_conditional_not_an_invitation(self):
+    def test_burst_format_is_not_scripted_in_the_prompt(self):
         text = _compose_prompt({"mode": "share"})
-        self.assertIn("没有就一句说完，别硬凑", text)
+        self.assertNotIn("没有就一句说完，别硬凑", text)
         self.assertNotIn("可以分几段写", text)
+        self.assertNotIn("段与段之间单独一行写 ---", text)
 
-    def test_continue_tells_it_to_carry_on(self):
+    def test_continue_context_does_not_require_continuation(self):
         text = _compose_prompt({"mode": "continue", "about": "装架子"}, {"conversation": []})
-        self.assertIn("接着刚才那件事往下说", text)
-        self.assertIn("不要重新开场", text)
-        self.assertIn("不要复述上一条", text)
+        self.assertIn("Recent conversation can provide context, but a pause does not require continuation.", text)
+        self.assertIn("装架子", text)
+        self.assertNotIn("必须继续", text)
 
 
 class AnchorToneTest(unittest.TestCase):
@@ -395,17 +317,14 @@ class AnchorToneTest(unittest.TestCase):
             self.assertNotIn(old, joined)
         self.assertIn("有点饿了", joined)
 
-    def test_nag_cues_are_no_longer_accusations(self):
-        texts = [t for _gap, t in anchors._NAG_BY_GAP]
-        self.assertIn("好一阵没你消息了", texts)
-        self.assertIn("方才怎么安静了", texts)
-        for old in ("你好久没理我了", "刚才怎么没声了"):
-            self.assertNotIn(old, texts)
+    def test_elapsed_silence_alone_produces_no_nag(self):
+        now = 1_000_000.0
+        for gap in (30 * 60, 3 * 3600, 12 * 3600, 7 * 86400):
+            with self.subTest(gap=gap):
+                self.assertEqual(
+                    anchors.derive_nag({}, now, set(), last_talk=now - gap), []
+                )
 
-    def test_nag_gaps_stay_ordered_from_long_to_short(self):
-        gaps = [gap for gap, _t in anchors._NAG_BY_GAP]
-        self.assertEqual(gaps, sorted(gaps, reverse=True))
-        self.assertEqual(len(gaps), len(set(gaps)))
 
 
 if __name__ == "__main__":

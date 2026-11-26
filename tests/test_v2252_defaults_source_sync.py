@@ -6,7 +6,7 @@
 硬失败**。作者记录过「两份差 16 项，调好的节奏对新装用户一次都没生效」，
 根因就是默认值散落多处却没有人逐项对拍。本测试钉住三件事：
 
-1. schema default == dataclass 裸默认值（145 项逐项比，浮点容差 1e-9）；
+1. schema default == dataclass 裸默认值（当前 136 项逐项比，浮点容差 1e-9）；
 2. 常量区里 *_DEFAULT 常量 == schema 对应 default（按显式映射表）；
 3. 版本号三处一致：metadata.yaml / social/__init__.py / CHANGELOG 最新标题。
 

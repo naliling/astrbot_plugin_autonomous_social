@@ -512,11 +512,11 @@ class DeadKindsWereRemoved(unittest.TestCase):
         finally:
             anchors.add_anchor = original
 
-        self.assertTrue(recorded, "一条由头都没派生出来，这条用例没验到东西")
         self.assertEqual(set(recorded) & set(self.DEAD), set(),
                          "有生产者出现了：那就该把常量加回来并更新本条用例")
-        self.assertIn(anchors.KIND_GREET, set(recorded),
-                      "样本里连 greet 都没有，覆盖不够")
+        self.assertEqual(
+            anchors.derive_nag({}, NOW, set(), last_talk=NOW - 7 * 3600.0), []
+        )
 
 
 if __name__ == "__main__":

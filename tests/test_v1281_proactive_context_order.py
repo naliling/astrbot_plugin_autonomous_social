@@ -263,8 +263,6 @@ class RealStateOrderTest(unittest.TestCase):
                 "b1", "u1", "刚下班，今天累死了", about="下班",
                 expect_reply=True, why="她想他了",
             )
-            # on_llm_request 消费掉待注入的主动消息（发出去→用户回→注入一轮）
-            state.user("b1", "u1")["pending_proactive_context"] = ""
             state.record_incoming("b1", "u1", "我也才忙完", name="小明")
             state.record_spoken("b1", "u1", "那正好，一起摸鱼")
             state.record_incoming("b1", "u1", "哈哈行", name="小明")
@@ -344,15 +342,11 @@ class UnansweredProactiveHintTest(unittest.TestCase):
         base.update(over)
         return base
 
-    def test_unanswered_proactive_is_stated_as_a_fact(self) -> None:
-        text = self._prompt(self._target())
-        self.assertIn("对方没有接话", text)
-        self.assertIn("13 小时", text)
-
-    def test_recent_unanswered_uses_a_softer_wording(self) -> None:
-        text = self._prompt(self._target(_proactive_unanswered_hours=0.2))
-        self.assertIn("对方还没有接话", text)
-        self.assertNotIn("13 小时", text)
+    def test_unanswered_state_is_not_a_prompt_topic(self) -> None:
+        for target in (self._target(), self._target(_proactive_unanswered_hours=0.2)):
+            text = self._prompt(target)
+            for phrase in ("没有得到回复", "没有接话", "13 小时"):
+                self.assertNotIn(phrase, text)
 
     def test_answered_proactive_gets_no_such_line(self) -> None:
         """对方接话了就别再提「没人回」——那句话会变成翻旧账。"""
@@ -387,17 +381,8 @@ class _FakeCtx:
 
 
 class UnansweredSurvivesSheddingTest(unittest.TestCase):
-    """「那句话没人接」是上下文，不能被预算裁掉。
+    """No unreplied-message hint is forced into generation prompts."""
 
-    装到线上跑真实数据时发现两个漏点，都在这一版补上：
-
-    1. 它原来挂在 `out_block`（「别重复句式」，纯装饰）那个 shed 组里。
-       超预算时装饰先被丢，于是**最需要这句话的用户反而看不到它**。
-       现在它独占 `unanswered` 组，排在 `history` 之后、`mind`/`persona` 之前。
-    2. 它原来只写在 `assemble()` 的 else 分支里，而 `intimate`（亲密氛围）分支
-       整段替换了那个 else——**所有走亲密路的用户都拿不到这个事实**。
-       真实数据里 67 个待回复用户有 7 个落在这条路上，提示词里一个字的上下文都没有。
-    """
 
     def _prompt(self, target):
         import asyncio
@@ -439,43 +424,26 @@ class UnansweredSurvivesSheddingTest(unittest.TestCase):
         base.update(over)
         return base
 
-    def test_unanswered_has_its_own_shed_group(self) -> None:
-        """它不能再挂在 out_block 那个装饰组里。"""
+    def test_unanswered_flag_is_not_rendered_in_normal_or_intimate_prompt(self) -> None:
+        targets = (
+            self._target(),
+            self._target(
+                conversation=[
+                    {"dir": "in", "text": "想操你", "ts": BASE - 600},
+                    {"dir": "out", "text": "（拉你入怀）这么急？", "ts": BASE - 300},
+                ],
+                last_message="想操你",
+                last_spoken_text="（拉你入怀）这么急？",
+            ),
+        )
+        for target in targets:
+            prompt = self._prompt(target)
+            for phrase in ("没有得到回复", "没有接话", "13 小时"):
+                self.assertNotIn(phrase, prompt)
+
+    def test_unanswered_shed_group_is_retired(self) -> None:
         from social import generator as G
 
-        self.assertIn("unanswered", G.SHED_ORDER)
-        self.assertGreater(
-            G.SHED_ORDER.index("unanswered"),
-            G.SHED_ORDER.index("out_block"),
-            "unanswered 必须排在装饰性的 out_block 之后才被丢",
-        )
-        self.assertLess(
-            G.SHED_ORDER.index("unanswered"),
-            G.SHED_ORDER.index("persona"),
-            "unanswered 不该比人设更晚被丢",
-        )
-
-    def test_intimate_branch_also_states_it(self) -> None:
-        """亲密氛围分支也不能吞掉这个事实。
-
-        真实数据里 7/67 个待回复用户走这条路（露骨内容对方常常不知道怎么接），
-        旧代码在她们身上一个字的上下文都不给。
-        """
-        # 触发 intimate：最近几条足够亲密
-        text = self._prompt(self._target(
-            conversation=[
-                {"dir": "in", "text": "想操你", "ts": BASE - 600},
-                {"dir": "out", "text": "（拉你入怀）这么急？", "ts": BASE - 300},
-            ],
-            last_message="想操你",
-            last_spoken_text="（拉你入怀）这么急？",
-        ))
-        self.assertIn("对方没有接话", text)
-
-    def test_normal_branch_still_states_it(self) -> None:
-        text = self._prompt(self._target())
-        self.assertIn("对方没有接话", text)
-
-
+        self.assertNotIn("unanswered", G.SHED_ORDER)
 if __name__ == "__main__":
     unittest.main()

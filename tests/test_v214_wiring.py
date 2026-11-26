@@ -341,17 +341,11 @@ class PreSendGateTest(unittest.TestCase):
         self.assertEqual("refusal_detected", code)
         self.assertIn("我无法", detail)
 
-    def test_self_continuation(self):
-        code, _ = self.eng._pre_send_gate(
-            "那我先睡了", dialogue=[_row("assistant", "嗯。", NOW - 60.0)], at=NOW
-        )
-        self.assertEqual("self_continuation", code)
+    def test_no_forced_turn_or_topic_gate(self):
+        self.assertEqual(("", ""), self.eng._pre_send_gate("随口聊点别的也行", at=NOW))
 
-    def test_no_self_continuation_when_user_spoke_last(self):
-        code, _ = self.eng._pre_send_gate(
-            "那我先睡了", dialogue=[_row("user", "你睡吧", NOW - 60.0)], at=NOW
-        )
-        self.assertEqual("", code)
+    def test_subjective_text_passes(self):
+        self.assertEqual(("", ""), self.eng._pre_send_gate("有点困，想先躺一会儿", at=NOW))
 
     def test_duplicate_inflight(self):
         text = "今天降温了，记得加衣服"
@@ -361,7 +355,8 @@ class PreSendGateTest(unittest.TestCase):
 
     def test_no_duplicate_for_different_text(self):
         inflight = [{"state": "accepted", "text": "今天降温了，记得加衣服", "ts": time.time() - 60.0}]
-        code, _ = self.eng._pre_send_gate("刚才看到一只很胖的猫", inflight=inflight, at=NOW)
+        with mock.patch.object(engine_mod, "grounded_claims", return_value={"ok": True, "missing": []}):
+            code, _ = self.eng._pre_send_gate("刚才看到一只很胖的猫", inflight=inflight, at=NOW)
         self.assertEqual("", code)
 
     def test_evidence_missing(self):
@@ -391,16 +386,33 @@ class PreSendGateTest(unittest.TestCase):
         plan = SimpleNamespace(facts=[])
         self.assertEqual(("", ""), self.eng._pre_send_gate("随口一句", plan=plan, cards=[], at=NOW))
 
-    def test_normal_text_passes(self):
-        self.assertEqual(("", ""), self.eng._pre_send_gate("今天下雨了，记得带伞", at=NOW))
+    def test_final_unsupported_claim_is_rejected(self):
+        with mock.patch.object(
+            engine_mod,
+            "grounded_claims",
+            return_value={"ok": False, "missing": ["今天去拔牙"], "ratio": 0.0},
+        ):
+            code, detail = self.eng._pre_send_gate("她今天去拔牙了", cards=[], at=NOW)
+        self.assertEqual("evidence_missing", code)
+        self.assertIn("今天去拔牙", detail)
 
-    def test_fail_open_when_guard_raises(self):
+    def test_factuality_checker_exception_fails_closed(self):
+        text = "今天去拔牙了"
+        with mock.patch.object(engine_mod, "grounded_claims", side_effect=RuntimeError("boom")):
+            self.assertEqual("evidence_gate_unavailable", self.eng._pre_send_gate(text, cards=[], at=NOW)[0])
+
+    def test_refusal_guard_exception_fails_closed(self):
         with mock.patch.object(guards, "looks_like_refusal", side_effect=RuntimeError("boom")):
-            self.assertEqual(("", ""), self.eng._pre_send_gate("今天下雨了", at=NOW))
+            self.assertEqual("safety_gate_unavailable", self.eng._pre_send_gate("随口聊点别的也行", at=NOW)[0])
 
-    def test_fail_open_when_dangling_raises(self):
-        with mock.patch.object(guards, "dangling_after_own_reply", side_effect=RuntimeError("boom")):
-            self.assertEqual(("", ""), self.eng._pre_send_gate("今天下雨了", at=NOW))
+    def test_inflight_guard_exception_fails_closed(self):
+        with mock.patch.object(guards, "duplicate_inflight", side_effect=RuntimeError("boom")):
+            self.assertEqual("duplicate_gate_unavailable", self.eng._pre_send_gate("随口聊点别的也行", at=NOW)[0])
+
+    def test_planned_fact_guard_exception_fails_closed(self):
+        plan = SimpleNamespace(facts=["今天去拔牙"])
+        with mock.patch.object(guards, "evidence_missing", side_effect=RuntimeError("boom")):
+            self.assertEqual("evidence_gate_unavailable", self.eng._pre_send_gate("今天去拔牙了", plan=plan, cards=[], at=NOW)[0])
 
 
 # ─── 四、先规划后写作 ────────────────────────────────────────────

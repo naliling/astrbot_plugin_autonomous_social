@@ -169,23 +169,34 @@ class TestGroundedClaims(unittest.TestCase):
         self.assertEqual(out["ratio"], 0.5)
         self.assertTrue(out["ok"])
 
-    def test_no_cards_passes(self):
+    def test_unverified_concrete_claim_is_reported(self):
         out = generator.grounded_claims("昨天在三里屯买了双新鞋", [])
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["ratio"], 1.0)
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["missing"])
+        self.assertEqual(out["ratio"], 0.0)
 
     def test_no_claims_passes(self):
         out = generator.grounded_claims("有点想你", [{"title": "别的"}])
         self.assertTrue(out["ok"])
+
+    def test_subjective_state_and_intention_are_not_concrete_claims(self):
+        text = "有点困，想先躺一会儿"
+        self.assertEqual([], generator._claimed_facts(text))
+        self.assertTrue(generator.grounded_claims(text, [])["ok"])
 
     def test_question_is_not_a_claim(self):
         out = generator.grounded_claims("你今天还加班吗", [{"title": "别的"}])
         self.assertTrue(out["ok"])
         self.assertEqual(out["missing"], [])
 
-    def test_dirty_input_passes(self):
-        for text, cards in ((None, None), ("", "不是列表"), ("今天三点的会", 42)):
+    def test_dirty_input_without_claims_passes(self):
+        for text, cards in ((None, None), ("", "不是列表")):
             self.assertTrue(generator.grounded_claims(text, cards)["ok"])
+
+    def test_dirty_evidence_with_concrete_claim_fails_closed(self):
+        out = generator.grounded_claims("今天三点的会", 42)
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["missing"])
 
 
 class TestGeneratorMethods(unittest.IsolatedAsyncioTestCase):

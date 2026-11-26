@@ -116,12 +116,7 @@
         "description": "先规划再写",
         "hint": "先让模型判断要不要说、说什么，再单独写正文。"
     },
-    "draft_review_enabled": {
-        "type": "bool",
-        "default": false,
-        "description": "发前自评",
-        "hint": "发之前让模型把这条当话看一遍，不合格就改写或不发。"
-    },
+
     "persona_platform_fallback": {
         "type": "bool",
         "default": false,
@@ -464,23 +459,7 @@
             "allow_private_chat": true
         }
     },
-    "cross_user_repeat_ratio": {
-        "type": "float",
-        "default": 0.88,
-        "min": 0.1,
-        "max": 1.0,
-        "slider": {
-            "min": 0.1,
-            "max": 1.0,
-            "step": 0.01
-        },
-        "description": "跟别人说过的话有多像就不发",
-        "hint": "相似度超过这个值就不发，越低越严。",
-        "condition": {
-            "allow_private_chat": true
-        }
-    },
-    "cross_user_repeat_hours": {
+    "anchor_repeat_cooldown_hours": {
         "type": "float",
         "default": 0.5,
         "min": 0,
@@ -490,17 +469,8 @@
             "max": 48.0,
             "step": 0.5
         },
-        "description": "跨人查重回看多久",
-        "hint": "往前比对多少小时内发过的记录。",
-        "condition": {
-            "allow_private_chat": true
-        }
-    },
-    "cross_user_calibrate": {
-        "type": "bool",
-        "default": false,
-        "description": "记录相似度分布",
-        "hint": "只写日志供你调阈值，不影响发送。",
+        "description": "同一用户的由头冷却",
+        "hint": "同一用户近期说过同一件事时，在冷却期内不重复。设为 0 关闭；旧配置 cross_user_repeat_hours 会兼容读取。",
         "condition": {
             "allow_private_chat": true
         }
@@ -706,38 +676,6 @@
         },
         "description": "对方几天不开口就停发",
         "hint": "连续这么多天没回应就不再主动找。",
-        "condition": {
-            "allow_private_chat": true
-        }
-    },
-    "miss_affection_min": {
-        "type": "int",
-        "default": 42,
-        "min": 0,
-        "max": 100,
-        "slider": {
-            "min": 0,
-            "max": 100,
-            "step": 2
-        },
-        "description": "说想她的好感门槛",
-        "hint": "好感到这里才会主动说想念。",
-        "condition": {
-            "allow_private_chat": true
-        }
-    },
-    "miss_daily_cap": {
-        "type": "int",
-        "default": 3,
-        "min": 0,
-        "max": 10,
-        "slider": {
-            "min": 0,
-            "max": 10,
-            "step": 1
-        },
-        "description": "每天最多说几次想她",
-        "hint": "没有正事、只是想找对方的次数上限。",
         "condition": {
             "allow_private_chat": true
         }
@@ -1209,22 +1147,6 @@
             "allow_group_chat": true
         }
     },
-    "cross_channel_dedup_hours": {
-        "type": "float",
-        "default": 6.0,
-        "min": 0.0,
-        "max": 72.0,
-        "slider": {
-            "min": 0.0,
-            "max": 72.0,
-            "step": 1.0
-        },
-        "description": "群和私聊别重复同一件事",
-        "hint": "群里讲过的，这个窗口内不会在私聊再讲一遍。",
-        "condition": {
-            "allow_group_chat": true
-        }
-    },
     "group_cross_bot_gap_seconds": {
         "type": "int",
         "default": 120,
@@ -1392,55 +1314,11 @@
         "description": "主动消息分段连发",
         "hint": "开则按 AstrBot 分段回复设置拆段，关则只发一整条。"
     },
-    "decorate_outgoing": {
-        "type": "bool",
-        "default": true,
-        "description": "普通回复发送前清理",
-        "hint": "删模板占位符、把错的身体词改对、剪掉说教小句。"
-    },
     "track_own_replies": {
         "type": "bool",
         "default": true,
         "description": "记住自己说过的话",
         "hint": "她要知道自己上一句说了什么才能接上。"
-    },
-    "reply_echo_guard": {
-        "type": "bool",
-        "default": true,
-        "description": "回复前提醒她刚说过什么",
-        "hint": "把最近说过的话放进上下文，避免同一件事讲两遍。"
-    },
-    "reply_echo_hours": {
-        "type": "float",
-        "default": 2.0,
-        "min": 0,
-        "max": 72,
-        "slider": {
-            "min": 0.0,
-            "max": 72.0,
-            "step": 1.0
-        },
-        "description": "提醒回看多久",
-        "hint": "只看最近这么多小时对同一个人说过的话。",
-        "condition": {
-            "reply_echo_guard": true
-        }
-    },
-    "reply_echo_limit": {
-        "type": "int",
-        "default": 4,
-        "min": 1,
-        "max": 12,
-        "slider": {
-            "min": 1,
-            "max": 12,
-            "step": 1
-        },
-        "description": "最多提醒几条",
-        "hint": "一次最多列几句。",
-        "condition": {
-            "reply_echo_guard": true
-        }
     },
     "closing_guard_enabled": {
         "type": "bool",

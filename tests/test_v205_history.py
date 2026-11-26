@@ -123,10 +123,6 @@ def _record(engine: SocialEngine, text: str) -> None:
     engine.state.record_outgoing(BID, UID, text, store_text=True)
 
 
-def _pending(engine: SocialEngine):
-    return engine.state.user(BID, UID).get("pending_proactive_context")
-
-
 async def _drain(engine: SocialEngine) -> None:
     """等 fire-and-forget 的后台任务跑完（发送主链路不等它）。"""
     for _ in range(20):
@@ -202,7 +198,7 @@ def _load_main_module():
 
 
 class PersistProactiveHistoryTest(unittest.IsolatedAsyncioTestCase):
-    """发送成功后补写 assistant 条目，并标记 pending 避免重复注入。"""
+    """Proactive assistant history is persisted independently of request hooks."""
 
     async def test_successful_persist_appends_assistant_entry(self) -> None:
         cm = _FakeConversationManager([{"role": "user", "content": "在吗"}])
@@ -223,9 +219,7 @@ class PersistProactiveHistoryTest(unittest.IsolatedAsyncioTestCase):
         # title/persona/token 传 None：DB 层只更新非 None 字段，不能顺手清空。
         self.assertIsNone(cm.updates[0]["title"])
         self.assertIsNone(cm.updates[0]["persona_id"])
-        # 写成功后打标记 → 不再临时注入。
-        self.assertTrue(_pending(engine)[0]["in_history"])
-        self.assertEqual(engine.consume_pending_proactive_context(BID, UID), "")
+        self.assertNotIn("pending_proactive_context", engine.state.user(BID, UID))
 
     async def test_duplicate_write_is_skipped(self) -> None:
         cm = _FakeConversationManager([{"role": "user", "content": "在吗"}])
@@ -250,7 +244,7 @@ class PersistProactiveHistoryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.history[-1], {"role": "assistant", "content": "还没睡呀"})
         self.assertEqual(len(cm.updates), 1)
 
-    async def test_persist_disabled_keeps_old_path(self) -> None:
+    async def test_persist_disabled_does_not_queue_for_injection(self) -> None:
         cm = _FakeConversationManager([{"role": "user", "content": "在吗"}])
         engine = _engine(cm, persist_proactive_history=False)
         self.assertFalse(engine.cfg.persist_proactive_history)
@@ -259,72 +253,43 @@ class PersistProactiveHistoryTest(unittest.IsolatedAsyncioTestCase):
         await _drain(engine)
 
         self.assertEqual(cm.history, [{"role": "user", "content": "在吗"}])
-        self.assertEqual(engine.consume_pending_proactive_context(BID, UID), "晚安")
+        self.assertNotIn("pending_proactive_context", engine.state.user(BID, UID))
 
     async def test_no_conversation_manager_is_quiet(self) -> None:
         engine = _engine(None)
         _record(engine, "晚安")
         ok = await engine._persist_proactive_to_history_inner(BID, UID, UMO, "晚安")
         self.assertFalse(ok)
-        # 没写进历史 → 老路径：仍然临时注入
-        self.assertEqual(engine.consume_pending_proactive_context(BID, UID), "晚安")
+        self.assertNotIn("pending_proactive_context", engine.state.user(BID, UID))
 
-    async def test_only_unpersisted_lines_are_injected(self) -> None:
+    async def test_history_persistence_does_not_create_an_injection_queue(self) -> None:
         cm = _FakeConversationManager()
         engine = _engine(cm)
-        _record(engine, "第一句")
-        await engine._persist_proactive_to_history_inner(BID, UID, UMO, "第一句")
-        _record(engine, "第二句")
-        self.assertEqual(
-            engine.consume_pending_proactive_context(BID, UID), "第二句"
-        )
-
-    async def test_legacy_string_pending_is_marked(self) -> None:
-        """升级途中 pending 还是旧字符串时，写历史后也要标记，否则注入两遍。"""
-        cm = _FakeConversationManager()
-        engine = _engine(cm)
-        engine.state.user(BID, UID)["pending_proactive_context"] = "旧格式的一句话"
-        ok = await engine._persist_proactive_to_history_inner(
-            BID, UID, UMO, "旧格式的一句话"
-        )
-        self.assertTrue(ok)
-        self.assertEqual(cm.history[-1], {"role": "assistant", "content": "旧格式的一句话"})
-        self.assertEqual(engine.consume_pending_proactive_context(BID, UID), "")
+        _record(engine, "主动历史保留")
+        await engine._persist_proactive_to_history_inner(BID, UID, UMO, "主动历史保留")
+        self.assertEqual(cm.history[-1], {"role": "assistant", "content": "主动历史保留"})
+        self.assertNotIn("pending_proactive_context", engine.state.user(BID, UID))
 
 
-class InjectProactiveContextTest(unittest.IsolatedAsyncioTestCase):
-    """main.py 的 on_llm_request：已进历史的条目不注入，没进历史的照旧注入。"""
 
-    def _plugin(self, engine: SocialEngine):
+
+
+class PassiveRequestIsolationTest(unittest.TestCase):
+    """Passive LLM requests must not receive autonomous-social text."""
+
+    def test_main_has_no_request_hook_or_request_mutation(self) -> None:
         main_mod = _load_main_module()
-        obj = object.__new__(main_mod.AutonomousSocial)
-        obj._engine = engine
-        obj._is_group = lambda ev: False
-        engine._get_bot_id = lambda ev: BID
-        engine._get_sender_id = lambda ev: UID
-        return obj
-
-    def _req(self):
-        return SimpleNamespace(contexts=[], extra_user_content_parts=[])
-
-    async def test_marked_pending_is_not_injected(self) -> None:
-        cm = _FakeConversationManager()
-        engine = _engine(cm)
-        _record(engine, "晚安")
-        await engine._persist_proactive_to_history_inner(BID, UID, UMO, "晚安")
-        obj = self._plugin(engine)
-        req = self._req()
-        await obj.inject_proactive_context(SimpleNamespace(), req)
-        self.assertEqual(req.contexts, [])
-        self.assertEqual(req.extra_user_content_parts, [])
-
-    async def test_unpersisted_pending_still_injected(self) -> None:
-        engine = _engine(_FakeConversationManager(), persist_proactive_history=False)
-        _record(engine, "晚安")
-        obj = self._plugin(engine)
-        req = self._req()
-        await obj.inject_proactive_context(SimpleNamespace(), req)
-        self.assertIn({"role": "assistant", "content": "晚安"}, req.contexts)
+        with open(main_mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        for forbidden in (
+            "on_llm_request",
+            "inject_proactive_context",
+            "consume_pending_proactive_context",
+            "extra_user_content_parts",
+            "req.contexts",
+        ):
+            self.assertNotIn(forbidden, src)
+        self.assertFalse(hasattr(main_mod.AutonomousSocial, "inject_proactive_context"))
 
 
 class LongProactiveDedupeTest(unittest.TestCase):

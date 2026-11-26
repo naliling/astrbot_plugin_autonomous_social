@@ -166,14 +166,16 @@ class AttemptRecordedOnFailureTest(unittest.TestCase):
             "失败不该消耗当天的破冰额度（用户要的是「没话说就不发」）",
         )
 
-    def test_three_questions_still_records_attempt(self):
+    def test_natural_question_is_allowed_and_records_send(self):
         eng = _engine()
         stub = _stub_icebreak(eng, [["你们今天都干嘛呢？"]])
-        self.assertFalse(_run_icebreak(stub))
-        self.assertEqual(len(stub.calls), 3, "三次都问句，三次都真打了模型")
+        self.assertTrue(_run_icebreak(stub))
+        self.assertEqual(len(stub.calls), 1)
         g = eng.state.group("b1", "g1")
         self.assertEqual(float(g.get("icebreak_try_at", 0) or 0), NOW)
-        self.assertEqual(int(g.get("icebreak_count_day", 0) or 0), 0)
+        self.assertEqual(float(g.get("icebreak_at", 0) or 0), NOW)
+        self.assertEqual(int(g.get("icebreak_count_day", 0) or 0), 1)
+        self.assertEqual(stub.sent, ["你们今天都干嘛呢？"])
 
     def test_topic_mode_records_topic_try_at(self):
         eng = _engine()

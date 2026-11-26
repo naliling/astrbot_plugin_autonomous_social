@@ -510,7 +510,7 @@ class BondLineNameTest(unittest.TestCase):
             "_call_name": "小明",
             "_name_source": "nickname",
         })
-        self.assertIn("你一直叫TA「小明」", text)
+        self.assertIn("可选称呼是「小明」", text)
         self.assertNotIn("名片名", text)
 
     def test_display_name_wording_uses_the_short_call_name(self):
@@ -519,18 +519,18 @@ class BondLineNameTest(unittest.TestCase):
             "_call_name": "爱筝挽起·冲击波冠军",
             "_name_source": "display_name",
         })
-        self.assertIn("TA 的名片名是「爱筝挽起」", text)
+        self.assertIn("可选称呼是「爱筝挽起」", text)
         self.assertNotIn("冲击波冠军", text)
         # v2.2.30：删掉「你可以偶尔这么叫」——它和下一句「开口要叫一声」打架。
-        self.assertNotIn("偶尔这么叫", text)
-        self.assertIn("开口要叫一声TA的称呼", text)
+        self.assertIn("仅在自然时使用", text)
+        self.assertIn("可选称呼是", text)
 
     def test_local_name_uses_the_same_card_name_wording(self):
         text = _bond_line({"_call_name": "游鱼", "_name_source": "local"})
-        self.assertIn("TA 的名片名是「游鱼」", text)
+        self.assertIn("可选称呼是「游鱼」", text)
         # v2.2.30：不再用「偶尔这么叫」这种可选措辞，来源差别只影响前半句。
-        self.assertNotIn("偶尔这么叫", text)
-        self.assertIn("开口要叫一声TA的称呼", text)
+        self.assertIn("仅在自然时使用", text)
+        self.assertIn("可选称呼是", text)
 
     def test_every_name_source_carries_the_usage_discipline(self):
         for target in (
@@ -542,14 +542,14 @@ class BondLineNameTest(unittest.TestCase):
                 text = _bond_line(target)
                 # v1.28.13：主动消息要开口叫一声（否则一条条发过去都不认人），
                 # 但位置要自然，不许孤零零挂在句尾。
-                self.assertIn("开口要叫一声TA的称呼", text)
-                self.assertIn("别单独挂在句尾", text)
-                self.assertIn("也别每句话都叫", text)
+                self.assertIn("可选称呼是", text)
+                self.assertNotIn("别单独挂在句尾", text)
+                self.assertIn("不必每条都叫", text)
 
     def test_no_name_says_do_not_invent_one(self):
         text = _bond_line({})
-        self.assertIn("你还不知道TA叫什么", text)
-        self.assertIn("别自己给TA编名字", text)
+        self.assertIn("目前没有可靠称呼信息", text)
+        self.assertIn("不要编造名字", text)
 
     def test_mood_attention_and_label_are_kept(self):
         text = _bond_line({
@@ -560,13 +560,13 @@ class BondLineNameTest(unittest.TestCase):
             "_label": "有点黏人",
         })
         self.assertIn("TA这会儿的状态是心情很好", text)
-        self.assertIn("你挺在意这个人", text)
+        self.assertNotIn("你挺在意这个人", text)
         self.assertIn("有点黏人", text)
 
     def test_label_alone_does_not_crash_and_no_name_is_still_said(self):
         text = _bond_line({"_label": "有点黏人"})
         self.assertIn("有点黏人", text)
-        self.assertIn("你还不知道TA叫什么", text)
+        self.assertIn("目前没有可靠称呼信息", text)
 
     def test_the_name_appears_only_once_in_the_bond_line(self):
         text = _bond_line({
@@ -631,8 +631,8 @@ class ProactivePromptNameTest(unittest.TestCase):
 
     def test_prompt_carries_the_call_name_exactly_once(self):
         text = self._prompt(self._target(_call_name="小明", _name_source="nickname"))
-        self.assertIn("你一直叫TA「小明」", text)
-        self.assertIn("开口要叫一声TA的称呼", text)
+        self.assertIn("可选称呼是「小明」", text)
+        self.assertIn("可选称呼是", text)
         # 名字只能出现在 bond_line 这一处：core_context 的 compact() 与
         # 关系/素材块都不该再提一次（否则模型会把它当复读模板）。
         self.assertEqual(text.count("小明"), 1, "名字在 prompt 里出现了不止一处")
@@ -642,18 +642,18 @@ class ProactivePromptNameTest(unittest.TestCase):
             _call_name="爱筝挽起·冲击波冠军",
             _name_source="display_name",
         ))
-        self.assertIn("TA 的名片名是「爱筝挽起」", text)
+        self.assertIn("可选称呼是「爱筝挽起」", text)
         self.assertNotIn("冲击波冠军", text)
         self.assertEqual(text.count("爱筝挽起"), 1)
 
     def test_prompt_without_a_name_tells_her_not_to_invent(self):
         text = self._prompt(self._target())
-        self.assertIn("你还不知道TA叫什么", text)
-        self.assertIn("别自己给TA编名字", text)
+        self.assertIn("目前没有可靠称呼信息", text)
+        self.assertIn("不要编造名字", text)
 
     def test_prompt_has_no_name_when_only_unusable_dirty_data_exists(self):
         text = self._prompt(self._target(_call_name={"坏": 1}, _name_source="nickname"))
-        self.assertIn("你还不知道TA叫什么", text)
+        self.assertIn("目前没有可靠称呼信息", text)
 
 
 # ─── 6. core_facade 封装：task 透传 + capabilities ─────────────────
@@ -796,6 +796,14 @@ class ContractHandshakeTest(unittest.TestCase):
             got["contract_handshake"], {"checked": True, "ok": True, "problems": []}
         )
         self.assertEqual(got["day"]["doing"], "写报告")
+
+    def test_legacy_form_is_ignored_by_view(self):
+        contract = _handshake_contract(form={"max_chars": 1, "long_reply_ok": False, "burst_ok": False, "question_bias": 0.0})
+        contract["fields_hash"] = self.bridge._fields_hash(contract)
+        got = self._view(contract)
+        self.assertNotIn("form", got)
+        self.assertEqual(got["day"]["doing"], "写报告")
+        self.assertTrue(got["contract_handshake"]["ok"])
 
     def test_v1_contract_without_handshake_keys_is_unchecked(self):
         """旧 Core 没有这三键：不占视图字段、不告警（与加机制之前逐字等价）。"""

@@ -23,10 +23,8 @@
 **A3 `ongoing` 3→5 条**：Core 契约自己截到 3，放宽在当前 Core 下是空转，
 只为对面的升级留空间。
 
-**A4 nag 三档 → 七档 + 按关系档措辞**：三档用完这个人当天/这周就没有
-「没事干」的开口理由了。加档不等于多说话——门槛由 `_min_gap_left` 与
-`miss_daily_cap` 管着，这里只是把「已经等了那么久」变成一句可说出口的话。
-三张表各自独立、互不共用句子，否则「算不出档位」和「算出是熟人」会说同一句。
+**A4 沉默时长驱动的固定 nag 话术已退役**：等待本身不再构成强迫亲密表达的理由；
+保留从真实用户历史派生的话题由头，并交给统一候选路径处理。
 
 **配套 `ANCHOR_MAX` 5→8、`TIER_POOL_MAX` 8/6/4**：不抬高读取侧上限，
 A1~A4 全被漏斗吃掉（派生侧产能 15 类以上，原来只看得见 5 条）。
@@ -222,9 +220,9 @@ class TopicRelationTest(unittest.TestCase):
             any("塞尔达传说" in t for t in abouts),
             f"话题由头没进池子：{abouts}",
         )
-        # 它必须是 KIND_MISS（关系向）：念想通道只收 miss/greet
+        # 话题线索保持为 cue，不把普通兴趣包装成思念或缺席信号。
         hit = [a for a in picks if "塞尔达传说" in str(a.get("about") or "")][0]
-        self.assertEqual(hit.get("kind"), anchors.KIND_MISS)
+        self.assertEqual(hit.get("kind"), anchors.KIND_CUE)
 
     def test_does_not_crowd_out_relations(self):
         """`derive_relations` 的产出优先：话题由头只占自己的额度，不把它挤掉。"""
@@ -430,95 +428,13 @@ class DoneOngoingCapTest(unittest.TestCase):
 
 
 class NagTiersTest(unittest.TestCase):
-    def _nag(self, gap, tier="", taken=None):
-        u = _u(last_seen=NOW - gap)
-        out = anchors.derive_nag(u, NOW, set() if taken is None else taken, tier=tier)
-        return [str(a.get("about") or "") for a in out]
+    def test_silence_alone_never_creates_a_nag(self):
+        for tier in (anchors.TIER_HIGH, anchors.TIER_MID, anchors.TIER_LOW, ""):
+            for gap in (30 * 60, 4 * HOUR, 2 * DAY, 8 * DAY):
+                with self.subTest(tier=tier, gap=gap):
+                    user = _u(last_seen=NOW - gap)
+                    self.assertEqual(anchors.derive_nag(user, NOW, set(), tier=tier), [])
 
-    def test_every_gap_tier_has_a_line(self):
-        """七档都够得着：原来只有三档，用完这个人就没话可说了。"""
-        for gap in (8 * DAY, 2 * DAY, 13 * HOUR, 7 * HOUR, 4 * HOUR, 90 * 60, 30 * 60):
-            got = self._nag(gap)
-            self.assertTrue(got, f"等了 {gap / HOUR:.0f} 小时却无话可说")
-
-    def test_tier_wording_differs(self):
-        """同一段沉默，三种关系说三句不同的话。
-
-        ⚠️ 用 30 小时：低档那张表最短是 24 小时，5 小时它一条都没有。
-        """
-        lines = {
-            tier: self._nag(30 * HOUR, tier=tier)[0]
-            for tier in (anchors.TIER_HIGH, anchors.TIER_MID, anchors.TIER_LOW)
-        }
-        self.assertEqual(len(set(lines.values())), 3,
-                         f"三档措辞串了：{lines}")
-
-    def test_high_tier_can_say_miss_you(self):
-        """对熟人可以说「想你了」——这是关系近才自然的一句。
-
-        ⚠️ 高档那张表里带「想你」的是 6 小时那一档，5 小时落到 3 小时档
-        （「忽然想找你」）。所以这里用 7 小时。
-        """
-        self.assertIn("想你", self._nag(7 * HOUR, tier=anchors.TIER_HIGH)[0])
-
-    def test_low_tier_never_says_miss_you(self):
-        """对半生不熟的人说「想你了」很怪。"""
-        for gap in (30 * HOUR, 8 * DAY):
-            got = self._nag(gap, tier=anchors.TIER_LOW)
-            self.assertTrue(got)
-            self.assertNotIn("想你", got[0], f"{gap / HOUR:.0f}h 时低档说出了亲昵话")
-
-    def test_empty_tier_falls_back_to_generic(self):
-        """算不出档位时用最中性的一句——那是「不知道多熟」，不是「最熟」。"""
-        got = self._nag(5 * HOUR, tier="")
-        self.assertTrue(got)
-        self.assertIn(got[0], [t for _n, t in anchors._NAG_BY_GAP])
-
-    def test_unknown_tier_falls_back(self):
-        self.assertTrue(self._nag(5 * HOUR, tier="wat"))
-
-    def test_low_tier_has_no_short_gaps(self):
-        """低档最小间隔 12 小时：它压根等不到 6 小时以下，表里就不该有那些档。"""
-        needs = [n for n, _t in anchors._NAG_BY_TIER[anchors.TIER_LOW]]
-        self.assertEqual(min(needs), 24 * 3600.0)
-
-    def test_used_line_not_repeated(self):
-        taken = {t for _n, t in anchors._NAG_BY_GAP}
-        self.assertEqual(self._nag(5 * HOUR, taken=taken), [])
-
-    def test_no_history_no_line(self):
-        u = _u(last_seen=0.0)
-        self.assertEqual(anchors.derive_nag(u, NOW, set()), [])
-
-    def test_tier_tables_are_ordered(self):
-        """每张表都要按「等得越久措辞越重」排，且阈值单调不升。"""
-        tables = {"generic": anchors._NAG_BY_GAP}
-        tables.update(anchors._NAG_BY_TIER)
-        for name, rows in tables.items():
-            needs = [n for n, _t in rows]
-            self.assertEqual(needs, sorted(needs, reverse=True),
-                             f"{name} 表的阈值不是降序")
-
-    def test_all_tier_lines_are_unique(self):
-        """中短档（24h 以下）的措辞不能互相重复：重复就等于分组白做。
-
-        长档（7 天 / 24 小时）**故意共用**——那两句对三种关系都成立，
-        分组是为了拆开「想你了」这类亲昵话，不是为了把每句都改写一遍
-        （硬改写只会得到「好久没你的音讯了」这种不像人话的句子）。
-        共用的清单在 `_NAG_SHARED_LONG_TIERS`，加新的共用句要同步登记。
-        """
-        shared = set(anchors._NAG_SHARED_LONG_TIERS)
-        seen = [t for _n, t in anchors._NAG_BY_GAP]
-        for tier, rows in anchors._NAG_BY_TIER.items():
-            for need, t in rows:
-                if need >= 24 * 3600.0:
-                    continue                     # 长档（含 24h）：允许共用
-                self.assertNotIn(t, seen, f"{tier} 档的「{t}」在别处也有")
-                seen.append(t)
-        # 共用清单必须真的在用：登记了却没用上，说明表被改过而清单没跟上
-        generic = [t for _n, t in anchors._NAG_BY_GAP]
-        for t in shared:
-            self.assertIn(t, generic, f"共用的「{t}」不在通用档里了")
 
 
 # ─── 配套：漏斗放宽 ──────────────────────────────────────────────

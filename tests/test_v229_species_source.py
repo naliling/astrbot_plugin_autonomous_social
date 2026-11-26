@@ -2,14 +2,14 @@
 
 ## 为什么
 
-v2.2.7 加了物种闸（蹄类不许说「手」、出口把「手」改「蹄子」），离线用例全绿。
+v2.2.7 加了物种闸（蹄类不许说「手」）；普通对话出口改写现已移除。
 但真机上这些闸**一次都没触发过**：`_species_of()` 只读 `users[*]["_brief"]`，
 而那个键在生产环境的 state.json 里**连键都不存在**（线上 499 个用户，0 个有
 `_brief`）。于是：
 
 * `_check_species` 永远拿到空物种 → 永远放行；
 * `local_materials(species=...)` 永远不换「蹄子」；
-* `on_decorating_result` 出口改写永远不改。
+* 普通对话回复保持原样；物种不一致仍由验收层拒绝。
 
 线上证据：茉心（天马）21:08 回「指尖还带着刚才洗手落下的凉意」原样发出去。
 
@@ -22,7 +22,7 @@ v2.2.7 加了物种闸（蹄类不许说「手」、出口把「手」改「蹄�
 * `_species_of` 从门面 brief 取物种（不是 `users[*]["_brief"]`）；
 * 取到后按 bot 缓存，不每条消息都问一次门面；
 * 门面拿不到时仍能回退旧路径，两边都没有就返回空串（不许抛）；
-* 端到端：拿到物种后出口改写真的把「手」改「蹄子」、验收层真的拦；
+* 端到端：普通出口原样返回，物种不一致由验收层拒绝；
 * `_repair_fields` 把「5.0→5」算归一化，不再冒充「按默认值重置」。
 """
 
@@ -125,12 +125,11 @@ class SpeciesSourceTest(unittest.TestCase):
 
 
 class SpeciesGateEndToEndTest(unittest.TestCase):
-    def test_tidy_outgoing_rewrites_hand_for_hoof(self):
+    def test_tidy_outgoing_preserves_ordinary_reply(self):
         eng = _bare_engine()
         with _brief("天马"):
             out = eng.tidy_outgoing("我刚醒手还有点僵", "b1")
-        self.assertIn("蹄", out)
-        self.assertNotIn("手", out)
+        self.assertEqual(out, "我刚醒手还有点僵")
 
     def test_verify_blocks_hand_for_hoof(self):
         ok, reason = verify_mod.verify_message("我刚醒手还有点僵", species="天马")

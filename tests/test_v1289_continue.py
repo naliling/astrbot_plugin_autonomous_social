@@ -422,7 +422,7 @@ class ThreadMetaContinueTest(unittest.TestCase):
         self.assertEqual(meta["category"], "continue")
         self.assertEqual(meta["mode"], "continue")
         self.assertEqual(meta["silence_minutes"], 120)
-        self.assertIn("没声", meta["msg_type_desc"])
+        self.assertNotIn("没声", meta["msg_type_desc"])
 
     def test_old_signature_still_works(self):
         """老调用（两个位置参数）逐字不变。"""
@@ -437,10 +437,11 @@ class ContinueGeneratorNotesTest(unittest.TestCase):
     def test_mode_note_quotes_her_own_last_sentence(self):
         note = generator._mode_note("continue", about="今天路上好堵", asked="那你早点休息吧")
         self.assertIn("那你早点休息吧", note, f"没引她自己上一句：{note}")
-        self.assertIn("不许查岗", note)
+        self.assertIn("你自己上一句说的是", note)
+        self.assertNotIn("没声了", note)
 
     def test_decide_note_says_it_is_not_small_talk(self):
-        self.assertIn("不是没话找话", generator._decide_note("continue"))
+        self.assertIn("pause does not require continuation", generator._decide_note("continue"))
 
     def test_is_followup_includes_continue(self):
         """`is_followup` 决定提示词走「就那件事接一句」那套，continue 必须算进去。"""
@@ -497,14 +498,16 @@ class ContinuePromptTest(unittest.TestCase):
         self.assertIsNotNone(prepared, "compose 返回 None（provider 不可用）")
         return prepared[1]
 
-    def test_continue_prompt_carries_the_silence_and_her_last_sentence(self):
+    def test_continue_prompt_uses_context_without_silence_pressure(self):
         meta = threads.thread_meta(
             "continue", about="今天路上好堵", asked="那你早点休息吧", silence_minutes=120
         )
         text = self._prompt(meta)
-        self.assertIn("那你早点休息吧", text, "没引她自己上一句，接话会接错话头")
-        self.assertIn("没声了", text, "没告诉模型对方已经消失多久")
-        self.assertIn("不许查岗", text, "没写清这是接话不是查岗")
+        self.assertIn("那你早点休息吧", text)
+        self.assertNotIn("没声了", text)
+        self.assertNotIn("人怎么突然没了", text)
+        self.assertIn("不要从沉默、经过的时间", text)
+        self.assertIn("Do not pressure the recipient", text)
 
 
 # ─── 5. 记账：一段沉默只接一次 + 面板 + why ───────────────────────
@@ -575,8 +578,9 @@ class ContinueSpeakEndToEndTest(unittest.IsolatedAsyncioTestCase):
         log = u.get("proactive_log") or []
         self.assertTrue(log, "没进主动消息日志")
         self.assertEqual(log[-1]["cat"], "continue_topic")
-        self.assertIn("她说完之后", log[-1]["why"])
+        self.assertEqual(log[-1]["why"], "沿着先前聊过的话题自然发起")
         self.assertEqual(log[-1]["about"], "今天路上好堵")
+
 
     async def test_the_same_silence_is_not_continued_twice(self):
         eng, u = self._engine_and_user()
@@ -603,8 +607,7 @@ class ContinueAccountingTest(unittest.TestCase):
         why = eng._why_now(
             "b1", u, "continue", "", {"category": "continue", "silence_minutes": 120}, NOW
         )
-        self.assertIn("TA", why)
-        self.assertIn("120", why)
+        self.assertEqual(why, "沿着先前聊过的话题自然发起")
 
     def test_continue_is_recorded_as_expecting_a_reply(self):
         """接话是在问人，按普通主动消息记账（`category not in ("greet", "closer")`）。"""

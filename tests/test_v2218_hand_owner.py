@@ -54,44 +54,42 @@ HOOF = "天马"
 
 
 class OtherHandTest(unittest.TestCase):
-    """对方的手：不改写、不拦。"""
+    """出站边界只透传正文；只有本人身体事实冲突才由硬门拒绝。"""
 
     def test_partner_wrist_untouched(self):
         got = V.tidy_outgoing_text("尾巴尾梢绕上你手腕。", species=HOOF)
-        self.assertIn("你手腕", got)
-        self.assertNotIn("蹄子", got)
+        self.assertEqual(got, "尾巴尾梢绕上你手腕。")
 
     def test_partner_palm_untouched(self):
         got = V.tidy_outgoing_text("我蹭了蹭你的手心", species=HOOF)
-        self.assertIn("你的手心", got)
+        self.assertEqual(got, "我蹭了蹭你的手心")
 
     def test_partner_arm_untouched(self):
         got = V.tidy_outgoing_text("触手顺着你的手臂攀爬", species=HOOF)
-        self.assertIn("你的手臂", got)
+        self.assertEqual(got, "触手顺着你的手臂攀爬")
 
     def test_classical_you_untouched(self):
         got = V.tidy_outgoing_text("汝手凉，本宫要睡了", species=HOOF)
-        self.assertIn("汝手凉", got)
+        self.assertEqual(got, "汝手凉，本宫要睡了")
 
     def test_partner_hand_not_blocked(self):
-        ok, why = V.verify_message("蹄子还搭在你手背上", species=HOOF)
+        ok, why = V.verify_hard_safety("蹄子还搭在你手背上", species=HOOF)
         self.assertTrue(ok, why)
 
     def test_meta_fingers_not_blocked(self):
-        ok, why = V.verify_message("这活儿是不是该找个有手指的干", species=HOOF)
+        ok, why = V.verify_hard_safety("这活儿是不是该找个有手指的干", species=HOOF)
         self.assertTrue(ok, why)
 
 
 class SelfHandTest(unittest.TestCase):
-    """她自己的手：照旧要改、要拦。"""
+    """本人身体部位不被改写；与角色物种冲突时拒绝发送。"""
 
-    def test_own_hand_rewritten(self):
-        got = V.tidy_outgoing_text("我刚醒手还有点僵", species=HOOF)
-        self.assertIn("蹄子", got)
-        self.assertNotIn("手还", got)
+    def test_own_hand_is_preserved_by_identity_boundary(self):
+        body = "我刚醒手还有点僵"
+        self.assertEqual(V.tidy_outgoing_text(body, species=HOOF), body)
 
     def test_own_hand_blocked(self):
-        ok, why = V.verify_message("我刚醒手还有点僵", species=HOOF)
+        ok, why = V.verify_hard_safety("我刚醒手还有点僵", species=HOOF)
         self.assertFalse(ok)
         self.assertIn("身体不一致", why or "")
 
@@ -105,12 +103,14 @@ class SelfHandTest(unittest.TestCase):
 class MixedSentenceTest(unittest.TestCase):
     def test_own_double_hands_and_partner_wrist(self):
         got = V.tidy_outgoing_text("(抬起双手扶住你的手腕) 别乱动", species=HOOF)
-        self.assertIn("两只蹄子", got)
-        self.assertIn("你的手腕", got)
+        self.assertEqual(got, "(抬起双手扶住你的手腕) 别乱动")
+        ok, why = V.verify_hard_safety(got, species=HOOF)
+        self.assertFalse(ok)
+        self.assertIn("身体不一致", why)
 
     def test_unknown_owner_treated_as_self(self):
         got = V.tidy_outgoing_text("手心划破了", species=HOOF)
-        self.assertIn("蹄心", got)
+        self.assertEqual(got, "手心划破了")
 
 
 if __name__ == "__main__":

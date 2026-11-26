@@ -1,16 +1,6 @@
-"""v1.28.0 社交侧 S1 + S2：群主动不点名、素材回到她自己的生活、没话说就不发。
+"""Regressions for group boundaries, optional context, and SEND/NO delivery.
 
-对应设计文档 `DESIGN-v1.28.0.md` §2：
-
-* S1 —— 用户原话「主动消息发群时会叫别人」：群主动默认不点名；起话头/破冰
-  **一个名字都不给**；心流接话最多只给「正在接的那个人」一个名字。
-* S2 —— 用户原话「只有天气，不会真的找话题」「如果没有能说的就不发」：
-  破冰/起话头的素材改成「她自己的生活」优先（刚做完/正在做/想做的/没做完/梦到的），
-  天气只在「变了 + 6 小时未说过」时当备选；破冰/起话头加 SEND/NO 决策，
-  模型答 NO 时这次不发、也不消耗当天的额度。
-
-另外覆盖与 Core 2.28 新字段 `day.dreams` 的兼容：旧版 Core 没有这个字段时必须
-容错成空，不允许 AttributeError/KeyError。
+The suite preserves factuality, privacy, weather deduplication, budget, and accounting.
 """
 from __future__ import annotations
 
@@ -150,26 +140,23 @@ class GroupBoundaryNoNameTest(unittest.TestCase):
 
 
 class TopicMaterialsTest(unittest.TestCase):
-    """S2：生活 > 节日 > 天气；全空返回空串。"""
+    """Supplied facts remain available without prescribing their order."""
 
-    def test_order_is_life_then_holiday_then_weather(self):
+    def test_supplied_materials_are_available_without_priority_order(self):
         text = groupflow.topic_materials(
             life=["刚做完手头的活"], holiday="中秋节", weather="中雨，气温 9℃"
         )
         lines = text.splitlines()
         self.assertEqual(len(lines), 3, text)
-        self.assertIn("刚做完手头的活", lines[0])
-        self.assertIn("中秋", lines[1])
-        self.assertIn("中雨", lines[2])
-        # 天气那一行照旧走 outside_lead（原句没交代方位时补「外头」）
-        self.assertTrue(lines[2].startswith("- 外头"))
+        self.assertTrue(any("刚做完手头的活" in line for line in lines), lines)
+        self.assertTrue(any("中秋" in line for line in lines), lines)
+        weather_line = next(line for line in lines if "中雨" in line)
+        self.assertTrue(weather_line.startswith("- 外头"), weather_line)
 
-    def test_no_life_still_has_holiday_and_weather(self):
+    def test_supplied_holiday_and_weather_are_context_not_ranked(self):
         text = groupflow.topic_materials(holiday="春节", weather="外面在下雪")
-        lines = text.splitlines()
-        self.assertEqual(len(lines), 2, text)
-        self.assertIn("春节", lines[0])
-        self.assertIn("外面在下雪", lines[1])
+        self.assertIn("春节", text)
+        self.assertIn("外面在下雪", text)
 
     def test_all_empty_is_empty(self):
         self.assertEqual(groupflow.topic_materials(), "")
@@ -180,7 +167,7 @@ class TopicMaterialsTest(unittest.TestCase):
         self.assertEqual(len(text.splitlines()), 4)
 
     def test_icebreak_topics_keeps_the_old_wrapper(self):
-        """旧入口不删：破冰素材的名字与「节日/天气」语义保持兼容。"""
+        """旧入口保持兼容，提供的事实可作为上下文。"""
         self.assertEqual(groupflow.icebreak_topics("", ""), "")
         text = groupflow.icebreak_topics("中秋节", "中雨，气温 9℃")
         self.assertIn("中秋", text)
@@ -200,16 +187,20 @@ class LifeLinesTest(unittest.TestCase):
         "ongoing": ["练一首新曲子", "把阳台的花换盆"],
     }
 
-    def test_high_priority_sources_are_extracted(self):
-        """总条数上限 4：done(1) + doing + wants(2) 之后轮不到 ongoing/梦。"""
+    def test_evidence_is_bounded_without_priority_order(self):
         lines = groupflow.life_lines(self.BODY)
-        self.assertIn("下午去了一趟银行", lines)
-        self.assertIn("正在整理个案笔记", lines)
-        self.assertIn("今天去那家旧书店", lines)
-        self.assertEqual(len(lines), groupflow.LIFE_MAX_LINES)
+        self.assertTrue(lines)
+        self.assertLessEqual(len(lines), groupflow.LIFE_MAX_LINES)
+        supported = {
+            "下午去了一趟银行", "傍晚才醒", "正在整理个案笔记",
+            "今天去那家旧书店", "今天想去看一场电影", "梦到自己在天上飞",
+            "还在练一首新曲子", "还在把阳台的花换盆",
+        }
+        for line in lines:
+            self.assertIn(line, supported)
 
     def test_every_source_is_extracted(self):
-        """每个来源单独喂都要认（含 ongoing / 梦——它们排在后面）。"""
+        """每个来源单独喂都要认，包括 ongoing / 梦境来源。"""
         cases = (
             ({"day": {"done": ["下午去了一趟银行"]}}, "下午去了一趟银行"),
             ({"day": {"doing": "整理个案笔记"}}, "正在整理个案笔记"),
@@ -415,7 +406,7 @@ class AnchorLifeSourcesTest(unittest.TestCase):
             any(p.get("kind") == anchors.KIND_WEATHER for p in picks), picks
         )
 
-    def test_life_anchor_comes_before_weather(self):
+    def test_life_and_weather_facts_are_available_without_priority(self):
         picks = anchors.prepare_round_anchors(
             {},
             {"day": {"done": ["下午去了一趟银行"]},
@@ -424,9 +415,8 @@ class AnchorLifeSourcesTest(unittest.TestCase):
             limit=5,
         )
         abouts = [str(p.get("about") or "") for p in picks]
-        life = next(i for i, a in enumerate(abouts) if "银行" in a)
-        weather = next(i for i, a in enumerate(abouts) if "中雨" in a)
-        self.assertLess(life, weather, f"生活由头排在天气后面：{abouts}")
+        self.assertTrue(any("银行" in about for about in abouts), abouts)
+        self.assertTrue(any("中雨" in about for about in abouts), abouts)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -435,7 +425,7 @@ class AnchorLifeSourcesTest(unittest.TestCase):
 
 
 class IcebreakPromptTest(unittest.TestCase):
-    """S2：prompt 要教她「优先分享自己的生活」「没话说就不发」。"""
+    """Facts are optional evidence; SEND/NO remains an independent choice."""
 
     def _prompt(self, mode: str = "icebreak", ctx=None) -> str:
         gen = MessageGenerator(None, None)
@@ -444,31 +434,36 @@ class IcebreakPromptTest(unittest.TestCase):
         )
         return prompt
 
-    def test_material_block_is_her_own_life(self):
+    def test_material_block_is_optional_evidence(self):
         prompt = self._prompt()
-        self.assertIn("她自己的生活", prompt)
-        self.assertIn("没有就别硬说", prompt)
+        self.assertIn("可选的真实背景，仅作参考", prompt)
+        self.assertIn("不要求提及", prompt)
         self.assertIn("下午去了一趟银行", prompt)
+        self.assertIn("具体事实必须有群聊内容或提供的背景支持", prompt)
+        self.assertIn("无法确认时省略", prompt)
 
-    def test_weather_is_only_a_fallback(self):
-        prompt = self._prompt()
-        self.assertIn("节日、天气只是备选", prompt)
-        self.assertIn("别把它当唯一话头", prompt)
+    def test_material_types_have_no_fixed_priority_instruction(self):
+        prompt = self._prompt(ctx={"topic_hint": "FACT: 银行行程；WEATHER: 中雨"})
+        self.assertIn("FACT: 银行行程", prompt)
+        self.assertIn("WEATHER: 中雨", prompt)
+        self.assertNotIn("节日、天气只是备选", prompt)
+        self.assertNotIn("她自己的生活优先", prompt)
 
     def test_send_no_decision_is_offered(self):
         prompt = self._prompt()
         self.assertIn("SEND", prompt)
         self.assertIn("只写一行 NO", prompt)
-        self.assertIn("这次不发", prompt)
+        self.assertIn("没有相关且可信的内容时答 NO", prompt)
 
     def test_topic_mode_also_has_the_decision(self):
         self.assertIn("只写一行 NO", self._prompt("topic"))
 
-    def test_original_requirements_are_kept(self):
+    def test_group_privacy_factuality_and_no_decision_are_kept(self):
         prompt = self._prompt()
-        self.assertIn("别像客服", prompt)
-        self.assertIn("长度不超过", prompt)
-        self.assertIn("别点名", prompt)
+        self.assertIn("别点名任何群友", prompt)
+        self.assertIn("群内内容会被所有成员看见", prompt)
+        self.assertIn("具体事实必须有群聊内容", prompt)
+        self.assertIn("只写一行 NO", prompt)
 
 
 class IcebreakDecisionParseTest(unittest.IsolatedAsyncioTestCase):
@@ -527,8 +522,8 @@ class _HintEngine:
     def __init__(self, body):
         self.core = types.SimpleNamespace(bot_self_state=lambda _bid: body)
         self.cfg = SocialConfig.from_astrbot({})
-        # v2.2.49：本地兜底素材默认关；本文件几条用例专门验兜底路径，显式打开。
-        self.cfg.local_materials_enabled = True
+        # Local fallback is off unless a test opts into that behavior.
+        self.cfg.local_materials_enabled = False
         self.state = types.SimpleNamespace(life_used_elsewhere=lambda *a, **k: False)
 
     def log(self, *a, **k):
@@ -536,22 +531,19 @@ class _HintEngine:
 
 
 class GroupTopicHintTest(unittest.TestCase):
-    """v2.1.0 起 `_group_topic_hint` 返回三元组：(素材文本, 采用的天气, 剔重后的生活行)，
-    第三项给 `_icebreak` 记账用（真发出去之后才知道该把哪条记成「这个群用过了」）。
-    本类只关心前两项，第三项接成 `_life`。"""
+    """Evidence availability and the six-hour weather dedup gate."""
 
-    def test_life_first_then_weather(self):
+    def test_supplied_materials_are_available_without_priority_order(self):
         body = {
             "day": {"done": ["下午去了一趟银行"], "doing": "整理个案笔记"},
             "holiday": "中秋节",
             "weather": {"env": "中雨，气温 9℃"},
         }
-        g: dict = {}
-        text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", g, NOW)
-        lines = text.splitlines()
-        self.assertIn("下午去了一趟银行", lines[0])
+        text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
+        self.assertIn("下午去了一趟银行", text)
+        self.assertIn("正在整理个案笔记", text)
         self.assertIn("中秋", text)
-        self.assertTrue(weather, "天气过了闸却没被采用")
+        self.assertTrue(weather)
         self.assertIn(weather, text)
 
     def test_weather_is_gated_for_six_hours(self):
@@ -565,7 +557,6 @@ class GroupTopicHintTest(unittest.TestCase):
         text, again, _life = engine._group_topic_hint("b", "g", g, NOW + 3600)
         self.assertEqual(again, "", "6 小时闸没生效，天气又被当成话头")
         self.assertNotIn("中雨", text)
-        # 一字不差永远不再说；变了样的天气要过了 6 小时才轮到它。
         same, unchanged, _life = engine._group_topic_hint("b", "g", g, NOW + 7 * 3600)
         self.assertEqual(unchanged, "")
         self.assertNotIn("中雨", same)
@@ -581,16 +572,13 @@ class GroupTopicHintTest(unittest.TestCase):
     def test_old_core_without_day_fields_is_tolerated(self):
         for body in ({}, None, {"day": None}, {"holiday": "", "weather": {}}):
             with self.subTest(body=body):
-                text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
-                # v2.2.2：没有 Core 素材时不再返回空串（那样起话头一句话都起不来），
-                # 改用本地时间兜底。
-                self.assertTrue(text, "没有 Core 时应该用本地兜底素材")
-                self.assertTrue(_life, "兜底素材要一并返回给 _icebreak 记账")
+                text, weather, life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
+                self.assertEqual(text, "")
                 self.assertEqual(weather, "")
+                self.assertEqual(life, [])
 
     def test_local_fallback_off_keeps_holiday_and_skips_local_lines(self):
         engine = _HintEngine({"holiday": "中秋节"})
-        engine.cfg.local_materials_enabled = False
         text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
         self.assertIn("今天是中秋节", text)
         self.assertEqual(life, [], "开关关掉后不该再用本地硬编码素材")
@@ -598,7 +586,6 @@ class GroupTopicHintTest(unittest.TestCase):
 
     def test_local_fallback_off_without_any_material_is_empty(self):
         engine = _HintEngine({})
-        engine.cfg.local_materials_enabled = False
         text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
         self.assertEqual(text, "", "没有 Core/节日/天气时不该硬编素材")
         self.assertEqual(life, [])
@@ -612,8 +599,8 @@ class GroupTopicHintTest(unittest.TestCase):
         engine = _HintEngine({})
         engine.core = _Boom()
         text, weather, life = engine._group_topic_hint("b", "g", {}, NOW)
-        self.assertTrue(text, "Core 抛异常也要有兜底素材")
-        self.assertTrue(life)
+        self.assertEqual(text, "")
+        self.assertEqual(life, [])
         self.assertEqual(weather, "")
 
 
@@ -709,9 +696,6 @@ class IcebreakNoQuotaTest(unittest.TestCase):
         self.assertFalse(out)
         self.assertEqual(engine.sent, [], "模型答 NO 还是发出去了")
         self.assertEqual(int(g.get("icebreak_count_day", 0) or 0), 0, "NO 也占了额度")
-        self.assertTrue(
-            any("不占今天的次数" in x for x in engine.logs), engine.logs
-        )
 
     def test_send_counts_and_marks_the_weather(self):
         body = {"weather": {"env": "中雨，气温 9℃"}}

@@ -148,64 +148,15 @@ class RecentOwnOutTest(unittest.TestCase):
 # ─── 二、注入：把「刚说过的话」摆到模型眼前 ─────────────────────
 
 
-class ReplyEchoHintTest(unittest.TestCase):
-    def _hint(self, conv=None, **cfg):
-        conv = conv if conv is not None else _conv(("总算把晚饭备好了", NOW - 60.0, "out"))
-        st = _state({"bots": {BID: _bot(conv)}})
-        base = dict(reply_echo_guard=True, reply_echo_hours=2.0, reply_echo_limit=4)
-        base.update(cfg)
-        return engine_mod.SocialEngine.reply_echo_hint(_engine(st, **base), BID, UID)
+class ReplyEchoRetiredTest(unittest.TestCase):
+    def test_engine_no_longer_exposes_reply_echo_hint(self):
+        self.assertFalse(hasattr(engine_mod.SocialEngine, "reply_echo_hint"))
 
-    def test_contains_tag_and_numbering(self):
-        hint = self._hint()
-        self.assertIn("<autonomous_social_echo_guard>", hint)
-        self.assertIn("</autonomous_social_echo_guard>", hint)
-        self.assertIn("1. 总算把晚饭备好了", hint)
-        self.assertIn("别再讲第二遍", hint)
-
-    def test_switch_off(self):
-        self.assertEqual(self._hint(reply_echo_guard=False), "")
-
-    def test_zero_hours_disables(self):
-        self.assertEqual(self._hint(reply_echo_hours=0.0), "")
-
-    def test_no_rows_is_empty(self):
-        self.assertEqual(self._hint(conv=_conv(("对方说的话", NOW - 60.0, "in"))), "")
-
-    def test_limit_respected(self):
-        conv = _conv(
-            ("第一句", NOW - 400.0, "out"),
-            ("第二句", NOW - 300.0, "out"),
-            ("第三句", NOW - 200.0, "out"),
-        )
-        hint = self._hint(conv=conv, reply_echo_limit=1)
-        self.assertIn("1. 第三句", hint)
-        self.assertNotIn("第一句", hint)
-
-    def test_long_line_truncated(self):
-        long_text = "傍晚用蹄子夹着锅柄把妹妹带的东西热了一锅" * 3
-        hint = self._hint(conv=_conv((long_text, NOW - 60.0, "out")))
-        self.assertIn("…", hint)
-        self.assertNotIn(long_text, hint)
-
-    def test_stand_in_without_new_method_is_safe(self):
-        eng = object.__new__(engine_mod.SocialEngine)
-        eng.cfg = types.SimpleNamespace(
-            reply_echo_guard=True, reply_echo_hours=2.0, reply_echo_limit=4
-        )
-        eng.state = types.SimpleNamespace()
-        eng._time = lambda: NOW
-        self.assertEqual(engine_mod.SocialEngine.reply_echo_hint(eng, BID, UID), "")
-
-    def test_blank_ids_are_safe(self):
-        st = _state({"bots": {BID: _bot(_conv(("随便一句", NOW - 60.0, "out")))}})
-        eng = _engine(st, reply_echo_guard=True, reply_echo_hours=2.0, reply_echo_limit=4)
-        self.assertEqual(
-            engine_mod.SocialEngine.reply_echo_hint(eng, "", UID), "", "没 bid 还拼提示词"
-        )
-        self.assertEqual(
-            engine_mod.SocialEngine.reply_echo_hint(eng, BID, ""), "", "没 uid 还拼提示词"
-        )
+    def test_retired_reply_echo_keys_are_absent_from_schema(self):
+        with open(os.path.join(PLUGIN_ROOT, "_conf_schema.json"), encoding="utf-8") as fh:
+            schema = json.load(fh)
+        for key in ("reply_echo_guard", "reply_echo_hours", "reply_echo_limit"):
+            self.assertNotIn(key, schema)
 
 
 # ─── 三、同一次发言内部去重 ─────────────────────────────────────
@@ -246,57 +197,36 @@ class DedupeSegmentsTest(unittest.TestCase):
 # ─── 四、配置项与 schema ────────────────────────────────────────
 
 
-class ConfigAndSchemaTest(unittest.TestCase):
-    def test_constants(self):
-        self.assertEqual(cfg_mod.REPLY_ECHO_HOURS_DEFAULT, 2.0)
-        self.assertEqual(cfg_mod.REPLY_ECHO_HOURS_MAX, 72.0)
-        self.assertEqual(cfg_mod.REPLY_ECHO_LIMIT_DEFAULT, 4)
-        self.assertEqual(cfg_mod.REPLY_ECHO_LIMIT_MAX, 12)
-
-    def test_schema_keys(self):
-        with open(
-            os.path.join(PLUGIN_ROOT, "_conf_schema.json"), encoding="utf-8"
-        ) as fh:
-            schema = json.load(fh)
-        expect = {
-            "reply_echo_guard": ("bool", True),
-            "reply_echo_hours": ("float", 2.0),
-            "reply_echo_limit": ("int", 4),
-        }
-        for key, (typ, default) in expect.items():
-            self.assertIn(key, schema, f"schema 缺 {key}")
-            self.assertEqual(schema[key]["type"], typ, key)
-            self.assertEqual(schema[key]["default"], default, key)
-
-    def test_schema_sliders(self):
-        # 没有 slider 块的数值项会被 test_v1273_review_fixes 的 ConfigSliderKeyTest 判红。
-        with open(
-            os.path.join(PLUGIN_ROOT, "_conf_schema.json"), encoding="utf-8"
-        ) as fh:
-            schema = json.load(fh)
-        for key in ("reply_echo_hours", "reply_echo_limit"):
-            self.assertIn("slider", schema[key], f"{key} 缺 slider")
+class RetiredReplyEchoConfigTest(unittest.TestCase):
+    def test_reply_echo_constants_are_removed(self):
+        for name in (
+            "REPLY_ECHO_HOURS_DEFAULT",
+            "REPLY_ECHO_HOURS_MAX",
+            "REPLY_ECHO_LIMIT_DEFAULT",
+            "REPLY_ECHO_LIMIT_MAX",
+        ):
+            self.assertFalse(hasattr(cfg_mod, name), name)
 
 
 # ─── 五、接线：两条链路都得真的调────────────────────────────────
 
 
 class WiringTest(unittest.TestCase):
-    def test_engine_source_calls_dedupe(self):
+    def test_engine_preserves_generated_segments_before_send(self):
         with open(
             os.path.join(PLUGIN_ROOT, "social", "engine.py"), encoding="utf-8"
         ) as fh:
             src = fh.read()
-        self.assertIn("_dedupe_same_event_segments(segments, waits)", src)
-        self.assertGreaterEqual(
-            src.count("_dedupe_same_event_segments("), 2, "只定义没调用"
-        )
+        self.assertNotIn("_dedupe_same_event_segments(segments, waits)", src)
+        self.assertIn("await self._send_message(target, text)", src)
 
-    def test_main_injects_echo_hint(self):
+    def test_main_does_not_inject_echo_hint(self):
         with open(os.path.join(PLUGIN_ROOT, "main.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("reply_echo_hint", src, "on_llm_request 没把刚说过的话给她")
-        self.assertIn("mark_as_temp", src, "不该落进历史")
+        self.assertNotIn("on_llm_request", src)
+        self.assertNotIn("reply_echo_hint", src)
+        self.assertNotIn("mark_as_temp", src)
+        self.assertNotIn("extra_user_content_parts", src)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-"""v2.2.53：开关门禁——11 个功能开关默认值必须为开，面板条件必须为 True。
+"""v2.2.54：10 个仍生效的功能开关默认开启，条件只控制子项显示。
 
-坏开关的由来：v2.2.51 基线把这 11 个开关默认改成关，用户装上新版本后发现
-追问、接话、回访、问候、群破冰等功能默认不工作；同时把它们子项的条件写成
-False（关着才显示参数）。本门禁钉住两件事：
-1. 11 个开关 default 必须 True；
+退役的普通回复开关不再进入插件设置；其余主动消息开关保持原默认。
+1. 10 个开关 default 必须 True；
 2. 所有 condition 的值必须 True（AstrBot 前端: config[键] !== 期望值 → 隐藏）。
 """
 from __future__ import annotations
@@ -22,7 +20,7 @@ SCHEMA = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-
 SWITCHES = (
     "followup_enabled", "continue_enabled", "loop_enabled", "closer_enabled",
     "special_care_auto", "group_icebreak_enabled", "group_topic_enabled",
-    "group_interject_others", "allow_burst", "decorate_outgoing", "greeting_enabled",
+    "group_interject_others", "allow_burst", "greeting_enabled",
 )
 
 

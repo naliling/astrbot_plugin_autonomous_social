@@ -1,20 +1,20 @@
-"""v2.1.5：draft_review_enabled / memory_tools_enabled 落进配置层与面板。
+"""ASO configuration contracts for active settings.
 
-为什么单独钉这两个开关：它们和 v2.1.4 那三项坏得不一样。那三项是「默认开、坏了
-就退回老路」；这两项原本**根本没进配置**——engine.py 早就用
-`getattr(self.cfg, "draft_review_enabled", False)` 读着，但 config.py 里没有这个
-字段、schema 里没有这个键，于是 getattr 每次都拿到兜底 False，「生成后自评」和
-「先查一次记忆再开口」两条路永远走不到，属于静默死代码。
+Memory tools remain configurable; output review and cross-recipient filters are retired.
+The same-user anchor cooldown supports legacy-key migration.
 
-所以这里钉四件事：
 
-* 默认值与 engine.py 的 getattr 兜底一致（v2.2.49 起 draft 也默认关，memory 默认关），
-  以 schema 为准——engine 那边的 False 原本只是「配置层没写」时的兜底；
-* 面板里填的 `"false"/"0"/"off"` 真的能关掉（gb 归一，老坑 P3-07）；
-* schema 键数、README 行、README 计数三处与 dataclass 一致；
-* engine.py 读的属性名与 dataclass 字段名对得上（这条是防死代码复发的唯一断言）。
 
-按仓库惯例自带最小 astrbot 桩（照抄 tests/test_v214_config.py 头部）。
+
+
+
+* Memory settings retain their schema/dataclass/default synchronization checks.
+
+* String-valued boolean settings normalize without silently enabling features.
+* The schema property count and README count match the current dataclass.
+
+
+
 """
 
 from __future__ import annotations
@@ -65,12 +65,11 @@ SCHEMA = json.loads((PLUGIN_ROOT / "_conf_schema.json").read_text(encoding="utf-
 README = (PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
 
 # v2.1.5 的两项：名字是外部契约（engine.py 的 getattr、面板、README 都按这个名字读）。
-NEW_KEYS = ("draft_review_enabled", "memory_tools_enabled")
-EXPECTED_DEFAULTS = {"draft_review_enabled": False, "memory_tools_enabled": False}
+NEW_KEYS = ("memory_tools_enabled",)
+EXPECTED_DEFAULTS = {"memory_tools_enabled": False}
 # 从 engine.py 里读的属性名 → 期望的 dataclass 字段。两者必须一致，否则又是死代码。
 ENGINE_ATTRS = {
-    "draft_review_enabled": "engine.py:8650 的 bool(getattr(self.cfg, \"draft_review_enabled\", False))",
-    "memory_tools_enabled": "engine.py:8595 的 bool(getattr(self.cfg, \"memory_tools_enabled\", False))",
+    "memory_tools_enabled": "engine.py 的 memory-tools 配置读取",
 }
 
 
@@ -101,28 +100,14 @@ def _readme_count() -> int:
 
 
 class DefaultsTest(unittest.TestCase):
-    """出厂状态：自评关、记忆工具关——与 engine.py 的 getattr 兜底一致。"""
-
-    def test_constants(self):
-        self.assertIs(config_mod.DRAFT_REVIEW_ENABLED_DEFAULT, False)
+    def test_memory_tools_default_off(self):
         self.assertIs(config_mod.MEMORY_TOOLS_ENABLED_DEFAULT, False)
+        self.assertIs(SocialConfig().memory_tools_enabled, False)
+        self.assertIs(_cfg().memory_tools_enabled, False)
 
-    def test_dataclass_defaults(self):
-        c = SocialConfig()
-        self.assertIs(c.draft_review_enabled, False)
-        self.assertIs(c.memory_tools_enabled, False)
-
-    def test_from_astrbot_empty_dict_uses_defaults(self):
-        c = _cfg()
-        self.assertIs(c.draft_review_enabled, False)
-        self.assertIs(c.memory_tools_enabled, False)
-
-    def test_fields_are_bool_typed(self):
-        # 类型标注写成 bool：面板与 dataclass 都靠它，写成 str 会让 gb 的返回值
-        # 在别处被当成字符串真值（"false" 也是 True）。
-        for key in NEW_KEYS:
-            ann = SocialConfig.__dataclass_fields__[key].type
-            self.assertIn(ann, (bool, "bool"), f"{key} 的标注不是 bool：{ann!r}")
+    def test_memory_tools_field_is_bool_typed(self):
+        ann = SocialConfig.__dataclass_fields__["memory_tools_enabled"].type
+        self.assertIn(ann, (bool, "bool"), f"memory_tools_enabled 的标注不是 bool：{ann!r}")
 
 
 class SchemaContractTest(unittest.TestCase):
@@ -145,15 +130,9 @@ class SchemaContractTest(unittest.TestCase):
         for key in NEW_KEYS:
             self.assertIs(SCHEMA[key]["default"], getattr(SocialConfig(), key), key)
 
-    def test_schema_key_count_is_144(self):
-        # v2.2.7：新增 decorate_outgoing（出口改写），131 → 132。
-        # v2.2.10：新增 allow_private_chat / allow_group_chat（私聊、群聊总开关），132 → 134。
-        # v2.2.12：新增 group_event_dedup_hours（同群不重复说同一件事），134 → 135。
-        # v2.2.20：新增 cross_channel_dedup_hours（群私聊之间不二传），135 → 136。
-        # v2.2.32：新增 group_cross_bot_gap_seconds（同群跨角色不抢话），139 → 140。
-        # v2.2.47：新增 group_only（只主动群聊）与 history_private_only（只导入私聊历史），140 → 142。
-        # v2.2.49：新增 persona_platform_fallback 与 local_materials_enabled，142 → 144。
-        self.assertEqual(len(SCHEMA), 145)
+    def test_schema_key_count_is_135(self):
+        # v2.2.54 also retires the unused cross-channel dedup option.
+        self.assertEqual(len(SCHEMA), 135)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -169,58 +148,55 @@ class StringNormalizationTest(unittest.TestCase):
     FALSE_TEXT = ("false", "0", "off", "no", "n", "f", "FALSE", " False ", "Off")
     TRUE_TEXT = ("true", "1", "on", "yes", "y", "t", "TRUE", " True ")
 
-    def test_false_text_turns_draft_review_off(self):
-        for raw in self.FALSE_TEXT:
-            with self.subTest(raw=raw):
-                self.assertIs(_cfg(draft_review_enabled=raw).draft_review_enabled, False)
-
     def test_true_text_turns_memory_tools_on(self):
         for raw in self.TRUE_TEXT:
             with self.subTest(raw=raw):
                 self.assertIs(_cfg(memory_tools_enabled=raw).memory_tools_enabled, True)
-
-    def test_true_text_keeps_draft_review_on(self):
-        for raw in self.TRUE_TEXT:
-            with self.subTest(raw=raw):
-                self.assertIs(_cfg(draft_review_enabled=raw).draft_review_enabled, True)
 
     def test_false_text_keeps_memory_tools_off(self):
         for raw in self.FALSE_TEXT:
             with self.subTest(raw=raw):
                 self.assertIs(_cfg(memory_tools_enabled=raw).memory_tools_enabled, False)
 
-    def test_missing_and_null_fall_back_to_schema_default(self):
-        for key in NEW_KEYS:
-            with self.subTest(key=key):
-                self.assertIs(getattr(_cfg(), key), EXPECTED_DEFAULTS[key])
-                self.assertIs(
-                    getattr(_cfg(**{key: None}), key), EXPECTED_DEFAULTS[key]
-                )
-
-    def test_empty_string_falls_back_to_default(self):
-        self.assertIs(_cfg(draft_review_enabled="").draft_review_enabled, False)
-        self.assertIs(_cfg(memory_tools_enabled="").memory_tools_enabled, False)
+    def test_missing_null_and_empty_fall_back_to_default(self):
+        for value in (None, ""):
+            self.assertIs(_cfg(memory_tools_enabled=value).memory_tools_enabled, False)
+        self.assertIs(_cfg().memory_tools_enabled, False)
 
     def test_unrecognized_value_never_raises(self):
         for raw in ("随便", "maybe", object(), [1], {"a": 1}):
             with self.subTest(raw=raw):
-                c = _cfg(draft_review_enabled=raw, memory_tools_enabled=raw)
-                self.assertIs(c.draft_review_enabled, False)
-                self.assertIs(c.memory_tools_enabled, False)
+                self.assertIs(_cfg(memory_tools_enabled=raw).memory_tools_enabled, False)
 
     def test_native_bools_and_numbers(self):
-        self.assertIs(_cfg(draft_review_enabled=False).draft_review_enabled, False)
         self.assertIs(_cfg(memory_tools_enabled=True).memory_tools_enabled, True)
-        self.assertIs(_cfg(draft_review_enabled=0).draft_review_enabled, False)
         self.assertIs(_cfg(memory_tools_enabled=1).memory_tools_enabled, True)
+        self.assertIs(_cfg(memory_tools_enabled=0).memory_tools_enabled, False)
 
-    def test_two_switches_are_independent(self):
-        c = _cfg(draft_review_enabled=False, memory_tools_enabled=True)
-        self.assertIs(c.draft_review_enabled, False)
+    def test_memory_setting_does_not_change_other_defaults(self):
+        c = _cfg(memory_tools_enabled=True)
         self.assertIs(c.memory_tools_enabled, True)
-        # 其余 v2.1.4 三项不受影响
         self.assertIs(c.planning_enabled, True)
         self.assertIs(c.time_projection_enabled, True)
+
+
+class AnchorCooldownConfigTest(unittest.TestCase):
+    def test_schema_readme_and_dataclass_default_match(self):
+        self.assertEqual(SCHEMA["anchor_repeat_cooldown_hours"]["default"], 0.5)
+        self.assertEqual(SocialConfig().anchor_repeat_cooldown_hours, 0.5)
+        self.assertEqual(_readme_table()["anchor_repeat_cooldown_hours"], "0.5")
+
+    def test_legacy_key_migrates_when_new_key_is_missing_or_default(self):
+        self.assertEqual(_cfg(cross_user_repeat_hours=2).anchor_repeat_cooldown_hours, 2.0)
+        self.assertEqual(_cfg(cross_user_repeat_hours=2, anchor_repeat_cooldown_hours=0.5).anchor_repeat_cooldown_hours, 2.0)
+
+    def test_explicit_new_value_and_zero_are_respected(self):
+        self.assertEqual(_cfg(cross_user_repeat_hours=2, anchor_repeat_cooldown_hours=3).anchor_repeat_cooldown_hours, 3.0)
+        self.assertEqual(_cfg(anchor_repeat_cooldown_hours=0).anchor_repeat_cooldown_hours, 0.0)
+
+    def test_retired_settings_are_absent(self):
+        for key in ("draft_review_enabled", "cross_user_repeat_ratio", "cross_user_calibrate"):
+            self.assertNotIn(key, SCHEMA)
 
 
 class ReadmeTest(unittest.TestCase):
@@ -239,10 +215,8 @@ class ReadmeTest(unittest.TestCase):
 
     def test_count_line_matches_schema(self):
         self.assertEqual(_readme_count(), len(SCHEMA))
-        # v2.2.7：新增 decorate_outgoing，README 的「共 N 项」跟着 131 → 132。
-        # v2.2.10：新增 allow_private_chat / allow_group_chat，跟着 132 → 134。
-        # v2.2.49：新增 persona_platform_fallback / local_materials_enabled，跟着 142 → 144。
-        self.assertEqual(_readme_count(), 145)
+        # The README schema count stays synchronized with the 135 active properties.
+        self.assertEqual(_readme_count(), 135)
 
 
 class EngineWiringTest(unittest.TestCase):

@@ -246,18 +246,18 @@ class SpecialCareBondLineTest(unittest.TestCase):
                 "_name_source": "display_name",
             }
         )
-        self.assertIn("你一直叫TA「大当家」", line)
+        self.assertIn("可选称呼是「大当家」", line)
         self.assertNotIn("认定昵称", line)
         self.assertNotIn("名片名", line)
-        self.assertIn("开口要叫一声TA的称呼", line)
+        self.assertIn("不必每条都叫", line)
 
     def test_no_pet_name_keeps_old_wording(self):
         line = _bond_line({"_nickname": "认定昵称", "_call_name": "名片名", "_name_source": "display_name"})
-        self.assertIn("你一直叫TA「认定昵称」", line)
+        self.assertIn("可选称呼是「认定昵称」", line)
 
     def test_no_pet_name_display_name_wording(self):
         line = _bond_line({"_call_name": "名片名", "_name_source": "display_name"})
-        self.assertIn("TA 的名片名是「名片名」", line)
+        self.assertIn("可选称呼是「名片名」", line)
 
 
 class SpecialCareWiringTest(unittest.TestCase):

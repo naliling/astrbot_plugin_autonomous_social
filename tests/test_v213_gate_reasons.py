@@ -586,12 +586,10 @@ class _LoopRoundEngine:
         bot["users"]["u1"] = self.u
         self.state.mark_dirty()
 
-    # 收集层：除追问外全部不产生候选
+    # 收集层：除追问外不产生候选
     def _promise_pick(self, *_a, **_k):
         return []
 
-    def _miss_pick(self, *_a, **_k):
-        return []
 
     def _intimacy_pick(self, *_a, **_k):
         return []
@@ -614,8 +612,6 @@ class _LoopRoundEngine:
     def _greet_pick(self, *_a, **_k):
         return []
 
-    def _miss_mark_today(self, _u, _day):
-        return 1
 
     def _count_block(self, *_a, **_k):
         return None

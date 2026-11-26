@@ -19,6 +19,8 @@ class PrivateTurnTest(unittest.IsolatedAsyncioTestCase):
         eng = _engine(**config)
         user = _user(eng, last_seen=NOW - 500 * 3600, last_message=OLD_QUESTION,
                      last_spoken=NOW - 4 * 3600, last_spoken_text=OLD_ANSWER,
+                     last_sent=NOW - 4 * 3600, last_proactive_sent=NOW - 4 * 3600,
+                     last_proactive_replied=False, pending_result='waiting',
                      topics=[OLD_QUESTION],
                      conversation=[
                          {'dir': 'in', 'text': OLD_QUESTION, 'ts': NOW - 500 * 3600},
@@ -47,6 +49,28 @@ class PrivateTurnTest(unittest.IsolatedAsyncioTestCase):
                 sent, _ = await self.send(eng, user, candidate)
                 self.assertFalse(sent)
                 eng._send_with_retry.assert_not_awaited()
+
+    async def test_answer_shaped_draft_waits_for_a_peer_turn(self):
+        for candidate in ('不冷呀🐾', '真的不冷啦。', '（拢拢翅膀）不过你一问就不冷啦。'):
+            with self.subTest(candidate=candidate):
+                eng, user = self.make_case()
+                sent, _ = await self.send(eng, user, candidate)
+                self.assertFalse(sent)
+                eng._send_with_retry.assert_not_awaited()
+
+    async def test_unanswered_context_does_not_block_a_new_question(self):
+        eng, user = self.make_case()
+        sent, reason = await self.send(eng, user, '下午的面试还顺利吗？')
+        self.assertTrue(sent, reason)
+        eng._send_with_retry.assert_awaited_once()
+
+    async def test_manual_send_does_not_apply_proactive_answer_shape_gate(self):
+        eng, user = self.make_case()
+        eng.generator = SimpleNamespace(generate=AsyncMock(return_value=['不冷呀🐾']))
+        sent, reason = await eng._speak_inner('b1', 'u1', user, 0.0, NOW, allow_veto=False,
+                                              preset=('', {'category': 'greet', 'mode': 'greet_morning'}))
+        self.assertTrue(sent, reason)
+        eng._send_with_retry.assert_awaited_once()
 
     async def test_invented_chore_is_blocked_even_without_a_plan(self):
         eng, user = self.make_case()

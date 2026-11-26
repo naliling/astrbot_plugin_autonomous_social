@@ -88,8 +88,15 @@ ANCHOR_MAX_TRIES = 2
 # 且它们的 TTL 最长 24h，不会长期滞留。
 KIND_CUE = "cue"           # 对方说的时间锚点到期了
 KIND_DERIVED = "derived"   # 从她自己的状态派生的一件具体的事
-KIND_MISS = "miss"         # 想念：好感够、又想了一阵子（不是有正事要说）
-KIND_GREET = "greet"       # 问候：没事干，随口说一句看看你回不回
+KIND_MISS = "miss"         # Legacy persisted kind; not generated from elapsed silence
+KIND_GREET = "greet"       # Legacy persisted kind; no longer generated
+
+_LEGACY_SILENCE_ONLY_ABOUT = frozenset({
+    "有点想你了",
+    "在干嘛呢",
+    "闲着没事，跟你说句话",
+    "突然想找你聊两句",
+})
 KIND_HOLIDAY = "holiday"   # 节日：今天是个节，顺口提一句
 KIND_WEATHER = "weather"   # 天气：外头变了样（下雨/降温），一句观察
 # v1.28.0：梦。Core 2.28 起契约的 `day.dreams` 才给这个字段；旧版 Core 没有，
@@ -195,12 +202,8 @@ WAKE_FRESH_SECONDS = 2 * 3600.0
 # 但 state.json 可能被手改、也可能 Core 换了时区。容忍 10 分钟，超过就当读不出来。
 WAKE_CLOCK_SKEW_SECONDS = 600.0
 
-# 每一个已知 kind 都必须在这里有一档。漏了的话 `live_anchors` 的
-# `KIND_RANK.get(kind, 9)` 会把它当成最低优先级——`KIND_GREET` 就漏过一次，
-# 而 `derive_nag` 造的正是一堆 greet：它明明是最常见的一类，却排在**所有**派生类
-# 之后（默认 9），比天气还低。
-# 数字只用来排序，允许留空档（0 档随 KIND_PROMISE 一起删了）；
-# `live_anchors` 里 `KIND_RANK.get(kind, 9)` 的默认 9 是给表外的 kind 的兜底。
+# Numeric ranks preserve stable ordering for stored anchors. Legacy miss/greet kinds remain
+# readable, while silence-only items are filtered before selection.
 KIND_RANK = {
     KIND_CUE: 1,
     # 梦排在第二档：刚醒那阵子最想说的就是它，比「今天想去」更具体、更有画面。
@@ -1384,10 +1387,10 @@ def prepare_round_anchors(
     last_talk: Optional[float] = None,
     missing_floor: float = 60.0,
 ) -> List[Dict[str, Any]]:
-    """本轮这个人可以用的由头：存量池 + 当场派生。
+    """Return live anchors and facts derived from recent, concrete context.
 
-    `relational=True` 时只走关系向（想念/牵挂/续聊），用于「念想」通道——那一类
-    说的必须是关于 TA，而不是她自己今天干了什么。`affection` 是好感度，想念那一档要用。
+    `relational=True` limits new candidates to peer-context facts. Elapsed silence and
+    affection never create a candidate; the legacy arguments remain for call compatibility.
     """
     prune_anchors(u, now)
     if tier:
@@ -1401,11 +1404,15 @@ def prepare_round_anchors(
     # 这一维上纯属摆设。这里把上限收到池容量，三档才真的有区别：
     #   high 5 / mid 4 / low 3（变更前 12 / 8 / 4，而实际永远 ≤ 5）。
     limit = min(int(limit), ANCHOR_MAX)
-    RELATIONAL_KINDS = (KIND_MISS, KIND_GREET, KIND_CUE)
-    picked: List[Dict[str, Any]] = live_anchors(
-        u, now, limit=limit,
+    RELATIONAL_KINDS = (KIND_CUE,)
+    available = live_anchors(
+        u, now, limit=ANCHOR_MAX,
         kinds=RELATIONAL_KINDS if relational else None,
     )
+    picked: List[Dict[str, Any]] = [
+        item for item in available
+        if _s(item.get("kind")) not in (KIND_GREET, KIND_MISS)
+    ][:limit]
 
     used = _remembered(u, now)
     for a in picked:
@@ -1418,16 +1425,11 @@ def prepare_round_anchors(
         candidates = derive_relations(
             u, affection, now, used, last_talk=last_talk, missing_floor=missing_floor
         )
-        kind = KIND_MISS
-        # v1.28.7：关系向里再补一类——「TA 上次说的那个X，后来呢」。素材是
-        # `u["topics"]`（每人一套，天然不撞车），比「有点想你了」具体得多。
+        kind = KIND_CUE
+        # Add a concrete remembered topic only when it came from the peer context.
         #
-        # **它有自己的额度**（`TOPIC_QUOTA`），不是「剩几个补几个」：
-        # `derive_relations` 常常正好返回两条（想念 + 搭话），按剩余额度算的话
-        # 话题由头一次都排不上——而它恰恰是最具体的那一类。所以只要关系向
-        # 没占满整个池子，就按额度补；补满额度或池子满即停。
-        #
-        # 顺序在关系向之后：牵挂/续聊/想念是更近的事，话题由头是「翻旧账」。
+        # A concrete remembered topic has its own quota; keep it after recent peer-context cues.
+        # Fill only while the pool has room, and never synthesize a topic from elapsed silence.
         if len(candidates) < limit:
             for line in derive_topic_relations(
                 u, now, used, limit=TOPIC_QUOTA, last_talk=last_talk
@@ -1435,16 +1437,6 @@ def prepare_round_anchors(
                 if len(candidates) >= limit:
                     break
                 candidates.append(line)
-        # 手上真没有新事发生 —— 真人这时候会随口说一句，不至于硬找个话题。
-        # 「你有多久没理我了」本身就是理由。
-        if not candidates:
-            gap_candidates = derive_nag(u, now, used, tier=tier, last_talk=last_talk)
-            if gap_candidates:
-                # 存量优先：`picked` 里已到点的关系向由头不能因为「当场也派生出了
-                # 一句搭话」就整批丢掉——那会让 `_miss_pick` 本来能在旧由头上开口的
-                # 机会白挂一轮，还把那句通用搭话消费进 7 天冷却。
-                # 原来直接 `return gap_candidates` 就是这个后果。
-                return list(picked) + list(gap_candidates)
     else:
         candidates = _derive_from_state(
             body, u, now, used, last_talk=last_talk, kinds=candidate_kinds
@@ -1636,12 +1628,7 @@ def _quotable(seg: str) -> bool:
 # 3. **不与已问过的重复**：`used`（`_remembered` + 本轮 picked）已经挡掉大多数，
 #    这里再按「最后一次出现」排一次序，让最新的先说。
 _TOPIC_FRESH_SECONDS = 21 * 86400.0
-# 关系向由头里，话题类最多占几条。
-#
-# 为什么是额度而不是「剩几个补几个」：`derive_relations` 常常正好返回两条
-# （想念 + 搭话），按剩余额度算的话话题由头一次都排不上——而它恰恰是
-# 最具体的那类（「你上次说的那个塞尔达」比「有点想你了」信息量大得多）。
-# 给 2 而不是更多：话题由头是「翻旧账」，一轮里翻两本就够了。
+# Limit concrete topic anchors so they cannot crowd out recent care cues.
 TOPIC_QUOTA = 2
 
 
@@ -1785,144 +1772,24 @@ def derive_relations(
         if out and out[-1].startswith("你上次说的"):
             break
 
-    # 想念：好感够 + 安静了一阵子。
-    # 走 _finite：nan 会让下面两个 `aff >= floor` 恒为 False，一个好感度坏掉的用户
-    # 连「有点想你了」和搭话都永远开不出口（静默少发，没有任何日志）。
-    aff = _finite(affection)
-    if aff is None:
-        aff = 0.0
-    floor = _finite(missing_floor)
-    if floor is None:
-        floor = 0.0
-    if aff >= floor and since >= 5 * 3600.0:
-        offer("有点想你了")
-    # 搭话：没什么事，就是想找 TA 说句话。关系不算生、也安静了一会儿，就开个口。
-    # 这是「她会主动打开话头」的那一类——**不需要对方先说过什么**。
-    if aff >= floor and since >= 2 * 3600.0:
-        for text in _CASUAL_OPENERS:
-            if text not in taken:
-                offer(text)
-                break
     return out
 
 
-# ── 没有新事发生时的由头 ──────────────────────────────────────────
-#
-# 真人「没事干问候一句，看你回不回」是常态：他不需要一个由头，**安静本身**就是理由。
-# 以前问候硬绑早/午/晚三个日历窗口，一天最多三次，还必须从固定句池抽一句——
-# 池子不消耗，于是某一晚连着 23 条全是同一件事。
-#
-# v1.28.7：三档 → 七档，且**按关系档位换措辞**。
-#
-# 原来只有 6h/3h/90min 三档，每档一辈子只说一次（用完进 7 天冷却）。三档用完
-# 之后，这个人当天、这周就再也没有「没事干」的开口理由了——用户看到的
-# 「私聊发送没看到几个」有一部分就是这个：不是不想说，是无话可说。
-#
-# 加档不等于多说话：门槛由 `_min_gap_left`（高档 20 分钟 / 中档 1 小时 / 低档
-# 12 小时）与 `miss_daily_cap` 管着，这里只是**把已经等了那么久这件事变成一句
-# 可说出口的话**。七档各自的措辞见 `_NAG_BY_GAP`。
-_NAG_BY_GAP = (
-    (7 * 86400.0, "都好几天没你的消息了"),
-    (24 * 3600.0, "昨天之后就没顾上跟你说话"),
-    (12 * 3600.0, "大半天没动静了"),
-    # v2.1.8（issue #4）：这两档原来写的是「你好久没理我了」「刚才怎么没声了」。
-    # 问题不在长短，在归因——它们把「对方没说话」说成了「对方欠了我」，一句
-    # 由头变成了责备；用户收到的不是「她想起我了」，是「她来要账了」。这一档
-    # 等待时间最短（25 分钟~6 小时），本来只是找个由头搭句话，更不该带情绪账。
-    (6 * 3600.0, "好一阵没你消息了"),
-    (3 * 3600.0, "好半天没动静了，你还在吗"),
-    (60 * 60.0, "有个把小时没跟你说话了"),
-    (25 * 60.0, "方才怎么安静了"),
-)
 
-# 按关系档位换措辞：对熟人可以说「想你了」，对半生不熟的人说这句很怪。
-#
-# **三张表各自独立，互不共用句子**：共用的话分组就白做了——`tier` 传空串时
-# 走通用档，共用句子意味着「算不出档位」和「算出是熟人」会说出同一句，
-# 而这两件事本该给出不同的观感。
-# 长档（好几天）三种关系都成立，所以三张表都覆盖到 7 天；低档只有两档，
-# 因为 `TIER_MIN_GAP_MINUTES[LOW] = 720` 分钟——它压根等不到 6 小时以下。
-#
-# 分组的作用是把「同一句话发给所有人」拆开——与跨用户撞车护栏是两个方向：
-# 护栏是发之后拦，这是发之前就不生成同一句。
-_NAG_BY_TIER = {
-    TIER_HIGH: (
-        (7 * 86400.0, "好几天没跟你好好说话了"),
-        (24 * 3600.0, "一天没跟你说话了，有点想找你"),
-        (12 * 3600.0, "大半天没你消息，怪不习惯"),
-        (6 * 3600.0, "好几个小时没你消息，想你了"),
-        (3 * 3600.0, "隔了会儿没说话，忽然想找你"),
-        (60 * 60.0, "有个把小时没找你说话了"),
-        (25 * 60.0, "怎么忽然没声了"),
-    ),
-    TIER_MID: (
-        (7 * 86400.0, "都好几天没你的消息了"),
-        (24 * 3600.0, "昨天之后就没顾上跟你说话"),
-        (12 * 3600.0, "大半天没动静了，你还忙吗"),
-        (6 * 3600.0, "一整个下午没你消息"),
-        (3 * 3600.0, "几小时没说话，还顺利吗"),
-        (60 * 60.0, "有一个钟头没说话了"),
-        (25 * 60.0, "刚那会儿怎么没声了"),
-    ),
-    TIER_LOW: (
-        (7 * 86400.0, "好久不见，你最近怎么样"),
-        (24 * 3600.0, "一天没消息了，近来可好"),
-    ),
-}
-
-# 通用档与三张分档表**刻意共用长档那几句**（7 天 / 24 小时）。理由：
-# 那两句对三种关系都成立，分组是为了把「想你了」这类亲昵话拆开，
-# 不是为了把每一句都改写一遍——硬改写只会得到「好久没你的音讯了」
-# 这种不像人话的句子。
-#
-# 所以唯一性检查只覆盖**中短档**（24 小时以下）：那才是关系差异真正显出来
-# 的地方。共用的清单写在这里，测试按它断言——不写的话，下次有人给
-# 通用档加一句短档措辞，分组就悄悄失效了。
-_NAG_SHARED_LONG_TIERS = ("都好几天没你的消息了", "昨天之后就没顾上跟你说话")
-
-# 「没事也想搭一句话」的开场白。与 `_NAG_BY_GAP` 的区别：那些是抱怨（你不理我），
-# 这些是**中性搭话**（在干嘛呢）。用过的会进由头冷却，不会天天同一句。
-_CASUAL_OPENERS = (
-    "在干嘛呢",
-    "闲着没事，跟你说句话",
-    "突然想找你聊两句",
-)
 
 
 def derive_nag(u: Dict[str, Any], now: float, taken: set, *, tier: str = "",
                last_talk: Optional[float] = None) -> List[str]:
-    """安静了一阵子 → 随口问一句。
-
-    v1.28.7：按关系档位取措辞（`_NAG_BY_TIER`），取不到才退回通用档
-    （`_NAG_BY_GAP`）。tier 传空串（调用方算不出档位）时直接走通用档——
-    那是「不知道她跟这个人多熟」，用最中性的一句最安全。
-    """
-    seen = _talk_ts(u, last_talk)
-    if seen <= 0:
-        return []
-    gap = max(0.0, now - seen)
-    out: List[str] = []
-    rows = _NAG_BY_TIER.get(str(tier or "")) or _NAG_BY_GAP
-    for need, text in rows:
-        if gap >= need and text not in taken:
-            taken.add(text)
-            out.append(text)
-            break
-    if not out:
-        return []
-    item = add_anchor(u, KIND_GREET, out[0], now=now, ttl=TTL_DAY_PART)
-    if item is None:
-        return []
-    item.setdefault("tries", 0)
-    return [item]
+    """Compatibility stub; elapsed silence alone does not create an anchor."""
+    return []
 
 
 # ── 转成给模型看的一句「为什么现在说这个」 ───────────────────────
 
 _REASON_BY_KIND = {
-    KIND_CUE: "TA之前说过的那个时间到了",
-    KIND_MISS: "你最近一直在想TA",
-    KIND_GREET: "你们有一阵子没说话了",
+    KIND_CUE: "TA近期对话中的线索",
+    KIND_MISS: "已记录上下文中的线索",
+    KIND_GREET: "已记录的背景线索",
     KIND_DERIVED: "你自己这边刚发生的事",
     KIND_DREAM: "她昨晚做了个梦",
     KIND_HOLIDAY: "今天是个节日",
@@ -1958,11 +1825,9 @@ def _flat(text: Any) -> str:
 
 
 def anchor_sentence(a: Dict[str, Any]) -> str:
-    """把一条由头写成提示词里的一句「给定事实」。
+    """Render a flattened anchor for legacy callers; prompt callers may omit it.
 
-    关键在于它是**陈述**，不是提问。模型不需要「去找话题」——它只需要就这件事
-    写一句话。之前让模型自己回答「你有什么由头」，得到的必然是
-    「想表达此刻的孤独」这种关于说话而不是关于内容的句子。
+    Peer-provided wording remains factual context, not an inferred feeling or a required topic.
     """
     about = _flat(a.get("about")) or "一件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
@@ -1979,46 +1844,39 @@ def anchor_sentence(a: Dict[str, Any]) -> str:
 
 
 def anchor_meta(a: Dict[str, Any]) -> Dict[str, Any]:
-    """由头驱动的那一类的 preset 元数据。
-
-    `about` 是那件事本身（会给到模型作「要说哪件事」的答案），不是让模型去
-    找话题——之前让它自己回答「你有什么由头」，得到的必然是关于说话而不是
-    关于内容的句子。
-    """
-    # 同一个 `about` 也进 `msg_type_desc`（「就那件事说句话：{about}」），
-    # 换行在那句里同样是伪造指令行的入口，所以两处都走 `_flat`。
+    """Build prompt metadata without turning an anchor into a required topic."""
     about = _flat(a.get("about")) or "这件事"
     kind = _s(a.get("kind")) or KIND_DERIVED
     retired = _s(a.get("retired"))
     mode = {
         KIND_CUE: "loop",
-        KIND_MISS: "miss",
+
         KIND_HOLIDAY: "holiday",
     }.get(kind, "share")
+    reason_code = {
+        KIND_CUE: "peer_context",
+        KIND_MISS: "legacy_miss",
+        KIND_GREET: "legacy_greet",
+        KIND_HOLIDAY: "calendar_context",
+    }.get(kind, "personal_context")
+    fact_source = "TA近期对话中的线索" if kind == KIND_CUE else "已记录上下文"
     return {
         "category": "anchor",
         "intent": "anchor",
         "mode": mode,
         "kind": kind,
+        "reason_code": reason_code,
         "msg_type": "share_thought",
-        "msg_type_desc": f"就那件事说句话：{about}",
-        # 想念这一类：明说「这条是关于 TA 的」，因为它是唯一一个**没有正事**的通道，
-        # 模型很容易滑回「我今天怎么样」。
-        "style_hint": (
-            "这条是关于TA的，不是讲你自己；就这件事说，别解释你为什么现在说它；"
-            "一句话说完整：说清是什么事，别只丢半句让人猜"
-            if kind == KIND_MISS else
-            "就这件事，别重新起话题，也别解释你为什么现在说它；"
-            "一句话说完整：说清是什么事，别只丢半句让人猜"
-        ),
+        "msg_type_desc": "一条自然的主动消息",
+        "style_hint": "这条事实是可选背景；只在自然相关时参考，也可以不提。",
         "about": about,
         "anchor": dict(a),
-        # 这条由头的去向，一栏说清："" 还没结束 / sent 真发出去了 /
-        # failed 试满 ANCHOR_MAX_TRIES 没写成 / cross_user 让位给别人。
-        # `reason` 保留给老面板看（跨用户撞车那一路原来把话写在这里）。
+        # Preserve these fields for existing UI and retirement consumers.
         "retired": retired,
         "retired_note": _RETIRED_NOTE.get(retired, ""),
         "reason": _s(a.get("reason")) or _RETIRED_NOTE.get(retired, ""),
-        # 给提示词的那句「给定事实」
-        "anchor_fact": anchor_sentence(a),
+        "anchor_fact": (
+            f"来源：{fact_source}；按你对TA说话的口吻记述，其中“我”指你自己、“你”指TA；"
+            f"转述TA原话的部分仍按TA视角理解，生成时转换人称，不要照抄：\n{about}"
+        ),
     }

@@ -70,32 +70,21 @@ class LocalMaterialsTest(unittest.TestCase):
         self.assertEqual(groupflow.local_materials("nope"), [])
 
 
-class GroupProactiveGateTest(unittest.TestCase):
-    """破冰/起话头原来只过 `_verify_all_segments`，纯评价照样进群。"""
-
-    def test_empty_weather_greeting_is_rejected(self):
-        why = engine_mod._group_proactive_issue(["早啊，今天风挺大"])
-        self.assertTrue(why, "只有一句空话，不该发")
-
-    def test_concrete_daily_event_passes(self):
+class SegmentPassthroughTest(unittest.TestCase):
+    def test_generated_segments_and_waits_are_preserved(self):
+        segments = ["我这边刚收拾完，你那边呢", "是啊"]
+        waits = [1.5]
         self.assertEqual(
-            engine_mod._group_proactive_issue(["下午去银行回来路上买了花"]), ""
+            engine_mod._cap_group_segments(segments, waits, cap=3),
+            (segments, waits),
         )
 
-    def test_self_action_passes(self):
+    def test_over_cap_draft_is_rejected_without_merging(self):
+        segments = ["第一段", "第二段", "第三段"]
         self.assertEqual(
-            engine_mod._group_proactive_issue(["（把翅膀拢了拢）刚把水烧上"]), ""
+            engine_mod._cap_group_segments(segments, [1.0, 2.0], cap=2),
+            ([], []),
         )
-
-    def test_sideways_you_is_rejected(self):
-        why = engine_mod._group_proactive_issue(["我这边刚收拾完，你那边呢"])
-        self.assertIn("某个人", why)
-
-    def test_pure_echo_is_rejected(self):
-        self.assertTrue(engine_mod._group_proactive_issue(["是啊是啊"]))
-
-    def test_empty_is_rejected(self):
-        self.assertTrue(engine_mod._group_proactive_issue([]))
 
 
 class _FakeState:
@@ -121,30 +110,21 @@ class _FakeEngine:
         return False
 
 
-class SleepChanceTest(unittest.TestCase):
-    """睡着不再等于群侧全哑：低概率放行，但不会变成半夜刷屏。"""
+class SleepStateGateTest(unittest.TestCase):
+    def test_asleep_state_is_passed_to_the_group_gate_unchanged(self):
+        seen = []
 
-    def test_constant_is_low(self):
-        self.assertGreater(engine_mod.ASLEEP_PROACTIVE_CHANCE, 0.0)
-        self.assertLess(engine_mod.ASLEEP_PROACTIVE_CHANCE, 0.5, "别变成半夜刷屏")
+        def due(_group, _now, **kwargs):
+            seen.append(kwargs.get("asleep"))
+            return not kwargs.get("asleep")
 
-    def _pick(self, chance):
         with mock.patch.object(
             engine_mod, "_person_flow_state", lambda *_a, **_k: (False, True)
-        ), mock.patch.object(
-            engine_mod, "ASLEEP_PROACTIVE_CHANCE", chance
-        ), mock.patch.object(
-            groupflow,
-            "icebreak_due",
-            lambda _g, _now, **kw: not kw.get("asleep"),
-        ):
-            return engine_mod.SocialEngine._icebreak_pick(_FakeEngine(), "b1", NOW)
+        ), mock.patch.object(groupflow, "icebreak_due", due):
+            picked = engine_mod.SocialEngine._icebreak_pick(_FakeEngine(), "b1", NOW)
 
-    def test_chance_one_treats_her_as_awake(self):
-        self.assertEqual(len(self._pick(1.0)), 1)
-
-    def test_chance_zero_keeps_the_gate_closed(self):
-        self.assertEqual(self._pick(0.0), [])
+        self.assertEqual(seen, [True])
+        self.assertEqual(picked, [])
 
 
 class GroupDailyCapTest(unittest.TestCase):

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v2.2.47：让她「想说就说」，别让口头禅和重复开头替她开口。
+"""主动生成正文保持原样，不按口头禅或开头频率改写。
 
 用户原话：「1的一天只能主动12条不行 要么没限制要么把这个删掉 我要的是那个人的主动
 人是想说就说的」+「2的解决掉提升质量 3同样要提升质量」。
@@ -58,16 +58,16 @@ class UnlimitedGroupCapTest(unittest.TestCase):
         self.assertTrue(engine_mod.SocialEngine._group_daily_exhausted(eng, "b1", "2026-11-11"))
 
 
-class FlowOpeningRotationTest(unittest.TestCase):
+class FlowOpeningDoesNotGateTest(unittest.TestCase):
     """心流也要有开头轮换（v2.2.7 只接了破冰/起话头）。"""
 
-    def test_flow_rejects_repeated_opening(self):
+    def test_flow_allows_repeated_opening(self):
         openings = ["刚睡醒", "刚把茶喝完", "刚趴窗边看外头"]
         why = engine_mod._flow_quality_issue(
             ["刚用蹄子夹着杯子泡茶，洒了半桌"], openings
         )
-        self.assertTrue(why)
-        self.assertIn("刚", why)
+        self.assertEqual(why, "")
+        self.assertEqual(why, "")
 
     def test_flow_allows_other_opening(self):
         openings = ["刚睡醒", "刚把茶喝完", "刚趴窗边看外头"]
@@ -78,46 +78,45 @@ class FlowOpeningRotationTest(unittest.TestCase):
 
     def test_flow_without_openings_still_checks_rest(self):
         why = engine_mod._flow_quality_issue(["你们说得对"], None)
-        self.assertTrue(why)  # 纯附和仍被拦
+        self.assertEqual(why, "")  # 纯附和不再因风格被拦
 
 
-class FillerHeadAtSendGateTest(unittest.TestCase):
-    """口头禅在发送口摘掉——主动消息与群消息从来不过 tidy_outgoing。"""
+class OutputTextPassThroughTest(unittest.TestCase):
+    """主动生成内容不在发送口被改写。"""
 
-    def _eng(self, recent):
-        eng = engine_mod.SocialEngine.__new__(engine_mod.SocialEngine)
-        eng.recent_spoken_texts = lambda count=6: list(recent)
-        return eng
+    def _eng(self):
+        return engine_mod.SocialEngine.__new__(engine_mod.SocialEngine)
 
-    def test_strips_when_overused(self):
-        eng = self._eng(["唔……今天累", "唔 急什么", "唔哈 突然"])
-        got = engine_mod._polish_filler_head(eng, "唔……最喜欢你了")
-        self.assertEqual(got, "最喜欢你了")
+    def test_overused_filler_is_preserved(self):
+        eng = self._eng()
+        got = engine_mod.SocialEngine.tidy_outgoing(eng, "唔……最喜欢你了", "b1")
+        self.assertEqual(got, "唔……最喜欢你了")
 
     def test_keeps_when_rare(self):
-        eng = self._eng(["今天累", "急什么", "突然用力"])
-        got = engine_mod._polish_filler_head(eng, "唔……最喜欢你了")
+        eng = self._eng()
+        got = engine_mod.SocialEngine.tidy_outgoing(eng, "唔……最喜欢你了", "b1")
         self.assertEqual(got, "唔……最喜欢你了")
 
     def test_keeps_action_prefix(self):
-        eng = self._eng(["唔……今天累", "唔 急什么", "唔哈 突然"])
-        got = engine_mod._polish_filler_head(eng, "（蹭了蹭）唔……我知道了")
-        self.assertIn("我知道了", got)
+        eng = self._eng()
+        got = engine_mod.SocialEngine.tidy_outgoing(eng, "（蹭了蹭）唔……我知道了", "b1")
+        self.assertEqual(got, "（蹭了蹭）唔……我知道了")
 
     def test_never_empties(self):
-        eng = self._eng(["唔……今天累", "唔 急什么", "唔哈 突然"])
-        self.assertTrue(engine_mod._polish_filler_head(eng, "唔").strip())
+        eng = self._eng()
+        self.assertTrue(engine_mod.SocialEngine.tidy_outgoing(eng, "唔", "b1").strip())
 
     def test_stub_safe(self):
-        got = engine_mod._polish_filler_head(types.SimpleNamespace(), "唔……你好")
+        got = engine_mod.SocialEngine.tidy_outgoing(types.SimpleNamespace(), "唔……你好", "b1")
         self.assertEqual(got, "唔……你好")
 
     def test_wired_into_send_gate(self):
         src = engine_mod.__file__
-        raw = io.open(src, encoding="utf-8", newline="").read()
-        self.assertIn("_polish_filler_head(self, text)", raw)
-        idx = raw.index("_polish_filler_head(self, text)")
-        self.assertLess(idx, raw.index("for attempt in range(1 + max(0, int(SEND_RETRY_COUNT)))"))
+        with io.open(src, encoding="utf-8", newline="") as stream:
+            raw = stream.read()
+        self.assertNotIn("_polish_filler_head", raw)
+        self.assertIn("await self._send_message(target, text)", raw)
+
 
 
 if __name__ == "__main__":

@@ -155,7 +155,6 @@ _NEW_METHODS = (
     "_rhythm_gate",
     "_budget_gate",
     "_generate_parts",
-    "_review_draft",
     "_note_send_ok",
     "_note_send_failure",
     "_breaker_slot",
@@ -424,14 +423,15 @@ class RhythmGateTest(unittest.TestCase):
         )
         self.assertEqual(("", ""), eng._rhythm_gate("bid1", "u1", now=NOW))
 
-    def test_rhythm_exception_fail_open(self):
+    def test_rhythm_exception_fails_closed(self):
         def boom(*args, **kwargs):
             raise RuntimeError("rhythm down")
 
         broken = SimpleNamespace(closing_hold=boom, burst_state=boom, round_allows=boom)
         eng = self._engine_with(("u1", "delivered", 10))
         with mock.patch.object(engine_mod, "_opt_module", return_value=broken):
-            self.assertEqual(("", ""), eng._rhythm_gate("bid1", "u1", now=NOW))
+            code, _ = eng._rhythm_gate("bid1", "u1", now=NOW)
+        self.assertEqual("rhythm_unavailable", code)
 
 
 # ─── 四、投递预算 ────────────────────────────────────────────────
@@ -465,14 +465,16 @@ class BudgetGateTest(unittest.TestCase):
         with mock.patch.object(engine_mod, "_opt_module", return_value=None):
             self.assertFalse(eng._budget_gate("bid1", "u1", now=NOW)[0])
 
-    def test_budget_exception_fail_open(self):
+    def test_budget_exception_fails_closed(self):
         def boom(*args, **kwargs):
             raise RuntimeError("budget down")
 
         broken = SimpleNamespace(occupancy=boom, budget_allows=boom)
         eng = self._engine_with(*[("u1", "unknown", 10 * i) for i in range(6)])
         with mock.patch.object(engine_mod, "_opt_module", return_value=broken):
-            self.assertFalse(eng._budget_gate("bid1", "u1", now=NOW)[0])
+            full, text = eng._budget_gate("bid1", "u1", now=NOW)
+        self.assertTrue(full)
+        self.assertIn("无法确认", text)
 
 
 # ─── 五、工具循环 ────────────────────────────────────────────────
@@ -565,45 +567,11 @@ class ToolLoopTest(unittest.TestCase):
         self.assertEqual(["异步结果"], parts)
 
 
-# ─── 六、生成后自评 ──────────────────────────────────────────────
-class DraftReviewTest(unittest.TestCase):
-    def _review(self, gen, parts, cfg=None, decision=None, cards=None):
-        eng = _engine(generator=gen, cfg=cfg or SimpleNamespace(draft_review_enabled=True))
-        return _run(eng._review_draft(parts, decision, cards))
-
-    def test_flag_off_returns_parts(self):
-        gen = _FakeGenerator(review={"verdict": "drop"})
-        out = self._review(gen, ["正文"], cfg=SimpleNamespace(draft_review_enabled=False))
-        self.assertEqual(["正文"], out)
-        self.assertEqual([], gen.review_calls)
-
-    def test_drop_returns_none(self):
-        gen = _FakeGenerator(review={"verdict": "drop"})
-        self.assertIsNone(self._review(gen, ["正文"]))
-
-    def test_rewrite_replaces_text(self):
-        gen = _FakeGenerator(review={"verdict": "rewrite", "text": "改过的"})
-        self.assertEqual(["改过的"], self._review(gen, ["正文"]))
-
-    def test_ok_returns_parts(self):
-        gen = _FakeGenerator(review={"verdict": "ok"})
-        self.assertEqual(["正文"], self._review(gen, ["正文"]))
-
-    def test_error_returns_parts(self):
-        gen = _FakeGenerator(review_error=RuntimeError("review down"))
-        self.assertEqual(["正文"], self._review(gen, ["正文"]))
-
-    def test_awaitable_result_awaited(self):
-        gen = _AsyncReviewGenerator(review={"verdict": "drop"})
-        self.assertIsNone(self._review(gen, ["正文"]))
-
-    def test_non_dict_result_returns_parts(self):
-        gen = _FakeGenerator(review="随便什么")
-        self.assertEqual(["正文"], self._review(gen, ["正文"]))
-
-    def test_rewrite_empty_text_returns_parts(self):
-        gen = _FakeGenerator(review={"verdict": "rewrite", "text": "   "})
-        self.assertEqual(["正文"], self._review(gen, ["正文"]))
+# ─── 六、普通输出不经过二次审稿 ───────────────────────────────────
+class DraftReviewBoundaryTest(unittest.TestCase):
+    def test_engine_has_no_post_generation_review_transform(self):
+        self.assertFalse(hasattr(SocialEngine, "_review_draft"))
+        self.assertFalse(hasattr(SocialEngine, "_note_grounded"))
 
 
 # ─── 七、发送记账 ────────────────────────────────────────────────

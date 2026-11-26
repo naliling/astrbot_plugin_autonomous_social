@@ -505,17 +505,17 @@ class VolumeDefaultsTest(unittest.TestCase):
     def test_schema_and_code_agree(self):
         schema = self._schema()
         cfg = self._cfg()
-        for key in ("max_sends_per_round", "miss_daily_cap", "hourly_sends_cap"):
+        for key in ("max_sends_per_round", "hourly_sends_cap"):
             self.assertEqual(
                 getattr(cfg, key), schema[key]["default"],
                 f"{key}：代码默认 {getattr(cfg, key)} ≠ schema {schema[key]['default']}",
             )
 
     def test_volume_went_up(self):
-        """v1.28.6 起的量比 v1.28.5 宽松（用户反馈「私聊发送没看到几个」）。"""
+        """Configured round and hourly send limits remain consistent with schema."""
         cfg = self._cfg()
         self.assertGreaterEqual(cfg.max_sends_per_round, 2)
-        self.assertGreaterEqual(cfg.miss_daily_cap, 3)
+
         self.assertGreaterEqual(cfg.hourly_sends_cap, 4)
 
 

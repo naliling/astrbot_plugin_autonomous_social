@@ -191,9 +191,9 @@ class FlowPromptContextTest(unittest.TestCase):
 
     def test_model_is_told_it_may_skip(self):
         prompt = self._prompt(groupflow.flow_context_note([], "小明"))
-        self.assertIn("你可以不插", prompt)
-        self.assertIn("否则 NO", prompt)
-        self.assertIn("别叫正在聊的那几个人的名字", prompt)
+        self.assertIn("没有需要发送的内容时答 NO", prompt)
+        self.assertIn("只写一行 NO", prompt)
+        self.assertIn("不需要为了活跃气氛而参与", prompt)
 
     def test_no_context_adds_no_block(self):
         prompt = self._prompt("")
@@ -202,7 +202,7 @@ class FlowPromptContextTest(unittest.TestCase):
 
     def test_two_step_judgement_points_at_the_context_block(self):
         prompt = self._prompt("群里现在是 阿哲 和 小鱼 在来回聊")
-        self.assertIn("先看【现在的群聊语境】", prompt)
+        self.assertIn("【现在的群聊语境】", prompt)
         # 旧的硬性口径（「大家在对着某个具体的人说事就别接」）改成了「接不上就 NO」
         self.assertNotIn("大家在对着某个具体的人说事", prompt)
 
@@ -229,7 +229,7 @@ class FlowMentionPromptTest(unittest.TestCase):
             "flow", {"members": ["小明"]}, "人设", 40
         )
         self.assertNotIn("小明", prompt)
-        self.assertIn("不要点名任何群友", prompt)
+        self.assertIn("别叫任何群友的名字", prompt)
 
 
 class InterjectConfigTest(unittest.TestCase):

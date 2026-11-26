@@ -658,16 +658,10 @@ class BehaviourSwitchOptionTest(unittest.TestCase):
         self.assertFalse(_cfg(track_own_replies=False).track_own_replies)
         self.assertFalse(_cfg(adaptive_reply_rate=False).adaptive_reply_rate)
 
-    def test_miss_daily_cap_clamped(self):
-        self.assertEqual(_cfg(miss_daily_cap=-1).miss_daily_cap, 0)
-        self.assertEqual(_cfg(miss_daily_cap=999).miss_daily_cap, 10)
-        # v1.28.6：2 → 3（用户反馈「私聊发送没看到几个」）
-        self.assertEqual(_cfg().miss_daily_cap, 3)
-
-    def test_miss_affection_min_clamped(self):
-        self.assertEqual(_cfg(miss_affection_min=-1).miss_affection_min, 0)
-        self.assertEqual(_cfg(miss_affection_min=999).miss_affection_min, 100)
-        self.assertEqual(_cfg().miss_affection_min, 42)
+    def test_retired_miss_settings_are_not_exposed(self):
+        cfg = _cfg(miss_daily_cap=3, miss_affection_min=42)
+        self.assertFalse(hasattr(cfg, "miss_daily_cap"))
+        self.assertFalse(hasattr(cfg, "miss_affection_min"))
 
     def test_reply_window_clamped(self):
         self.assertEqual(_cfg(reply_window_hours=0).reply_window_hours, REPLY_WINDOW_MIN)

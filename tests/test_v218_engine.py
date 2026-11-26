@@ -46,6 +46,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 from social import groupflow  # noqa: E402
 from social.config import SocialConfig  # noqa: E402
 from social.engine import SocialEngine  # noqa: E402
+from social.threads import thread_reason  # noqa: E402
 
 NOW = 1_800_000_000.0
 
@@ -263,38 +264,21 @@ def _run_icebreak(stub):
     )
 
 
-class NoQuestionTest(unittest.TestCase):
-    """用户原话「破冰全是低质询问」：默认不许提问，只给「素材里真有具体计划」留一个小口。"""
+class IcebreakOutputTest(unittest.TestCase):
+    """自然问句可以原样发送；NO 仍是模型可选的结果。"""
 
-    def test_no_question_is_the_default(self):
-        stub = _icebreak_stub([None])
-        self.assertFalse(_run_icebreak(stub))
-        self.assertTrue(stub.calls, "应该已经走到生成")
-        self.assertIs(stub.calls[0]["no_question"], True)
-
-    def test_question_output_is_regenerated_then_sent(self):
-        stub = _icebreak_stub([["你们今天都干嘛呢？"], ["早啊，我刚把窗户推开，风挺大"]])
+    def test_question_is_sent_unchanged_after_one_generation(self):
+        question = "你们今天都干嘛呢？"
+        stub = _icebreak_stub([[question]])
         self.assertTrue(_run_icebreak(stub))
-        self.assertEqual(len(stub.calls), 2, "第一次是问句，应该重生成一次")
-        self.assertEqual(stub.sent, ["早啊，我刚把窗户推开，风挺大"])
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.sent, [question])
 
-    def test_three_questions_means_silence_not_a_reworded_question(self):
-        stub = _icebreak_stub([["你们今天都干嘛呢？"]])
+    def test_no_choice_skips_sending(self):
+        stub = _icebreak_stub([[]])
         self.assertFalse(_run_icebreak(stub))
-        self.assertEqual(len(stub.calls), 3)
-        self.assertEqual(stub.sent, [], "三次都问句就这次不发，不能换个问法再问")
-
-    def test_specific_plan_allows_a_question(self):
-        # 素材里有「打算/想去」这种具体计划，且最近没有问句惯性 → 允许顺着计划问。
-        stub = _icebreak_stub([None], topic_hint="我打算周末去爬山")
-        self.assertFalse(_run_icebreak(stub))
-        self.assertIs(stub.calls[0]["no_question"], False)
-
-    def test_question_habit_keeps_the_gate_closed(self):
-        # 最近 5 条里问句占比不为 0：说明她最近一直在查岗，这次即使有素材也不许问。
-        stub = _icebreak_stub([None], q_pressure=0.4, topic_hint="我打算周末去爬山")
-        self.assertFalse(_run_icebreak(stub))
-        self.assertIs(stub.calls[0]["no_question"], True)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.sent, [])
 
 
 class GroupContextWindowTest(unittest.TestCase):
@@ -323,66 +307,50 @@ class GroupContextWindowTest(unittest.TestCase):
         self.assertIsNone(eng._build_group_ctx("b1", "g1", g)["addressed"])
 
 
-class HotContinueTest(unittest.TestCase):
-    """用户原话「私聊时模型在聊完一句不会选择继续发言」：热聊里 6 分钟就能接。"""
+class ContinueAfterWindowTest(unittest.TestCase):
+    """The configured continue_after window controls candidate eligibility."""
 
-    @staticmethod
-    def _u(entries):
-        return {"conversation": [dict(e) for e in entries]}
-
-    def test_hot_exchange_allows_six_minutes(self):
-        eng = _engine(continue_enabled=True)
-        entries = []
-        for i in range(3):
-            entries.append({"dir": "in", "text": f"对方{i}", "ts": NOW - 300 + i * 20})
-            entries.append({"dir": "out", "text": f"她{i}", "ts": NOW - 290 + i * 20})
-        self.assertEqual(eng._hot_continue_after(self._u(entries), NOW), 360.0)
-
-    def test_last_word_is_theirs_so_she_waits(self):
-        eng = _engine(continue_enabled=True)
-        entries = []
-        for i in range(3):
-            entries.append({"dir": "out", "text": f"她{i}", "ts": NOW - 300 + i * 20})
-            entries.append({"dir": "in", "text": f"对方{i}", "ts": NOW - 290 + i * 20})
-        self.assertEqual(eng._hot_continue_after(self._u(entries), NOW), 0.0)
-
-    def test_one_sided_chatter_is_not_a_hot_exchange(self):
-        eng = _engine(continue_enabled=True)
-        entries = [{"dir": "out", "text": f"她{i}", "ts": NOW - 300 + i * 10} for i in range(6)]
-        self.assertEqual(eng._hot_continue_after(self._u(entries), NOW), 0.0)
-
-    def test_stale_exchange_is_not_hot(self):
-        eng = _engine(continue_enabled=True)
-        entries = []
-        for i in range(3):
-            entries.append({"dir": "in", "text": f"对方{i}", "ts": NOW - 4000 + i * 20})
-            entries.append({"dir": "out", "text": f"她{i}", "ts": NOW - 3990 + i * 20})
-        self.assertEqual(eng._hot_continue_after(self._u(entries), NOW), 0.0)
-
-    def test_continue_disabled_means_zero(self):
-        eng = _engine(continue_enabled=False)
-        entries = [{"dir": "in", "text": "a", "ts": NOW - 10}]
-        self.assertEqual(eng._hot_continue_after(self._u(entries), NOW), 0.0)
-
-
-class HotContinueWhyTest(unittest.TestCase):
-    """面板/日志要能看出「6 分钟就接」是热聊顺延，不是配置没生效。"""
-
-    def test_hot_continue_is_marked(self):
-        eng = _engine(continue_after_minutes=25)
-        why = SocialEngine._why_now(
-            eng, "b1", {"urge": 0.0}, "continue", "",
-            {"category": "continue", "silence_minutes": 6}, NOW,
+    def _candidate(self, gap_seconds):
+        eng = _engine(
+            followup_enabled=False,
+            continue_enabled=True,
+            continue_after_minutes=25,
+            continue_window_hours=8,
         )
-        self.assertIn("热聊顺延", why)
+        rec = eng.state.user("b1", "u1")
+        conversation = [
+            ("in", "周末想看电影", 8 * 60),
+            ("out", "我也有点想看", 6 * 60),
+            ("in", "那周六呢", 4 * 60),
+            ("out", "我看看安排", 2 * 60),
+            ("in", "好呀", 60),
+            ("out", "到时告诉你", 0),
+        ]
+        rec.update({
+            "umo": "aiocqhttp:FriendMessage:u1",
+            "last_seen": NOW - gap_seconds - 60,
+            "last_spoken": NOW - gap_seconds,
+            "last_message": "好呀",
+            "last_spoken_text": "到时告诉你",
+            "conversation": [
+                {"dir": direction, "text": text, "ts": NOW - gap_seconds - offset}
+                for direction, text, offset in conversation
+            ],
+        })
+        # Isolate eligibility from unrelated quiet-hour and cooldown gates.
+        eng.thread_gate = lambda *_args, **_kwargs: ""
+        return SocialEngine._thread_pick(eng, "b1", NOW, None), eng._thread_windows()[4]
 
-    def test_normal_continue_is_not_marked(self):
-        eng = _engine(continue_after_minutes=25)
-        why = SocialEngine._why_now(
-            eng, "b1", {"urge": 0.0}, "continue", "",
-            {"category": "continue", "silence_minutes": 40}, NOW,
-        )
-        self.assertNotIn("热聊顺延", why)
+    def test_recent_exchange_below_configured_window_is_not_a_candidate(self):
+        candidate, wait_seconds = self._candidate(6 * 60)
+        self.assertEqual(wait_seconds, 25 * 60)
+        self.assertIsNone(candidate)
+
+    def test_candidate_is_allowed_at_configured_window(self):
+        candidate, wait_seconds = self._candidate(25 * 60)
+        self.assertEqual(wait_seconds, 25 * 60)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate[2], "continue")
 
 
 class OwnStyleTest(unittest.TestCase):

@@ -409,7 +409,7 @@ class GenerateFinishPartsTest(unittest.TestCase):
         gen._finish_parts = lambda *a, **k: ["SPY"]
         self.assertEqual(_run(gen.generate("umo", {}, "ctx", "reason", None, "人设")), ["SPY"])
 
-    def test_intent_line_is_stripped_like_the_other_path(self):
+    def test_title_like_body_text_is_preserved_without_rewriting(self):
         gen = self._gen()
 
         async def fake_compose(*args, **kwargs):
@@ -421,7 +421,7 @@ class GenerateFinishPartsTest(unittest.TestCase):
         gen._compose = fake_compose
         gen._call_llm = fake_call
         out = _run(gen.generate("umo", {}, "ctx", "reason", None, "人设"))
-        self.assertEqual(out, ["对了你面试咋样"])
+        self.assertEqual(out, ["#想问他面试\n对了你面试咋样"])
 
 
 class ComposeClockAndBudgetTest(unittest.TestCase):

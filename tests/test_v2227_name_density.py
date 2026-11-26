@@ -135,30 +135,12 @@ def _engine(state, **cfg):
     return eng
 
 
-class HintWiringTest(unittest.TestCase):
-    def test_hint_contains_name_fact(self):
-        eng = _engine(_state("蝴蝶忍", BUTTERFLY))
-        hint = eng.reply_echo_hint(BID, UID)
-        self.assertIn("都叫了对方的名字「蝴蝶忍」", hint)
-        self.assertIn("名字不用每句都叫", hint)
-
-    def test_hint_clean_history_has_no_name_fact(self):
-        eng = _engine(_state("蝴蝶忍", ["我先睡了", "刚把茶喝完", "外头冷"]))
-        hint = eng.reply_echo_hint(BID, UID)
-        self.assertNotIn("都叫了对方的名字", hint)
-
-    def test_guard_off_returns_empty(self):
-        eng = _engine(_state("蝴蝶忍", BUTTERFLY), reply_echo_guard=False)
-        self.assertEqual(eng.reply_echo_hint(BID, UID), "")
-
-    def test_source_wiring(self):
-        src = (os.path.join(PLUGIN_ROOT, "social", "engine.py"))
-        with open(src, encoding="utf-8") as fh:
-            code = fh.read()
-        self.assertIn("name_density_tics(wide, peer_name)", code)
-        self.assertIn("名字不用每句都叫", code)
-        vsrc = open(os.path.join(PLUGIN_ROOT, "social", "verify.py"), encoding="utf-8").read()
-        self.assertIn("def name_density_tics(", vsrc)
+class HintWiringRetiredTest(unittest.TestCase):
+    def test_name_statistics_do_not_feed_ordinary_reply_injection(self):
+        self.assertFalse(hasattr(engine_mod.SocialEngine, "reply_echo_hint"))
+        with open(os.path.join(PLUGIN_ROOT, "main.py"), encoding="utf-8") as fh:
+            main_source = fh.read()
+        self.assertNotIn("on_llm_request", main_source)
 
 
 if __name__ == "__main__":

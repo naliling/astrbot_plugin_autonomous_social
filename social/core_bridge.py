@@ -693,7 +693,7 @@ class CoreBridge:
         它们回答「她现在在干什么」，几天前的答案会让模型一本正经地说瞎话。
 
         保留：identity（她是谁，稳定）、body 标量（energy 等，读方本来按「最近已知值」
-        用）、feelings/form（表达约束，不是时刻事实）、contract_v 与新鲜度标记。
+        用）、feelings（情绪）、contract_v 与新鲜度标记。
         """
         view["activity"] = {}
         view["routine"] = {}
@@ -883,7 +883,6 @@ class CoreBridge:
         # Core 已经把能量翻成人话了（"精神不错"/"有点发沉"），比自己再翻一遍准
         view["energy_text"] = str(body.get("energy_text") or "").strip()
         view["feelings"] = contract.get("feelings") or []
-        view["form"] = contract.get("form") or {}
         view["activity"] = contract.get("activity") or {}
         core_time = contract.get("time") or {}
         view["core_time"] = core_time

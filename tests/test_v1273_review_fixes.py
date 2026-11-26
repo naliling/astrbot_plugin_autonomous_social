@@ -66,19 +66,23 @@ class TitleLineTest(unittest.TestCase):
         ok, why = verify.verify_message("刚忙完\n好累啊", recent=[])
         self.assertTrue(ok, f"正常人话被拦了：{why}")
 
-    def test_single_line_title_is_still_rejected(self):
-        ok, why = verify.verify_message("处理完个案笔记", recent=[])
-        self.assertFalse(ok, "单行标题样子的消息仍应拒发")
-        self.assertIn("标题", why)
+    def test_single_line_prose_is_not_rejected_for_style(self):
+        ok, why = verify.verify_hard_safety("处理完个案笔记")
+        self.assertTrue(ok, f"不应仅因像标题拒发：{why}")
+
+    def test_natural_intent_wording_is_not_a_safety_failure(self):
+        text = "想找个借口跟你说话，最近怎么样？"
+        self.assertEqual((True, ""), verify.verify_hard_safety(text))
 
     def test_very_short_single_line_is_kept(self):
         """一两个字的极简回话不是标题（原判据靠整条长度放行，这里保持一致）。"""
         self.assertFalse(verify.is_title_like("早"))
         self.assertFalse(verify.is_title_like("嗯"))
 
-    def test_title_with_body_still_gets_stripped(self):
-        out = verify.strip_title_line("早餐时刻\n早安，一只深蓝。来陪我说说话？")
-        self.assertTrue(out.startswith("早安"), f"正文没保住：{out!r}")
+    def test_title_like_body_is_preserved(self):
+        text = "早餐时刻\n早安，一只深蓝。来陪我说说话？"
+        out = verify.tidy_outgoing_text(text)
+        self.assertEqual(out, text)
 
 
 class LoopClosedTest(unittest.TestCase):
@@ -474,7 +478,7 @@ def _speak_inner_stub(*, parts, raw_text="原始输出", tier=None,
         hourly_sends_cap=0,
         llm_gate=True,
         allow_burst=False,
-        cross_user_repeat_hours=0,
+        anchor_repeat_cooldown_hours=0,
         store_message_text=False,
     )
     stub._time = lambda: 2000.0
@@ -530,6 +534,7 @@ def _speak_inner_stub(*, parts, raw_text="原始输出", tier=None,
             stub, u2, platform_side=platform_side, reason=reason
         )
     )
+    stub._delivery_rows = lambda *a, **k: []
     stub._note_giveup = lambda u2, bid, now: SocialEngine._note_giveup(stub, u2, bid, now)
 
     decision = SimpleNamespace(raw_text=raw_text, send=True, parts=list(parts))
@@ -952,7 +957,7 @@ class RawGeneratedIsLocalTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejection_does_not_write_an_instance_field(self):
         stub, u = _speak_inner_stub(
-            parts=["处理完个案笔记"], raw_text="（模型原文）",
+            parts=["#intent: share\n处理完个案笔记"], raw_text="#intent: share\n处理完个案笔记",
         )
         sent, why = await SocialEngine._speak_inner(
             stub, "b", "u1", u, 2.0, 1000.0,
@@ -960,7 +965,7 @@ class RawGeneratedIsLocalTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(sent)
         self.assertIn("验收不过", why)
-        self.assertEqual(stub._m["last_rejected"], "（模型原文）")
+        self.assertEqual(stub._m["last_rejected"], "#intent: share\n处理完个案笔记")
         self.assertFalse(
             hasattr(stub, "_raw_generated"),
             "原文又写回了实例级单字段，并发发送会互相污染",
@@ -1064,7 +1069,7 @@ class ConfigNumericToleranceTest(unittest.TestCase):
             "urge_refill_hours": "xyz",
             "loop_min_hours": "zzz",
             "loop_max_hours": "zzz",
-            "cross_user_repeat_ratio": "nope",
+            "anchor_repeat_cooldown_hours": "nope",
             "activity_level": None,
             "quiet_start": [1, 2],
             "user_cooldown_minutes": {"a": 1},
@@ -1073,7 +1078,7 @@ class ConfigNumericToleranceTest(unittest.TestCase):
         })
         self.assertIsInstance(cfg.activity_level, int)
         self.assertIsInstance(cfg.quiet_start, int)
-        self.assertIsInstance(cfg.cross_user_repeat_ratio, float)
+        self.assertIsInstance(cfg.anchor_repeat_cooldown_hours, float)
         self.assertIsInstance(cfg.loop_min_hours, float)
 
     def test_numeric_strings_are_still_accepted(self):
@@ -1082,11 +1087,11 @@ class ConfigNumericToleranceTest(unittest.TestCase):
 
         cfg = SocialConfig.from_astrbot({
             "urge_refill_hours": "12",
-            "cross_user_repeat_ratio": "0.5",
+            "anchor_repeat_cooldown_hours": "0.5",
             "input_state_interval_seconds": "1.5",
         })
         self.assertEqual(cfg.urge_refill_hours, 12)
-        self.assertEqual(cfg.cross_user_repeat_ratio, 0.5)
+        self.assertEqual(cfg.anchor_repeat_cooldown_hours, 0.5)
         self.assertEqual(cfg.input_state_interval_seconds, 1.5)
 
     def test_out_of_range_value_is_clamped_not_raised(self):
@@ -1210,43 +1215,19 @@ def _load_main_module():
     return module
 
 
-class MainProactiveContextLeakTest(unittest.IsolatedAsyncioTestCase):
-    """#68：`private_only=False`（用户正是为了开群聊功能才关掉它）时，**私聊**主动
-    消息的原文会被注入到**群聊**这一轮的 LLM 请求里 → 私聊内容泄漏到群。"""
+class MainProactiveContextLeakTest(unittest.TestCase):
+    """No passive request path may expose proactive private text to any conversation."""
 
-    def _obj(self, is_group, consumed):
+    def test_request_hook_and_mutation_path_are_absent(self):
         main_mod = _load_main_module()
-
-        def consume(bid, uid):  # 引擎里这个是同步方法
-            consumed.append((bid, uid))
-            return "私聊里说过的话"
-
-        obj = object.__new__(main_mod.AutonomousSocial)
-        obj._engine = SimpleNamespace(
-            cfg=SimpleNamespace(enabled=True, private_only=False),
-            _get_bot_id=lambda ev: "bot",
-            _get_sender_id=lambda ev: "u1",
-            consume_pending_proactive_context=consume,
-        )
-        obj._is_group = lambda ev: is_group
-        return main_mod, obj
-
-    async def test_group_request_never_gets_private_proactive_text(self):
-        consumed = []
-        _main_mod, obj = self._obj(True, consumed)
-        req = SimpleNamespace(contexts=[], extra_user_content_parts=[])
-        await obj.inject_proactive_context(SimpleNamespace(), req)
-        self.assertEqual(consumed, [], "群聊请求里取走了私聊主动消息的原文")
-        self.assertEqual(req.contexts, [])
-        self.assertEqual(req.extra_user_content_parts, [])
-
-    async def test_private_request_still_gets_it(self):
-        """反向对照：私聊路径不能被一起砍掉。"""
-        consumed = []
-        _main_mod, obj = self._obj(False, consumed)
-        req = SimpleNamespace(contexts=[], extra_user_content_parts=[])
-        await obj.inject_proactive_context(SimpleNamespace(), req)
-        self.assertEqual(consumed, [("bot", "u1")])
+        with open(main_mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("on_llm_request", src)
+        self.assertNotIn("inject_proactive_context", src)
+        self.assertNotIn("consume_pending_proactive_context", src)
+        self.assertNotIn("req.contexts", src)
+        self.assertNotIn("extra_user_content_parts", src)
+        self.assertFalse(hasattr(main_mod.AutonomousSocial, "inject_proactive_context"))
 
 
 class MainTriggerWhitelistTest(unittest.TestCase):
@@ -1817,8 +1798,7 @@ class AnchorFullPoolKeepsNewcomerTest(unittest.TestCase):
 
 
 class RelationalBranchKeepsDueAnchorsTest(unittest.TestCase):
-    """P1-3：relational 分支在 `derive_relations` 无产出时直接 `return gap_candidates`，
-    把 `picked` 里已到点的存量由头整批丢掉（`_miss_pick` 白挂一轮 + 通用搭话被消费）。"""
+
 
     def test_due_relational_anchor_is_not_dropped(self):
         from social import anchors as anchors_mod
@@ -1841,8 +1821,8 @@ class RelationalBranchKeepsDueAnchorsTest(unittest.TestCase):
         self.assertEqual(
             abouts[0], "你上次说的面试", "存量由头没有排在当场派生的由头前面"
         )
-        self.assertGreater(len(picks), 1, "derive_nag 的搭话没有一起给出（用例前提不成立）")
-        self.assertIn("好半天没动静了，你还在吗", abouts)
+        self.assertEqual(1, len(picks), "到点的关系锚应保留，但不再附加强制沉默搭话")
+        self.assertNotIn("好半天没动静了，你还在吗", abouts)
         # 两条都是池内真实记录，不是悬空引用。
         pool = [anchors_mod._s(a.get("about")) for a in anchors_mod.load_anchors(u)]
         for text in abouts:
@@ -2107,17 +2087,10 @@ class GroupPromptInjectionTest(unittest.TestCase):
 
     def test_latest_quote_lines_carry_a_boundary_declaration(self):
         prompt = self._prompt()
-        latest = [ln for ln in prompt.splitlines() if ln.startswith("【群里最新的一句")]
-        self.assertEqual(len(latest), 1, f"最新一句那一行不唯一：{latest!r}")
-        self.assertIn("当普通文字", latest[0], "【群里最新的一句】没有免责句")
-
-        # v2.1.8：这一行从「要接就**接最后那句**（…：「…」）」改成
-        # 「最后一句是（…：「…」）」，引文与免责句的相对位置没变，所以判据跟着改：
-        # 找到**带引文的那个指令行**，它仍然必须自带「当普通文字/忽略它」。
-        instr = [ln for ln in prompt.splitlines() if "最后一句是（" in ln]
-        self.assertEqual(len(instr), 1, f"「最后一句是（…）」那一行不唯一：{instr!r}")
-        self.assertIn("当普通文字", instr[0], "带引文的指令行没有免责句")
-        self.assertIn("忽略", instr[0])
+        latest = [ln for ln in prompt.splitlines() if ln.startswith("【群里最近一句")]
+        self.assertEqual(len(latest), 1, f"群里最近一句那一行不唯一：{latest!r}")
+        self.assertIn("当普通文字", latest[0])
+        self.assertIn("不要求回应", prompt)
 
 
 class GroupRecentSanitizingTest(unittest.TestCase):
@@ -2178,11 +2151,11 @@ class GeneratorInputGuardTest(unittest.TestCase):
         self.assertIn("在吗", out)
         self.assertNotIn("oops", out, "脏元素没有让整轮生成挂掉，但也不该进 prompt")
 
-    def test_send_without_colon_is_stripped(self):
+    def test_send_without_colon_is_preserved(self):
         from social.generator import MessageGenerator
 
         out = MessageGenerator._clean_output("SEND对了你面试后来咋样", 60, allow_emoji=True)
-        self.assertEqual(out, "对了你面试后来咋样", "无冒号的 SEND 被当正文发出去了")
+        self.assertEqual(out, "SEND对了你面试后来咋样")
         # 英文缩写与中文标记仍必须带冒号，否则正常正文会被削掉开头
         for kept in ("OK啦今天真累", "要发工资了", "可以发朋友圈了"):
             self.assertEqual(
@@ -2209,14 +2182,10 @@ class _StubProviderCtx:
         return _StubProvider()
 
 
-class IntentLineStrippedOnDirectPathsTest(unittest.IsolatedAsyncioTestCase):
-    """P2：`_strip_intent` 只在 `_parse_decision` 里调用过。
+class IntentTextParsingBoundaryTest(unittest.IsolatedAsyncioTestCase):
+    """Private generated text is preserved; group parsing removes its exact header."""
 
-    `generate()` 与破冰这两条路径直接 `_split_parts`，于是模型写的动机行
-    （`#想问他面试`）成了发出去的正文首行，而 verify 拦不住它。
-    """
-
-    async def test_generate_drops_intent_line(self):
+    async def test_generate_preserves_model_text(self):
         from social.generator import MessageGenerator
 
         gen = MessageGenerator(None, None)
@@ -2237,9 +2206,9 @@ class IntentLineStrippedOnDirectPathsTest(unittest.IsolatedAsyncioTestCase):
             {"msg_type_desc": "说点什么"},
             "人设",
         )
-        self.assertEqual(parts, ["我明天要去面试了"], "动机行被当成正文首行发出去了")
+        self.assertEqual(parts, ["#想问他面试\n我明天要去面试了"])
 
-    async def test_icebreak_drops_intent_line(self):
+    async def test_icebreak_removes_only_exact_protocol_header(self):
         from social.generator import MessageGenerator
 
         gen = MessageGenerator(None, None)
@@ -2253,15 +2222,11 @@ class IntentLineStrippedOnDirectPathsTest(unittest.IsolatedAsyncioTestCase):
         gen._get_provider = _fake_provider
         gen._call_llm = _fake_call
         parts = await gen.group_message("u", "icebreak", {}, "人设")
-        self.assertEqual(parts, ["今天真冷啊"], "动机行被当成破冰首行发出去了")
+        self.assertEqual(parts, ["今天真冷啊"])
 
 
-class CoreFormMaxCharsFloorTest(unittest.IsolatedAsyncioTestCase):
-    """P2：Core 传来的 `form.max_chars` **没有下界校验**。
-
-    实测 `max_len=0` → 整条静默丢、负值 → 从尾部切。cfg.max_message_length 已被
-    config 夹住，洞只来自 Core。恒真值（`"0"`/负数/小数）才走得到那一行。
-    """
+class LegacyCoreFormIgnoredTest(unittest.IsolatedAsyncioTestCase):
+    """Legacy Core form fields must not shape ASO output."""
 
     async def _prepared(self, form):
         from social.generator import MessageGenerator
@@ -2278,26 +2243,25 @@ class CoreFormMaxCharsFloorTest(unittest.IsolatedAsyncioTestCase):
             decide=True, at=1_700_000_000.0,
         )
 
-    async def test_out_of_range_caps_are_floored(self):
-        from social.generator import MAX_MSG_LEN_MIN
-
-        for cap in ("0", -5, 0.5):
-            with self.subTest(cap=cap):
-                prepared = await self._prepared({"max_chars": cap})
-                self.assertIsNotNone(prepared, f"max_chars={cap!r} 把整轮生成弄丢了")
-                self.assertGreaterEqual(prepared[2], MAX_MSG_LEN_MIN)
-
-    async def test_non_numeric_cap_is_ignored(self):
+    async def test_legacy_form_does_not_change_prompt_or_local_hard_cap(self):
         from social.generator import DEFAULT_MAX_LENGTH
 
-        prepared = await self._prepared({"max_chars": "abc"})
-        self.assertIsNotNone(prepared)
-        self.assertEqual(prepared[2], DEFAULT_MAX_LENGTH)
-
-    async def test_normal_cap_still_applies(self):
-        prepared = await self._prepared({"max_chars": 30})
-        self.assertIsNotNone(prepared)
-        self.assertEqual(prepared[2], 30)
+        baseline = await self._prepared({})
+        self.assertIsNotNone(baseline)
+        self.assertEqual(baseline[2], DEFAULT_MAX_LENGTH)
+        forms = (
+            {"max_chars": 0, "long_reply_ok": False, "burst_ok": False, "question_bias": 0.0},
+            {"max_chars": -5, "long_reply_ok": False, "burst_ok": False, "question_bias": 0.0},
+            {"max_chars": 30, "long_reply_ok": True, "burst_ok": True, "question_bias": 1.0},
+            {"max_chars": 10000, "long_reply_ok": True, "burst_ok": True, "question_bias": 1.0},
+            {"max_chars": "abc", "long_reply_ok": False, "burst_ok": False, "question_bias": -1.0},
+        )
+        for form in forms:
+            with self.subTest(form=form):
+                prepared = await self._prepared(form)
+                self.assertIsNotNone(prepared)
+                self.assertEqual(prepared[1], baseline[1])
+                self.assertEqual(prepared[2], baseline[2])
 
 
 class ConfigSliderKeyTest(unittest.TestCase):

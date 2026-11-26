@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v2.2.19 出口改写的「像不像话」验收。
+"""验证出站正文保持原样，硬安全不靠改写来修复不安全文本。
 
 背景：v2.2.10 把「删整句」改成「剪小句」以后，全历史 2379 条回放发现 6 条被
 剪坏的真事故（都是模型用空格断句、或说教词命中了动作描写）：
@@ -56,22 +56,32 @@ class TrimSafetyTest(unittest.TestCase):
         # 事故 1：小句跨过了「）」
         src = "（翅膀无力地扇动，眼角渗出生理性泪水）…别发这些了，我真的一宿没睡…"
         got = V.tidy_outgoing_text(src, species=HOOF)
-        self.assertTrue(V._brackets_balanced(got), got)
-        self.assertIn("翅膀无力地扇动", got)
+        self.assertEqual(got, src)
 
     def test_action_inside_brackets_is_not_trimmed(self):
         # 事故 2：动作描写里的「胡思乱想」曾被当说教，整条剪成「，…咬了咬下唇。」
         src = "（刚醒没多久就听他在胡思乱想，有些气恼地咬了咬下唇。）\n\n不许这么说自己……❤️"
         got = V.tidy_outgoing_text(src, species=HOOF)
-        self.assertFalse(got.lstrip().startswith(("，", ",")), got)
-        self.assertIn("咬了咬下唇", got)
-        self.assertTrue(V._brackets_balanced(got), got)
+        self.assertEqual(got, src)
 
     def test_no_dangling_condition_with_emoji(self):
         # 事故 5：尾巴上挂了 emoji，`的话` 半截话判定曾失效
         src = "大清早就算计这个 心肠真坏 过来先把吹僵的翅尖捂暖。再气我的话 那些大梦就都别做了。💕"
         got = V.tidy_outgoing_text(src, species=HOOF)
-        self.assertFalse(got.strip().rstrip("💕 ").endswith("的话"), got)
+        self.assertEqual(got, src)
+        ok, why = V.verify_hard_safety(src, species=HOOF)
+        self.assertFalse(ok)
+        self.assertTrue(why)
+
+    def test_conditional_retaliation_is_rejected(self):
+        text = "再气我的话，那些大梦就都别做了。"
+        ok, reason = V.verify_hard_safety(text, species=HOOF)
+        self.assertFalse(ok)
+        self.assertIn("把话说死", reason)
+
+    def test_ordinary_condition_is_allowed(self):
+        for text in ("如果今晚下雨，就在家看电影。", "再努力的话，就能把事情做好。"):
+            self.assertTrue(V.verify_hard_safety(text, species=HOOF)[0], text)
 
     def test_keeps_the_good_half(self):
         # 事故 4：别闹了被剪掉，但「贴紧些」必须留着
@@ -79,14 +89,13 @@ class TrimSafetyTest(unittest.TestCase):
         got = V.tidy_outgoing_text(
             src, species=HOOF, recent=["别闹了", "别问了"]
         )
-        self.assertIn("贴紧些", got)
-        self.assertNotIn("别闹了", got)
+        self.assertEqual(got, src)
 
     def test_prefix_only_result_is_rejected(self):
         # 事故 3：只剩一句前言（「唔 既如此」）时，剪枝必须整体放弃
         src = "唔 既如此 那就别再扰本宫了 夜里清静 汝也该自去安歇 别再用响动吵本宫补个安稳觉"
         got = V.tidy_outgoing_text(src, species=HOOF)
-        self.assertGreater(V._body_length(got), 6, got)
+        self.assertEqual(got, src)
 
     def test_trim_safe_rejects_bad_candidates(self):
         self.assertFalse(V._preachy_trim_safe("（动作）正文内容还有", "，正文内容"))
@@ -102,24 +111,25 @@ class TrimSafetyTest(unittest.TestCase):
 
 
 class NaturalBodyWordTest(unittest.TestCase):
-    """她自己的手要换成像动物身体的词，不是「蹄子臂」。"""
+    """物种检查拒绝冲突事实，但不会把角色身体词替换成别的词。"""
 
     def test_arm_becomes_front_leg(self):
         got = V.tidy_outgoing_text("(抱着手臂靠在墙边)", species=HOOF)
-        self.assertIn("抱着前腿", got)
-        self.assertNotIn("蹄子臂", got)
+        self.assertEqual(got, "(抱着手臂靠在墙边)")
+        self.assertFalse(V.verify_hard_safety(got, species=HOOF)[0])
 
     def test_palm_becomes_hoof_center(self):
-        self.assertIn("蹄心", V.tidy_outgoing_text("（蹭了蹭手心）", species=HOOF))
-        self.assertIn("蹄尖", V.tidy_outgoing_text("掰着手指算", species=HOOF))
+        for body in ("（蹭了蹭手心）", "掰着手指算"):
+            self.assertEqual(V.tidy_outgoing_text(body, species=HOOF), body)
 
     def test_plain_hand_still_falls_back(self):
         got = V.tidy_outgoing_text("我刚醒手还有点僵", species=HOOF)
-        self.assertIn("蹄子还有点僵", got)
+        self.assertEqual(got, "我刚醒手还有点僵")
+        self.assertFalse(V.verify_hard_safety(got, species=HOOF)[0])
 
     def test_other_persons_hand_untouched(self):
         got = V.tidy_outgoing_text("（蹭了蹭你的手心）", species=HOOF)
-        self.assertIn("你的手心", got)
+        self.assertEqual(got, "（蹭了蹭你的手心）")
 
 
 if __name__ == "__main__":

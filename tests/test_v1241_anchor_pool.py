@@ -213,11 +213,13 @@ class AnchorLevelCrossUserGuard(unittest.TestCase):
         self.assertIn("刚忙完个案笔记", _remembered(u, now),
                       "没进 remembered → 下一轮还会重新派生同一件事")
 
-    def test_engine_checks_the_event_not_the_wording(self):
+    def test_engine_uses_only_the_current_users_anchor_cooldown(self):
         from social import engine as engine_mod
         src = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        self.assertIn("anchor_recent_users", src, "事件级护栏没接上")
-        self.assertIn("刚发给过别人", src)
+        self.assertIn("anchor_used_for(", src)
+        self.assertIn("anchor_repeat_cooldown_hours", src)
+        self.assertNotIn("_check_cross_user", src)
+        self.assertNotIn("recent_proactive_others", src)
 
 
 class PressureGuard(unittest.TestCase):

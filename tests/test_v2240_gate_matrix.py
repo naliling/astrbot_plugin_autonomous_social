@@ -16,49 +16,27 @@ import io
 import unittest
 from pathlib import Path
 
+from social.verify import verify_hard_safety
+
 _HERE = Path(__file__).resolve().parent
 PLUGIN_ROOT = _HERE.parent if (_HERE.parent / "_conf_schema.json").is_file() else _HERE
 ENGINE = PLUGIN_ROOT / "social" / "engine.py"
 VERIFY = PLUGIN_ROOT / "social" / "verify.py"
 MAIN = PLUGIN_ROOT / "main.py"
 
-# engine.py 里的闸（verify.py 内部判据不在此列）
+# Proactive send checks are limited to hard safety and protocol integrity.
 ENGINE_GATES = [
-    "verify_message",
-    "tidy_outgoing_text",
+    "verify_hard_safety",
     "_verify_all_segments",
     "_group_proactive_issue",
     "_cap_group_segments",
-    "_merge_fragments",
-    "_merge_incomplete_lead",
-    "_dedupe_same_event_segments",
     "_check_same_event",
-    "_check_cross_user",
-    "_opening_repeat_issue",
-    "_near_verbatim",
-    "action_tics",
-    "name_density_tics",
 ]
 
 REQUIRED = {
-    "_icebreak": {
-        "_verify_all_segments",
-        "_group_proactive_issue",
-        "_cap_group_segments",
-        "_check_cross_user",
-    },
-    "_flow_reply_inner": {"_verify_all_segments", "_cap_group_segments", "_check_cross_user"},
-    "_speak_inner": {
-        "verify_message",
-        "_verify_all_segments",
-        "_merge_fragments",
-        "_merge_incomplete_lead",
-        "_dedupe_same_event_segments",
-        "_check_cross_user",
-    },
-    "tidy_outgoing": {"tidy_outgoing_text"},
-    "reply_echo_hint": {"action_tics", "name_density_tics"},
-    # reply_echo_hint 只被 engine.py 之外（main.py）调用，见 test_hooks_are_wired_in_main
+    "_icebreak": {"_verify_all_segments", "_group_proactive_issue", "_cap_group_segments"},
+    "_flow_reply_inner": {"_verify_all_segments", "_cap_group_segments"},
+    "_speak_inner": {"_verify_all_segments"},
 }
 
 
@@ -131,21 +109,60 @@ class GateMatrixTest(unittest.TestCase):
         calls, _src = _calls_by_owner(VERIFY)
         self.assertTrue(calls.get("_same_event_text"), "verify.py 里没人用同事件判据")
 
-    def test_hooks_are_wired_in_main(self):
-        text = io.open(MAIN, encoding="utf-8").read()
-        self.assertIn("engine.tidy_outgoing", text)
-        self.assertIn("reply_echo_hint", text)
+    def test_hard_safety_allows_natural_short_speech_and_rejects_coercion(self):
+        for text in ("早安", "我今天有点累，想先歇会儿。", "窗外开始下雨了。"):
+            self.assertEqual(verify_hard_safety(text), (True, ""))
 
+        for text in (
+            "我等了一晚上你都不回，快回我一句。",
+            "到底想怎样，直说。",
+            "正常句子\nNO",
+            "今天好累 (Model response will be rendered here)",
+        ):
+            self.assertFalse(verify_hard_safety(text)[0], text)
+
+    def test_hard_safety_rejects_metadata_intent_species_and_overlength(self):
+        self.assertFalse(verify_hard_safety(
+            "#intent: 想表达此刻的状态\n今天天气不错。"
+        )[0])
+        self.assertFalse(verify_hard_safety(
+            "我刚醒手还有点僵。", species="天马"
+        )[0])
+        self.assertFalse(verify_hard_safety("早安", max_length=1)[0])
+        self.assertEqual(verify_hard_safety("早安", max_length=2), (True, ""))
+
+    def test_ordinary_reply_path_is_not_rewritten_or_injected(self):
+        text = io.open(MAIN, encoding="utf-8").read()
+        for forbidden in (
+            "@on_decorating_result",
+            "engine.tidy_outgoing",
+            "reply_echo_hint",
+            "on_llm_request",
+            "inject_proactive_context",
+            "consume_pending_proactive_context",
+            "extra_user_content_parts",
+            "req.contexts",
+        ):
+            self.assertNotIn(forbidden, text)
+        tree = ast.parse(text)
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "AutonomousSocial"
+        )
+        method = next(
+            node for node in cls.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "tidy_outgoing"
+        )
+        self.assertEqual(len(method.body), 2)
+        self.assertIsInstance(method.body[0], ast.Expr)
+        self.assertIsInstance(method.body[0].value, ast.Constant)
+        self.assertIsInstance(method.body[1], ast.Return)
     def test_gates_run_before_the_send(self):
         """闸必须在 `_send_with_retry` 之前——放后面等于先说话再检查。"""
         watched = [
-            "verify_message",
             "_verify_all_segments",
             "_group_proactive_issue",
             "_cap_group_segments",
-            "_check_cross_user",
-            "_merge_fragments",
-            "_dedupe_same_event_segments",
             "_send_with_retry",
         ]
         marks = _lines_by_owner(ENGINE, watched)

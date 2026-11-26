@@ -304,29 +304,13 @@ URGE_REFILL_MAX = 96
 # 1.5 之后同样的 interest 是 0.64/h，约 3.3~4.3 小时够一次——这才是「一晚上想找人
 # 说句话」的量级。要更快就继续往下调，别指望改名字。
 URGE_REFILL_DEFAULT = 1.5
-# 跨用户撞车：同一 bot 近 N 小时发给别人的消息，和这条重合度到这个线就拦。
-#
-# 2.0.8：0.6 → 0.88、2.0 → 0.5 小时。0.6 太松——同一句「刚忙完个案笔记」换个说法
-# 就能过（实测跨用户撞车一次没拦住，报告 P1-3），而拦截总量 57 次里绝大多数是
-# 一天里不同时段的正常重复。收紧到 0.88 才拦得住「几乎逐字相同」，窗口收到 0.5
-# 小时才只拦「这一小时内给别人发过同样的话」——真正会让人看出「群发」的那个窗口。
-CROSS_USER_REPEAT_RATIO_DEFAULT = 0.88
-CROSS_USER_REPEAT_HOURS_DEFAULT = 0.5
+# Same-user cooldown for repeating a concrete anchor.
+ANCHOR_REPEAT_COOLDOWN_HOURS_DEFAULT = 0.5
 HOURLY_SENDS_CAP_DEFAULT = 4
 HOURLY_SENDS_CAP_MAX = 12
 GREETING_MIDDAY_START_DEFAULT = 12
 GREETING_MIDDAY_END_DEFAULT = 14
-# 中档好感门槛。「念想」这道门的绝对值本来就不可靠（基线设 40 的人聊久了到 80），
-# 真正的档位换算在 _miss_floor：高档 ×0.45、中档 ×1.0、低档 ×1.6。
-# 55 → 42：反馈「每句话都得有件事、不像想找他聊天」——门槛压在 55 时，
-# 大多数真实用户（Core 实测中位 30、均值 37）永远收不到一句没有正事的「想你」。
-MISS_AFFECTION_MIN_DEFAULT = 42
-# 「念想」（没有正事、就是想找你）每人每天的条数上限。
-# 1 → 2：反馈是「每一次发言都有事情，感觉不像想跟他聊天」——一天一条且门槛高，
-# 「就是想你了」几乎从来没发生过；两句日常聊天里的黏糊话该是正常频率。
-# 2 → 3（v1.28.6）：用户反馈「私聊发送没看到几个」。好感高的人本该是最容易
-# 被主动联系的那批，而这条专程为他们开的通道一天只给两句。
-MISS_DAILY_CAP_DEFAULT = 3
+
 # 两条主动消息的最小间隔（分钟）默认值与范围；
 MIN_GAP_MINUTES_DEFAULT = 30
 MIN_GAP_MAX = 720
@@ -387,20 +371,10 @@ FOLLOWUP_COOLDOWN_MIN = 5
 FOLLOWUP_COOLDOWN_MAX = 720
 FOLLOWUP_COOLDOWN_DEFAULT = 30
 
-# ─── 接话（continue）：她回完、对方就没声了 ──────────────────────
-#
-# 上面那条 followup 的判据是「**对方**那句还悬着」，而主链路一回复，最后一条永远是
-# 她的——于是「她说完之后对方消失」永远落不进任何一条未完话题：`thread_reason` 在
-# 「spoken >= seen 且沉默超过 presence_after」处直接 return ""，再往上又被
-# followup_max（默认 70 分钟）截一刀。用户原话是「这种情况应当判断要不要接话/问
-# 对方干啥去了，而不是被回避逻辑挡住」。所以单开一条：起点比追问晚（她刚回完就
-# 追问像催），窗口比追问长（隔几小时问一句「你人呢」才自然）。
+# ─── 接话（continue）等待窗口 ───────────────────────────────────
+# 接话只按此配置判定；近期轮数不会再缩短等待。
 CONTINUE_AFTER_MIN = 10
 CONTINUE_AFTER_MAX = 720
-# v2.1.8：90 → 25。用户原话「私聊时模型在聊完一句不会选择继续发言」——90 分钟是
-# 按「隔很久再追一句」定的，可热聊里对方停一下，她要等一个半小时才接，观感就是
-# 「聊完一句就消失了」。热聊（15 分钟内来回 3 轮以上）另有更短的 6 分钟覆盖，
-# 见 engine.HOT_CONTINUE_AFTER_MINUTES；这里下调的是所有场景的底噪。
 CONTINUE_AFTER_DEFAULT = 25
 CONTINUE_WINDOW_HOURS_MIN = 1
 CONTINUE_WINDOW_HOURS_MAX = 24
@@ -611,17 +585,12 @@ GLOBAL_PROACTIVE_GAP_MAX = 3600
 # v2.2.20：跨渠道（群↔私聊）同一件事的窗口。
 # 素材是共用的一份，群和私聊都在用，而旧护栏按渠道各查各的：群只看别的群、
 # 私聊只看别的用户。0 = 关闭（不比对另一条渠道）。
-CROSS_CHANNEL_DEDUP_HOURS_DEFAULT = 6.0
 
 # v2.1.2：每个角色**在所有群里**一天最多主动说几条（破冰 + 起话头 + 心流都算）。
 # 每群各自的额度只管单群，59 个群 × 2 就是一天 118 条——线上 11-06 群发 68 条、
 # 私聊 13 条，群聊把私聊挤没了，而主人以为「她不太找我」。
 # v2.2.22：「回复前提醒」的窗口与条数。普通回复没法拦（拦了就是不回人话），
 # 只能在她开口之前把最近说过的话摆到模型眼前。0 小时 = 关掉提醒。
-REPLY_ECHO_HOURS_DEFAULT = 2.0
-REPLY_ECHO_HOURS_MAX = 72.0
-REPLY_ECHO_LIMIT_DEFAULT = 4
-REPLY_ECHO_LIMIT_MAX = 12
 
 # v2.2.47：默认 0 = **不限**。用户原话「一天只能主动12条不行 要么没限制要么把这个
 # 删掉 我要的是那个人的主动 人是想说就说的」——一天说几条该由她自己决定，不该由
@@ -639,12 +608,6 @@ SPECIAL_CARE_HOURLY_CAP_MAX = 60
 GROUP_TOPIC_MAX_SEGMENTS_MIN = 0
 GROUP_TOPIC_MAX_SEGMENTS_MAX = 4
 GROUP_TOPIC_MAX_SEGMENTS_DEFAULT = 2
-# v2.1.0：群聊跨群撞车判定用的相似度阈值。私聊侧的 cross_user_repeat_ratio 在
-# 2.1.0 松到了 0.88（「同一个人别再听第二遍」本来就该宽），但群里要抓的是
-# 「同一句话换个群又说一遍」——0.88 只认近乎逐字，实测抓不到 11-06 那批
-# 「刚睡醒」/「你们今天都干嘛呢」的换群复读。所以群侧取两者更严的那个：
-# 用户把私聊阈值调得更严就跟着更严，但不会比 0.6 更宽。
-GROUP_CROSS_GROUP_RATIO_MAX = 0.6
 
 # v2.2.7（issue #3）：同一条连发里，两段**说的是同一件事**就合并成一段。
 # 判据是字符二元组重合度：0.45 能抓住「刚醒，睡0小时，趴床上赖着」与
@@ -702,13 +665,7 @@ PLANNING_ENABLED_DEFAULT = True
 MAX_OUTPUT_TOKENS_ENABLED_DEFAULT = True
 TIME_PROJECTION_ENABLED_DEFAULT = True
 
-# v2.1.5：这两项在 engine.py 里早就被 getattr(cfg, ..., False) 读着，但配置层一直
-# 没这两个字段——getattr 的兜底是 False，于是「生成后自评一遍再发」和「先查一次
-# 记忆再开口」两条路永远是死代码。补进配置层等于给已有的实现接上电源。
-# - draft_review_enabled：v2.2.49 起默认关——自评会把正文整条替换成另一模型改写版，
-#   而计数只有 _bump_review 累加、不记日志，用户看不出被换过；想开的人自己开。
-# - memory_tools_enabled：每轮多一次模型调用、多一份延迟，默认关，想要的人自己开。
-DRAFT_REVIEW_ENABLED_DEFAULT = False
+# Memory lookup adds a model call and latency, so it remains opt-in.
 MEMORY_TOOLS_ENABLED_DEFAULT = False
 
 REPLY_WINDOW_MIN = 1
@@ -738,8 +695,7 @@ LEGACY_DEFAULTS: Dict[str, Set[Any]] = {
     "gate_energy_floor": {35},
     "max_sends_per_round": {3, 2, 8},
     "hourly_sends_cap": {24},
-    "cross_user_repeat_ratio": {0.6},
-    "cross_user_repeat_hours": {2.0},
+
     "silent_giveup_days": {3},
     "special_care_min_affection": {85},
     # v2.2.1：群主动的三个节奏默认值收紧了。原来的 6 小时冷场 / 8 小时间隔 / 120 秒
@@ -854,15 +810,10 @@ class SocialConfig:
     # 稳定抽一个 [low, high] 的系数乘上去；发下一条时重新抽。两个值填 0 就是关掉。
     gap_jitter_low: float = GAP_JITTER_LOW_DEFAULT
     gap_jitter_high: float = GAP_JITTER_HIGH_DEFAULT
-    # 「念想」通道：没有正事、只是想 TA 说一句。这一类**不受「刚聊过」阻断**——
-    # 「刚聊完还发一条」是打断，「过了一阵子想你了」不是。
-    miss_affection_min: int = MISS_AFFECTION_MIN_DEFAULT
-    miss_daily_cap: int = MISS_DAILY_CAP_DEFAULT
+
     # 每小时最多主动联系几人（按角色算）。安全闸，不是节奏——见 schema 的说明。
     hourly_sends_cap: int = HOURLY_SENDS_CAP_DEFAULT
-    cross_user_repeat_ratio: float = CROSS_USER_REPEAT_RATIO_DEFAULT
-    cross_user_repeat_hours: float = CROSS_USER_REPEAT_HOURS_DEFAULT
-    cross_user_calibrate: bool = False
+    anchor_repeat_cooldown_hours: float = ANCHOR_REPEAT_COOLDOWN_HOURS_DEFAULT
 
     # 心跳间隔（分钟）：一轮跑完后随机等这么久再看一眼
     heartbeat_min_minutes: int = HEARTBEAT_MIN_DEFAULT
@@ -909,17 +860,6 @@ class SocialConfig:
     # 是否把 bot 在主链路里自己说的话也记进对话账本（追问判定的地基）
     track_own_replies: bool = True
 
-    # v2.2.7：普通对话回复发出前的确定性清理（占位符/物种用词/连着的说教句）。
-    # 默认开——线上被投诉的那几句全部来自普通回复，而那条链本来没有任何闸。
-    decorate_outgoing: bool = True
-    # v2.2.22：回复前提醒——普通回复里她看不见「自己刚说过什么」，同一件事
-    # 会在几分钟内讲两遍（线上 3.8%）。这里把最近说过的话作为本轮临时内容块
-    # 注入，只提醒、不拦话。
-    reply_echo_guard: bool = True
-    # 窗口：只看最近这么多小时内对同一个人说过的话（0 = 不提醒）。
-    reply_echo_hours: float = REPLY_ECHO_HOURS_DEFAULT
-    # 最多列几条（列太多反而像背清单）。
-    reply_echo_limit: int = REPLY_ECHO_LIMIT_DEFAULT
 
     # 主动发出的消息要不要追加进 AstrBot 的会话历史（WebUI 可见、别的插件读得到）
     persist_proactive_history: bool = True
@@ -1146,8 +1086,6 @@ class SocialConfig:
     # v2.2.52：跨 bot 全局主动发言冷却。同一轮心跳里任一角色开口后，其它角色
     # 暂缓主动开口，避免几个角色在同一分钟各说一句雷同的话。0 = 关闭。
     global_proactive_gap_seconds: int = GLOBAL_PROACTIVE_GAP_DEFAULT
-    # v2.2.20：多久之内不许把同一件事在群和私聊两边都说一遍。0 = 关闭
-    cross_channel_dedup_hours: float = CROSS_CHANNEL_DEDUP_HOURS_DEFAULT
     # v2.1.2：每个角色在所有群里一天最多主动说几条（破冰 + 起话头 + 心流都算）。
     # 0 = 不设总上限（只按每群各自的额度）。
     group_daily_total_cap: int = GROUP_DAILY_TOTAL_CAP_DEFAULT
@@ -1201,9 +1139,6 @@ class SocialConfig:
     # v2.1.4：每次生成注入「此刻」投影块（本地时间 / 星期 / 距上次发消息多久），
     # 防她按日期自己换算、说「好久没见」。关掉不注入。
     time_projection_enabled: bool = TIME_PROJECTION_ENABLED_DEFAULT
-    # v2.1.5：生成后自评一次（generator.review_draft），不过就换个时机重来。
-    # 关掉则生成完直接进验收层，省一次模型调用。v2.2.49 起默认关。
-    draft_review_enabled: bool = DRAFT_REVIEW_ENABLED_DEFAULT
     # v2.1.5：允许她先查一次记忆再开口（generator.generate_with_tools）。
     # 会多一次模型调用，所以默认关；生成器不支持工具时自动退回普通生成。
     memory_tools_enabled: bool = MEMORY_TOOLS_ENABLED_DEFAULT
@@ -1442,6 +1377,24 @@ class SocialConfig:
             value = g(key, default)
             return [] if value is None else value
 
+        anchor_repeat_default = _d(
+            "anchor_repeat_cooldown_hours", ANCHOR_REPEAT_COOLDOWN_HOURS_DEFAULT
+        )
+        anchor_repeat_raw = g("anchor_repeat_cooldown_hours", None)
+        legacy_repeat_raw = g("cross_user_repeat_hours", None)
+        if legacy_repeat_raw is not None:
+            parsed_new_repeat = _safe_float(
+                anchor_repeat_raw, anchor_repeat_default, "anchor_repeat_cooldown_hours"
+            )
+            if anchor_repeat_raw is None or parsed_new_repeat == anchor_repeat_default:
+                anchor_repeat_raw = legacy_repeat_raw
+        anchor_repeat = _safe_float(
+            anchor_repeat_raw, anchor_repeat_default, "anchor_repeat_cooldown_hours"
+        )
+        if anchor_repeat < 0.0 or anchor_repeat > 48.0:
+            _warn_clamped("anchor_repeat_cooldown_hours", anchor_repeat, 0.0, 48.0)
+        anchor_repeat = max(0.0, min(48.0, anchor_repeat))
+
         # 模式
         mode = str(g("mode", _d("mode",  "auto"))).lower().strip()
         if mode not in VALID_MODES:
@@ -1530,21 +1483,8 @@ class SocialConfig:
                 GAP_JITTER_MIN,
                 min(GAP_JITTER_MAX, gf("gap_jitter_high", GAP_JITTER_HIGH_DEFAULT)),
             ),
-            miss_affection_min=max(
-                0, min(100, gi("miss_affection_min", MISS_AFFECTION_MIN_DEFAULT)),
-            ),
-            miss_daily_cap=max(
-                0, min(10, gi("miss_daily_cap", MISS_DAILY_CAP_DEFAULT)),
-            ),
-            cross_user_repeat_ratio=max(
-                0.1, min(1.0, gf("cross_user_repeat_ratio", CROSS_USER_REPEAT_RATIO_DEFAULT))
-            ),
-            # 0 = 整道检查关掉（面板上就写着这么用，所以这里得真的认 0，
-            # 钳到 0.5 的话「设 0 关闭」就是一句骗人的话）
-            cross_user_repeat_hours=max(
-                0.0, min(48.0, gf("cross_user_repeat_hours", CROSS_USER_REPEAT_HOURS_DEFAULT))
-            ),
-            cross_user_calibrate=gb("cross_user_calibrate", False),
+
+            anchor_repeat_cooldown_hours=anchor_repeat,
             hourly_sends_cap=max(
                 0, min(HOURLY_SENDS_CAP_MAX, gi("hourly_sends_cap", HOURLY_SENDS_CAP_DEFAULT)),
             ),
@@ -1751,16 +1691,6 @@ class SocialConfig:
                     ),
                 ),
             ),
-            cross_channel_dedup_hours=max(
-                0.0,
-                min(
-                    72.0,
-                    gf(
-                        "cross_channel_dedup_hours",
-                        CROSS_CHANNEL_DEDUP_HOURS_DEFAULT,
-                    ),
-                ),
-            ),
             group_topic_dedup_hours=max(
                 GROUP_TOPIC_DEDUP_HOURS_MIN,
                 min(
@@ -1857,22 +1787,6 @@ class SocialConfig:
                 min(CLOSER_AFTER_MAX, gi("closer_after_hours", CLOSER_AFTER_DEFAULT)),
             ),
             track_own_replies=gb("track_own_replies", True),
-            decorate_outgoing=gb("decorate_outgoing", True),
-            reply_echo_guard=gb("reply_echo_guard", True),
-            reply_echo_hours=max(
-                0.0,
-                min(
-                    REPLY_ECHO_HOURS_MAX,
-                    gf("reply_echo_hours", REPLY_ECHO_HOURS_DEFAULT),
-                ),
-            ),
-            reply_echo_limit=max(
-                1,
-                min(
-                    REPLY_ECHO_LIMIT_MAX,
-                    int(gf("reply_echo_limit", REPLY_ECHO_LIMIT_DEFAULT)),
-                ),
-            ),
             persist_proactive_history=gb("persist_proactive_history", True),
             use_core_clock=gb("use_core_clock", True),
             use_core_facade=facade_mode,
@@ -1921,11 +1835,6 @@ class SocialConfig:
             time_projection_enabled=gb(
                 "time_projection_enabled", TIME_PROJECTION_ENABLED_DEFAULT
             ),
-            # v2.1.5 两项：同样走 gb()，面板里填的 "false"/"0"/"off" 也认。
-            # v2.2.49：draft_review 默认改成 False 后，与 engine.py 的 getattr 兜底一致。
-            draft_review_enabled=gb(
-                "draft_review_enabled", DRAFT_REVIEW_ENABLED_DEFAULT
-            ),
             memory_tools_enabled=gb(
                 "memory_tools_enabled", MEMORY_TOOLS_ENABLED_DEFAULT
             ),
@@ -1954,8 +1863,7 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     "user_cooldown_minutes": USER_COOLDOWN_DEFAULT,
     "min_gap_minutes": MIN_GAP_MINUTES_DEFAULT,
     "proactive_min_gap_minutes": PROACTIVE_MIN_GAP_DEFAULT,
-    "miss_affection_min": MISS_AFFECTION_MIN_DEFAULT,
-    "miss_daily_cap": MISS_DAILY_CAP_DEFAULT,
+
     "hourly_sends_cap": HOURLY_SENDS_CAP_DEFAULT,
     "max_message_length": MAX_MSG_LEN_DEFAULT,
     "reply_window_hours": REPLY_WINDOW_DEFAULT,
@@ -1971,8 +1879,7 @@ _NEW_DEFAULTS: Dict[str, Any] = {
     # 2.1.0 新进 LEGACY_DEFAULTS 的这几项
     "gate_energy_floor": GATE_ENERGY_FLOOR_DEFAULT,
     "max_sends_per_round": MAX_SENDS_PER_ROUND_DEFAULT,
-    "cross_user_repeat_ratio": CROSS_USER_REPEAT_RATIO_DEFAULT,
-    "cross_user_repeat_hours": CROSS_USER_REPEAT_HOURS_DEFAULT,
+
     "silent_giveup_days": SILENT_GIVEUP_DAYS_DEFAULT,
     "special_care_min_affection": SPECIAL_CARE_MIN_AFFECTION_DEFAULT,
     "group_daily_total_cap": GROUP_DAILY_TOTAL_CAP_DEFAULT,
@@ -2038,8 +1945,7 @@ def migrate_legacy_defaults(config: Any, baseline_dir: str, version: str) -> Lis
             try:
                 probe = int(str(current).strip())
             except (TypeError, ValueError):
-                # 浮点默认值（cross_user_repeat_ratio 这类）用 int() 永远转不过去，
-                # 面板把值存成字符串 "0.6" 时就会被判成「不是旧默认」而漏掉提示。
+                # 浮点默认值用 int() 永远转不过去，面板把值存成字符串时也要能比较。
                 try:
                     probe = float(str(current).strip())
                 except (TypeError, ValueError):

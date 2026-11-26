@@ -137,57 +137,12 @@ class ActionTicsTest(unittest.TestCase):
 # ─── 二、注入：这句话要真的送到她眼前，且不改正文 ──────────────
 
 
-class ReplyEchoHintTicsTest(unittest.TestCase):
-    def _hint(self, conv, **cfg):
-        base = dict(reply_echo_guard=True, reply_echo_hours=2.0, reply_echo_limit=4)
-        base.update(cfg)
-        st = _state({"bots": {BID: _bot(conv)}})
-        return engine_mod.SocialEngine.reply_echo_hint(_engine(st, **base), BID, UID)
-
-    def test_hint_carries_the_note(self):
-        conv = _conv(
-            ("（伸懒腰）好困", NOW - 600.0, "out"),
-            ("（伸懒腰）再睡会儿", NOW - 500.0, "out"),
-            ("（伸个懒腰）几点了", NOW - 400.0, "out"),
-            ("唔 才六点", NOW - 300.0, "out"),
-        )
-        hint = self._hint(conv)
-        self.assertIn("这一轮注意", hint)
-        self.assertIn("伸懒腰", hint)
-        self.assertIn("直接说话", hint)
-
-    def test_clean_history_has_no_note(self):
-        conv = _conv(
-            ("今天好累", NOW - 300.0, "out"),
-            ("早点睡吧", NOW - 200.0, "out"),
-            ("我也想你", NOW - 100.0, "out"),
-        )
-        self.assertNotIn("这一轮注意", self._hint(conv))
-
-    def test_hint_does_not_rewrite_text(self):
-        conv = _conv(
-            ("（伸懒腰）好困", NOW - 600.0, "out"),
-            ("（伸懒腰）再睡会儿", NOW - 500.0, "out"),
-        )
-        hint = self._hint(conv)
-        # 原文原样留着（只提示不改写），且仍然只有一种提示块
-        self.assertIn("（伸懒腰）好困", hint)
-        self.assertEqual(hint.count("这一轮注意"), 1)
-
-    def test_switch_off_still_wins(self):
-        conv = _conv(
-            ("（伸懒腰）好困", NOW - 600.0, "out"),
-            ("（伸懒腰）再睡会儿", NOW - 500.0, "out"),
-        )
-        self.assertEqual(self._hint(conv, reply_echo_guard=False), "")
-
-    def test_stub_without_state_method_is_safe(self):
-        eng = _engine(_state(), reply_echo_guard=True, reply_echo_hours=2.0,
-                      reply_echo_limit=4)
-        eng.state = types.SimpleNamespace()
-        self.assertEqual(
-            engine_mod.SocialEngine.reply_echo_hint(eng, BID, UID), ""
-        )
+class ReplyEchoHintTicsRetiredTest(unittest.TestCase):
+    def test_action_statistics_are_not_wired_into_ordinary_replies(self):
+        self.assertFalse(hasattr(engine_mod.SocialEngine, "reply_echo_hint"))
+        with open(os.path.join(PLUGIN_ROOT, "main.py"), encoding="utf-8") as fh:
+            main_source = fh.read()
+        self.assertNotIn("on_llm_request", main_source)
 
 
 if __name__ == "__main__":

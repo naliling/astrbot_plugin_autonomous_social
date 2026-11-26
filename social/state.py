@@ -144,9 +144,6 @@ MAX_CONVERSATION_HISTORY = 10
 MESSAGE_TRUNCATE_LENGTH = 200
 # 对话历史单条截断长度
 CONVERSATION_TRUNCATE_LENGTH = 200
-# pending_proactive_context 最多保留几条：每次主动发送追加一条，用户下一次
-# LLM 请求时整段消费掉；不设上限的话长时间没人回会一直攒。
-PENDING_PROACTIVE_KEEP = 8
 # 最近消息类型追踪数量
 RECENT_MSG_TYPES_COUNT = 6
 # 每用户主动消息日志保留天数：只记自己主动发出的那几条，按（bid,uid）天然隔离不串台，
@@ -405,10 +402,6 @@ class SocialState:
             "proactive_replied": 0,
             "last_proactive_sent": 0.0,
             "last_proactive_replied": True,
-            # 尚未被用户下一次 LLM 请求消费的主动消息原文。每项
-            # {text, ts, in_history}：in_history=True 表示这条已经补写进 AstrBot
-            # 会话历史，on_llm_request 不能再把它当临时内容块注入一遍。
-            "pending_proactive_context": [],
             # v2: 回复时间统计
             "avg_reply_seconds": 0.0,
             "reply_samples": 0,
@@ -2384,29 +2377,6 @@ class SocialState:
         # 口径）：关掉「更隐私」之后，主动消息原文不该还落 120 字在盘上。
         u["last_spoken"] = ts
         u["last_spoken_text"] = str(text or "")[:120] if store_text else ""
-        # 暂存完整文本：同步写进 AstrBot 会话历史是后台任务，可能还没写完用户就
-        # 回了；那时仍要靠 on_llm_request 临时注入一次。写成功后会打 in_history
-        # 标记，消费时跳过，避免模型看到两遍。连发（burst）时追加而不是覆盖。
-        pending = u.get("pending_proactive_context")
-        if isinstance(pending, str):
-            # 旧状态里的字符串格式，升级时归一成列表
-            pending = (
-                [{"text": pending, "ts": ts, "in_history": False}] if pending else []
-            )
-        elif not isinstance(pending, list):
-            pending = []
-        # 已经进会话历史的条目不再需要临时注入，顺手丢掉，状态不会越攒越大
-        pending = [m for m in pending if isinstance(m, dict) and not m.get("in_history")]
-        # 关掉「保存消息正文」时**不能**把原文塞进这里。这条路径原来完全不受开关
-        # 约束：`conversation` 与 `proactive_log` 都按 store_text 写空串了，只有这里
-        # 还留着完整原文（`str(text or "")` 连截断都没有），而它同样会落进 state.json。
-        # 关掉开关的用户以为「她说过的话不落盘」，实际整段原文还躺在盘上。
-        # 不追加的代价是：这条主动消息在用户回话前不会被临时注入进 prompt——
-        # 但那本来就是「没有正文可注入」，宁可少注入一次，也不能偷偷留正文。
-        if store_text:
-            pending.append({"text": str(text or ""), "ts": ts, "in_history": False})
-        del pending[:-PENDING_PROACTIVE_KEEP]
-        u["pending_proactive_context"] = pending
 
         self.mark_dirty()
         return u
@@ -2613,105 +2583,6 @@ class SocialState:
             seen.add(text)
             out.append(text)
         return out[-max(1, int(limit)):]
-
-    def own_group_openings(
-        self, bid: str, now: float, hours: float = 24.0, limit: int = 6
-    ) -> List[str]:
-        """她**在所有群里**最近开口的正文（旧→新，最多 limit 条）。
-
-        v2.2.17：开头是「她自己」的习惯，不是「这个群」的记忆。
-        线上 11-10 那天她发了 52 条群消息、25 个群，13 条以「刚」开头；
-        但按群分开看，每个群只见到 1~5 条——「最近 6 条里同一个开头 ≥3 次」
-        这种统计在单个群里永远凑不满。实测把 52 条按群回放，开头轮换闸
-        一条都拦不住（`scripts/replay_group_openings.py`）。
-        所以这里跨群汇总她的开口样本，给提示词轮换和 `_opening_repeat_issue`
-        一个真正看得见她习惯的窗口。
-        """
-        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
-        rows: List[Tuple[float, str]] = []
-        groups = self.bot(bid).get("groups") or {}
-        if not isinstance(groups, dict):
-            return []
-        for _gid, g in groups.items():
-            if not isinstance(g, dict):
-                continue
-            for e in (g.get("samples") or []):
-                if not isinstance(e, dict) or not e.get("self"):
-                    continue
-                ts = _safe_ts(e.get("ts"))
-                if ts < cutoff:
-                    continue
-                text = str(e.get("text", "") or "").strip()
-                if text:
-                    rows.append((ts, text))
-        rows.sort(key=lambda r: r[0])
-        out: List[str] = []
-        for _ts, text in rows:
-            if out and out[-1] == text:
-                continue
-            out.append(text)
-        return out[-max(1, int(limit)):]
-
-
-    def recent_own_group_texts(
-        self, bid: str, now: float, hours: float = 6.0, limit: int = 12
-    ) -> List[Tuple[str, str]]:
-        """她**在所有群里**最近说过的话，返回 [(gid, 正文)]，最近的排前面。
-
-        v2.2.20：跨渠道二传。旧账本分方向各查各的——群侧只跟「别的群」比
-        （`recent_group_self_others`），私聊只跟「别的用户」比
-        （`recent_proactive_others`）。于是同一件事可以先进群、再跟人私聊讲一遍，
-        或者反过来：线上 1839 条语料里，私聊主动消息有 25 条和 6 小时内的群发言
-        是同一件事（「刚用蹄子夹着碗勺洗完」逐字重复、「娜莉灵下午来了一趟」对
-        群里的「听娜莉灵说话」）。这里给私聊侧一个看得见群发言的窗口。
-        """
-        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
-        rows: List[Tuple[float, str, str]] = []
-        groups = self.bot(bid).get("groups") or {}
-        if not isinstance(groups, dict):
-            return []
-        for gid, g in groups.items():
-            if not isinstance(g, dict):
-                continue
-            for e in (g.get("samples") or []):
-                if not isinstance(e, dict) or not e.get("self"):
-                    continue
-                ts = _safe_ts(e.get("ts"))
-                if ts < cutoff:
-                    continue
-                text = str(e.get("text", "") or "").strip()
-                if text:
-                    rows.append((ts, str(gid), text))
-        rows.sort(key=lambda r: -r[0])
-        return [(who, text) for _ts, who, text in rows[:max(1, int(limit))]]
-
-    def recent_proactive_all(
-        self, bid: str, now: float, hours: float = 6.0, limit: int = 12
-    ) -> List[Tuple[str, str]]:
-        """她最近**发给任何人**的主动消息，返回 [(uid, 正文)]，最近的排前面。
-
-        v2.2.20 的另一半：群侧开口前要先看看「这件事是不是刚跟谁私聊讲过」。
-        不传 uid 是有意的——私聊对象是谁不影响判断，反正都不该拿到群里再说一遍。
-        """
-        cutoff = float(now) - max(0.0, float(hours)) * 3600.0
-        rows: List[Tuple[float, str, str]] = []
-        users = self.bot(bid).get("users") or {}
-        if not isinstance(users, dict):
-            return []
-        for uid, u in users.items():
-            if not isinstance(u, dict):
-                continue
-            for e in (u.get("proactive_log") or []):
-                if not isinstance(e, dict):
-                    continue
-                ts = _safe_ts(e.get("ts"))
-                if ts < cutoff:
-                    continue
-                text = str(e.get("text", "") or "").strip()
-                if text:
-                    rows.append((ts, str(uid), text))
-        rows.sort(key=lambda r: -r[0])
-        return [(who, text) for _ts, who, text in rows[:max(1, int(limit))]]
 
     def last_any_bot_proactive(self) -> float:
         """v2.2.52：任意一个角色最近一次**主动开口**（群破冰/起话头 + 私聊主动）的时刻。

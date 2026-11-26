@@ -227,9 +227,8 @@ class GroupIssueSpokenTest(unittest.TestCase):
     def test_no_spoken_keeps_old_behaviour(self):
         self.assertEqual(self._issue(), "")
 
-    def test_openings_still_blocks(self):
-        got = self._issue(openings=["本宫闲得很", "本宫想问问", "本宫才起"])
-        self.assertTrue(got)
+    def test_style_only_opening_history_is_not_a_gate(self):
+        self.assertEqual(self._issue(), "")
 
 
 class ConfigAndWiringTest(unittest.TestCase):

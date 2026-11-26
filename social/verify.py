@@ -1502,115 +1502,45 @@ _FILLER_TAIL = "…．.。 　\t~～，,"
 def _strip_filler_head(
     text: str, recent: Sequence[str], window: int = 6, limit: int = 3
 ) -> str:
-    """开头填充字用滥了，就把开头这一下摘掉。
-
-    `唔……最喜欢你了` → `最喜欢你了`；`唔哈 突然这么用力` → `哈 突然这么用力`。
-    摘完剩不到 3 个字就原样返回（不能把一条消息摘没）。
-    """
-    body = str(text or "")
-    cur = opening_head(body)
-    if not cur or cur not in _FILLER_HEADS:
-        return body
-    heads = [opening_head(o) for o in list(recent or [])[-window:]]
-    if sum(1 for h in heads if h == cur) < limit:
-        return body
-    stripped = strip_actions(body).lstrip()
-    if not stripped.startswith(cur):
-        return body
-    # 前面可能还有括号动作（`（蹭了蹭）唔……`），原样留着。
-    lead = body.split(stripped, 1)[0] if stripped else ""
-    rest = stripped[len(cur):].lstrip(_FILLER_TAIL)
-    if len(strip_actions(rest).strip()) < 3:
-        return body
-    return (lead + rest).strip()
+    """Deprecated compatibility helper; never edits generated speech."""
+    return str(text or "")
 
 
 def tidy_outgoing_text(
     text: str, *, species: str = "", recent: Sequence[str] = (),
     context: Sequence[str] = (),
 ) -> str:
-    """主链路回复的**确定性清理**（`on_decorating_result` 用，v2.2.7）。
+    """Deprecated compatibility helper; return model text unchanged."""
+    return str(text or "")
 
-    主动消息那条链有完整验收，普通对话回复却一道闸都没有——线上被投诉的说教句、
-    「手还有点僵」、占位符原文，全部来自普通回复（`state.json` 里 `src=chat`）。
-    但普通回复的提示词不在本插件手里（由人设/主链路决定），所以这里只做**不改语义**
-    的三件事：
 
-    1. 删掉模板占位符（「(Model response will be rendered here)」）；
-    2. 蹄类角色把身体部位的「手」改成「蹄子」；
-    3. 最近已经在连着纠正对方时，删掉这条里继续纠正对方的那几句；
-    4. 没有由头却说「我也爱你」时，把「也」去掉（`context` 由调用方传入
-       对方刚说的话；主动消息没有上下文，一律去掉）；
-    5. 开头填充字（唔/嗯/哦）在最近几条里用滥了，摘掉开头这一下。
-
-    改不动就原样返回；删空了返回空串，由调用方决定这条不发。
-    """
-    body = str(text or "")
-    if not body.strip():
-        return body
-    body = _PLACEHOLDER_RESIDUE.sub("", body)
-    # 占位符常常是**带括号**的：删掉文字会留下「今天好累 ()」这种空壳，
-    # 发出去比原文更怪。把只剩括号的一对一起清掉。
-    body = re.sub(r"[（(【\[「『]\s*[）)】\]」』]", "", body)
-    if _echo_also_hit(body) and not _context_allows_echo(context):
-        body = _ECHO_ALSO.sub(
-            lambda m: ("我" + m.group(1)) if m.group(1) else "我也是", body
-        )
-    sp = _s(species).strip()
-    if sp and _HOOF_SPECIES.search(sp):
-        for old, new in (
-            ("双手", "两只蹄子"),
-            ("两只手", "两只蹄子"),
-            ("一只手", "一只蹄子"),
-            ("左手", "左蹄"),
-            ("右手", "右蹄"),
-        ):
-            body = body.replace(old, new)
-        body = _hoof_hand_sub(body)  # v2.2.18：只改她自己的手
-    if _preachy_hits(body):
-        olds = [str(o or "") for o in list(recent or [])[-5:]]
-        # 窗口里累计命中 ≥2，或**这一条自己**就纠了两处（同一条里连纠两下 = 训话）。
-        if sum(_preachy_hits(o) for o in olds) >= 2 or _preachy_hits(body) >= 2:
-            # v2.2.10：**剪小句，不整句删**。整句删会把回复删空（线上真发生过：
-            # 「没睡透，别闹。…可别想我理你。」→ 空 → 这一轮她一个字没说）。
-            # 先按句末标点切，句内剪掉「，别…」这类祈使小句；剪完只剩括号动作/
-            # 标点的句子才丢；全丢光就保留原文（宁可带点脾气，也不能不吭声）。
-            kept: list = []
-            for piece in re.split(r"(?<=[。！？!?])", body):
-                if not piece.strip():
-                    continue
-                if _preachy_hits(piece):
-                    piece = _strip_preachy_clauses(piece)
-                    piece = re.sub(r"[，,、；;]\s*(?=[。！？!?]|$)", "", piece)
-                    piece = re.sub(r"[，,、；;]{2,}", "，", piece).strip()
-                    residual = strip_actions(piece).strip(
-                        "，。！？!?…~～、；;：: 　"
-                    )
-                    # 剪完只剩称呼（「酥牧。」）或虚词（「了。」）→ 这一句整句不要。
-                    if len(residual) < 3:
-                        continue
-                kept.append(piece)
-            # 剪掉中间的小句后，前后两截会直接粘在一起（「没睡透上次冷落我…」），
-            # 补个逗号才是人话；前一截已经有句末标点就不补。
-            buf = ""
-            for piece in kept:
-                if buf and not buf.rstrip().endswith(tuple("。！？!?…，,；;：:")):
-                    if _starts_with_word(piece):
-                        buf = buf.rstrip() + "，"
-                buf += piece
-            joined = buf.strip()
-            # 剪完只剩表情/标点（真机出现过只剩「💕」）就退回原文：宁可有脾气，
-            # 也不能发一条残缺的。全是空（全被剪）同样退回原文。
-            keep = strip_actions(joined).strip(
-                "，。！？!?…~～、；;：: 　"
-            )
-            # v2.2.19：剪完还要过一遍「像不像话」——括号闭合、不以逗号开头、
-            # 不停在半截条件上、实字没被剪掉太多。不过就整条不剪。
-            body = joined if (len(keep) >= 3 and _preachy_trim_safe(body, joined)) else body
-    # v2.2.11：口头禅开头（「唔……」「嗯」）在最近几条里用滥了，摘掉开头这一下。
-    body = _strip_filler_head(body, recent)
-    body = re.sub(r"[ \t]{2,}", " ", body).strip()
-    return body
+def verify_hard_safety(
+    text: str, *, species: str = "", max_length: int = 0
+) -> Tuple[bool, str]:
+    """Reject unsafe, malformed, or over-limit proactive output without rewriting it."""
+    original = str(text or "")
+    body = original.strip()
+    if not body:
+        return False, "内容为空"
+    if not _CONTENT_CHAR.search(body):
+        return False, "内容只有符号，没有可发送正文"
+    if re.search(r"(?im)^\s*#\s*(?:intent|意图|动机)\s*(?::|：)?", body):
+        return False, "发送文本包含意图元数据"
+    try:
+        limit = max(0, int(max_length or 0))
+    except (TypeError, ValueError):
+        limit = 0
+    if limit and len(original) > limit:
+        return False, "发送文本超过单条长度上限"
+    checks = (
+        _check_protocol_residue(body),
+        _check_placeholder_residue(body),
+        _check_species(body, species),
+        _check_pressure(body),
+        _check_ultimatum(body),
+    )
+    reason = next((item for item in checks if item), None)
+    return (False, str(reason)) if reason else (True, "")
 
 
 def verify_message(
@@ -1623,72 +1553,10 @@ def verify_message(
     msg_type: str = "",
     species: str = "",
     context: Sequence[str] = (),
+    max_length: int = 0,
 ) -> Tuple[bool, str]:
-    """验收一条即将发出的消息。返回 (通过, 原因)。
-
-    `require_about_peer` 只给「念想」通道开：那一类本来就是「闲下来想起一个人」，
-    整条却没有第二人称就说明它在讲自己——那正是 197 条记录里最扎手的问题。
-    `allow_short` 只给群心流开：群里「嗯」「哈哈」这类短应和是常态。
-    `msg_type` 由调用方给出这条消息的类型（greeting/closer/...）：`SHORT_OK_TYPES`
-    里的类型按场景放宽空泛与复读判据，默认空串 = 老行为，不影响既有调用方。
-    """
-    if not _s(text):
-        return False, "空消息"
-    reason = _check_structure(text)
-    if reason:
-        return False, reason
-    reason = _check_intent_leak(text)
-    if reason:
-        return False, reason
-    reason = _check_thin(text, called, allow_short=allow_short, msg_type=msg_type)
-    if reason:
-        return False, reason
-    reason = _check_repeat(text, recent, msg_type=msg_type)
-    if reason:
-        return False, reason
-    reason = _check_action_repeat(text, recent)
-    if reason:
-        return False, reason
-    reason = _check_protocol_residue(text)
-    if reason:
-        return False, reason
-    # v2.2.7 / issue #11：占位符子串级兜底（旧实现只认整条框架块）。
-    reason = _check_placeholder_residue(text)
-    if reason:
-        return False, reason
-    reason = _check_pressure(text)
-    if reason:
-        return False, reason
-    # P3-06：最后通牒/逼表态。这个检查器定义后一直没被调用（死代码）——
-    # 模型输出「到底想怎样，直说」时没有任何运行时兜底，而生成侧提示词明确要求
-    # 「不下最后通牒」。放在 `_check_pressure` 之后：「催回 + 计较没回」那种要债
-    # 已有更准的结构判据，先让它命中（同一个坏样本会得到更具体的原因）。
-    reason = _check_ultimatum(text)
-    if reason:
-        return False, reason
-    # v2.2.7 / issue #6：连续纠正对方（「别…」「少…」「算你…」）。
-    reason = _check_preachy(text, recent)
-    if reason:
-        return False, reason
-    # v2.2.8 / issue #9：没有由头却用「也」接对方的话（「我也爱你」）。
-    # 主动消息没有上下文（`context` 为空）→ 一律不许出现情感回声。
-    reason = _check_echo_also(text, context)
-    if reason:
-        return False, reason
-    reason = _check_wall(text)
-    if reason:
-        return False, reason
-    # v2.2.7 / issue #10：物种与身体部位一致性（蹄类不许说「手」）。
-    reason = _check_species(text, species)
-    if reason:
-        return False, reason
-    # 剥掉标题行之后**还是**标题样子的，说明整条只有一句标题没有正文。
-    # 这种退回重生成没用——模型换个标题再来一遍。直接不发。
-    if is_title_like(strip_title_line(text)):
-        return False, "整条只有一行标题、没有正文"
-    if require_about_peer and not _PEER_REF.search(strip_actions(text)):
-        return False, "没有指向对方（这一类要说给 TA 听，不是讲她自己）"
-    return True, ""
+    """Compatibility wrapper; only hard safety and protocol boundaries reject output."""
+    return verify_hard_safety(text, species=species, max_length=max_length)
 
 # 最后通牒式：把对方逼到必须给个说法。线上真实样本 `到底想怎样，直说`。
 # 只认**命令/逼问**的固定说法，不碰普通的问句——她当然可以问事情。
@@ -1700,12 +1568,17 @@ _ULTIMATUM = re.compile(
     r"到底想怎样|你到底要|给个说法|把话说清楚|少来这套"
     r"|别装(?:了|蒜|死|傻|没事|无辜)?(?=[，。！？、,.!?;\s]|$)"
 )
+_CONDITIONAL_RETALIATION = re.compile(
+    r"(?:再|如果|要是)[^。！？\n]{0,20}(?:气我|惹我|惹恼我|让我生气|不听话|不乖|顶嘴)"
+    r"[^。！？\n]{0,8}(?:的话|就)[^。！？\n]{0,24}"
+    r"(?:就)?(?:都)?(?:别|不要|不许|不准|别想|不再|不给|不让|不陪|不理|取消|收回|拉黑|断绝)"
+)
 
 
 def _check_ultimatum(text: str) -> Optional[str]:
-    """这条是不是在逼对方表态（把话堵死）。"""
+    """拒绝逼迫表态和以惩罚为后果的条件威胁。"""
     body = strip_actions(text)
-    hit = _ULTIMATUM.search(body)
+    hit = _ULTIMATUM.search(body) or _CONDITIONAL_RETALIATION.search(body)
     if hit:
         return f"把话说死了（「{hit.group(0)}」）——她不会逼人表态"
     return None

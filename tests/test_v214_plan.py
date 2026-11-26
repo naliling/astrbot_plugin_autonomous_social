@@ -10,10 +10,9 @@
 
 1. `_parse_plan()` 的宽容与不宽容：围栏/think 块/客套话要剥掉，但「说要发却既没
    切口也没事实」必须判成解析失败——拿一个空规划去写正文等于把拆分的意义抹掉。
-2. 时间投影是**算好再给**：间隔读不出来必须写「不知道」，不能编；星期与时段以
-   投影块为准，模型不许自己按日期换算。
+2. 时间投影只提供当前本地时钟，不把沉默时长当作主动发送理由。
 3. `decide_with_plan()` 两条路径：skip 一次写作调用都不花，why_not 带原因码原文；
-   send 才走 `_compose(decide=True)` 并追加【这次的说法】。
+   send 才走 `_compose(decide=True)`，规划结果只作为可忽略参考，不替模型写句子。
 4. `max_tokens` 只在 provider 签名吃得下时才传；不吃就原样调用。这条路径绝不能
    把「试探性传参」变成「这一路候选被永久剔除」。
 
@@ -276,27 +275,27 @@ class TestTimeProjection(unittest.TestCase):
     def setUp(self):
         self.gen = _make()
 
-    def test_contains_clock_weekday_period_and_gap(self):
+    def test_contains_clock_weekday_and_period_without_silence_inference(self):
         text = self.gen._time_projection({"last_sent": NOW - 37 * 60}, NOW, OFFSET)
         self.assertIn("2026-11-07 20:31", text)
         self.assertIn("周六", text)
         self.assertIn("傍晚", text)
-        self.assertIn("37 分钟", text)
-        self.assertIn("不要自己按日期换算", text)
-
-    def test_unknown_gap_says_so_instead_of_guessing(self):
-        text = self.gen._time_projection({}, NOW, OFFSET)
-        self.assertIn("不知道", text)
+        self.assertIn("仅是事实参考", text)
         self.assertNotIn("分钟", text)
 
-    def test_future_timestamp_is_treated_as_unknown(self):
-        text = self.gen._time_projection({"last_sent": NOW + 3600}, NOW, OFFSET)
-        self.assertIn("不知道", text)
+    def test_missing_or_future_timestamps_do_not_change_clock_context(self):
+        no_history = self.gen._time_projection({}, NOW, OFFSET)
+        future = self.gen._time_projection({"last_sent": NOW + 3600}, NOW, OFFSET)
+        self.assertEqual(no_history, future)
+        self.assertIn("【此刻】", no_history)
+        self.assertNotIn("不知道", no_history)
+        self.assertNotIn("分钟", no_history)
 
-    def test_prefers_the_later_of_two_timestamps(self):
+    def test_multiple_send_timestamps_do_not_expose_elapsed_gap(self):
         target = {"last_sent": NOW - 120 * 60, "last_proactive_sent": NOW - 30 * 60}
         text = self.gen._time_projection(target, NOW, OFFSET)
-        self.assertIn("30 分钟", text)
+        self.assertNotIn("30 分钟", text)
+        self.assertNotIn("120 分钟", text)
 
     def test_minutes_helper_returns_none_for_bad_target(self):
         self.assertIsNone(self.gen._minutes_since_last_sent(None, NOW))
@@ -313,7 +312,9 @@ class TestPlanPrompt(unittest.TestCase):
     def test_forbids_writing_the_message(self):
         prompt = self.gen._plan_prompt(**_plan_prompt_args())
         self.assertIn("这次只做规划，不写正文", prompt)
-        self.assertIn("不要写出", prompt)
+        self.assertIn('\"decision\":\"send\"', prompt)
+        self.assertIn('\"decision\":\"skip\"', prompt)
+        self.assertNotIn("【这次的说法】", prompt)
 
     def test_lists_all_skip_reasons(self):
         prompt = self.gen._plan_prompt(**_plan_prompt_args())
@@ -327,7 +328,8 @@ class TestPlanPrompt(unittest.TestCase):
 
     def test_says_explicitly_when_there_are_no_cards(self):
         prompt = self.gen._plan_prompt(**_plan_prompt_args(cards=[]))
-        self.assertIn("没有一件能指认的具体事", prompt)
+        self.assertIn("没有提供具体事件材料", prompt)
+        self.assertIn("无需为了发消息而找话题", prompt)
 
     def test_includes_time_projection_when_enabled(self):
         prompt = self.gen._plan_prompt(**_plan_prompt_args())
@@ -342,8 +344,8 @@ class TestPlanPrompt(unittest.TestCase):
 
     def test_includes_reason_and_core_context(self):
         prompt = self.gen._plan_prompt(**_plan_prompt_args())
-        self.assertIn("想起她昨天提过面包", prompt)
         self.assertIn("她刚睡醒", prompt)
+        self.assertNotIn("想起她昨天提过面包", prompt)
 
     def test_card_lines_cap_at_five(self):
         cards = [{"title": "事%d" % i, "detail": "细节"} for i in range(8)]
@@ -355,14 +357,16 @@ class TestPlanPrompt(unittest.TestCase):
             decision="send", angle="面包", facts=["她昨天说面包难吃"], avoid=["别问吃没吃"]
         )
         block = self.gen._plan_block(plan)
-        self.assertIn("【这次的说法】", block)
-        self.assertIn("切口：面包", block)
+        self.assertIn("【规划参考（可忽略）】", block)
+        self.assertIn("可选方向（可以忽略）：面包", block)
         self.assertIn("- 她昨天说面包难吃", block)
-        self.assertIn("别问吃没吃", block)
+        self.assertNotIn("别问吃没吃", block)
 
     def test_plan_block_without_facts_forbids_inventing_events(self):
         block = self.gen._plan_block(generator.Plan(decision="send", angle="就说想她"))
-        self.assertIn("不要编具体事件", block)
+        self.assertIn("没有可核实的规划事实", block)
+        self.assertIn("不要补造具体事件", block)
+        self.assertIn("可以答 NO", block)
 
 
 class TestPlanCall(unittest.TestCase):
@@ -456,9 +460,10 @@ class TestDecideWithPlan(unittest.TestCase):
         self.assertEqual(decision.parts, ["面包那事儿我还在想"])
         self.assertIsNotNone(decision.plan)
         self.assertEqual(decision.plan.angle, "面包")
-        # 第二次调用才是写作：提示词末尾必须带上规划，且带写作档的输出预算
-        self.assertIn("【这次的说法】", provider.prompts[1])
-        self.assertIn("切口：面包", provider.prompts[1])
+        # 第二次调用才是写作：规划只作为可忽略参考，且使用写作档输出预算。
+        self.assertIn("【规划参考（可忽略）】", provider.prompts[1])
+        self.assertIn("可选方向（可以忽略）：面包", provider.prompts[1])
+        self.assertNotIn("【这次的说法】", provider.prompts[1])
         self.assertEqual(provider.tokens[1], generator.OUTPUT_TOKENS["proactive"])
 
     def test_send_path_keeps_time_projection_in_writing_prompt(self):

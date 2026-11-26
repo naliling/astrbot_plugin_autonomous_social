@@ -342,9 +342,7 @@ class ZeroMeansOffTest(unittest.TestCase):
             len(eng._build_group_ctx("b1", "g1", g)["recent"]), 20,
         )
 
-    def test_miss_affection_min_zero_disables_the_floor(self):
-        # 旧写法 `or 42` 把 0 变成 42：面板上填 0 的人以为关了，实际还在按 42 卡。
-        self.assertEqual(_engine(miss_affection_min=0)._miss_floor("high"), 0.0)
+
 
 
 class QuietWindowIntersectionTest(unittest.TestCase):

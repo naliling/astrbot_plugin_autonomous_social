@@ -111,8 +111,6 @@ class _FakeGenerator:
 _NEW_METHODS = (
     "_memory_tool_ctx",
     "_generate_parts",
-    "_review_draft",
-    "_note_grounded",
 )
 
 
@@ -140,7 +138,7 @@ def _run(coro):
 
 
 def _cfg(**over):
-    base = SimpleNamespace(memory_tools_enabled=True, draft_review_enabled=True)
+    base = SimpleNamespace(memory_tools_enabled=True)
     for key, value in over.items():
         setattr(base, key, value)
     return base
@@ -324,133 +322,13 @@ class ToolWiringTest(unittest.TestCase):
         self.assertIn("tool_round_cap", eng._recorder.codes())
 
 
-# ─── 三、成稿事实核对（_review_draft + _note_grounded）───────────
-class GroundedReviewTest(unittest.TestCase):
-    def _review(self, parts, cards, gen=None, cfg=None, decision=None):
-        gen = gen or _FakeGenerator(review={"verdict": "ok"})
-        eng = _engine(generator=gen, cfg=cfg or _cfg())
-        out = _run(eng._review_draft(parts, decision, cards))
-        return out, eng
+# ─── 三、普通输出不经过事后筛选 ───────────────────────────────────
+class OutputBoundaryTest(unittest.TestCase):
+    def test_engine_has_no_post_generation_review_or_grounding_hook(self):
+        self.assertFalse(hasattr(SocialEngine, "_review_draft"))
+        self.assertFalse(hasattr(SocialEngine, "_note_grounded"))
 
-    def test_ungrounded_is_noted_but_message_kept(self):
-        out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual(["draft_ungrounded"], eng._recorder.codes())
 
-    def test_note_carries_ratio_and_missing(self):
-        out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        _code, _text, detail = eng._recorder.notes[0]
-        self.assertEqual(0.0, detail["ratio"])
-        self.assertIn("23:00", detail["missing"])
-
-    def test_grounded_text_is_not_noted(self):
-        cards = [{"title": "约定", "detail": "明天 23:00 见"}]
-        out, eng = self._review(["明天 23:00 见。"], cards)
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_no_cards_skips_grounding(self):
-        out, eng = self._review(["明天 23:00 见。"], [])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_grounding_runs_even_when_review_disabled(self):
-        gen = _FakeGenerator()
-        out, eng = self._review(
-            ["明天 23:00 见。"],
-            [{"title": "天气", "detail": "昨天晴"}],
-            gen=gen,
-            cfg=_cfg(draft_review_enabled=False),
-        )
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], gen.review_calls)
-        self.assertEqual(["draft_ungrounded"], eng._recorder.codes())
-
-    def test_drop_returns_none_and_skips_grounding(self):
-        gen = _FakeGenerator(review={"verdict": "drop", "why": "重复"})
-        out, eng = self._review(
-            ["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}], gen=gen
-        )
-        self.assertIsNone(out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_rewrite_is_reviewed_and_grounded(self):
-        gen = _FakeGenerator(review={"verdict": "rewrite", "text": "明天 23:00 见。"})
-        out, eng = self._review(
-            ["原稿"], [{"title": "天气", "detail": "昨天晴"}], gen=gen
-        )
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual(["draft_ungrounded"], eng._recorder.codes())
-
-    def test_rewrite_grounded_passes_silently(self):
-        gen = _FakeGenerator(review={"verdict": "rewrite", "text": "明天 23:00 见。"})
-        out, eng = self._review(
-            ["原稿"], [{"title": "约定", "detail": "明天 23:00 见"}], gen=gen
-        )
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_review_error_is_fail_open_and_grounded_still_runs(self):
-        gen = _FakeGenerator(review_error=RuntimeError("自评炸了"))
-        out, eng = self._review(
-            ["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}], gen=gen
-        )
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual(["draft_ungrounded"], eng._recorder.codes())
-
-    def test_review_non_dict_result_keeps_parts(self):
-        gen = _FakeGenerator(review="我觉得还行")
-        out, _eng = self._review(["好的"], [], gen=gen)
-        self.assertEqual(["好的"], out)
-
-    def test_empty_parts_short_circuits(self):
-        gen = _FakeGenerator(review={"verdict": "drop"})
-        out, _eng = self._review([], [], gen=gen)
-        self.assertEqual([], out)
-        self.assertEqual([], gen.review_calls)
-
-    def test_decision_none_passes_none_plan(self):
-        gen = _FakeGenerator(review={"verdict": "ok"})
-        self._review(["好的"], [], gen=gen, decision=None)
-        args = gen.review_calls[0][0]
-        self.assertEqual("fake-provider", args[0])
-        self.assertIsNone(args[2])
-
-    def test_grounded_module_missing_is_silent(self):
-        with mock.patch.object(engine_mod, "_opt_module", return_value=None):
-            out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_grounded_raising_is_silent(self):
-        fake = types.SimpleNamespace(grounded_claims=mock.Mock(side_effect=RuntimeError("核对炸了")))
-        with mock.patch.object(engine_mod, "_opt_module", return_value=fake):
-            out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_grounded_non_dict_result_is_silent(self):
-        fake = types.SimpleNamespace(grounded_claims=lambda text, cards: "???")
-        with mock.patch.object(engine_mod, "_opt_module", return_value=fake):
-            out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.codes())
-
-    def test_missing_list_is_capped_at_three_and_120_chars(self):
-        claims = ["第%d号 23:0%d 见" % (i, i) for i in range(1, 6)]
-        text = "。".join(claims) + "。"
-        out, eng = self._review([text], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual([text], out)
-        _code, _text, detail = eng._recorder.notes[0]
-        parts = detail["missing"].split("；")
-        self.assertEqual(3, len(parts))
-        self.assertTrue(all(len(part) <= 120 for part in parts))
-
-    def test_grounding_failure_never_blocks_message(self):
-        # 这条是「只记不拦」的总闸：不管核对怎么不通过，正文都必须原样回去。
-        out, eng = self._review(["明天 23:00 见。"], [{"title": "天气", "detail": "昨天晴"}])
-        self.assertEqual(["明天 23:00 见。"], out)
-        self.assertEqual([], eng._recorder.blocks)
 
 
 if __name__ == "__main__":

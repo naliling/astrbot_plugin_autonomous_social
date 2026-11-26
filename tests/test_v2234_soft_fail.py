@@ -95,11 +95,10 @@ class SoftFailLoggingTest(unittest.TestCase):
 
 
 class WiringTest(unittest.TestCase):
-    def test_five_call_sites(self) -> None:
+    def test_retired_output_cleanup_has_no_logging_call_sites(self) -> None:
         src = io.open(Path(PLUGIN_ROOT) / "social" / "engine.py", encoding="utf-8").read()
-        self.assertEqual(src.count("self._note_soft_fail("), 5)
-        for where in ("出口「刚」开头统计", "出口清理", "回声提醒取数", "私聊碎片合并", "同次发言去重"):
-            self.assertIn(where, src, f"缺少 {where} 的降级留痕")
+        self.assertNotIn("self._note_soft_fail(", src)
+        self.assertNotIn("_merge_fragments(segments, waits)", src)
 
     def test_no_bare_pass_in_those_four_spots(self) -> None:
         src = io.open(Path(PLUGIN_ROOT) / "social" / "engine.py", encoding="utf-8").read()

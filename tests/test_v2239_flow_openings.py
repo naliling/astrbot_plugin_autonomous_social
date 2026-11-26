@@ -1,14 +1,10 @@
-"""v2.2.39：心流接话也要知道自己最近怎么开口的。
+"""Regression: legacy opening history is context, not a rotation rule.
 
-开头轮换这道统计闸从 v2.2.7 起就挂在破冰/起话头分支上，但心流接话那条分支一直
-没有——而线上「刚…」开头的群消息里，有相当一部分就是心流接话（11-10 那天 52 条
-群消息里 13 条以「刚」开头）。这一版把同一份事实也递给心流：你最近用过这些开头、
-这个字用滥了别再用；只给事实，不硬拦（心流是「有话说才说」，拦掉等于让她闭嘴）。
+Recent conversation context and optional SEND/NO output remain available.
 """
 
 from __future__ import annotations
 
-import inspect
 import logging
 import sys
 import types
@@ -40,7 +36,6 @@ import social.generator as gen_mod  # noqa: E402
 
 GEN = gen_mod.MessageGenerator(None, None)
 PERSONA = "你叫露娜，是蹄类角色。"
-TAIL = "你最近在群里开口用过的开头"
 
 
 def _ctx(openings=None):
@@ -69,35 +64,28 @@ def _prompt(mode, openings=None):
     return GEN._compose_group(mode, _ctx(openings), PERSONA, 120)[0]
 
 
-class FlowOpeningsTest(unittest.TestCase):
-    def test_flow_prompt_lists_recent_openings(self):
-        prompt = _prompt("flow", ["刚用魔法烧了壶水", "外头阴天，毛潮"])
-        self.assertIn(TAIL, prompt)
-        self.assertIn("刚用魔法烧了壶水", prompt)
+class NeutralOpeningContextTest(unittest.TestCase):
+    def test_recent_openings_do_not_change_flow_prompt(self):
+        baseline = _prompt("flow")
+        with_legacy_openings = _prompt(
+            "flow", ["刚用魔法烧了壶水", "刚把窗户推开", "刚睡醒，睡0小时"]
+        )
+        self.assertEqual(with_legacy_openings, baseline)
 
-    def test_flow_prompt_bans_overused_head(self):
-        prompt = _prompt("flow", ["刚用魔法烧了壶水", "刚把窗户推开", "刚睡醒，睡0小时"])
-        self.assertIn("这一条不要用「刚」开头", prompt)
+    def test_recent_openings_do_not_change_icebreak_prompt(self):
+        baseline = _prompt("icebreak")
+        with_legacy_openings = _prompt(
+            "icebreak", ["刚用魔法烧了壶水", "刚把窗户推开", "刚睡醒，睡0小时"]
+        )
+        self.assertEqual(with_legacy_openings, baseline)
 
-    def test_flow_prompt_no_ban_when_sparse(self):
-        prompt = _prompt("flow", ["刚用魔法烧了壶水", "外头阴天，毛潮", "本宫才不关心这些"])
-        self.assertNotIn("这一条不要用", prompt)
-
-    def test_flow_works_without_openings(self):
-        prompt = _prompt("flow", None)
-        self.assertNotIn(TAIL, prompt)
+    def test_group_context_and_optional_decision_remain(self):
+        prompt = _prompt("flow", ["刚用魔法烧了壶水"])
         self.assertIn("群里最近在聊", prompt)
-
-    def test_icebreak_still_has_openings(self):
-        prompt = _prompt("icebreak", ["刚用魔法烧了壶水", "刚把窗户推开", "刚睡醒，睡0小时"])
-        self.assertIn(TAIL, prompt)
-        self.assertIn("这一条不要用「刚」开头", prompt)
-
-
-class WiringTest(unittest.TestCase):
-    def test_both_branches_ship_the_note(self):
-        src = inspect.getsource(gen_mod.MessageGenerator._compose_group)
-        self.assertEqual(src.count(TAIL), 2, "破冰/心流两条分支都要给开头事实")
+        self.assertIn("SEND", prompt)
+        self.assertIn("NO", prompt)
+        self.assertNotIn("这一条不要用「刚」开头", prompt)
+        self.assertNotIn("你最近在群里开口用过的开头", prompt)
 
 
 if __name__ == "__main__":

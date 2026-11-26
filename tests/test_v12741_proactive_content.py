@@ -49,25 +49,26 @@ def parse(text: str):
 class TitleLineLeakTest(unittest.TestCase):
     """协议行不能变成正文。"""
 
-    def test_real_world_sample_title_is_stripped(self):
+    def test_title_like_body_is_preserved(self):
         """线上原文：'想念\\n刚眯醒，脑子里全是你，有些想你了💕'"""
         d = parse("SEND\n# 想念\n刚眯醒，脑子里全是你，有些想你了💕")
         self.assertTrue(d.send)
-        self.assertEqual(d.parts, ["刚眯醒，脑子里全是你，有些想你了💕"])
+        self.assertEqual(d.parts, ["# 想念\n刚眯醒，脑子里全是你，有些想你了💕"])
 
-    def test_title_without_space_is_stripped(self):
+    def test_title_without_space_is_preserved(self):
         d = parse("SEND\n#想念\n你在干嘛呀")
         self.assertTrue(d.send)
-        self.assertEqual(d.parts, ["你在干嘛呀"])
+        self.assertEqual(d.parts, ["#想念\n你在干嘛呀"])
 
     def test_second_real_world_sample(self):
         d = parse("SEND\n# 答应带回来的吃的\n出门时许诺带给我的美味，现在到哪儿了呢？💕")
         self.assertTrue(d.send)
-        self.assertEqual(d.parts, ["出门时许诺带给我的美味，现在到哪儿了呢？💕"])
+        self.assertEqual(d.parts, ["# 答应带回来的吃的\n出门时许诺带给我的美味，现在到哪儿了呢？💕"])
 
-    def test_title_only_means_nothing_to_send(self):
+    def test_title_only_is_preserved_as_generated_content(self):
         d = parse("SEND\n# 想念")
-        self.assertFalse(d.send, "整条只有一个标题，没有正文，不该发")
+        self.assertTrue(d.send)
+        self.assertEqual(d.parts, ["# 想念"])
 
     def test_a_long_heading_is_content_not_title(self):
         """超过 16 字的 `#` 行是模型自己写的 markdown，不是协议标题。"""
@@ -83,7 +84,7 @@ class TitleLineLeakTest(unittest.TestCase):
 
     def test_normal_message_untouched(self):
         d = parse("SEND\n# 面试\n你那个面试后来怎么样了")
-        self.assertEqual(d.parts, ["你那个面试后来怎么样了"])
+        self.assertEqual(d.parts, ["# 面试\n你那个面试后来怎么样了"])
 
 
 class WeatherGateTest(unittest.TestCase):

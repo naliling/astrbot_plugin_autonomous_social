@@ -43,7 +43,7 @@ _install_stub()
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from social.config import SocialConfig  # noqa: E402
-from social.engine import SocialEngine  # noqa: E402
+from social.engine import ANCHOR_ROUND_PER_USER, SocialEngine  # noqa: E402
 from social.state import SocialState  # noqa: E402
 
 
@@ -74,7 +74,7 @@ class _NullSignals:
 
 
 class _BatchEngine:
-    """只保留 `try_once` 发送段用到的那几个依赖，收集层只走「念想」通道。"""
+    """只保留 `try_once` 发送段依赖，用通用由头候选验证调度不变量。"""
 
     try_once = SocialEngine.try_once
     _user_lock = SocialEngine._user_lock
@@ -85,7 +85,7 @@ class _BatchEngine:
     # 否则一轮心跳在排序那一行就 AttributeError（本文件 5 个用例全炸）。
     _candidate_sort_key = SocialEngine._candidate_sort_key
 
-    def __init__(self, uids, miss_dupes=(), budget=2, concurrency=4):
+    def __init__(self, uids, anchor_dupes=(), budget=2, concurrency=4):
         self.cfg = SocialConfig.from_astrbot({})
         self.cfg.enabled = True
         self.cfg.group_icebreak_enabled = False
@@ -104,27 +104,25 @@ class _BatchEngine:
 
         bot = self.state.bot("bot1")
         bot.setdefault("users", {})
-        for uid in list(uids) + list(miss_dupes):
+        for uid in list(uids) + list(anchor_dupes):
             bot["users"].setdefault(uid, {"umo": f"aiocqhttp:FriendMessage:{uid}"})
-        self._misses = [(uid, bot["users"][uid], {"about": "x"}) for uid in uids]
-        self._misses += [(uid, bot["users"][uid], {"about": "y"}) for uid in miss_dupes]
+        self._anchors = [(uid, bot["users"][uid], {"about": "x"}) for uid in uids]
+        self._anchors += [(uid, bot["users"][uid], {"about": "y"}) for uid in anchor_dupes]
         self.state.mark_dirty()
 
-    # ── 收集层：除「念想」外一律空 ─────────────────────────────
+    # ── 候选层：仅注入通用由头候选 ─────────────────────────────
     def _promise_pick(self, *a, **k):
         return []
-
-    def _miss_pick(self, *a, **k):
-        return list(self._misses)
 
     def _intimacy_pick(self, *a, **k):
         return []
 
     def settle_minds(self, *a, **k):
-        return []
+        return [(uid, user, 2.0) for uid, user, _anchor in self._anchors]
 
     def _anchor_pick(self, *a, **k):
-        return []
+        user = a[0] if a else k.get("user")
+        return [anchor for _uid, candidate, anchor in self._anchors if candidate is user]
 
     def _thread_pick(self, *a, **k):
         return None
@@ -139,9 +137,6 @@ class _BatchEngine:
         return []
 
     # ── 记账/时钟 ──────────────────────────────────────────────
-    def _miss_mark_today(self, u, day):
-        return 1
-
     def _count_block(self, *a, **k):
         pass
 
@@ -156,6 +151,12 @@ class _BatchEngine:
 
     def _moment_of(self, bid, now):
         return datetime.datetime(2023, 11, 15, 14, 0)
+
+    def _core_last_interaction(self, root, bid, uid):
+        return 0.0
+
+    def gate_reason(self, bid, uid, user, now, body):
+        return ""
 
     async def _speak(self, bid, uid, u, urge, now, *, allow_veto=True, preset=None,
                      require_about_peer=False):
@@ -191,10 +192,10 @@ class BatchDispatch(unittest.TestCase):
         self.assertGreater(len(e.sent), 0, e.sent)
         self.assertEqual(len({uid for _b, uid in e.sent}), len(e.sent), e.sent)
 
-    def test_same_user_never_sent_twice(self):
-        e = _BatchEngine(["u1"], miss_dupes=["u1", "u1"], budget=10, concurrency=4)
+    def test_same_user_respects_anchor_round_cap_under_duplicates(self):
+        e = _BatchEngine(["u1"], anchor_dupes=["u1", "u1"], budget=10, concurrency=4)
         self._run_round(e)
-        self.assertEqual(len(e.sent), 1, e.sent)
+        self.assertEqual(len(e.sent), ANCHOR_ROUND_PER_USER, e.sent)
 
     def test_concurrency_really_overlaps(self):
         # 配额给足，5 个候选全发；并发上限 3 → 应能看到 3 个 job 同时在途。

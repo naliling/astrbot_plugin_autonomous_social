@@ -4,8 +4,8 @@
 
 线上真实日志（一天之内同一条重复了 9763 次）：
 
-    念想「有点想你了」 2114128887 → LLM 不可用（3 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送
-    念想「在干嘛呢」     3574784101 → LLM 不可用（3 条 provider 调用失败：超时/连接/5xx 这类瞬时故障），本轮未发送
+    主动候选「上次提到的体检」2114128887 → LLM 不可用（超时/连接/5xx 等瞬时故障），本轮未发送
+    主动候选「下周的面试」    3574784101 → LLM 不可用（超时/连接/5xx 等瞬时故障），本轮未发送
     ……（一分钟内 550 行）
 
 根因不是「日志写得太多」，是**一轮里把 550 个候选全试了一遍**：
@@ -97,7 +97,7 @@ class _FakeGenerator:
 
 
 class _RoundEngine:
-    """只保留 `try_once` 发送段需要的依赖；候选全走「念想」通道。"""
+    """只保留 `try_once` 发送段需要的依赖；候选全走通用由头路径。"""
 
     try_once = SocialEngine.try_once
     _user_lock = SocialEngine._user_lock
@@ -128,28 +128,26 @@ class _RoundEngine:
 
         bot = self.state.bot("bot1")
         bot.setdefault("users", {})
-        self._misses = []
+        self._anchors = []
         for i in range(n_users):
             uid = f"u{i}"
             bot["users"][uid] = {"umo": f"aiocqhttp:FriendMessage:{uid}"}
-            self._misses.append((uid, bot["users"][uid], {"about": f"上次说的第{i}件事"}))
+            self._anchors.append((uid, bot["users"][uid], {"about": f"上次说的第{i}件事"}))
         self.state.mark_dirty()
 
     # 收集层
     def _promise_pick(self, *a, **k):
         return []
 
-    def _miss_pick(self, *a, **k):
-        return list(self._misses)
-
     def _intimacy_pick(self, *a, **k):
         return []
 
     def settle_minds(self, *a, **k):
-        return []
+        return [(uid, user, 2.0) for uid, user, _anchor in self._anchors]
 
     def _anchor_pick(self, *a, **k):
-        return []
+        user = a[0] if a else k.get("user")
+        return [anchor for _uid, candidate, anchor in self._anchors if candidate is user]
 
     def _thread_pick(self, *a, **k):
         return None
@@ -164,9 +162,6 @@ class _RoundEngine:
         return []
 
     # 记账
-    def _miss_mark_today(self, u, day):
-        return 1
-
     def _count_block(self, *a, **k):
         pass
 
@@ -193,6 +188,9 @@ class _RoundEngine:
 
     def _relation_bucket(self, u):
         return 0
+
+    def gate_reason(self, bid, uid, user, now, body):
+        return ""
 
     async def _speak(self, bid, uid, u, urge, now, *, allow_veto=True, preset=None,
                      require_about_peer=False):
@@ -323,7 +321,6 @@ class GateSkipAggregationTest(unittest.TestCase):
                     ("bot1", uid, self.state.bot("bot1")["users"][uid], 2.0,
                      {"about": f"第{uid}件事"})
                 )
-            self._misses = []
 
         def _anchor_pick(self, *a, **k):
             return [{"about": "某件事", "kind": "derived", "due": 0.0}]

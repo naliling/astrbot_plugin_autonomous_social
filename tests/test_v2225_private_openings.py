@@ -82,11 +82,11 @@ class ProactiveActionTicTest(unittest.TestCase):
         notes = V.action_tics(texts)
         self.assertTrue(any("先写括号动作" in n for n in notes), notes)
 
-    def test_prompt_has_the_two_blocks_wired(self):
+    def test_prompt_keeps_recent_messages_as_context_without_style_directives(self):
         src = Path(PLUGIN_ROOT, "social", "generator.py").read_text(encoding="utf-8")
-        self.assertIn("opening_head(body)", src)
-        self.assertIn("action_tics(", src)
-        self.assertIn("这次换个起手，或者干脆不写动作", src)
+        self.assertIn("【你最近发给TA的主动消息·仅作上下文】", src)
+        self.assertNotIn("别再重复类似的开头和句式", src)
+        self.assertNotIn("action_tics(", src)
 
 
 if __name__ == "__main__":

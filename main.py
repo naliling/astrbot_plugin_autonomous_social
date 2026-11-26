@@ -60,87 +60,7 @@ if after_message_sent is None:
 else:
     HOOK_AFTER_SENT = True
 
-# on_llm_request 钩子：把主动消息作为本轮临时上下文补回 LLM 请求。
-# 主动消息走 context.send_message，不经过 respond 阶段，框架不会自动把它写进会话历史；
-# 引擎会另外补写一条 assistant 条目（persist_proactive_history）。补写成功的那条
-# 在 pending 里打了 in_history 标记，这里只挑还没进历史的临时注入一次。
-# 新版用 TextPart.mark_as_temp()：本轮模型看得到，但 AstrBot 不会把它持久化。
-# 老版本没有临时块 API 时，才退回追加 req.contexts。
-on_llm_request = None
-try:
-    from astrbot.api.event.filter import on_llm_request  # type: ignore[assignment]
-except Exception:
-    try:
-        from astrbot.api.event import filter as _filter_mod2  # type: ignore[assignment]
-        on_llm_request = getattr(_filter_mod2, "on_llm_request", None)
-    except Exception as _e:
-        logger.info(f"[autonomous_social] 未找到 on_llm_request 钩子（{_e}），回复主动消息时可能失忆")
-        on_llm_request = None
 
-if on_llm_request is None:
-    def on_llm_request(_func=None, **_kwargs):
-        if _func is not None:
-            return _func
-
-        def _decorator(func):
-            return func
-
-        return _decorator
-
-    HOOK_LLM_REQUEST = False
-else:
-    HOOK_LLM_REQUEST = True
-
-# on_decorating_result 钩子：发送前最后一道确定性清理（v2.2.7）。
-# 主动消息那条链有完整验收，普通对话回复却一道闸都没有——线上被投诉的说教句、
-# 「手还有点僵」、「(Model response will be rendered here)」原文，全部来自普通回复
-# （state.json 里 src=chat）。普通回复的提示词不在本插件手里，所以这里只做
-# **不改语义**的三件事：删占位符、蹄类把身体部位的「手」改「蹄子」、已经在连着
-# 纠正对方时删掉那条里继续纠正对方的句子。
-on_decorating_result = None
-try:
-    from astrbot.api.event.filter import on_decorating_result  # type: ignore[assignment]
-except Exception:
-    try:
-        from astrbot.api.event import filter as _filter_mod3  # type: ignore[assignment]
-        on_decorating_result = getattr(_filter_mod3, "on_decorating_result", None)
-    except Exception as _e:
-        logger.info(
-            f"[autonomous_social] 未找到 on_decorating_result 钩子（{_e}），"
-            "主链路回复不做发送前清理"
-        )
-        on_decorating_result = None
-
-if on_decorating_result is None:
-    def on_decorating_result(_func=None, **_kwargs):
-        if _func is not None:
-            return _func
-
-        def _decorator(func):
-            return func
-
-        return _decorator
-
-    HOOK_DECORATE_RESULT = False
-else:
-    HOOK_DECORATE_RESULT = True
-
-# 消息组件：改链要用 Plain 重建。拿不到就整条放弃清理（不影响发送）。
-try:
-    from astrbot.api.message_components import Plain  # type: ignore[assignment]
-except Exception:
-    Plain = None  # type: ignore[assignment,misc]
-
-# ProviderRequest：用于类型提示，拿不到就用 Any
-try:
-    from astrbot.api.provider import ProviderRequest  # type: ignore[assignment]
-except Exception:
-    from typing import Any as ProviderRequest  # type: ignore[misc, assignment]
-
-try:
-    from astrbot.core.agent.message import TextPart  # type: ignore[assignment]
-except Exception:
-    TextPart = None  # type: ignore[assignment,misc]
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -275,12 +195,7 @@ class AutonomousSocial(Star):
                     "插件看不到 bot 自己说过的话：追问会退化成只按对方最后那句判断。"
                     "升级 AstrBot 到 4.x 后重开插件即可。"
                 )
-            if not HOOK_LLM_REQUEST:
-                logger.warning(
-                    "[autonomous_social] 这个 AstrBot 版本没有 on_llm_request 钩子，"
-                    "主动消息发出去后用户回复时，AI 看不到自己刚才说了什么。"
-                    "升级 AstrBot 到支持该钩子的版本即可修复。"
-                )
+
         except Exception as e:
             logger.error(f"[autonomous_social] 启动失败: {e}")
             raise
@@ -313,162 +228,11 @@ class AutonomousSocial(Star):
         except Exception as exc:
             logger.warning(f"[autonomous_social] 记录已发送消息失败: {exc}")
 
-    @on_decorating_result()
     async def tidy_outgoing(self, event: AstrMessageEvent):
-        """发送前清理普通对话回复（v2.2.7，默认开启）。
+        """普通对话回复保持原样，不由插件改写。"""
+        return
 
-        只改文本、不改语义：删模板占位符、蹄类把身体部位的「手」改「蹄子」、
-        已经在连着纠正对方时删掉这条里继续纠正对方的句子、没有由头时去掉
-        「我也爱你」里的「也」（v2.2.8）。清理后整条为空就 `clear_result()`
-        ——宁可这一轮不回，也不把「(Model response will be rendered here)」
-        发出去。
-        """
-        if self._engine is None or Plain is None:
-            return
-        try:
-            engine = self._engine
-            cfg = getattr(engine, "cfg", None)
-            if cfg is None or not getattr(cfg, "enabled", False):
-                return
-            if not getattr(cfg, "decorate_outgoing", True):
-                return
-            result = event.get_result()
-            if result is None:
-                return
-            chain = list(getattr(result, "chain", None) or [])
-            if not chain:
-                return
-            bid = engine._get_bot_id(event)
-            if not bid:
-                return
-            # v2.2.8：对方刚说的那句是「也」的由头来源——TA 说了「我爱你」，
-            # 这条才能回「我也爱你」；TA 说「好累呀」，就不许用「也」接。
-            context = ""
-            try:
-                context = str(getattr(event, "message_str", "") or "")
-            except Exception:
-                context = ""
-            # v2.2.10：说教闸的 recent 要从会话历史取（内存缓冲一重载就空）。
-            try:
-                uid = str(event.get_sender_id() or "")
-            except Exception:
-                uid = ""
-            changed = False
-            new_chain: list = []
-            for comp in chain:
-                text = getattr(comp, "text", None)
-                if not isinstance(text, str):
-                    new_chain.append(comp)
-                    continue
-                cleaned = engine.tidy_outgoing(text, bid, context, uid)
-                if cleaned == text:
-                    new_chain.append(comp)
-                    continue
-                changed = True
-                if cleaned.strip():
-                    try:
-                        new_chain.append(Plain(cleaned))
-                    except Exception:
-                        comp.text = cleaned
-                        new_chain.append(comp)
-                else:
-                    logger.info(
-                        f"[autonomous_social][{bid}] 主链路回复清理后为空，"
-                        f"这条不发：{text[:40]!r}"
-                    )
-            if not changed:
-                return
-            if not new_chain:
-                event.clear_result()
-                return
-            result.chain = new_chain
-        except Exception as exc:
-            logger.warning(f"[autonomous_social] 发送前清理失败，原样发送: {exc}")
 
-    @on_llm_request()
-    async def inject_proactive_context(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ):
-        """把用户回复前主动发出的消息作为本轮临时上下文注入。
-
-        已经补写进 AstrBot 会话历史的那几条不用注入（模型在正常历史里能看到），
-        由 consume_pending_proactive_context 过滤；剩下没写进去的用官方临时
-        内容块让模型本轮看到，消费后清空，不会污染后续会话。旧版没有
-        mark_as_temp() 时才退回 req.contexts。
-        """
-        if self._engine is None:
-            return
-        try:
-            if not self._engine.cfg.enabled:
-                return
-            # 私聊主动消息的原文只属于那个私聊窗口，群聊里**绝不**注入。
-            # 原条件写成 `private_only and _is_group`，于是 private_only=False
-            # （用户正是为了开群聊功能才关掉它）变成了「允许把私聊原文注入群聊
-            # 上下文」的开关：同一用户先在私聊收到主动消息，随后在群里说话，
-            # 私聊原文就被当成本轮上下文塞进群聊请求 → 私聊内容泄漏到群。
-            # private_only 的语义只是「要不要在群里主动说话」，与注入无关。
-            if self._is_group(event):
-                return
-            contexts = getattr(req, "contexts", None)
-            extra_parts = getattr(req, "extra_user_content_parts", None)
-            if not isinstance(contexts, list) and not isinstance(extra_parts, list):
-                return
-            bid = self._engine._get_bot_id(event)
-            uid = self._engine._get_sender_id(event)
-            if not bid or not uid or uid == bid:
-                return
-            temp_factory = getattr(TextPart, "mark_as_temp", None) if TextPart else None
-            can_use_temp = isinstance(extra_parts, list) and callable(temp_factory)
-            if not can_use_temp and not isinstance(contexts, list):
-                return
-            text = self._engine.consume_pending_proactive_context(bid, uid)
-            lines = [line.strip() for line in str(text or "").split("\n") if line.strip()]
-            # v2.2.22：普通回复里她看不到「自己刚跟这个人说过什么」，同一件事会在
-            # 几分钟内讲两遍（线上 1327 条私有回复里 51 条，3.8%）。这里只提醒，
-            # 不拦话——拦掉普通回复等于她不回人。
-            echo = ""
-            if can_use_temp:
-                try:
-                    echo = str(self._engine.reply_echo_hint(bid, uid) or "")
-                except Exception as exc:
-                    logger.debug(f"[autonomous_social] 组装回复提醒失败（跳过）: {exc}")
-                    echo = ""
-            if not lines and not echo:
-                return
-            if lines:
-                hint = (
-                    "<autonomous_social_proactive_context>\n"
-                    "以下是你在当前对话中刚刚主动发出的原文；这是你已经说过的话，"
-                    "不是用户的新消息，只在本次回复中参考：\n"
-                    + "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, 1))
-                    + "\n</autonomous_social_proactive_context>"
-                )
-            else:
-                hint = ""
-            if can_use_temp:
-                if hint:
-                    extra_parts.append(TextPart(text=hint).mark_as_temp())
-                    logger.debug(
-                        f"[autonomous_social] 主动消息已临时注入本轮上下文（{len(text)} 字）: {text[:40]}…"
-                    )
-                if echo:
-                    extra_parts.append(TextPart(text=echo).mark_as_temp())
-                    logger.debug(
-                        f"[autonomous_social] 已把「刚跟这个人说过什么」提醒注入本轮（{len(echo)} 字）"
-                    )
-                return
-            if isinstance(contexts, list) and lines:
-                for line in lines:
-                    contexts.append({"role": "assistant", "content": line})
-                logger.warning(
-                    "[autonomous_social] 当前 AstrBot 不支持临时内容块，主动消息已退回写入本轮 contexts"
-                )
-                return
-            logger.warning(
-                "[autonomous_social] 当前请求没有可用的临时内容块或 contexts，主动消息未注入"
-            )
-        except Exception as exc:
-            logger.warning(f"[autonomous_social] 主动消息补入上下文失败: {exc}")
 
     @command("自主社交状态")
     async def social_status(self, event: AstrMessageEvent):

@@ -76,50 +76,21 @@ def check(text: str, recent=()):
 
 
 class WallRejectedTest(unittest.TestCase):
-    """破墙的必须被拦。样本全部来自线上真实记录或它们的直系变体。"""
-
-    def test_phone_against_chest(self) -> None:
-        ok, why = check("我把手机按在胸口，深深吸了一口气，仿佛还能透过屏幕闻到你身上的气息。")
-        self.assertFalse(ok, "「手机/屏幕」放进来了")
-        self.assertIn("第四面墙", why)
-
-    def test_open_ui_inside_action_paren(self) -> None:
-        """破墙点在括号里——所以必须查原文，不能查 strip_actions 之后的正文字。"""
-        ok, why = check(
-            "(放下杯子，无奈地叹了口气，起身去打开界面。)  真是的，这么着急呀。"
+    def test_device_platform_and_role_mentions_are_not_style_vetoes(self) -> None:
+        texts = (
+            "我把手机按在胸口，深深吸了一口气，仿佛还能透过屏幕闻到你身上的气息。",
+            "(放下杯子，无奈地叹了口气，起身去打开界面。) 真是的。",
+            "可惜我现在只能打字给你。",
+            "(独角轻蹭) 茉莉会用魔法看电脑，但蹄子打字很慢。",
+            "打开对话框看到你还在，我就放心了。",
+            "(把手机扣在桌上) 你刚才那句我没听清。",
+            "别盯着屏幕了，眼睛会疼。",
+            "作为一个人工智能助手，我理解您的要求。",
+            "你这个APP又崩了吧，哈哈。",
         )
-        self.assertFalse(ok, "括号里的「界面」被 strip_actions 剥掉了就没拦住")
-        self.assertIn("第四面墙", why)
-
-    def test_typing_is_a_device_act(self) -> None:
-        ok, why = check("可惜我现在只能打字给你… 但心里默念给你听好不好？")
-        self.assertFalse(ok)
-        self.assertIn("打字", why)
-
-    def test_magic_computer(self) -> None:
-        ok, why = check("(独角轻蹭) 茉莉会用魔法看电脑……但蹄子打字很慢……")
-        self.assertFalse(ok)
-
-    def test_chat_box(self) -> None:
-        ok, why = check("打开对话框看到你还在，我就放心了。")
-        self.assertFalse(ok)
-
-    def test_put_phone_down(self) -> None:
-        ok, why = check("(把手机扣在桌上) 你刚才那句我没听清。")
-        self.assertFalse(ok, "「把手机扣在桌上」也是设备动作")
-
-    def test_stop_staring_at_screen(self) -> None:
-        ok, why = check("别盯着屏幕了，眼睛会疼。")
-        self.assertFalse(ok)
-
-    def test_ai_self_reference(self) -> None:
-        ok, why = check("作为一个人工智能助手，我理解您的要求。")
-        self.assertFalse(ok, "AI 自指放进来了")
-
-    def test_app_crash(self) -> None:
-        ok, why = check("你这个APP又崩了吧，哈哈。")
-        self.assertFalse(ok)
-
+        for text in texts:
+            ok, why = check(text)
+            self.assertTrue(ok, f"不应按风格过滤 {text!r}: {why}")
 
 class WallNotOverreachingTest(unittest.TestCase):
     """不能误伤正常发言——这一半同样重要。"""
@@ -149,11 +120,9 @@ class WallNotOverreachingTest(unittest.TestCase):
         ok, why = check("[CronJob] 日常问候 triggered at 2026-08-23T07:00:00")
         self.assertTrue(ok, f"CronJob 回显被误伤: {why}")
 
-    def test_account_with_chinese_prefix_is_caught(self) -> None:
-        """真提账号时要拦——她不会说「我给你我的账号」。"""
+    def test_account_mention_without_exposed_identifier_is_not_a_privacy_veto(self) -> None:
         ok, why = check("我没法给你我的账号哦，想去AI角色平台找她")
-        self.assertFalse(ok)
-        self.assertIn("账号", why)
+        self.assertTrue(ok, why)
 
     def test_bare_message_word_is_not_a_wall_break(self) -> None:
         """「消息」单独出现不拦：真实数据里 40 条只有 2 条真破墙，误伤率 95%。"""

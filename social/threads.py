@@ -275,19 +275,10 @@ def thread_meta(
     `about` 是对方最后说的那句、`asked` 是她上一句问的那件——带着这两样才写得出
     一句接着话头的话，而不是干巴巴的「在吗」。
 
-    `silence_minutes` 只有 continue 用：同一句「你人呢」在沉默 20 分钟和 5 小时后
-    是两种说法，得让生成侧知道到底隔了多久。
+    `silence_minutes` 仅用于候选记账与诊断；不据此推断对方态度，也不传递沉默理由。
     """
     if kind == "continue":
-        # 与 probe/presence 的区别：那两条是**对方那句悬着**，这条是**她说完之后
-        # 对方消失**。所以说法也要换：短沉默接着上一个话题往下说，长沉默问一句人去哪了；
-        # 两种都不许查岗、不许提「你怎么不回」——那是催，不是接话。
         minutes = int(silence_minutes or 0)
-        away = f"{minutes} 分钟" if minutes < 120 else f"{minutes / 60:.1f} 小时"
-        # v2.0.6（m00055）：沉默多长、她上一句是不是问句，生成侧都要知道。
-        # v2.0.5 的 _MODE_NOTES["continue"] 本来就写着「沉默还短就顺着说、沉默久了
-        # 就问人去哪了」，但这份时长从来没进过提示词——模型无从分支，只能回一句
-        # 「继续」「然后呢」。这里把它作为字段交出去。
         asked_text = str(asked or "").strip()
         asked_question = asked_text.endswith("？") or asked_text.endswith("?")
         return {
@@ -295,15 +286,11 @@ def thread_meta(
             "intent": "followup",
             "mode": "continue",
             "msg_type": "continue_topic",
-            "msg_type_desc": f"接着刚才那半句话往下说（TA 已经 {away}没声了）",
-            "style_hint": (
-                "短沉默就顺着上一个话题往下说；长沉默就问一句人怎么突然没了。"
-                "别查岗、别问「你怎么不回」、别连着问两句"
-            ),
+            "msg_type_desc": "可选地延续已有话题；若没有自然内容，可以不发",
+            "style_hint": "只在自然时承接上下文；不要推断对方态度或要求回应。",
             "about": about,
             "asked": asked,
             "silence_minutes": minutes,
-            "short_silence": minutes <= 120,
             "asked_question": asked_question,
         }
     if kind == "probe":

@@ -109,7 +109,7 @@ class CardLinesGeneratedNoteTest(unittest.TestCase):
 
     def test_plan_block_without_facts_keeps_old_forbid(self):
         block = MessageGenerator._plan_block(Plan(decision="send", angle="就说想她"))
-        self.assertIn("不要编具体事件", block)
+        self.assertIn("没有可核实的规划事实；不要补造具体事件。", block)
 
 
 if __name__ == "__main__":

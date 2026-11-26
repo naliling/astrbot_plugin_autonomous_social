@@ -219,7 +219,7 @@ class VerifyPunctuationOnlyTest(unittest.TestCase):
 
     def test_emoji_only_body_still_passes(self):
         """emoji 是内容，不是标点——这条不能被上面的修复误伤。"""
-        self.assertIsNone(verify._check_structure("😊😊😊"))
+        self.assertTrue(verify.verify_message("😊😊😊")[0])
 
     def test_normal_text_passes_structure(self):
         self.assertIsNone(verify._check_structure("今天降温了，你那边冷不冷"))

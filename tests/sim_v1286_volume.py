@@ -139,7 +139,7 @@ def _engine(clock, ctx, **cfg_kw):
             "heartbeat_max_minutes": 1,
             "llm_gate": False,             # 省掉 decide 那一轮
             "greeting_enabled": False,
-            "miss_daily_cap": 0,           # 单独测「由头」通道
+
             "group_flow_enabled": False,
             "group_icebreak_enabled": False,
             "group_topic_enabled": False,
@@ -215,13 +215,7 @@ class MoreAnchorsSimTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(picks[0].get("about"), picks[1].get("about"))
 
     async def test_topic_anchor_reaches_the_pool(self):
-        """v1.28.7：`u["topics"]` 现在也是由头——「你上次说的那个X」对每个人独一份。
-
-        ⚠️ 话题由头是**关系向**的（「你上次说的X」是关于 TA 的话），所以它从
-        `prepare_round_anchors(relational=True)` 出来，也就是「念想」那条通道
-        （`engine._miss_pick`）——不是「另起话题」那条。这两条通道的素材本来就
-        该分开：一边说她自己的生活，一边说关于 TA 的事。
-        """
+        """Topics can supply concrete conversation anchors through the common candidate path."""
         import social.anchors as anchors_mod
         now = T0
         u = {
@@ -236,9 +230,9 @@ class MoreAnchorsSimTest(unittest.IsolatedAsyncioTestCase):
         abouts = [str(p.get("about") or "") for p in picks]
         self.assertTrue(any("塞尔达传说" in t for t in abouts),
                         f"话题由头没进来：{abouts}")
-        # 它必须是 KIND_MISS：念想通道只收 miss/greet
+        # The topic is a neutral cue, not a retired miss/greet candidate.
         hit = [p for p in picks if "塞尔达传说" in str(p.get("about") or "")][0]
-        self.assertEqual(hit.get("kind"), anchors_mod.KIND_MISS)
+        self.assertEqual(hit.get("kind"), anchors_mod.KIND_CUE)
 
     async def test_topic_anchor_not_polluted(self):
         """污染话题一句都不该进来：捧「你上次说的「好的」后来呢」回去最假。"""
@@ -371,7 +365,7 @@ class VolumeSimTest(unittest.IsolatedAsyncioTestCase):
     def test_defaults_are_higher(self):
         cfg = SocialConfig.from_astrbot({})
         self.assertEqual(cfg.max_sends_per_round, 3)
-        self.assertEqual(cfg.miss_daily_cap, 3)
+
         self.assertEqual(cfg.hourly_sends_cap, 24)
 
     def test_round_budget_scales_with_config(self):

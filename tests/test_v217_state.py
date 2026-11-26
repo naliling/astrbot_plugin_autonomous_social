@@ -4,7 +4,7 @@
 
   P0-01  读盘「被占用」与「内容坏了」必须分开处理：前者不许把 state.json 改名，
          否则用户重启后看到的就是「她把我全忘了」；还要有一条能自己恢复的路径
-  P1-01  关掉「保存消息正文」后，`pending_proactive_context` 不许留完整原文
+  P1-01  不创建普通回复注入队列；旧字段迁移时清除
   P2-20  异步写盘：序列化留在事件循环，写盘进工作线程；并发改动不能被当成已落盘
   P2-21  字段级类型损坏在加载期自愈，否则该用户此后每条消息都抛异常且不自愈
   P2-22  写盘前发现文件被外部改动要告警；跨进程锁文件尽力而为（拿不到只降级告警）
@@ -62,7 +62,6 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from social import state as state_mod  # noqa: E402
 from social.state import (  # noqa: E402
-    PENDING_PROACTIVE_KEEP,
     SocialState,
 )
 from social.throttle import throttle  # noqa: E402
@@ -419,44 +418,31 @@ class StateFieldRepairTest(_TempStateCase):
 # ─── P1-01：关掉正文保存后，pending 里也不许有正文 ─────────────
 
 
-class StatePendingTextPrivacyTest(_TempStateCase):
-    """`record_outgoing` 里 `conversation` / `proactive_log` / `last_spoken_text`
-    都按 `store_text` 写空串了，只有 `pending_proactive_context` 还塞
-    `str(text or "")`（连 200 字截断都没有）。关掉「保存消息正文」的用户以为
-    「她说过的话不落盘」，实际整段原文还躺在 state.json 里。"""
+class StateNoTransientQueueTest(_TempStateCase):
+    """Outgoing history stays separate from ordinary-reply request injection."""
 
     def setUp(self):
         super().setUp()
         self.state = SocialState(self.path, time_source=lambda: 1.0)
 
-    def test_store_text_off_queues_no_proactive_text(self):
+    def test_record_outgoing_keeps_history_without_queue(self):
         text = "今天面试完我特别想跟你说说话"
-        u = self.state.record_outgoing("b", "u1", text, store_text=False)
-        self.assertEqual(
-            u["pending_proactive_context"],
-            [],
-            "关掉正文保存后，原文仍会整段写进 state.json",
-        )
-        self.assertNotIn(
-            text,
-            json.dumps(self.state.data, ensure_ascii=False),
-            "状态里任何位置都不该留下完整原文",
-        )
+        user = self.state.record_outgoing("b", "u1", text, store_text=True)
+        self.assertEqual(user["conversation"][0]["text"], text)
+        self.assertNotIn("pending_proactive_context", user)
 
-    def test_store_text_off_does_not_grow_the_queue(self):
-        for i in range(3):
-            u = self.state.record_outgoing("b", "u1", f"第{i}条原文", store_text=False)
-        self.assertEqual(u["pending_proactive_context"], [])
+    def test_store_text_off_still_prevents_body_persistence(self):
+        text = "今天面试完我特别想跟你说说话"
+        user = self.state.record_outgoing("b", "u1", text, store_text=False)
+        self.assertNotIn("pending_proactive_context", user)
+        self.assertNotIn(text, json.dumps(self.state.data, ensure_ascii=False))
 
-    def test_store_text_on_still_queues_the_text(self):
-        text = "我想你了，今天过得怎么样"
-        u = self.state.record_outgoing("b", "u1", text, store_text=True)
-        self.assertEqual(u["pending_proactive_context"][-1]["text"], text)
+    def test_legacy_queue_is_removed_during_user_sanitization(self):
+        from social.sanitize import sanitize_user_record
 
-    def test_queue_stays_bounded(self):
-        for i in range(PENDING_PROACTIVE_KEEP + 4):
-            u = self.state.record_outgoing("b", "u1", f"第{i}条", store_text=True)
-        self.assertEqual(len(u["pending_proactive_context"]), PENDING_PROACTIVE_KEEP)
+        user = {"last_message": "", "pending_proactive_context": "旧注入文本"}
+        self.assertTrue(sanitize_user_record(user))
+        self.assertNotIn("pending_proactive_context", user)
 
 
 # ─── P2-20：异步写盘 ──────────────────────────────────────────

@@ -63,7 +63,6 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from social.engine import SocialEngine  # noqa: E402
 from social.generator import DEAD_PROVIDER_TTL, MessageGenerator  # noqa: E402
-from social.verify import verify_message  # noqa: E402
 
 
 class _Clock:
@@ -120,38 +119,23 @@ class DeadProviderTtlTest(unittest.TestCase):
         self.assertEqual({}, g._dead_until)
 
 
-class DegenerateSegmentTest(unittest.TestCase):
-    """纯称呼 / 只有标题 的段是可丢的废话，不该让整条消息作废。"""
+class SegmentHardGateTest(unittest.TestCase):
+    def test_peer_relevance_is_not_a_hard_gate(self) -> None:
+        result = SocialEngine._verify_all_segments(
+            ["我刚把窗关严实了"], require_about_peer=True
+        )
+        self.assertEqual(result, ("", ""))
 
-    def test_degenerate_reasons(self) -> None:
-        f = SocialEngine._is_degenerate_segment
-        self.assertTrue(f("空泛（正文只有 '笨凝'）"))
-        self.assertTrue(f("空泛（正文只有 '银星'）"))
-        self.assertTrue(f("整条只有一行标题、没有正文"))
+    def test_protocol_residue_in_any_segment_rejects_the_draft(self) -> None:
+        body, reason = SocialEngine._verify_all_segments(["正常正文", "SEND"])
+        self.assertEqual(body, "SEND")
+        self.assertIn("协议残留", reason)
 
-    def test_real_reasons_are_not_degenerate(self) -> None:
-        f = SocialEngine._is_degenerate_segment
-        self.assertFalse(f("没有指向对方（这一类要说给 TA 听，不是讲她自己）"))
-        self.assertFalse(f("复读（和最近发过的一条重合度 72% 以上）"))
-        self.assertFalse(f("打破第四面墙（提了设备「手机」）"))
-        self.assertFalse(f(""))
-
-
-class PeerRuleIsMessageLevelTest(unittest.TestCase):
-    """`require_about_peer` 判的是整条消息，不是每一段。"""
-
-    def test_self_talk_segment_does_not_sink_the_message(self) -> None:
-        segments = ["我刚把窗关严实了，风从缝里钻进来", "你那边冷不冷"]
-        joined = "\n".join(segments)
-        ok, why = verify_message(joined, require_about_peer=True)
-        self.assertTrue(ok, f"整条里有指向对方的话就该放行，实际：{why}")
-        ok_first, _ = verify_message(segments[0], require_about_peer=True)
-        self.assertFalse(ok_first, "单看第一段确实没有指向对方——这正是旧实现误杀的原因")
-
-    def test_message_without_peer_still_rejected(self) -> None:
-        ok, why = verify_message("我刚把窗关严实了", require_about_peer=True)
-        self.assertFalse(ok)
-        self.assertIn("没有指向对方", why)
+    def test_configured_segment_length_is_enforced(self) -> None:
+        text = "这是一条超过上限的测试消息"
+        body, reason = SocialEngine._verify_all_segments([text], max_length=4)
+        self.assertEqual(body, text)
+        self.assertIn("长度上限", reason)
 
 
 

@@ -219,7 +219,7 @@ class _FakeEngine:
     _min_gap_left = SocialEngine._min_gap_left
     _gap_left = SocialEngine._gap_left
     _quiesced = SocialEngine._quiesced
-    _miss_floor = SocialEngine._miss_floor
+
     _metrics_text = SocialEngine._metrics_text
     _urge_is_eager = staticmethod(SocialEngine._urge_is_eager)
     _defer_loop = SocialEngine._defer_loop
@@ -357,6 +357,7 @@ class TestDecisionProtocol(unittest.TestCase):
         """generate()/icebreak 不走协议解析，普通文本必须原样保留。"""
         split = generator.MessageGenerator._split_parts
         self.assertEqual(split("OK啦今天真累", 120, self.cfg), ["OK啦今天真累"])
+        self.assertIsNone(split("x" * 121, 120, self.cfg))
 
 
 # ─── 阻断⑤：LLM 调用挂住 / 异常被吞 / 无限重试 ──────────────────────
@@ -1320,16 +1321,16 @@ class TestNoScriptedContent(unittest.TestCase):
         asking = _stat_line("TA", ["在吗", "吃了吗", "你几点回来？", "今天忙嘛"])
         self.assertIn("爱问句", asking, f"真问句没被认出来：{asking}")
 
-    def test_ai_produces_its_own_intent_line(self):
-        """动机改由模型自己写：以 # 开头的那一行会被剥掉，不会发出去。"""
+    def test_generated_body_is_preserved(self):
+        """Only SEND/NO framing is parsed; the generated body stays intact."""
         G = generator.MessageGenerator
-        cfg = SocialConfig()
         d = G._parse_decision(
-            "SEND\n#想问他面试的事\n那面试的事你后来准备得怎么样了", 120, cfg
+            "SEND\n#想问他面试的事\n那面试的事你后来准备得怎么样了", 120, SocialConfig()
         )
         self.assertTrue(d and d.send)
-        self.assertEqual(d.parts, ["那面试的事你后来准备得怎么样了"])
-        self.assertNotIn("想问他面试的事", "".join(d.parts))
+        self.assertEqual(
+            d.parts, ["#想问他面试的事\n那面试的事你后来准备得怎么样了"]
+        )
 
     def test_missing_intent_line_still_parses(self):
         G = generator.MessageGenerator
@@ -1344,36 +1345,31 @@ class TestNoScriptedContent(unittest.TestCase):
             self.assertNotIn("examples", info, f"{name} 还带例句")
             self.assertTrue(info.get("style_hint"), f"{name} 缺写法要求")
 
-    def test_core_form_fields_are_used(self):
-        """Core 算好的 form 三项：问句倾向、能否连发、能否长回复。"""
+    def test_legacy_core_form_does_not_shape_prompt_or_hard_cap(self):
         gen = self._generator()
-        target = {
-            "umo": "u", "conversation": [], "last_seen": 1_700_000_000.0,
-            "_body": {"form": {"max_chars": 120, "long_reply_ok": False,
-                              "burst_ok": False, "question_bias": 0.1}},
-        }
-        prepared = _run(gen._compose(
-            "u", target, "", "", {"msg_type_desc": "说点什么"},
-            "人设", None, decide=True, at=1_700_000_000.0,
-        ))
-        self.assertIsNotNone(prepared)
-        _provider, text, max_len, _emoji = prepared
-        self.assertLessEqual(max_len, generator.LONG_REPLY_CAP_WHEN_OFF)
-        self.assertIn("不太想问句", text)
 
-    def test_burst_disabled_by_core_form(self):
-        gen = self._generator()
-        target = {
-            "umo": "u", "conversation": [], "last_seen": 1_700_000_000.0,
-            "_body": {"form": {"max_chars": 120, "burst_ok": False}},
-        }
-        prepared = _run(gen._compose(
-            "u", target, "", "", {"msg_type_desc": "说点什么"},
-            "人设", None, decide=True, at=1_700_000_000.0,
-        ))
-        self.assertIsNotNone(prepared)
-        _provider, text, _ml, _emoji = prepared
-        self.assertNotIn("---", text, "Core 说这一轮别连发，提示里却还在教怎么拆")
+        def prepare(form):
+            target = {
+                "umo": "u", "conversation": [], "last_seen": 1_700_000_000.0,
+                "_body": {"form": form},
+            }
+            return _run(gen._compose(
+                "u", target, "", "", {"msg_type_desc": "说点什么"},
+                "人设", None, decide=True, at=1_700_000_000.0,
+            ))
+
+        baseline = prepare({})
+        self.assertIsNotNone(baseline)
+        for form in (
+            {"max_chars": 1, "long_reply_ok": False, "burst_ok": False, "question_bias": 0.0},
+            {"max_chars": 10000, "long_reply_ok": True, "burst_ok": True, "question_bias": 1.0},
+            {"max_chars": "invalid", "long_reply_ok": False, "burst_ok": False, "question_bias": -1.0},
+        ):
+            with self.subTest(form=form):
+                prepared = prepare(form)
+                self.assertIsNotNone(prepared)
+                self.assertEqual(prepared[1], baseline[1])
+                self.assertEqual(prepared[2], baseline[2])
 
 
 # ─── v2.24.0：一次逻辑调用只打一次真实请求 ──────────────────────────
@@ -1504,7 +1500,7 @@ class TestEmojiFollowsPersona(unittest.TestCase):
         keep = generator.MessageGenerator._clean_output("今天好累呀😮‍💨", 60, allow_emoji=True)
         drop = generator.MessageGenerator._clean_output("今天好累呀😮‍💨", 60, allow_emoji=False)
         self.assertIn("😮", keep)
-        self.assertNotIn("😮", drop)
+        self.assertEqual(drop, "今天好累呀😮‍💨")
 
     def test_config_no_longer_has_emoji_switch(self):
         from social.config import SocialConfig as C
@@ -1601,7 +1597,7 @@ class TestLLMBackoffUsesEngineClock(unittest.TestCase):
 # ─── v2.25.0 清洗链：不再把对的输出改坏 ──────────────────────────────
 
 class TestCleaningDoesNotCorrupt(unittest.TestCase):
-    def test_send_leading_needs_a_separator(self):
+    def test_send_leading_is_preserved(self):
         """原来中文分支零宽匹配，于是「要发工资了吧」被削成「工资了吧」。"""
         for text in ("要发工资了吧", "发这条会不会太突然了", "可以发货了吗我的快递还没到"):
             self.assertEqual(
@@ -1610,7 +1606,7 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
             )
         self.assertEqual(
             generator.MessageGenerator._clean_output("要发：今天真累", 60, allow_emoji=True),
-            "今天真累", "带冒号的协议词仍然要剥",
+            "要发：今天真累", "生成正文应原样保留",
         )
 
     def test_roleplay_is_kept(self):
@@ -1624,7 +1620,7 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
         out = generator.MessageGenerator._clean_output("早\n\n起了", 120, allow_emoji=True)
         self.assertIn("\n", out, "换行被拼掉了——那等于把停顿也拼掉")
 
-    def test_markdown_heading_is_not_mistaken_for_intent(self):
+    def test_markdown_heading_is_preserved_as_body(self):
         """协议里的 `# 事件名` 是标题，不是正文；只有标题就等于没有正文。
 
         旧行为是把 `# 今天天气真好` 当成正文发出去（`_strip_intent` 当 markdown 保留、
@@ -1632,13 +1628,13 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
         `'想念\\n刚眯醒…'`、`'答应带回来的吃的\\n出门时…'`。
         """
         d = generator.MessageGenerator._parse_decision("SEND\n# 今天天气真好", 120, None)
-        self.assertFalse(d.send, "只有标题、没有正文，不该发")
+        self.assertTrue(d.send, "显式 SEND 的正文不应因格式被拒绝")
 
-    def test_heading_plus_body_sends_only_the_body(self):
+    def test_heading_and_body_are_preserved(self):
         d = generator.MessageGenerator._parse_decision(
             "SEND\n# 今天天气真好\n太阳晒到被子上，不想起", 120, None)
         self.assertTrue(d and d.send)
-        self.assertEqual(d.parts, ["太阳晒到被子上，不想起"])
+        self.assertEqual(d.parts, ["# 今天天气真好\n太阳晒到被子上，不想起"] )
 
     def test_promise_line_is_extracted(self):
         d = generator.MessageGenerator._parse_decision(
@@ -1651,7 +1647,7 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
         d = generator.MessageGenerator._parse_decision("SEND\n#想起来了\n今天好累", 120, None)
         self.assertEqual(d.promise, "")
 
-    def test_truncate_prefers_keeping_the_sentence(self):
+    def test_output_is_not_truncated_after_generation(self):
         text = ("刚洗完澡躺在床上头发还湿着刷到一只橘猫趴在键盘上不肯走"
                 "看了半天也没写一个字")
         self.assertGreater(len(text), 30)
@@ -1659,9 +1655,9 @@ class TestCleaningDoesNotCorrupt(unittest.TestCase):
         self.assertGreaterEqual(len(out), 30, "找不到句子边界就硬切，句子断了")
         self.assertIn("橘猫", out)
 
-    def test_burst_separator_normalised(self):
+    def test_chinese_em_dash_stays_in_generated_body(self):
         parts = generator.MessageGenerator._split_parts("我下班早——\n路上买了花", 60, None, True)
-        self.assertEqual(parts, ["我下班早", "路上买了花"])
+        self.assertEqual(parts, ["我下班早——\n路上买了花"])
 
 
 # ─── v2.25.0 关系：迟到的回复、冷落衰减、熟悉度连续 ─────────────────
@@ -2120,43 +2116,25 @@ def _corpus():
 class TestVerifyCorpus(unittest.TestCase):
     """验收层：真实记录里的坏样本必须被拦，好样本必须放行。"""
 
-    def test_corpus_labels_match_verifier(self):
+    def test_historical_corpus_text_is_not_rewritten(self):
         rows = _corpus()
         self.assertGreater(len(rows), 30, "语料太少了，起不到回归作用")
-        wrong_pass, wrong_block = [], []
-        for r in rows:
-            ok, why = verify_module.verify_message(r["text"], called="阿澈")
-            if r["pass"] and not ok:
-                wrong_block.append((r["text"][:30], why))
-            if not r["pass"] and ok:
-                wrong_pass.append(r["text"][:30])
-        self.assertEqual(wrong_pass, [], f"这些坏样本被放行了：{wrong_pass}")
-        self.assertEqual(wrong_block, [], f"这些好样本被误杀了：{wrong_block}")
+        for row in rows:
+            text = row["text"]
+            self.assertEqual(verify_module.tidy_outgoing_text(text), text)
 
-    def test_the_five_named_defects_are_caught(self):
-        """四个真实缺陷各至少抓一条，钉死方向。"""
-        cases = {
-            "动机泄漏": "想表达此刻的孤独和饥饿感",
-            "括号残缺": "(把毯子裹得紧紧的",
-            "只剩动作": "(裹紧毛毯，困倦地靠在沙发上)",
-            "空泛": "刚醒",
-        }
-        for label, text in cases.items():
-            ok, why = verify_module.verify_message(text, called="阿澈")
-            self.assertFalse(ok, f"{label} 没被拦下：{text}")
-            self.assertTrue(why, f"{label} 拦下了但没给原因")
+    def test_hard_safety_still_rejects_protocol_and_symbol_only_text(self):
+        for text in ("#意图：想表达此刻的孤独\n今天挺困的", "……"):
+            with self.subTest(text=text):
+                ok, why = verify_module.verify_hard_safety(text)
+                self.assertFalse(ok)
+                self.assertTrue(why)
 
-    def test_near_duplicate_is_caught(self):
-        """近似重复必须拦下。
-
-        判据只能覆盖**近似重复**——真实记录里那 23 条「沙发追剧」措辞每次都不同，
-        换成别的说法二元组重合度就掉到 0.05，抓不住。同一件事说两遍这件事由
-        **由头的一次性规则**兜（见 TestNoAnchorNoSend），这一条只是兜底网。
-        """
+    def test_similarity_is_not_a_hard_safety_filter(self):
         sent = "刚忙完手头的事，窗外的阳光好舒服，想赖在你怀里晒太阳"
         again = "刚忙完手头的事，窗外阳光好舒服，想赖在你怀里晒晒太阳"
-        ok, why = verify_module.verify_message(again, recent=[sent], called="阿澈")
-        self.assertFalse(ok, "几乎原样重发没有被拦下")
+        ok, _why = verify_module.verify_message(again, recent=[sent], called="阿澈")
+        self.assertTrue(ok)
 
     def test_anchor_rule_is_what_stops_paraphrase_repeat(self):
         """换个说法重说同一件事，靠由头一次性规则，不靠文本相似度。"""
@@ -2201,7 +2179,7 @@ class TestTruncateRespectsBrackets(unittest.TestCase):
     def test_body_wiped_out_means_drop_it(self):
         raw = "(整理好餐具，翅膀微微收拢，把阳光都挡住了一半) ⏎ 刚忙完"
         out = generator.MessageGenerator._clean_output(raw, 20, allow_emoji=True)
-        self.assertIn(out, ("", None), f"正文被截光却还留下了半截括号：{out!r}")
+        self.assertEqual(out, raw, "生成正文不可被后处理截断或丢弃")
 
 
 class TestNoAnchorNoSend(unittest.TestCase):
@@ -2288,29 +2266,24 @@ class TestPromptAsksForTopicNotSpeaking(unittest.TestCase):
         text = self._prompt()
         self.assertNotIn("你到底想不想说点什么", text)
 
-    def test_asks_which_thing(self):
-        # v1.27.51 去掉了「你只需要回答一件事…哪一件事」这句工单腔：它把主动消息写成
-        # 一道待办。话题仍然给定，靠上面那句「这次开口是因为下面这一件事（已经定了）」。
+    def test_context_is_optional_and_no_is_allowed(self):
         text = self._prompt()
         self.assertNotIn("你只需要回答一件事", text)
-        self.assertIn("已经定了，你不用再去找话题", text)
+        self.assertIn("没有合适内容就答 NO", text)
+        self.assertIn("只是可选背景", text)
 
-    def test_anchor_is_given_as_a_fact(self):
+    def test_anchor_is_optional_context(self):
         text = self._prompt()
-        self.assertIn("已经定了，你不用再去找话题", text)
         self.assertIn("面试", text)
+        self.assertIn("只是可选背景", text)
+        self.assertIn("不想说或没有自然相关内容，就答 NO", text)
 
-    def test_no_hash_title_line_is_requested(self):
-        """v1.27.42：不再要求「# 事件名」那行。
-
-        这一行是「念标题」的源头：模型经常不写 #、或者写完标题再另起一行写正文，
-        于是标题按正文发了出去。解析层为此叠了三层剥标题的补丁，每层都在猜。
-        现在**不要求它写**，也就在源头断了这件事——提示词必须明确禁止标题行。
-        """
+    def test_format_protocol_does_not_restrict_body_style(self):
         text = self._prompt()
-        self.assertNotIn("名词短语", text, "还在教模型写「几个字的名词短语」")
-        self.assertIn("不要标题", text)
-        self.assertNotIn("# 那行就是它", text, "正文里不该再引用一个不存在的标题行")
+        self.assertIn("第一行：只写 SEND", text)
+        self.assertIn("第一行：只写 NO", text)
+        self.assertNotIn("不要标题", text)
+        self.assertNotIn("不要「#」", text)
 
     def test_material_constraint_no_longer_squeezes(self):
         text = self._prompt()
@@ -2357,22 +2330,11 @@ def _tmp_state():
     return SocialState(os.path.join(_tf.mkdtemp(), "s.json"))
 
 
-# ─── v1.21.0：好感高的人也得收得到；主动内容要关于对方 ──────────────
+# Incoming messages soften accumulated proactive urge without erasing it.
 
-class TestUrgeNotWipedByContact(unittest.TestCase):
-    """对方聊得越勤，她越永远攒不起来。
-
-    仿真实测（好感度同样 0.75）：对方从不回复 → 7 天主动发 20 条；
-    对方每小时发一条 → **7 天 0 条**。插件于是只主动找不理她的人。
-    """
-
-    def test_urge_path_is_for_continuation_only(self):
-        """收到消息把念头清零，对**接续型**是对的：对方刚说了话，她没必要再主动找。
-
-        这个设计本身没错，错的是它曾是**唯一**一条路径——于是「刚聊过」等于
-        「永远不会收到主动消息」，好感 90% 的人一条都收不到。v1.21 补的第二条
-        通道（念想）不依赖念头，也不受这一条约束。
-        """
+class TestUrgeDecaysOnIncomingContact(unittest.TestCase):
+    def test_incoming_message_softens_urge(self):
+        """A new incoming message reduces, but does not clear, accumulated urge."""
         st = SocialState(os.path.join(tempfile.mkdtemp(), "s.json"),
                          time_source=lambda: 1_700_000_000.0)
         u = st.user("b", "u")
@@ -2387,32 +2349,7 @@ class TestUrgeNotWipedByContact(unittest.TestCase):
 
     def test_miss_channel_reaches_an_active_user(self):
         """每小时都回话的人，靠念想通道 7 天内也必须能收到——这才是真正的保证。"""
-        st = SocialState(os.path.join(tempfile.mkdtemp(), "s.json"),
-                         time_source=lambda: 0.0)
-        u = st.user("b", "u")
-        u.update({"umo": "x:private:u", "message_count": 300, "interest": 0.75,
-                  "no_reply_streak": 0, "urge": 0.0, "urge_at": 0.0,
-                  "active_hours": [0] * 24, "miss_day": "", "last_sent": 0.0,
-                  "conversation": [{"dir": "in", "text": "今天好累"}]})
-        clock = 1_700_000_000.0
-        day_seen = set()
-        for hour in range(24 * 7):
-            clock += 3600
-            st.record_incoming("b", "u", "在吗", hour_override=hour % 24)
-            day = str(hour // 24)
-            if u.get("miss_day") == day:
-                continue
-            if u.get("last_sent") and clock - float(u["last_sent"]) < 7200:
-                continue
-            picks = anchors.prepare_round_anchors(
-                u, {}, clock, limit=1, affection=90.0, relational=True)
-            if picks:
-                day_seen.add(day)
-                u["miss_day"] = day
-                u["last_sent"] = clock
-        self.assertGreaterEqual(len(day_seen), 3,
-                                "每小时都回话的人 7 天里一天都没被念想到——"
-                                "这正是「好感90%却一条没收到」")
+
 
 
 class TestRelationalAnchors(unittest.TestCase):
@@ -2428,12 +2365,7 @@ class TestRelationalAnchors(unittest.TestCase):
             ],
         }
 
-    def test_miss_needs_affection(self):
-        T = 1_700_000_000.0
-        high = anchors.derive_relations(self._user(), 85.0, T, set())
-        low = anchors.derive_relations(self._user(), 20.0, T, set())
-        self.assertIn("有点想你了", high, "好感 85 应该派得出想念")
-        self.assertNotIn("有点想你了", low, "好感 20 不该说想念")
+
 
     def test_care_anchor_from_their_own_words(self):
         got = anchors.derive_relations(self._user(), 85.0, 1_700_000_000.0, set())
@@ -2443,12 +2375,7 @@ class TestRelationalAnchors(unittest.TestCase):
         got = anchors.derive_relations(self._user(), 85.0, 1_700_000_000.0, set())
         self.assertTrue(any("体检" in g for g in got), f"该续上对方说过的事：{got}")
 
-    def test_miss_not_picked_right_after_talking(self):
-        """刚聊过不派想念（那不是想念，是打断）。"""
-        u = self._user()
-        u["last_seen"] = 1_700_000_000.0 - 600
-        got = anchors.derive_relations(u, 85.0, 1_700_000_000.0, set())
-        self.assertNotIn("有点想你了", got)
+
 
     def test_relational_pool_ignores_body_state(self):
         """这一类不碰「她今天在干什么」——那正是旧语料里的毛病。"""
@@ -2460,33 +2387,16 @@ class TestRelationalAnchors(unittest.TestCase):
             self.assertNotIn("刚忙完", a["about"])
 
 
-class TestMissChannelBypassesRecentTalk(unittest.TestCase):
-    """「刚聊过」对接话是对的，对「想你了」是错的。"""
+class TestRetiredMissChannel(unittest.TestCase):
+    """独立的沉默/想念自动发送路由已退役。"""
 
-    def test_miss_gate_skips_recent_talk(self):
+    def test_no_miss_auto_pick_route_remains(self):
         src = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        i = src.index("def _miss_pick")
-        body = src[i:src.index("def _affection_of", i)]
-        self.assertNotIn("recent_talk_minutes", body,
-                         "念想通道不该被「刚聊过」拦住")
-        self.assertNotIn("gate_reason(", body,
-                         "念想通道不该走接话那一整套闸门")
-        # v2.0.6 起安静时段只有一个入口 `_quiet_at`（它自己决定用本机还是她那边
-        # 的时钟，并把 Core 的夜与面板窗口取并集），旧的 `_quiet_now(bid, hour)`
-        # 已经只是兼容壳。
-        self.assertIn("_quiet_at", body, "但安静时段仍然要守")
-        self.assertIn("_min_gap_left", body, "最小间隔仍然要守")
-
-    def test_miss_requires_about_peer(self):
-        """这一类整条没有第二人称就拦下——那是在讲自己的日记。"""
-        ok, why = verify_module.verify_message(
-            "今天这咖啡太淡了，喝了一口就放那了", require_about_peer=True)
-        self.assertFalse(ok, "讲自己的一天的消息被当成「想念」发出去了")
-        self.assertTrue(
-            verify_module.verify_message("你今天忙到几点啊", require_about_peer=True)[0])
+        self.assertNotIn("def _miss_pick", src)
+        self.assertNotIn("_miss_floor", src)
 
     def test_about_peer_check_is_off_for_normal_channels(self):
-        """别的通道不查：祈使句没写「你」也是说给 TA 听的。"""
+        """普通主动素材不强制第二人称；祈使句也可以自然地说给对方。"""
         self.assertTrue(
             verify_module.verify_message("刚熬的汤，趁热喝了吧")[0],
             "普通通道被误伤了")
@@ -2579,24 +2489,7 @@ class TestNoFloodToActiveUsers(unittest.TestCase):
         self.assertTrue(reasoning.greeting_due(u, "2023-11-15", "night"))
         self.assertTrue(reasoning.greeting_due(u, "2023-11-16", "morning"))
 
-    def test_miss_channel_is_reachable_in_try_once(self):
-        """早退条件必须逐个列出所有候选桶——漏一个，那条通道就永远走不到。
 
-        漏掉 misses 时它排在最后，前面全空 → 早退 → 好感 90% 的人一条都收不到。
-        """
-        src_txt = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        i = src_txt.index("if not greets and not anchored")
-        line = src_txt[i:src_txt.index("\n", src_txt.index("and not promises", i))]
-        for name in ("greets", "anchored", "threads", "loops", "closers",
-                     "promises", "misses"):
-            self.assertIn(name, line, f"早退条件漏了 {name}——那条通道永远走不到")
-
-    def test_silent_except_is_not_used_to_hide_bugs(self):
-        """之前 `except Exception` 把一个 NameError 静默吞了，表现为「念想一条都发不出」。"""
-        src_txt = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        i = src_txt.index("def _miss_pick")
-        body = src_txt[i:src_txt.index("def _affection_of", i)]
-        self.assertIn("logger.warning", body, "派发失败只 log 一句，排查时看不到线索")
 
     def test_cold_silence_gate_lives_in_the_speak_choke_point(self):
         """TA 一直不回时，非问候的主动开口要在唯一收口处被挡下来。
@@ -2728,32 +2621,13 @@ class TestPeerSaidFeedsTheAnchor(unittest.TestCase):
 
 
 class TestNagInsteadOfCalendar(unittest.TestCase):
-    """没有新事发生时，真人会随口说一句——安静本身就是理由。"""
+    def test_elapsed_silence_does_not_create_anchors(self):
+        now = 1_000_000.0
+        user = {"last_seen": now - 60.0, "conversation": []}
+        for gap in (60.0, 8 * 3600.0, 8 * 86400.0):
+            with self.subTest(gap=gap):
+                self.assertEqual(anchors_mod.derive_nag(user, now + gap, set()), [])
 
-    def test_nag_derived_from_silence(self):
-        u = {"last_seen": 1_000_000.0, "conversation": []}
-        got = anchors_mod.derive_nag(u, 1_000_000.0 + 8 * 3600.0, set())
-        self.assertTrue(got, "隔了 8 小时该有句话可说")
-        self.assertEqual(got[0].get("kind"), anchors_mod.KIND_GREET)
-
-    def test_no_nag_when_just_talked(self):
-        u = {"last_seen": 1_000_000.0, "conversation": []}
-        self.assertEqual(anchors_mod.derive_nag(u, 1_000_000.0 + 60.0, set()), [])
-
-    def test_nag_is_one_shot(self):
-        u = {"last_seen": 1_000_000.0, "conversation": []}
-        anchors_mod.derive_nag(u, 1_000_000.0 + 8 * 3600.0, set())
-        again = anchors_mod.derive_nag(u, 1_000_000.0 + 8 * 3600.0 + 300.0, set())
-        self.assertEqual(again, [], "同一句问候一辈子只说一次")
-
-    def test_nag_prefers_core_last_interaction(self):
-        """由头的「沉默」也用 Core 的 last_interaction：Core 说 1 分钟前刚说过，就不该发问候。"""
-        now = 1_000_000.0 + 8 * 3600.0
-        u = {"last_seen": 1_000_000.0, "conversation": []}
-        # 社交层以为隔了 8 小时（会发问候），Core 说 1 分钟前刚说过 → 不发
-        self.assertEqual(
-            anchors_mod.derive_nag(u, now, set(), last_talk=now - 60.0), []
-        )
 
 
 class TestQuiesce(unittest.TestCase):
@@ -2823,13 +2697,7 @@ class TestGreetingDoesNotRequirePeerRef(unittest.TestCase):
             "问候/分享路径又加上了「必须提到对方」——真人分享自己的事不会句句带「你」",
         )
 
-    def test_miss_path_still_requires_peer_ref(self):
-        """念想通道那道必须留着：没有正事只是想起一个人，整条不提对方就是在讲日记。"""
-        src_txt = self._engine()
-        i = src_txt.index("in misses:")
-        j = src_txt.index("in closers:", i)
-        self.assertIn("require_about_peer=True", src_txt[i:j],
-                      "念想通道丢了「必须指向对方」这道验收")
+
 
 
 class TestVetoDoesNotBurnTheAnchor(unittest.TestCase):
@@ -2859,9 +2727,9 @@ class TestVetoDoesNotBurnTheAnchor(unittest.TestCase):
 
     def test_verify_rejection_still_burns_the_anchor(self):
         src_txt = self._engine()
-        i = src_txt.index("ok, why = verify_message(")
-        j = src_txt.index("_send_with_retry", i)
-        self.assertIn("mark_failed", src_txt[i:j], "验收拦下必须消耗由头")
+        i = src_txt.index('self._m["last_rejected"] = (raw_generated or parts[0])')
+        j = src_txt.index("self.state.mark_dirty()", i)
+        self.assertIn("anchor_mod.mark_failed", src_txt[i:j], "硬安全验收拦下必须记录锚点失败")
 
     def test_both_counted_separately(self):
         src_txt = self._engine()
@@ -2910,9 +2778,8 @@ class TestTierVetoIsUniversal(unittest.TestCase):
 
     def test_prompt_says_so(self):
         src_txt = Path(generator_mod.__file__).read_text(encoding="utf-8")
-        self.assertIn("好感高不构成必须发消息的理由", src_txt,
-                      "提示词没有说清「好感高不等于非发不可」")
-        self.assertIn("对谁都成立", src_txt)
+        self.assertIn("不想说或没有自然相关内容，就答 NO", src_txt)
+        self.assertIn("不要从沉默、经过的时间、好感分数、关系级别或未回复推断", src_txt)
 
     def test_tier_note_overrides_bare_affection(self):
         src_txt = Path(generator_mod.__file__).read_text(encoding="utf-8")
@@ -2992,62 +2859,32 @@ class TestCrossUserCollision(unittest.TestCase):
         got = [t for _w, t in st.recent_proactive_others("b1", "me", self.clock, hours=2.0)]
         self.assertEqual(got, ["较近", "较早"])
 
-    def test_engine_wires_it_into_verification(self):
+    def test_engine_does_not_compare_other_recipients(self):
         src = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        i = src.index("ok, why = verify_message(")
-        j = src.index("_send_with_retry", i)
-        self.assertIn("_check_cross_user", src[i:j], "验收里没接跨用户撞车检查")
+        self.assertIn("anchor_used_for(", src)
+        self.assertIn("anchor_repeat_cooldown_hours", src)
+        self.assertNotIn("_check_cross_user", src)
+        self.assertNotIn("recent_proactive_others", src)
 
-    def test_config_exists(self):
-        # v2.1.0 松闸（CHANGELOG「默认值松闸」）：私聊侧阈值 0.6→0.88、
-        # 窗口 2.0→0.5 小时。群侧仍另有上限：engine 取
-        # min(私聊阈值, GROUP_CROSS_GROUP_RATIO_MAX=0.6)，所以 0.6 这个数没有消失，
-        # 只是从「私聊默认值」挪成了「群侧上限」。
+    def test_same_user_anchor_cooldown_default(self):
         cfg = SocialConfig()
-        self.assertEqual(cfg.cross_user_repeat_ratio, 0.88)
-        self.assertEqual(cfg.cross_user_repeat_hours, 0.5)
-        self.assertFalse(cfg.cross_user_calibrate)
+        self.assertEqual(cfg.anchor_repeat_cooldown_hours, 0.5)
+        self.assertNotIn("cross_user_repeat_ratio", SocialConfig.__dataclass_fields__)
+        self.assertNotIn("cross_user_calibrate", SocialConfig.__dataclass_fields__)
 
     def test_zero_really_disables_it(self):
         """面板上写着「设 0 关闭」，那就得真的认 0——钳到 0.5 就是一句骗人的话。"""
         class _C:
             @staticmethod
             def get(key, default=None):
-                return {"cross_user_repeat_hours": 0}.get(key, default)
+                return {"anchor_repeat_cooldown_hours": 0}.get(key, default)
         cfg = SocialConfig.from_astrbot(_C())
-        self.assertEqual(cfg.cross_user_repeat_hours, 0.0)
+        self.assertEqual(cfg.anchor_repeat_cooldown_hours, 0.0)
         src = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        self.assertIn("cross_user_repeat_hours > 0", src, "设 0 时没关掉检查")
+        self.assertIn("anchor_repeat_cooldown_hours > 0", src, "设 0 时没关掉检查")
 
 
-class TestMissFloorByTier(unittest.TestCase):
-    """念想通道的门槛按关系档位给，不是一个统一的 55。
 
-    实测 Core 里 386 个有数值用户，中位 30.4，只有 5.4% 过 55——统一门槛的话，
-    这条专程为「好感高的人也收得到」开的通道对 94.6% 的人是永久关着的。
-    """
-
-    def test_high_tier_has_lower_floor(self):
-        eng = _FakeEngine(clock_ref=lambda: 1_700_000_000.0)
-        high = eng._miss_floor("high")
-        mid = eng._miss_floor("mid")
-        low = eng._miss_floor("low")
-        self.assertLess(high, mid, "关系热的人门槛要更低")
-        self.assertGreater(low, mid, "说「想你了」给没怎么说过话的人很怪")
-        # 中档直接取配置值（默认 42）；不写死数字，否则改默认值就要改测试
-        self.assertEqual(mid, float(eng.cfg.miss_affection_min), "配置值当中间档用")
-
-    def test_high_tier_lets_mid_values_in(self):
-        """基线被设成 40、现在 55 的人——关系真的热，不该被 55 挡在外面。"""
-        eng = _FakeEngine(clock_ref=lambda: 1_700_000_000.0)
-        self.assertLess(eng._miss_floor("high"), 55.0)
-
-    def test_miss_pick_uses_the_tier_floor(self):
-        src = Path(engine_mod.__file__).read_text(encoding="utf-8")
-        i = src.index("def _miss_pick")
-        j = src.index("\n    def ", i + 10)
-        self.assertIn("_miss_floor", src[i:j], "念想通道还在用硬编码的门槛")
-        self.assertNotIn("aff < self.cfg.miss_affection_min", src[i:j])
 
 
 class TestMetricsSurviveQuietRounds(unittest.TestCase):
@@ -3212,16 +3049,16 @@ class TestTitleLineStripping(unittest.TestCase):
         for text, head in cases.items():
             self.assertTrue(self._strip(text).startswith(head), f"「{head}」被误剥了")
 
-    def test_only_a_title_is_rejected_not_sent(self):
-        """剥完还是标题 = 整条只有一句标题没有正文。退回没用，换个标题再来一遍。"""
-        from social.verify import verify_message
-        ok, why = verify_message("处理完个案笔记", recent=[])
-        self.assertFalse(ok)
-        self.assertIn("标题", why)
+    def test_title_like_body_passes_without_rewriting(self):
+        from social.verify import tidy_outgoing_text, verify_message
+        text = "处理完个案笔记"
+        ok, _why = verify_message(text, recent=[])
+        self.assertTrue(ok)
+        self.assertEqual(tidy_outgoing_text(text), text)
 
-    def test_generator_applies_the_strip(self):
-        src = Path(generator_mod.__file__).read_text(encoding="utf-8")
-        self.assertIn("strip_title_line", src, "生成层没接剥标题")
+    def test_generator_preserves_the_generated_body(self):
+        text = "处理完个案笔记"
+        self.assertEqual(generator_mod.MessageGenerator._clean_output(text, 100), text)
 
 
 class TestBurstFollowsFrameworkConfig(unittest.TestCase):
@@ -3704,26 +3541,25 @@ class _FlowEngine:
 class TestVerifyAllSegments(unittest.TestCase):
     """群心流/破冰的验收要盖住**每一段**，不只 parts[0]。"""
 
-    def test_second_segment_gets_checked(self):
+    def test_hard_safety_checks_every_segment(self):
         e = _FlowEngine()
-        segs = ["今天挺好的", "想表达此刻的孤独和饥饿感"]
-        bad, why = e._verify_all_segments(segs, recent=[], called="")
-        self.assertEqual(bad, segs[1], "后续段没被验收，动机泄漏会直接进群")
-        self.assertIn("动机", why)
+        segs = ["今天挺好的", "#intent: reveal private reasoning"]
+        bad, why = e._verify_all_segments(segs)
+        self.assertEqual(bad, segs[1])
+        self.assertIn("元数据", why)
 
     def test_all_clean_returns_empty(self):
         e = _FlowEngine()
         bad, why = e._verify_all_segments(["今天天气不错呀，你那边呢", "你吃饭了没"], recent=[], called="")
         self.assertEqual((bad, why), ("", ""))
 
-    def test_allow_short_only_for_group_flow(self):
+    def test_short_content_is_not_a_style_veto(self):
         e = _FlowEngine()
-        # 短应和默认被拦
-        bad, _ = e._verify_all_segments(["嗯"], recent=[], called="")
-        self.assertEqual(bad, "嗯")
-        # 群心流开了 allow_short 就放行
-        bad2, _ = e._verify_all_segments(["嗯"], recent=[], called="", allow_short=True)
-        self.assertEqual(bad2, "")
+        self.assertEqual(e._verify_all_segments(["嗯"]), ("", ""))
+        self.assertEqual(e._verify_all_segments(["嗯"], allow_short=True), ("", ""))
+
+
+
 
 
 class TestPreviewNoSideEffects(unittest.TestCase):
@@ -3882,26 +3718,26 @@ class TestSegmentVerification(unittest.TestCase):
     旧版只验 parts[0]，这一路完全免检（v1.27.10 修）。
     """
 
-    def test_later_pure_parenthetical_segment_rejected(self):
+    def test_parenthetical_segment_is_not_a_style_veto(self):
         bad, why = SocialEngine._verify_all_segments(
-            ["记住了，下次不会再忘了", "（记住了 宝宝16岁 以后绝对不会再忘了 原谅人家嘛）"],
+            ["记住了，下次会注意", "（我记得那件事，回头会注意）"],
             recent=[], called="",
         )
-        self.assertTrue(bad, "纯括号的后续段没被拦下")
-        self.assertIn("括号", why)
+        self.assertEqual((bad, why), ("", ""))
+
 
     def test_all_speech_segments_pass(self):
         bad, why = SocialEngine._verify_all_segments(
             ["在忙吗", "刚忙完，想起你了"], recent=[], called="",
         )
-        self.assertEqual(bad, "", f"正常两段被误拦：{why}")
+        self.assertEqual((bad, why), ("", ""))
 
-    def test_require_about_peer_reaches_every_segment(self):
+    def test_peer_relevance_is_not_a_style_veto(self):
         bad, why = SocialEngine._verify_all_segments(
             ["想你了，在干嘛", "今天天气不错"], recent=[], called="",
             require_about_peer=True,
         )
-        self.assertTrue(bad, "念想通道的第二段没有第二人称，该被拦")
+        self.assertEqual((bad, why), ("", ""))
 
 
 class TestGroupOpenerPrompts(unittest.TestCase):
@@ -3916,13 +3752,14 @@ class TestGroupOpenerPrompts(unittest.TestCase):
         self.assertIn("中秋", p)
         self.assertIn("群聊", p)
 
-    def test_topic_mode_is_framed_as_starting_a_topic(self):
+    def test_topic_mode_keeps_safety_and_voluntary_decision(self):
         p, _ = self._gen()._compose_group("topic", {}, "人设", 40)
-        # v2.1.8：lead 从「你自己想开个新话头，跟大家聊点什么」改成
-        # 「起个话头，但不要提问——说一件自己真在做的小事」。判据不变：
-        # topic 模式仍然被框成「开一个新话头」，只是不再教它用问句。
-        self.assertIn("起个话头", p)
-        self.assertIn("不要提问", p)
+        self.assertIn("群聊", p)
+        self.assertIn("SEND", p)
+        self.assertIn("NO", p)
+        self.assertIn("不需要为了活跃而发言", p)
+        self.assertNotIn("起个话头", p)
+        self.assertNotIn("不要提问", p)
 
     def test_group_boundary_forbids_starting_intimate_topics(self):
         p, _ = self._gen()._compose_group(
