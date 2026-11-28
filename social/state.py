@@ -1567,6 +1567,60 @@ class SocialState:
 
     # ─── 持久化 ─────────────────────────────────────────
 
+    def prune_group_samples(self, retention_days: int, now: Optional[float] = None) -> int:
+        """Prune old or malformed group text samples without deleting group state."""
+        try:
+            days = float(retention_days)
+            current = float(time.time() if now is None else now)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if not math.isfinite(days) or days <= 0 or not math.isfinite(current):
+            return 0
+
+        cutoff = current - days * 86400.0
+        pruned = 0
+        bots = self.data.get("bots")
+        if not isinstance(bots, dict):
+            return 0
+        for bot in bots.values():
+            groups = bot.get("groups") if isinstance(bot, dict) else None
+            if not isinstance(groups, dict):
+                continue
+            for group in groups.values():
+                if not isinstance(group, dict) or "samples" not in group:
+                    continue
+                samples = group.get("samples")
+                if not isinstance(samples, list):
+                    group["samples"] = []
+                    pruned += 1
+                    continue
+                kept = []
+                for sample in samples:
+                    if not isinstance(sample, dict):
+                        pruned += 1
+                        continue
+                    text = sample.get("text")
+                    try:
+                        timestamp = float(sample.get("ts"))
+                    except (TypeError, ValueError, OverflowError):
+                        pruned += 1
+                        continue
+                    if (
+                        not isinstance(text, str)
+                        or not text.strip()
+                        or not math.isfinite(timestamp)
+                        or timestamp > current
+                        or timestamp <= cutoff
+                    ):
+                        pruned += 1
+                        continue
+                    kept.append(sample)
+                if len(kept) != len(samples):
+                    group["samples"] = kept
+        if pruned:
+            self.mark_dirty()
+        return pruned
+
     def prune_stale_groups(self, stale_days: int, now: Optional[float] = None) -> int:
         """丢掉超过 stale_days 天没见过任何消息的群（被踢/退群/解散），返回被清群数。
 

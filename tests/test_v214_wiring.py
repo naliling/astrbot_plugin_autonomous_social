@@ -7,6 +7,7 @@
 和老测试验的业务规则不是一类东西，混在一起以后没人敢删。
 """
 
+import ast
 import asyncio
 import sys
 import time
@@ -498,7 +499,14 @@ class WiringSourceTest(unittest.TestCase):
         self.source = (PLUGIN_ROOT / "social" / "engine.py").read_text(encoding="utf-8")
 
     def test_imports_guards(self):
-        self.assertIn("core_facade, desire, guards", self.source)
+        tree = ast.parse(self.source)
+        imported = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None
+            for alias in node.names
+        }
+        self.assertTrue({"core_facade", "desire", "guards"} <= imported)
 
     def test_decide_goes_through_planner(self):
         self.assertIn("SocialEngine._decide_proactive(", self.source)

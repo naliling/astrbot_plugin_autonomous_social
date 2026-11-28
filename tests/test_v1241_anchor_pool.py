@@ -550,6 +550,21 @@ class MainUserIsActuallyServed(unittest.TestCase):
                        key=lambda kv: (-E._relation_bucket(kv[1]), float(kv[1]["last_sent"])))
         self.assertEqual(order[0][0], "a", "同档里久没联系的先来，这就是轮转")
 
+    def test_empty_thread_and_loop_anchors_are_checked_before_budget(self):
+        import inspect
+        from social.engine import SocialEngine
+        src = inspect.getsource(SocialEngine.try_once)
+        greet_start = src.index("for bid, uid, u, kind, _reason in greets")
+        thread_start = src.index("for bid, uid, u, kind, reason, gap in sorted(threads")
+        loop_start = src.index("for bid, uid, u, about, overdue in sorted(loops", thread_start)
+        greet_block = src[greet_start:thread_start]
+        thread_block = src[thread_start:loop_start]
+        loop_block = src[loop_start:]
+        self.assertIn("if not picks or not pre_take(bid):", greet_block, "无具体锚点的问候必须静默")
+        self.assertLess(greet_block.index("if not picks"), greet_block.index("jobs.append"))
+        self.assertLess(thread_block.index("if not _about.strip()"), thread_block.index("pre_take(bid)"))
+        self.assertLess(loop_block.index('if not str(about or "").strip()'), loop_block.index("pre_take(bid)"))
+
     def test_anchored_channel_gets_a_reserved_slot(self):
         """「另起话题」必须拿到至少一条，否则主通道整轮哑火。"""
         import inspect

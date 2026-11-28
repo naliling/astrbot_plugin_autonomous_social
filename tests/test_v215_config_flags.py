@@ -130,9 +130,9 @@ class SchemaContractTest(unittest.TestCase):
         for key in NEW_KEYS:
             self.assertIs(SCHEMA[key]["default"], getattr(SocialConfig(), key), key)
 
-    def test_schema_key_count_is_135(self):
+    def test_schema_key_count_is_136(self):
         # v2.2.54 also retires the unused cross-channel dedup option.
-        self.assertEqual(len(SCHEMA), 135)
+        self.assertEqual(len(SCHEMA), 136)
 
     def test_schema_json_has_no_duplicate_keys(self):
         # json.loads 会静默保留后一个同名键；重复键会让面板只显示一个、_d() 读到另一个。
@@ -215,8 +215,8 @@ class ReadmeTest(unittest.TestCase):
 
     def test_count_line_matches_schema(self):
         self.assertEqual(_readme_count(), len(SCHEMA))
-        # The README schema count stays synchronized with the 135 active properties.
-        self.assertEqual(_readme_count(), 135)
+        # The README schema count stays synchronized with the 136 active properties.
+        self.assertEqual(_readme_count(), 136)
 
 
 class EngineWiringTest(unittest.TestCase):

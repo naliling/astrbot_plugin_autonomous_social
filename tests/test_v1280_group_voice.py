@@ -407,8 +407,9 @@ class AnchorLifeSourcesTest(unittest.TestCase):
         )
 
     def test_life_and_weather_facts_are_available_without_priority(self):
+        peer = {"conversation": [{"dir": "in", "ts": NOW - 60, "text": "外面今天又下雨了"}]}
         picks = anchors.prepare_round_anchors(
-            {},
+            peer,
             {"day": {"done": ["下午去了一趟银行"]},
              "weather": {"env": "中雨，气温 9℃"}},
             NOW,
@@ -539,16 +540,29 @@ class GroupTopicHintTest(unittest.TestCase):
             "holiday": "中秋节",
             "weather": {"env": "中雨，气温 9℃"},
         }
-        text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", {}, NOW)
+        group = {"samples": [{"ts": NOW - 60, "self": False, "text": "今天外面下雨了"}]}
+        text, weather, _life = _HintEngine(body)._group_topic_hint("b", "g", group, NOW)
         self.assertIn("下午去了一趟银行", text)
         self.assertIn("正在整理个案笔记", text)
         self.assertIn("中秋", text)
         self.assertTrue(weather)
         self.assertIn(weather, text)
 
+    def test_weather_requires_an_explicit_recent_peer_sample(self):
+        body = {"weather": {"env": "中雨，气温 9℃"}}
+        engine = _HintEngine(body)
+        for sample in (
+            {"ts": NOW - 60, "self": True, "text": "今天下雨了"},
+            {"ts": NOW - 60, "text": "今天下雨了"},
+        ):
+            with self.subTest(sample=sample):
+                text, weather, _life = engine._group_topic_hint("b", "g", {"samples": [sample]}, NOW)
+                self.assertEqual(weather, "")
+                self.assertNotIn("中雨", text)
+
     def test_weather_is_gated_for_six_hours(self):
         body = {"weather": {"env": "中雨，气温 9℃"}}
-        g: dict = {}
+        g: dict = {"samples": [{"ts": NOW - 60, "self": False, "text": "今天外面下雨了"}, {"ts": NOW + 7 * 3600 - 60, "self": False, "text": "今晚又下雨了"}]}
         engine = _HintEngine(body)
         _text, weather, _life = engine._group_topic_hint("b", "g", g, NOW)
         self.assertTrue(weather)
@@ -683,8 +697,9 @@ class IcebreakNoQuotaTest(unittest.TestCase):
         g["last_seen"] = NOW - 6 * 3600
         return st, g
 
-    def _run(self, parts, body=None):
+    def _run(self, parts, body=None, samples=()):
         st, g = self._state()
+        g["samples"].extend(samples)
         engine = _IcebreakEngine(body or {}, parts, st)
         import asyncio
 
@@ -699,7 +714,8 @@ class IcebreakNoQuotaTest(unittest.TestCase):
 
     def test_send_counts_and_marks_the_weather(self):
         body = {"weather": {"env": "中雨，气温 9℃"}}
-        out, engine, g, _st = self._run(["下午去银行回来路上买了花"], body)
+        peer_weather = [{"ts": NOW - 60, "self": False, "text": "今天外面一直下雨"}]
+        out, engine, g, _st = self._run(["下午去银行回来路上买了花"], body, samples=peer_weather)
         self.assertTrue(out)
         self.assertEqual(engine.sent, ["下午去银行回来路上买了花"])
         self.assertEqual(int(g.get("icebreak_count_day", 0) or 0), 1)

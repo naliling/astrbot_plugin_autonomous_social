@@ -32,7 +32,7 @@ try:
 except ImportError:
     MessageChain = None
 
-from . import __version__, anchors, anchors as anchor_mod, core_facade, desire, guards
+from . import __version__, anchors, anchors as anchor_mod, core_facade, conversation_quality, desire, guards
 from . import history_ingest
 from . import memory_bridge
 from . import pacing
@@ -3363,7 +3363,8 @@ class SocialEngine:
 
     @staticmethod
     def _verify_all_segments(segments, *, recent=(), called="", allow_short=False,
-                             require_about_peer=False, msg_type="", species="", max_length=0):
+                             require_about_peer=False, msg_type="", species="", max_length=0,
+                             peer_context=(), peer_context_kind="private", now=0.0):
         """Reject the complete draft if any final segment violates a hard boundary."""
         if not segments:
             return "", "没有可发送的消息段"
@@ -3381,6 +3382,11 @@ class SocialEngine:
             )
             if not passed:
                 return body, reason
+            quality_why = conversation_quality.proactive_content_issue(
+                body, peer_context, now, group=(peer_context_kind == "group")
+            )
+            if quality_why:
+                return body, quality_why
         return "", ""
 
     async def _flow_reply_inner(self, bid: str, gid: str, trigger_ts: float) -> None:
@@ -3570,6 +3576,9 @@ class SocialEngine:
             segments, recent=own_recent_texts, called=called,
             species=_species_safe(self, bid),
             max_length=int(getattr(self.cfg, "max_message_length", 0) or 0),
+            peer_context=group_ctx.get("recent") or (),
+            peer_context_kind="group",
+            now=now,
         )
         if bad_text or flow_why:
             self._m["rejected_total"] = int(self._m.get("rejected_total", 0)) + 1
@@ -3681,6 +3690,7 @@ class SocialEngine:
                 "name": str(s.get("name", "") or ""),
                 "text": str(s.get("text", "") or ""),
                 "self": bool(s.get("self")),
+                "ts": s.get("ts"),
             }
             for s in samples[-n:]
             if str(s.get("text", "") or "").strip()
@@ -3827,9 +3837,8 @@ class SocialEngine:
         给 `_icebreak` 用：真发出去之后才知道该把哪一条记成「这个群用过了」。
 
         素材以**她自己的生活**优先（`groupflow.life_lines`：刚做完/正在做/今天想去/
-        还没做完/昨晚梦到），节日其次，天气最后。天气必须过
-        `anchors.weather_worth_telling` 的「变了 + 6 小时未说过」闸——天气永远有，
-        不过闸就成了唯一话头（用户原话：「只有天气，不会真的找话题」）。
+        还没做完/昨晚梦到），节日其次，天气最后。天气既要由近期群友提起，也要过
+        `anchors.weather_worth_telling` 的「变了 + 6 小时未说过」闸，避免无关天气成为兜底。
 
         天气的去重存在**群状态** `g` 里（不是用户状态）：同一个群连着破冰不该反复
         说同一句天气；发送成功后由 `_icebreak` 调 `mark_weather_told` 落账。
@@ -3869,9 +3878,10 @@ class SocialEngine:
         else:
             weather = str(raw_weather or "").strip()
         weather_used = ""
-        if weather:
-            # 闸的返回非空 = 这次可以说；用**完整原句**而不是截断版当素材，
-            # 免得「外面下着很大的雷阵雨」被切成半句。
+        if weather and conversation_quality.has_recent_weather_mention(
+            g.get("samples") or [], now, group=True
+        ):
+            # 近期群友确实提过天气后，再应用变化/去重闸并保留完整原句。
             worth = anchors.weather_worth_telling(
                 g, {"weather": {"env": weather}}, now
             )
@@ -4188,6 +4198,9 @@ class SocialEngine:
                 called=str(self._last_persona.get(bid, "") or ""),
                 species=_species_safe(self, bid),
                 max_length=int(getattr(self.cfg, "max_message_length", 0) or 0),
+                peer_context=g.get("samples") or (),
+                peer_context_kind="group",
+                now=now,
             )
         except Exception as ice_exc:
             if throttle.allow(f"icebreak.verify_error.{bid}", window=1800.0):
@@ -7745,20 +7758,14 @@ class SocialEngine:
         # **距上次说上话多久了**。所以这里纯静音时长驱动，隔了够久就能说，一天说几次
         # 由关系档和这句话当下的分量决定。
         for bid, uid, u, kind, _reason in greets:
-            if budget.get(bid, 0) <= 0 or _served_once(bid, uid) or not pre_take(bid):
+            if budget.get(bid, 0) <= 0 or _served_once(bid, uid):
                 continue
             tier, aff, warmth = self._tier_of(bid, uid, u, core_root, now)
             picks = self._anchor_pick(
                 u, bodies.get(bid), now, limit=1, tier=tier, affection=aff, warmth=warmth,
                 last_talk=self._core_last_interaction(core_root, bid, uid),
             )
-            if not picks:
-                # 问候本来就不要求「有事」：手上真没有具体的事时，也别把这条问候整条丢掉——
-                # 直接给一句纯问候（不带由头）。避重由发送侧的复读检查兜着。
-                meta = greet_meta(kind)
-                meta["tier_note"] = anchors.tier_note(tier, aff, warmth)
-                label = {"morning": "早安", "night": "晚安"}.get(kind, "打个招呼")
-                jobs.append(job_of(bid, uid, u, 0.0, ("", meta), f"问候（{label}） "))
+            if not picks or not pre_take(bid):
                 continue
             a = picks[0]
             meta = greet_meta(kind)
@@ -7781,14 +7788,16 @@ class SocialEngine:
             ))
 
         for bid, uid, u, kind, reason, gap in sorted(threads, key=lambda item: item[5]):
-            if budget.get(bid, 0) <= 0 or not pre_take(bid):
-                continue
             _about = str(u.get("last_message", "") or "")
             if kind == "continue":
                 # v2.1.8：continue 的动机要指向「上一次聊到的事」。对方没留过话
                 # 时取她最后一句；以前一律 last_message，空的时候模型只能泛泛
                 # 来一句「在吗」——用户说的「聊完一句就不会继续」有一半是这个。
                 _about = SocialEngine._continue_topic(u) or _about
+            if not _about.strip():
+                continue
+            if budget.get(bid, 0) <= 0 or not pre_take(bid):
+                continue
             meta = thread_meta(
                 kind,
                 about=_about,
@@ -7799,6 +7808,8 @@ class SocialEngine:
             jobs.append(job_of(bid, uid, u, 0.0, (reason, meta), f"{kind}（沉默 {gap / 60:.0f} 分钟）"))
 
         for bid, uid, u, about, overdue in sorted(loops, key=lambda item: -item[4]):
+            if not str(about or "").strip():
+                continue
             if budget.get(bid, 0) <= 0 or not pre_take(bid):
                 continue
             # 这条线索是不是「追问过、对方还没回音」？是的话这一轮按复核语气问，
@@ -8854,6 +8865,9 @@ class SocialEngine:
         bad_seg, seg_why = self._verify_all_segments(
             segments, recent=_recent, called=_called, species=_sp_priv,
             max_length=int(getattr(self.cfg, "max_message_length", 0) or 0),
+            peer_context=u.get("conversation") or (),
+            peer_context_kind="private",
+            now=self._time(),
         )
         if seg_why and not bad_seg:
             bad_seg = "[empty segment]"
@@ -11569,6 +11583,15 @@ class SocialEngine:
         if now - self._last_prune < PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = now
+        try:
+            _sample_days = getattr(self.cfg, "group_message_retention_days", 30)
+            _samples_pruned = self.state.prune_group_samples(_sample_days, now)
+            if _samples_pruned:
+                logger.info(
+                    f"[autonomous_social] 已清理 {_samples_pruned} 条过期或无效群聊正文样本"
+                )
+        except Exception as e:
+            logger.warning(f"[autonomous_social] 群聊正文样本清理失败: {e}")
         # 永久删除：很久不说话、她发过去也没人回的会话，连记录一起丢掉（私聊 + 群）。
         # 放在历史清理**之前**：清完历史就分不清它当初到底有没有人回过。
         try:
