@@ -200,7 +200,8 @@ class WeatherLeadIsNotDoubled(unittest.TestCase):
 
     def test_7_prepare_round_never_yields_doubled_prefix(self):
         picks = anchors.prepare_round_anchors(
-            {}, {"weather": {"env": "外面在下雨"}}, NOW, limit=5)
+            {"conversation": [{"dir": "in", "ts": NOW - 60, "text": "外面在下雨"}]},
+            {"weather": {"env": "外面在下雨"}}, NOW, limit=5)
         abouts = [anchors._s(p.get("about")) for p in picks]
         self.assertTrue(abouts)
         for a in abouts:

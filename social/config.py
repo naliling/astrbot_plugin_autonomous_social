@@ -621,6 +621,11 @@ GROUP_STALE_DAYS_MIN = 1
 GROUP_STALE_DAYS_MAX = 90
 GROUP_STALE_DAYS_DEFAULT = 3
 
+# 只清理群聊正文样本，不删除群状态；0 禁用按时间清理。
+GROUP_MESSAGE_RETENTION_MIN = 0
+GROUP_MESSAGE_RETENTION_MAX = 365
+GROUP_MESSAGE_RETENTION_DEFAULT = 30
+
 # 发言参考库：每群保留多少条近期群友发言样本，注入生成时抽几条当风格参考
 GROUP_REF_SAMPLE_MIN = 5
 GROUP_REF_SAMPLE_MAX = 200
@@ -1104,6 +1109,7 @@ class SocialConfig:
     # 频率/窗口/配额等护栏不受它影响，仍然全部生效。
     group_interject_others: bool = True
     group_stale_days: int = GROUP_STALE_DAYS_DEFAULT
+    group_message_retention_days: int = GROUP_MESSAGE_RETENTION_DEFAULT
     group_ref_sample_size: int = GROUP_REF_SAMPLE_DEFAULT
     group_ref_prompt_count: int = GROUP_REF_PROMPT_DEFAULT
 
@@ -1717,6 +1723,10 @@ class SocialConfig:
             group_interject_others=gb("group_interject_others", True),
             group_stale_days=max(
                 GROUP_STALE_DAYS_MIN, min(GROUP_STALE_DAYS_MAX, gi("group_stale_days", GROUP_STALE_DAYS_DEFAULT))
+            ),
+            group_message_retention_days=max(
+                GROUP_MESSAGE_RETENTION_MIN,
+                min(GROUP_MESSAGE_RETENTION_MAX, gi("group_message_retention_days", GROUP_MESSAGE_RETENTION_DEFAULT)),
             ),
             group_ref_sample_size=max(
                 GROUP_REF_SAMPLE_MIN,

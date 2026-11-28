@@ -4,7 +4,7 @@
 > 没说完的话，她记得回来问。
 > 不是定时器：什么时候开口、对谁开口、说什么，由念头和一件具体的事决定。
 
-![version](https://img.shields.io/badge/version-v2.2.56-7c3aed?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.2.58-7c3aed?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -189,7 +189,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 
 ### 全部配置项
 
-> 下表与 `_conf_schema.json` 同源，共 135 项；第一列是配置键（面板里的英文名），第三列开头的中文名就是面板上显示的标签。父开关关掉时，子项在面板里是折叠的（由 `condition` 控制），配置本身仍然存在。
+> 下表与 `_conf_schema.json` 同源，共 136 项；第一列是配置键（面板里的英文名），第三列开头的中文名就是面板上显示的标签。父开关关掉时，子项在面板里是折叠的（由 `condition` 控制），配置本身仍然存在。
 
 | 配置键 | 默认值 | 中文名与说明 |
 | --- | --- | --- |
@@ -271,6 +271,7 @@ AstrBot 插件页 → 本地安装，上传 zip；或者把整个文件夹放进
 | `group_idle_hours` | `1` | **群安静多久算冷场**：到这么久没人说话才考虑破冰。 |
 | `icebreak_daily_cap` | `2` | **每群每天最多破冰几次**：防止天天在同一群破冰。 |
 | `group_stale_days` | `3` | **多少天没消息算退群**：超过就不再去这个群破冰。 |
+| `group_message_retention_days` | `30` | 群内样本文字保留天数；只清理过期样本、不删群状态；设为 `0` 禁用按时间清理。 |
 | `group_topic_enabled` | `true` | **群内主动起话头**：她自己静了一阵、又有现成话头时可以主动起话题。 |
 | `group_topic_gap_hours` | `2.5` | **同群隔多久才能再起话头**：她在同一个群里静了这么久才考虑起话题。 |
 | `group_topic_daily_cap` | `1` | **每群每天最多起几次话头**：和破冰分开计数。 |

@@ -21,13 +21,20 @@ class NewAnchorKinds(unittest.TestCase):
 
     def test_notable_weather_becomes_an_anchor(self):
         picks = anchors.prepare_round_anchors(
-            {}, {"weather": "中雨，气温 9℃"}, NOW, limit=5)
+            {"conversation": [{"dir": "in", "ts": NOW - 60, "text": "刚才提到外面下雨"}]},
+            {"weather": "中雨，气温 9℃"}, NOW, limit=5)
         self.assertTrue(any(a.get("kind") == anchors.KIND_WEATHER for a in picks), picks)
 
     def test_plain_weather_is_not_an_anchor(self):
         """多云、气温 20℃ 这种太平常，拿它当由头等于没话找话。"""
         picks = anchors.prepare_round_anchors(
             {}, {"weather": "多云，气温 20℃"}, NOW, limit=5)
+        self.assertFalse(any(a.get("kind") == anchors.KIND_WEATHER for a in picks), picks)
+
+    def test_weather_without_recent_inbound_context_is_not_an_anchor(self):
+        user = {"conversation": [{"dir": "out", "ts": NOW - 60, "text": "外面下雨了"}]}
+        picks = anchors.prepare_round_anchors(
+            user, {"weather": "中雨，气温 9℃"}, NOW, limit=5)
         self.assertFalse(any(a.get("kind") == anchors.KIND_WEATHER for a in picks), picks)
 
     def test_cold_snap_counts(self):

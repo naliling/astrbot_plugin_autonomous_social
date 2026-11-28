@@ -480,6 +480,14 @@ class QuietHoursTest(unittest.TestCase):
         self.assertEqual(eng._night_windows, {})
 
 
+def _run_closed(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 class PruneTest(unittest.TestCase):
     def test_prune_runs_once_per_interval(self):
         eng = _engine()
@@ -497,11 +505,25 @@ class PruneTest(unittest.TestCase):
     def test_seed_interval_gate(self):
         eng = _engine()
         eng._last_seed = eng._time()
-        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(eng._seed_tick())
+        _run_closed(eng._seed_tick())
         self.assertEqual(eng._last_seed, eng._time())
         eng._time_source.advance(SEED_INTERVAL_SECONDS)
-        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(eng._seed_tick())
+        _run_closed(eng._seed_tick())
         self.assertEqual(eng._last_seed, eng._time())
+
+
+class GroupSamplePruneIsolationTest(unittest.TestCase):
+    def test_samples_are_pruned_even_if_user_retention_fails(self):
+        eng = _engine()
+        eng._last_prune = 0.0
+        calls = []
+        eng.state.prune_group_samples = lambda days, now=None: calls.append((days, now)) or 1
+        def fail_user_prune(*args, **kwargs):
+            raise RuntimeError("user cleanup failed")
+        eng.state.prune_expired = fail_user_prune
+        eng._prune_expired()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], eng.cfg.group_message_retention_days)
 
 
 class UserLockPruneTest(unittest.TestCase):
@@ -525,7 +547,7 @@ class UserLockPruneTest(unittest.TestCase):
         # 丢掉正被持有的锁会让两个协程各拿一把新锁，互斥直接失效
         eng = _engine()
         lock = eng._user_lock("b1", "ghost")
-        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(lock.acquire())
+        _run_closed(lock.acquire())
         try:
             self.assertEqual(eng._prune_user_locks(), 0)
             self.assertIn(("b1", "ghost"), eng._user_locks)

@@ -614,6 +614,53 @@ class UserRetentionOptionTest(unittest.TestCase):
         )
 
 
+class GroupMessageRetentionTest(unittest.TestCase):
+    def _state(self):
+        tmp = tempfile.mkdtemp()
+        return SocialState(str(Path(tmp) / "state.json"))
+
+    def test_default_and_clamp(self):
+        self.assertEqual(_cfg().group_message_retention_days, 30)
+        self.assertEqual(_cfg(group_message_retention_days=0).group_message_retention_days, 0)
+        self.assertEqual(_cfg(group_message_retention_days=-1).group_message_retention_days, 0)
+        self.assertEqual(_cfg(group_message_retention_days=999).group_message_retention_days, 365)
+
+    def test_prune_removes_only_invalid_or_expired_samples(self):
+        state = self._state()
+        now = 1_800_000_000.0
+        group = state.group("bot1", "g1")
+        group["last_seen"] = now
+        group["topic"] = "keep-topic"
+        group["samples"] = [
+            {"ts": now - 31 * 86400, "text": "expired"},
+            {"ts": now + 10, "text": "future"},
+            {"ts": "bad", "text": "invalid time"},
+            {"ts": now - 10, "text": "   "},
+            None,
+            {"ts": now - 86400, "text": "fresh peer"},
+        ]
+        dirty = []
+        state.mark_dirty = lambda: dirty.append(True)
+        self.assertEqual(state.prune_group_samples(30, now), 5)
+        self.assertEqual(group["samples"], [{"ts": now - 86400, "text": "fresh peer"}])
+        self.assertEqual(group["last_seen"], now)
+        self.assertEqual(group["topic"], "keep-topic")
+        self.assertEqual(dirty, [True])
+
+    def test_zero_disables_pruning_and_clean_state_stays_clean(self):
+        state = self._state()
+        now = 1_800_000_000.0
+        group = state.group("bot1", "g1")
+        group["samples"] = [{"ts": now - 31 * 86400, "text": "old"}]
+        dirty = []
+        state.mark_dirty = lambda: dirty.append(True)
+        self.assertEqual(state.prune_group_samples(0, now), 0)
+        self.assertEqual(len(group["samples"]), 1)
+        group["samples"] = [{"ts": now - 60, "text": "fresh"}]
+        self.assertEqual(state.prune_group_samples(30, now), 0)
+        self.assertEqual(dirty, [])
+
+
 # ── 播种平台 ─────────────────────────────────────────────────────
 
 

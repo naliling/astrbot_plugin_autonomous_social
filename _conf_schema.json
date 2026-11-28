@@ -1031,6 +1031,22 @@
             "group_icebreak_enabled": true
         }
     },
+    "group_message_retention_days": {
+        "type": "int",
+        "default": 30,
+        "min": 0,
+        "max": 365,
+        "slider": {
+            "min": 0,
+            "max": 365,
+            "step": 1
+        },
+        "description": "群聊消息正文样本保存天数",
+        "hint": "超过期限只删除文本样本，不删除群资料与互动状态；0 表示不按时间清理。",
+        "condition": {
+            "allow_group_chat": true
+        }
+    },
     "group_topic_enabled": {
         "type": "bool",
         "default": true,

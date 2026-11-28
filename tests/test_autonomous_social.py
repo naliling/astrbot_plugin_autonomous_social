@@ -275,14 +275,16 @@ class TestStateLoadFailure(unittest.TestCase):
 
     def test_broken_json_stays_in_place_and_blocks_writes(self):
         def write(p):
-            open(p, "w").write('{"bots": {"bot1": ')
+            with open(p, "w") as f:
+                f.write('{"bots": {"bot1": ')
         st, p = self._make("broken.json", write)
         self._assert_corrupt_file_preserved(st, p)
 
     def test_non_utf8_is_preserved_and_blocks_writes(self):
         """UnicodeDecodeError 是 ValueError 子类，不会被 JSONDecodeError 捕获。"""
         def write(p):
-            open(p, "wb").write(b'{"bots": {"b": {"n": "\xff\xfe"}}}')
+            with open(p, "wb") as f:
+                f.write(b'{"bots": {"b": {"n": "\xff\xfe"}}}')
         st, p = self._make("bin.json", write)
         self._assert_corrupt_file_preserved(st, p)
 
@@ -2248,12 +2250,14 @@ class TestNoAnchorNoSend(unittest.TestCase):
     """没有由头就不开口——这是本轮最核心的行为变更。"""
 
     def test_derived_anchors_are_one_shot(self):
-        u = {"last_seen": 0.0}
-        body = {"day": {"doing": "改方案", "next": ["晚饭"]}, "weather": "外面在下雨"}
         now = 1_700_000_000.0
+        u = {"last_seen": 0.0, "conversation": [
+            {"dir": "in", "ts": now - 60, "text": "外面正在下雨"},
+        ]}
+        body = {"day": {"doing": "改方案", "next": ["晚饭"]}, "weather": "外面在下雨"}
         first = anchors.prepare_round_anchors(u, body, now, limit=5)
         self.assertTrue(first, "真实状态应该派得出由头")
-        # 同一份状态再要一次：除了新出现的沉默档位，不该再有新由头
+        # 同一份状态再要一次，不应再派生新由头。
         second = anchors.prepare_round_anchors(u, body, now, limit=5)
         fresh = [a for a in second
                  if a["about"] not in {x["about"] for x in first}]
@@ -3612,7 +3616,7 @@ class TestVerifyAllSegments(unittest.TestCase):
 
     def test_all_clean_returns_empty(self):
         e = _FlowEngine()
-        bad, why = e._verify_all_segments(["今天天气不错呀，你那边呢", "你吃饭了没"], recent=[], called="")
+        bad, why = e._verify_all_segments(["今天挺好的", "你吃饭了没"], recent=[], called="")
         self.assertEqual((bad, why), ("", ""))
 
     def test_short_content_is_not_a_style_veto(self):
@@ -3790,13 +3794,37 @@ class TestSegmentVerification(unittest.TestCase):
 
     def test_all_speech_segments_pass(self):
         bad, why = SocialEngine._verify_all_segments(
-            ["在忙吗", "刚忙完，想起你了"], recent=[], called="",
+            ["刚忙完", "想起你了"], recent=[], called="",
         )
         self.assertEqual((bad, why), ("", ""))
 
+    def test_generic_status_question_is_rejected(self):
+        bad, why = SocialEngine._verify_all_segments(
+            ["在忙吗"], recent=[], called="",
+        )
+        self.assertEqual(bad, "在忙吗")
+        self.assertIn("泛化近况", why)
+
+    def test_weather_requires_recent_inbound_context(self):
+        now = 1_700_000_000.0
+        outgoing = [{"dir": "out", "ts": now - 60, "text": "外面正在下雨"}]
+        bad, why = SocialEngine._verify_all_segments(
+            ["今天天气不错"], recent=[], called="",
+            peer_context=outgoing, peer_context_kind="private", now=now,
+        )
+        self.assertEqual(bad, "今天天气不错")
+        inbound = [{"dir": "in", "ts": now - 60, "text": "外面正在下雨"}]
+        self.assertEqual(
+            SocialEngine._verify_all_segments(
+                ["今天天气不错"], recent=[], called="",
+                peer_context=inbound, peer_context_kind="private", now=now,
+            ),
+            ("", ""),
+        )
+
     def test_peer_relevance_is_not_a_style_veto(self):
         bad, why = SocialEngine._verify_all_segments(
-            ["想你了，在干嘛", "今天天气不错"], recent=[], called="",
+            ["想你了，刚提到的电影后来选哪部了", "你上次说的方案定下来了吗"], recent=[], called="",
             require_about_peer=True,
         )
         self.assertEqual((bad, why), ("", ""))

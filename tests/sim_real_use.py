@@ -25,12 +25,11 @@ from pathlib import Path
 
 # 复用主仿真基建（假 LLM / 假平台 / 状态构造）
 HERE = Path(__file__).resolve().parent
+PLUGIN_ROOT = HERE.parent
+sys.path.insert(0, str(PLUGIN_ROOT))
 _spec = importlib.util.spec_from_file_location("_sim_base", HERE / "_sim_support.py")
 _base = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_base)
-
-PLUGIN_ROOT = HERE.parent / "astrbot_plugin_autonomous_social"
-sys.path.insert(0, str(PLUGIN_ROOT))
 
 from social.engine import SocialEngine  # noqa: E402
 from social.config import SocialConfig  # noqa: E402

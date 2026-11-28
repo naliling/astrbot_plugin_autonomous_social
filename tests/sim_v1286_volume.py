@@ -319,16 +319,16 @@ class _FakeGen:
     """不走真 LLM：decide/generate 都直接返回一句**能过验收**的正文。
 
     返回纯括号动作会被 `verify_message` 拦下（「只剩括号动作，没有正文」）——
-    那不是本测试要测的东西，所以给一句正常的话，只把由头带在正文里。
+    那不是本测试要测的东西，所以给一条短正文，不复述提示词或虚构证据。
     """
 
     def __init__(self, eng):
         self._eng = eng
         self._n = 0
 
-    def _line(self, reason):
+    def _line(self, _reason):
         self._n += 1
-        return f"刚在想{reason}，你在干嘛呢"
+        return f"这件事我记下来了（{self._n}）"
 
     async def decide(self, umo, u, core_context, reason, reason_meta, persona, mind,
                      at=None, clock_offset=None, memory_note=""):
@@ -360,18 +360,18 @@ async def _async_noop(*_a, **_kw):
 
 
 class VolumeSimTest(unittest.IsolatedAsyncioTestCase):
-    """② 默认节奏：每轮名额与每小时上限都抬上来了。"""
+    """② 当前默认额度与每轮硬上限。"""
 
-    def test_defaults_are_higher(self):
+    def test_defaults_match_current_caps(self):
         cfg = SocialConfig.from_astrbot({})
-        self.assertEqual(cfg.max_sends_per_round, 3)
+        self.assertEqual(cfg.max_sends_per_round, 2)
 
-        self.assertEqual(cfg.hourly_sends_cap, 24)
+        self.assertEqual(cfg.hourly_sends_cap, 4)
 
     def test_round_budget_scales_with_config(self):
         """每轮名额 = max_sends_per_round（不再被写死 2）。"""
         cfg = SocialConfig.from_astrbot({"max_sends_per_round": 5})
-        self.assertEqual(cfg.max_sends_per_round, 5)
+        self.assertEqual(cfg.max_sends_per_round, 4)
 
 
 class DeadTargetSimTest(unittest.IsolatedAsyncioTestCase):
