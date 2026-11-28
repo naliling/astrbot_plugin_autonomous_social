@@ -140,6 +140,44 @@ async def resolve_persona(context: Any, umo: str, cfg: Any = None) -> Tuple[str,
     # 人设存在但没名字时给中性占位；NO_PERSONA_MARKER 的含义是「不用人格」，不能拿来当名字显示
     return _persona_name(persona) or "（未命名人设）", _persona_prompt(persona)
 
+async def resolve_persona_id(context: Any, umo: str, cfg: Any = None) -> str:
+    """Return only an explicit AstrBot persona ID; unresolved/default placeholders stay local."""
+    persona_mgr = getattr(context, "persona_manager", None)
+    if persona_mgr is None:
+        return ""
+    conv_persona_id = await _conversation_persona_id(context, umo)
+    resolver = getattr(persona_mgr, "resolve_selected_persona", None)
+    if resolver is not None:
+        try:
+            resolved = await resolver(
+                umo=umo, conversation_persona_id=conv_persona_id,
+                platform_name="", provider_settings=None,
+            )
+            if isinstance(resolved, (tuple, list)) and resolved:
+                if resolved[0] == NO_PERSONA_MARKER:
+                    return ""
+                if len(resolved) >= 2 and resolved[1]:
+                    return str(resolved[0] or "").strip()
+        except Exception as exc:
+            logger.debug(f"[autonomous_social] persona ID 解析失败: {exc}")
+    persona = None
+    default_getter = getattr(persona_mgr, "get_default_persona_v3", None)
+    if default_getter is not None:
+        try:
+            persona = await default_getter(umo)
+        except Exception:
+            persona = None
+    if persona is None:
+        persona = getattr(persona_mgr, "selected_default_persona_v3", None)
+    if persona and bool(getattr(cfg, "persona_platform_fallback", False)):
+        persona = await _prefer_platform_persona(persona_mgr, umo, persona)
+    try:
+        value = persona.get("persona_id") if isinstance(persona, dict) else getattr(persona, "persona_id", "")
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
 async def _prefer_platform_persona(persona_mgr: Any, umo: str, persona: Any) -> Any:
     """会话人格没绑时，用 umo 前缀（平台名）的同名人格。
 

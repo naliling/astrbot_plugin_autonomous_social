@@ -86,7 +86,7 @@ from .signals import FILE_NAME as SIGNALS_FILE_NAME, SignalsWriter
 from .style_profile import emoji_habit
 from .throttle import closeout_allows, closeout_state, throttle
 from .generator import MessageGenerator, grounded_claims
-from .persona import resolve_persona
+from .persona import resolve_persona, resolve_persona_id
 from .reasoning import (
     extract_cue,
     generate_reason,
@@ -2409,9 +2409,16 @@ class SocialEngine:
         except Exception:
             pass
 
+        try:
+            persona_id = await resolve_persona_id(self.context, umo, self.cfg)
+        except Exception:
+            persona_id = ""
+
         # 迁移 default → 真实 bid（如果存在旧数据）
         if bid != "default":
             self.state.migrate_default_bot(bid)
+        if persona_id:
+            self.state.user(bid, uid, persona_id)
 
         # 获取发送者名称
         sender_name = uid
@@ -5974,7 +5981,14 @@ class SocialEngine:
         return "\n".join(lines)
 
     def _user_lock(self, bid: str, uid: str) -> asyncio.Lock:
-        key = (str(bid or ""), str(uid or ""))
+        persona_id = ""
+        get_persona_id = getattr(self.state, "persona_id_for_user", None)
+        if callable(get_persona_id):
+            try:
+                persona_id = str(get_persona_id(bid, uid) or "")
+            except Exception:
+                persona_id = ""
+        key = (persona_id or str(bid or ""), str(uid or ""))
         lock = self._user_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()

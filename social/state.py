@@ -240,6 +240,9 @@ class SocialState:
         self.data: Dict[str, Any] = {
             "version": STATE_VERSION,
             "bots": {},
+            "_persona_users": {},
+            "_persona_user_accounts": {},
+            "_persona_user_migrations": {},
             # v2.2.52：跨 bot 全局发言令牌。记「任意一个角色最近一次主动开口」的时刻，
             # 让同一轮心跳里几个角色不会前后几秒各发一句雷同的话。放在顶层（不在
             # bots[bid] 里），四个角色天然看到同一份。
@@ -284,8 +287,85 @@ class SocialState:
             bot = bots[bid] = {"users": {}, "last_global_send": 0.0}
         return bot
 
-    def user(self, bid: str, uid: str) -> Dict[str, Any]:
-        """获取或创建用户状态。"""
+    def persona_id_for_user(self, bid: str, uid: str) -> str:
+        accounts = self.data.get("_persona_user_accounts")
+        users = accounts.get(str(bid)) if isinstance(accounts, dict) else None
+        return str(users.get(str(uid)) or "").strip() if isinstance(users, dict) else ""
+
+    def _persona_user(self, bid: str, uid: str, persona_id: str) -> Dict[str, Any]:
+        bid, uid, persona_id = str(bid), str(uid), str(persona_id).strip()
+        bot = self.bot(bid)
+        users = bot.get("users")
+        if not isinstance(users, dict):
+            users = bot["users"] = {}
+        local = users.get(uid)
+        if not isinstance(local, dict):
+            local = users[uid] = self._default_user()
+        accounts = self.data.setdefault("_persona_user_accounts", {})
+        if not isinstance(accounts, dict):
+            accounts = self.data["_persona_user_accounts"] = {}
+        account_users = accounts.setdefault(bid, {})
+        if not isinstance(account_users, dict):
+            account_users = accounts[bid] = {}
+        previous_persona = str(account_users.get(uid) or "")
+        all_users = self.data.setdefault("_persona_users", {})
+        if not isinstance(all_users, dict):
+            all_users = self.data["_persona_users"] = {}
+        persona_users = all_users.setdefault(persona_id, {})
+        if not isinstance(persona_users, dict):
+            persona_users = all_users[persona_id] = {}
+        shared = persona_users.get(uid)
+        created = not isinstance(shared, dict)
+        changed = False
+        if created:
+            shared = self._default_user() if previous_persona and previous_persona != persona_id else dict(local)
+            persona_users[uid] = shared
+            changed = True
+        migrations = self.data.setdefault("_persona_user_migrations", {})
+        if not isinstance(migrations, dict):
+            migrations = self.data["_persona_user_migrations"] = {}
+        by_persona = migrations.setdefault(persona_id, {})
+        if not isinstance(by_persona, dict):
+            by_persona = migrations[persona_id] = {}
+        by_account = by_persona.setdefault(bid, {})
+        if not isinstance(by_account, dict):
+            by_account = by_persona[bid] = {}
+        if not by_account.get(uid):
+            if not created and not (previous_persona and previous_persona != persona_id) and local is not shared:
+                self._merge_user(shared, local)
+            by_account[uid] = True
+            changed = True
+        if account_users.get(uid) != persona_id:
+            account_users[uid] = persona_id
+            changed = True
+        shared["__uid"] = uid
+        users[uid] = shared
+        if changed:
+            self.mark_dirty()
+        return shared
+
+    def _restore_persona_user_views(self) -> None:
+        accounts = self.data.get("_persona_user_accounts")
+        all_users = self.data.get("_persona_users")
+        bots = self.data.get("bots")
+        if not all(isinstance(value, dict) for value in (accounts, all_users, bots)):
+            return
+        for bid, account_users in accounts.items():
+            bot = bots.get(bid)
+            users = bot.get("users") if isinstance(bot, dict) else None
+            if not isinstance(users, dict) or not isinstance(account_users, dict):
+                continue
+            for uid, persona_id in account_users.items():
+                persona_users = all_users.get(str(persona_id))
+                shared = persona_users.get(str(uid)) if isinstance(persona_users, dict) else None
+                if isinstance(shared, dict):
+                    users[str(uid)] = shared
+
+    def user(self, bid: str, uid: str, persona_id: str = "") -> Dict[str, Any]:
+        """获取或创建用户状态；明确 persona ID 时使用共享主记录。"""
+        persona_id = str(persona_id or self.persona_id_for_user(bid, uid) or "").strip()
+        if persona_id:
+            return self._persona_user(bid, uid, persona_id)
         users = self.bot(bid).get("users")
         if not isinstance(users, dict):
             users = self.bot(bid)["users"] = {}
@@ -945,6 +1025,7 @@ class SocialState:
             self.mark_dirty()
         self._merge_split_identities_once()
         self._migrate()
+        self._restore_persona_user_views()
 
     def _read_json_with_retry(self, *, allow_sleep: bool = True) -> Any:
         """读一次状态文件；只有「被占用」这类瞬时错误才退避重试。

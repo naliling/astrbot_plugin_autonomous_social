@@ -114,6 +114,40 @@ class _TempStateCase(unittest.TestCase):
 # ─── P0-01：读盘被占用 ≠ 文件坏了 ──────────────────────────────
 
 
+class PersonaUserSharingTest(_TempStateCase):
+    def setUp(self):
+        super().setUp()
+        self.state = SocialState(self.path, time_source=lambda: 100.0)
+
+    def test_accounts_share_persona_user_and_restore_view_after_restart(self):
+        self.state.user("a", "42")["message_count"] = 2
+        self.state.user("b", "42")["message_count"] = 3
+        a = self.state.user("a", "42", "persona-P")
+        b = self.state.user("b", "42", "persona-P")
+        self.assertIs(a, b)
+        self.assertEqual(a["message_count"], 5)
+        a["message_count"] = 6
+        self.state.save()
+
+        restored = SocialState(self.path, time_source=lambda: 100.0)
+        self.assertEqual(restored.user("b", "42")["message_count"], 6)
+        self.assertEqual(restored.bot("a")["users"]["42"]["message_count"], 6)
+        self.assertEqual(restored.bot("b")["users"]["42"]["message_count"], 6)
+        other = restored.user("a", "42", "persona-Q")
+        self.assertEqual(other["message_count"], 0)
+
+    def test_persona_user_repairs_malformed_account_container(self):
+        self.state.bot("a")["users"] = None
+        user = self.state.user("a", "42", "persona-P")
+        self.assertEqual(user["message_count"], 0)
+
+    def test_unresolved_persona_stays_account_local(self):
+        self.state.user("a", "42")["name"] = "A"
+        self.state.user("b", "42")["name"] = "B"
+        self.assertEqual(self.state.user("a", "42")["name"], "A")
+        self.assertEqual(self.state.user("b", "42")["name"], "B")
+
+
 class StateLoadDeferredTest(_TempStateCase):
     """旧实现把 OSError 与 JSONDecodeError 一起送进 `_fail_load` → `_backup_unreadable`
     → `os.rename`，然后拿空壳跑并整轮拒绝写盘。Windows 上杀软扫描、OneDrive 同步、
