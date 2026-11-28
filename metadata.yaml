@@ -9,7 +9,7 @@ desc: |
   导入历史聊天后，可以接续已有关系。选装「人形化核心伴侣」后，主动内容可参考角色的身体、日程与关系状态；选装「我会牢牢记住你」后，可按当前由头读取相关记忆。
 
   普通对话仍由原有回复链路处理，本插件只负责主动消息。
-version: "2.2.56"
+version: "2.2.58"
 author: 娜莉灵
 repo: https://github.com/naliling/astrbot_plugin_autonomous_social
 astrbot_version: ">=4.24.2"
